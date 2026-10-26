@@ -1,16 +1,20 @@
 ## For Humans
 
-This is a compact [AGENTS.md](https://agents.md/) file for Cloud Hypervisor.
+This is a compact [AGENTS.md](https://agents.md/) file for **Pylon** (`CMKL-APEX/pylon`), a surgical fork of Cloud Hypervisor for the Glidex Cloud suite.
 It is meant to help automated coding agents make useful changes that stay safe,
 reviewable, and compatible with the project's normal engineering constraints.
+
+> **Repository Scope & Upstream Isolation Policy:**
+> All changes, commits, branches, pushes, pull requests, and issues belong to the **Pylon** repository (`https://github.com/CMKL-APEX/pylon`, remote `origin`) and **MUST NOT** be pushed, submitted as PRs, or filed as issues to upstream `cloud-hypervisor/cloud-hypervisor` (`upstream`) unless the project owner explicitly instructs otherwise.
 
 ## For LLMs
 
 ### Project Context
 
-- Start with `README.md` for the project shape and `CONTRIBUTING.md` for the
+- Start with `README.md` and `spec/00-architecture.md` for the project shape and `CONTRIBUTING.md` for the
   contribution rules, coding style, commit message guidance, and LLM assistance
   disclosure policy. Following `CONTRIBUTING.md` is crucial!
+- Keep all work scoped to `CMKL-APEX/pylon`. Never push, open PRs, or create issues against `cloud-hypervisor/cloud-hypervisor` unless explicitly directed by the project owner.
 - Respect `.editorconfig` when editing files, in addition to any
   language-specific formatter required by `CONTRIBUTING.md`.
 

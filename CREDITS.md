@@ -1,6 +1,8 @@
-# Cloud Hypervisor Credits and Thanks
+# Pylon & Cloud Hypervisor Credits and Thanks
 
-The Cloud Hypervisor code is based on the [rust-vmm](https://github.com/rust-vmm), [Firecracker](https://firecracker-microvm.github.io/) and [crosvm](https://chromium.googlesource.com/chromiumos/platform/crosvm/)
+**Pylon** (`CMKL-APEX/pylon`) is developed by CMKL-APEX as a surgical fork of [Cloud Hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor). All Pylon-specific development, issues, and pull requests are maintained within `CMKL-APEX/pylon` unless the project owner explicitly directs otherwise.
+
+The upstream Cloud Hypervisor code is based on the [rust-vmm](https://github.com/rust-vmm), [Firecracker](https://firecracker-microvm.github.io/) and [crosvm](https://chromium.googlesource.com/chromiumos/platform/crosvm/)
 projects implementations.
 
 Our thanks go to the contributors of those projects:
