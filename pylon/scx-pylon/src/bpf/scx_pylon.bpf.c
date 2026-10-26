@@ -1,4 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+// Copyright © 2026 CMKL-APEX
+//
+// SPDX-License-Identifier: Apache-2.0
+//
 /*
  * scx_pylon.bpf.c - Zero-Syscall sched_ext Dispatcher for Pylon
  *
@@ -7,8 +10,12 @@
  * to a Recipient vCPU thread.
  */
 
-#include <linux/types.h>
-#include <linux/bpf.h>
+typedef unsigned int __u32;
+typedef int __s32;
+typedef unsigned long long __u64;
+
+#define BPF_MAP_TYPE_ARRAY 2
+#define BPF_FUNC_map_lookup_elem 1
 
 #define SEC(name) __attribute__((section(name), used))
 #define __uint(name, val) int (*name)[val]
