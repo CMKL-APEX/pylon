@@ -113,15 +113,19 @@ jobs:
           toolchain: stable
       - name: Test pylon-abi (#![no_std] ABI & layout assertions)
         run: cargo test -p pylon-abi -- --nocapture
-      - name: Test pylond (Control Plane & Matrix Engine)
-        run: cargo test -p pylond -- --nocapture
+      - name: Test pylond (Control Plane, Matrix Engine, and End-to-End Integration)
+        run: |
+          cargo test -p pylond -- --nocapture
+          cargo test -p pylond --test e2e_pylon -- --nocapture
       - name: Test scx-pylon (BPF compilation & BPF_F_MMAPABLE wrapper)
         run: cargo test -p scx-pylon -- --nocapture
       - name: Test VMM Pylon module & CLI configuration
         run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           cargo test -p vmm --features kvm --lib pylon -- --nocapture
           cargo test -p vmm --features kvm --lib config -- --nocapture
           cargo test -p cloud-hypervisor --features kvm --bin cloud-hypervisor -- --nocapture
-      - name: Build release binaries (pylond & cloud-hypervisor)
+      - name: Build release binaries & run Pylon vs. ACPI Hotplug benchmark
         run: |
           cargo build --release -p pylon-abi -p pylond -p scx-pylon -p cloud-hypervisor --features cloud-hypervisor/kvm
+          cargo run --release -p pylond --bin pylon-bench -- --quick
