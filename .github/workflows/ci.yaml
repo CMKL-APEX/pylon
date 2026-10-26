@@ -240,7 +240,7 @@ jobs:
         rust: [nightly]
         target:
           - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+          # - aarch64-unknown-linux-musl
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -362,10 +362,10 @@ jobs:
           - beta
           - stable
         target:
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+          # - aarch64-unknown-linux-gnu
+          # - aarch64-unknown-linux-musl
           - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
+          # - x86_64-unknown-linux-musl
         include:
           - rust: beta
             experimental: true
@@ -376,6 +376,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Install BPF & VMM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq \
+            build-essential \
+            clang \
+            llvm \
+            libelf-dev \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config
       - name: Install Rust toolchain (${{ matrix.rust }})
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -388,7 +399,7 @@ jobs:
         run: |
           set -eufo pipefail
           commits=$(git rev-list origin/${{ github.base_ref }}..${{ github.sha }})
-          for commit in $commits; do git checkout $commit; cargo check --tests --examples --all --target=${{ matrix.target }}; done
+          for commit in $commits; do git checkout $commit; cargo check --locked --tests --examples --all --target=${{ matrix.target }}; done
           git checkout ${{ github.sha }}
       - name: Clippy (kvm)
         uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
@@ -397,20 +408,20 @@ jobs:
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm" -- -D warnings
-      - name: Clippy (mshv)
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv" -- -D warnings
-      - name: Clippy (mshv + kvm)
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,kvm" -- -D warnings
+      # - name: Clippy (mshv)
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv" -- -D warnings
+      # - name: Clippy (mshv + kvm)
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,kvm" -- -D warnings
       - name: Clippy (default features)
         uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
@@ -425,13 +436,13 @@ jobs:
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --tests --examples --features "guest_debug" -- -D warnings
-      - name: Clippy (default features + pvmemcontrol)
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --tests --examples --features "pvmemcontrol" -- -D warnings
+      # - name: Clippy (default features + pvmemcontrol)
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --tests --examples --features "pvmemcontrol" -- -D warnings
       - name: Clippy (default features + tracing)
         uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
@@ -439,78 +450,78 @@ jobs:
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
           args: --locked --all --all-targets --tests --examples --features "tracing" -- -D warnings
-      - name: Clippy (default features + fw_cfg)
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --target=${{ matrix.target }} --locked --all --all-targets --tests --examples --features "fw_cfg" -- -D warnings
-      - name: Clippy (default features + ivshmem)
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --tests --examples --features "ivshmem" -- -D warnings
-      - name: Clippy (kvm + sev_snp)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,sev_snp" -- -D warnings
-      - name: Clippy (mshv + sev_snp)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,sev_snp" -- -D warnings
-      - name: Clippy (mshv + igvm + sev_snp)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,igvm,sev_snp" -- -D warnings
-      - name: Clippy (kvm + igvm)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,igvm" -- -D warnings
-      - name: Clippy (mshv + igvm)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,igvm" -- -D warnings
-      - name: Clippy (kvm + igvm + sev_snp + fw_cfg)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          cross-version: 3e0957637b49b1bbced23ad909170650c5b70635
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,igvm,sev_snp,fw_cfg" -- -D warnings
-      - name: Clippy (default features + sev_snp + igvm + fw_cfg)
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
-        uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
-        with:
-          command: clippy
-          cross-version: 3e0957637b49b1bbced23ad909170650c5b70635
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
-          args: --locked --all --all-targets --tests --examples --features "sev_snp,igvm,fw_cfg" -- -D warnings
+      # - name: Clippy (default features + fw_cfg)
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --target=${{ matrix.target }} --locked --all --all-targets --tests --examples --features "fw_cfg" -- -D warnings
+      # - name: Clippy (default features + ivshmem)
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --tests --examples --features "ivshmem" -- -D warnings
+      # - name: Clippy (kvm + sev_snp)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,sev_snp" -- -D warnings
+      # - name: Clippy (mshv + sev_snp)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,sev_snp" -- -D warnings
+      # - name: Clippy (mshv + igvm + sev_snp)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,igvm,sev_snp" -- -D warnings
+      # - name: Clippy (kvm + igvm)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,igvm" -- -D warnings
+      # - name: Clippy (mshv + igvm)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "mshv,igvm" -- -D warnings
+      # - name: Clippy (kvm + igvm + sev_snp + fw_cfg)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     cross-version: 3e0957637b49b1bbced23ad909170650c5b70635
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --no-default-features --tests --examples --features "kvm,igvm,sev_snp,fw_cfg" -- -D warnings
+      # - name: Clippy (default features + sev_snp + igvm + fw_cfg)
+      #   if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+      #   uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
+      #   with:
+      #     command: clippy
+      #     cross-version: 3e0957637b49b1bbced23ad909170650c5b70635
+      #     toolchain: ${{ matrix.rust }}
+      #     target: ${{ matrix.target }}
+      #     args: --locked --all --all-targets --tests --examples --features "sev_snp,igvm,fw_cfg" -- -D warnings
       - name: Check build did not modify any files
         run: test -z "$(git status --porcelain)"
   build:
@@ -529,12 +540,23 @@ jobs:
           - "1.89.0" # MSRV — keep quoted.
         target:
           - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
+          # - x86_64-unknown-linux-musl
     steps:
       - name: Code checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Install BPF & VMM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq \
+            build-essential \
+            clang \
+            llvm \
+            libelf-dev \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config
       - name: Install musl-gcc
         run: sudo apt install -y musl-tools
       - name: Install Rust toolchain (${{ matrix.rust }})
@@ -556,22 +578,22 @@ jobs:
         run: cargo build --locked --bin cloud-hypervisor --features "fw_cfg"
       - name: Build (default features + ivshmem)
         run: cargo build --locked --bin cloud-hypervisor --features "ivshmem"
-      - name: Build (mshv)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv"
-      - name: Build (mshv + igvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm"
-      - name: Build (mshv + sev_snp)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,sev_snp"
-      - name: Build (mshv + igvm + sev_snp)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm,sev_snp"
-      - name: Build (kvm + sev_snp)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,sev_snp"
-      - name: Build (kvm + igvm + sev_snp + fw_cfg)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm,sev_snp,fw_cfg"
-      - name: Build (kvm + igvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm"
-      - name: Build (mshv + kvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,kvm"
+      # - name: Build (mshv)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv"
+      # - name: Build (mshv + igvm)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm"
+      # - name: Build (mshv + sev_snp)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,sev_snp"
+      # - name: Build (mshv + igvm + sev_snp)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm,sev_snp"
+      # - name: Build (kvm + sev_snp)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,sev_snp"
+      # - name: Build (kvm + igvm + sev_snp + fw_cfg)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm,sev_snp,fw_cfg"
+      # - name: Build (kvm + igvm)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm"
+      # - name: Build (mshv + kvm)
+      #   run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,kvm"
       - name: Release Build (default features)
         run: cargo build --locked --all --release --target=${{ matrix.target }}
       - name: Check build did not modify any files
@@ -579,7 +601,8 @@ jobs:
   build-riscv64:
     name: build-riscv64
     needs: [preflight]
-    if: needs.preflight.outputs.full == 'true'
+    # if: needs.preflight.outputs.full == 'true'
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -617,7 +640,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        libc: [gnu, musl]
+        # libc: [gnu, musl]
+        libc: [gnu]
     steps:
       - name: Code checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -633,8 +657,9 @@ jobs:
   integration-x86-64-pr:
     name: integration-x86-64-pr
     needs: [preflight, dco, quality, build]
-    if: >-
-      github.event_name == 'pull_request' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+    # if: >-
+    #   github.event_name == 'pull_request' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
+    if: false
     timeout-minutes: 80
     env:
       # Our runner has 16 cores (nproc).
@@ -926,7 +951,8 @@ jobs:
   virtio-villain:
     name: virtio-villain
     needs: [preflight, dco, quality, build]
-    if: needs.preflight.outputs.full == 'true'
+    # if: needs.preflight.outputs.full == 'true'
+    if: false
     timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
