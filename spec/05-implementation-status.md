@@ -13,8 +13,8 @@
 | **Track 1A** | `pylon/track-1-abi-pylond` | `pylon/pylon-abi`: `#![no_std]` 64B cache-line ABI & compile-time size/offset assertions | Subagent 1 | `DONE` | `cargo test -p pylon-abi` |
 | **Track 1B** | `pylon/track-1-abi-pylond` | `pylon/pylond`: Two-plane arbiter daemon (Core 0 Tokio Unix socket + Core 1 `_rdtsc`/`_tpause` engine) | Subagent 1 | `DONE` | `cargo test -p pylond` |
 | **Track 2** | `pylon/track-2-scx-pylon` | `pylon/scx-pylon`: `sched_ext` BPF C program (`scx_pylon.bpf.c`) & `libbpf-rs` `BPF_F_MMAPABLE` wrapper | Subagent 2 | `DONE` | `cargo test -p scx-pylon` |
-| **Track 3** | `pylon/track-3-vmm-hooks` | `vmm/src/pylon.rs` & surgical hooks in `vmm/src/config.rs`, `vmm/src/memory_manager.rs`, `vmm/src/cpu.rs` | Subagent 3 | `IN_PROGRESS` | `cargo test -p vmm --features kvm` |
-| **Integration** | `feat/pylon` | Merge `pylon/track-1-abi-pylond`, `pylon/track-2-scx-pylon`, `pylon/track-3-vmm-hooks` & full test suite | Coordinator | `PENDING` | `cargo test -p pylon-abi -p pylond -p scx-pylon && cargo test -p vmm --features kvm` |
+| **Track 3** | `pylon/track-3-vmm-hooks` | `vmm/src/pylon.rs` & surgical hooks in `vmm/src/config.rs`, `vmm/src/memory_manager.rs`, `vmm/src/cpu.rs` | Subagent 3 | `DONE` | `cargo test -p vmm --features kvm` |
+| **Integration** | `feat/pylon` | Merge `pylon/track-1-abi-pylond`, `pylon/track-2-scx-pylon`, `pylon/track-3-vmm-hooks` & full test suite | Coordinator | `DONE` | `cargo test -p pylon-abi -p pylond -p scx-pylon && cargo test -p vmm --features kvm` |
 
 ---
 
@@ -52,12 +52,13 @@
 
 ## Track 3 (`vmm/src/pylon.rs` & VMM Hooks)
 
-- **Status:** `PENDING`
+- **Status:** `DONE`
 - **Checklist:**
-  - [ ] Create `vmm/src/pylon.rs` encapsulating `PylonConfig`, `PylonVmmState`, `/dev/shm/<vm-id>-pylon` creation & GPA `0xFEDF_0000` mapping, `gettid()` registration, and fast-park wait primitives.
-  - [ ] Wire `--pylon` config hook into `vmm/src/config.rs` (and `cloud-hypervisor/src/main.rs`).
-  - [ ] Wire GPA `0xFEDF_0000` shared memory mapping hook into `vmm/src/memory_manager.rs`.
-  - [ ] Wire vCPU `host_tid` registration and fast-park exit handler hook into `vmm/src/cpu.rs`.
-  - [ ] Run `cargo test -p vmm --features kvm`.
+  - [x] Create `vmm/src/pylon.rs` encapsulating `PylonConfig`, `PylonVmmState`, `/dev/shm/<vm-id>-pylon` creation & GPA `0xFEDF_0000` mapping, `gettid()` registration, and fast-park wait primitives.
+  - [x] Wire `--pylon` config hook into `vmm/src/config.rs` (and `cloud-hypervisor/src/main.rs`).
+  - [x] Wire GPA `0xFEDF_0000` shared memory mapping hook into `vmm/src/memory_manager.rs`.
+  - [x] Wire vCPU `host_tid` registration and fast-park exit handler hook into `vmm/src/cpu.rs`.
+  - [x] Run `cargo test -p vmm --features kvm`.
 - **Notes / Logs:**
-  - _Not started yet._
+  - Implemented `PylonConfig` and `PylonVmmState` in `vmm/src/pylon.rs`, including 8,192B `/dev/shm/<vm-id>-pylon` creation/mmap, `PylonHeader` initialization, `GuestRegionMmap` GPA mapping (`0xFEDF_0000`, `MAP_SHARED`, `MemoryVisibility::Shared`), optional `pylond` Unix socket `SCM_RIGHTS` registration, `gettid()` export to `PylonVcpuSlot::host_tid`, initial vCPU parking (`vcpu_id >= initial_active_vcpus`), and `revoke_requested` fast-park/wake lifecycle.
+  - Verified with `cargo test -p vmm --features kvm --lib pylon` (6/6 passed), `cargo test -p vmm --features kvm --lib config` (38/38 passed), `cargo test -p cloud-hypervisor --features kvm --bin cloud-hypervisor` (44/44 passed), and `cargo clippy -p vmm -p cloud-hypervisor --features kvm --tests` (0 warnings).

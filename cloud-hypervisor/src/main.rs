@@ -31,6 +31,7 @@ use vmm::api::http::http_api_graceful_shutdown;
 use vmm::api::{self, ApiAction};
 use vmm::config::{self, RestoreConfig, VmParams};
 use vmm::landlock::{Landlock, LandlockError};
+use vmm::pylon::PylonConfig;
 use vmm::seccomp_filters::{Thread, get_seccomp_filter};
 use vmm::vm::Vm;
 use vmm::vm_config;
@@ -484,6 +485,11 @@ fn get_cli_options_sorted(
             .help("Enable pvpanic device")
             .num_args(0)
             .action(ArgAction::SetTrue)
+            .group("vm-config"),
+        Arg::new("pylon")
+            .long("pylon")
+            .help(PylonConfig::SYNTAX)
+            .num_args(1)
             .group("vm-config"),
         Arg::new("rate-limit-group")
             .long("rate-limit-group")
