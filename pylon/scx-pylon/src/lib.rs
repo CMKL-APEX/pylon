@@ -210,13 +210,10 @@ impl PcpuOwnerMap {
     /// zero syscalls.
     #[inline]
     pub fn set_owner(&self, pcpu: usize, target_tid: u32, flags: PcpuOwnerFlags) -> Result<()> {
-        let slot = self
-            .slots()
-            .get(pcpu)
-            .ok_or(Error::PcpuOutOfBounds {
-                pcpu,
-                max: MAX_PCPUS - 1,
-            })?;
+        let slot = self.slots().get(pcpu).ok_or(Error::PcpuOutOfBounds {
+            pcpu,
+            max: MAX_PCPUS - 1,
+        })?;
         slot.flags.store(flags.bits(), Ordering::Release);
         slot.target_tid.store(target_tid, Ordering::Release);
         Ok(())
@@ -231,13 +228,10 @@ impl PcpuOwnerMap {
     /// Atomically reads the current [`PcpuOwnerEntry`] for `pcpu`.
     #[inline]
     pub fn get_owner(&self, pcpu: usize) -> Result<PcpuOwnerEntry> {
-        let slot = self
-            .slots()
-            .get(pcpu)
-            .ok_or(Error::PcpuOutOfBounds {
-                pcpu,
-                max: MAX_PCPUS - 1,
-            })?;
+        let slot = self.slots().get(pcpu).ok_or(Error::PcpuOutOfBounds {
+            pcpu,
+            max: MAX_PCPUS - 1,
+        })?;
         let target_tid = slot.target_tid.load(Ordering::Acquire);
         let flags = slot.flags.load(Ordering::Acquire);
         Ok(PcpuOwnerEntry { target_tid, flags })
@@ -279,9 +273,7 @@ impl ScxPylonUserspace {
     /// validates its map contract before kernel loading.
     pub fn open_embedded() -> Result<OpenObject> {
         let mut builder = ObjectBuilder::default();
-        let open_obj = builder
-            .open_memory(SCX_PYLON_BPF_OBJ)
-            .map_err(Error::Bpf)?;
+        let open_obj = builder.open_memory(SCX_PYLON_BPF_OBJ).map_err(Error::Bpf)?;
         Self::validate_open_object_map(&open_obj)?;
         Ok(open_obj)
     }
@@ -332,7 +324,9 @@ impl ScxPylonUserspace {
         if (map_flags & BPF_F_MMAPABLE) == 0 {
             return Err(Error::InvalidMapMetadata {
                 map_name: PCPU_OWNERS_MAP_NAME,
-                reason: format!("BPF_F_MMAPABLE (0x{BPF_F_MMAPABLE:x}) not set in map_flags (0x{map_flags:x})"),
+                reason: format!(
+                    "BPF_F_MMAPABLE (0x{BPF_F_MMAPABLE:x}) not set in map_flags (0x{map_flags:x})"
+                ),
             });
         }
 
