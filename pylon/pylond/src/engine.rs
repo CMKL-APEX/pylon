@@ -11,9 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{info, warn};
-use pylon_abi::{
-    MAX_VCPUS, PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_WAKING,
-};
+use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_WAKING};
 
 use crate::{
     CoreState, Error, MAX_PCPUS, PcpuOwnerTable, VmHandle, VmSnapshot, pin_current_thread_to_core,
@@ -222,7 +220,7 @@ impl MatrixEngine {
     #[inline]
     pub fn select_parked_vcpu(vm: &VmHandle) -> Option<u8> {
         let page = vm.shared_page();
-        let num_vcpus = ( vm.num_vcpus() as usize ).min(MAX_VCPUS);
+        let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
         let mut bitmap = page.telemetry.stranded_work_bitmap.load(Ordering::Acquire);
 
         while bitmap != 0 {
@@ -485,8 +483,9 @@ impl MatrixEngine {
                     recipient_vcpu,
                     deadline_tsc,
                 };
-                self.eval_buf[donor_eval_idx].assigned_cores =
-                    self.eval_buf[donor_eval_idx].assigned_cores.saturating_sub(1);
+                self.eval_buf[donor_eval_idx].assigned_cores = self.eval_buf[donor_eval_idx]
+                    .assigned_cores
+                    .saturating_sub(1);
                 self.eval_buf[order_idx].incoming_cores += 1;
             }
             order_idx += 1;

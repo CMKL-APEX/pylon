@@ -22,7 +22,11 @@ use tokio::sync::watch;
 
 /// Pylon Node Core Arbiter Daemon (`pylond`).
 #[derive(Debug, Parser)]
-#[command(name = "pylond", version, about = "Pylon microsecond node core arbiter daemon")]
+#[command(
+    name = "pylond",
+    version,
+    about = "Pylon microsecond node core arbiter daemon"
+)]
 struct CliArgs {
     /// Unix domain socket path for Plane 1 control plane.
     #[arg(long, default_value = DEFAULT_SOCKET_PATH)]

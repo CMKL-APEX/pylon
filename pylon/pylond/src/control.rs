@@ -157,13 +157,8 @@ async fn recv_registration_async(
     stream: &UnixStream,
 ) -> Result<(VmRegistrationRequest, Vec<OwnedFd>), Error> {
     loop {
-        stream
-            .ready(Interest::READABLE)
-            .await
-            .map_err(Error::Io)?;
-        match stream.try_io(Interest::READABLE, || {
-            recv_msg_with_fds(stream.as_raw_fd())
-        }) {
+        stream.ready(Interest::READABLE).await.map_err(Error::Io)?;
+        match stream.try_io(Interest::READABLE, || recv_msg_with_fds(stream.as_raw_fd())) {
             Ok((payload, fds)) => {
                 let req: VmRegistrationRequest =
                     serde_json::from_slice(&payload).map_err(Error::Json)?;
@@ -182,10 +177,7 @@ async fn send_response_async(
     let encoded = serde_json::to_vec(resp).map_err(Error::Json)?;
     let mut written = 0usize;
     while written < encoded.len() {
-        stream
-            .ready(Interest::WRITABLE)
-            .await
-            .map_err(Error::Io)?;
+        stream.ready(Interest::WRITABLE).await.map_err(Error::Io)?;
         match stream.try_write(&encoded[written..]) {
             Ok(n) => written += n,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,

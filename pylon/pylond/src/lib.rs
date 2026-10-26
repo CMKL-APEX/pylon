@@ -121,7 +121,8 @@ pub struct PcpuOwnerTable {
 impl PcpuOwnerTable {
     /// Creates an in-memory `PcpuOwnerTable` suitable for unprivileged execution and testing.
     pub fn new_in_memory() -> Self {
-        let entries: Box<[PcpuOwnerEntry; MAX_PCPUS]> = Box::new(from_fn(|_| PcpuOwnerEntry::new()));
+        let entries: Box<[PcpuOwnerEntry; MAX_PCPUS]> =
+            Box::new(from_fn(|_| PcpuOwnerEntry::new()));
         Self {
             storage: PcpuOwnerStorage::Heap(entries),
         }
@@ -389,13 +390,7 @@ pub fn write_eventfd(fd: RawFd) -> Result<(), Error> {
 pub fn read_eventfd(fd: RawFd) -> Result<u64, Error> {
     let mut val: u64 = 0;
     // SAFETY: `fd` is a valid file descriptor and `&mut val` points to an 8-byte mutable buffer.
-    let ret = unsafe {
-        libc::read(
-            fd,
-            (&raw mut val).cast::<libc::c_void>(),
-            size_of::<u64>(),
-        )
-    };
+    let ret = unsafe { libc::read(fd, (&raw mut val).cast::<libc::c_void>(), size_of::<u64>()) };
     if ret < 0 {
         return Err(Error::Io(io::Error::last_os_error()));
     }
@@ -446,9 +441,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
-    use pylon_abi::{
-        PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_RUNNING, VCPU_STATE_WAKING,
-    };
+    use pylon_abi::{PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_RUNNING, VCPU_STATE_WAKING};
     use tokio::sync::watch;
     use tokio::task::spawn_blocking;
     use tokio::time::sleep;
@@ -572,7 +565,13 @@ mod tests {
         let wake_raws: Vec<RawFd> = rig.wake_fds.iter().map(AsRawFd::as_raw_fd).collect();
 
         let resp = spawn_blocking(move || {
-            send_registration(&sock_for_client, &req_clone, shm_raw, &kick_raws, &wake_raws)
+            send_registration(
+                &sock_for_client,
+                &req_clone,
+                shm_raw,
+                &kick_raws,
+                &wake_raws,
+            )
         })
         .await
         .unwrap()
@@ -609,7 +608,8 @@ mod tests {
     fn test_plane2_phase1_zero_core_wakeup_and_stranded_work_tzcnt() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
+        let mut engine =
+            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
 
         let vm_timer = build_test_vm(1, 4, 0, 4, 1);
         let vm_rx = build_test_vm(2, 4, 0, 4, 1);
@@ -691,7 +691,8 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         // Manage 2 physical cores: pCPU 4 and pCPU 5.
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4, 5]);
+        let mut engine =
+            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4, 5]);
 
         let donor = build_test_vm(10, 2, 1, 2, 1);
         let recipient = build_test_vm(20, 2, 1, 2, 10);
@@ -717,17 +718,11 @@ mod tests {
         engine.poll_once(1_000);
         assert_eq!(
             engine.core_state(4),
-            CoreState::Assigned {
-                vm_id: 10,
-                vcpu: 0
-            }
+            CoreState::Assigned { vm_id: 10, vcpu: 0 }
         );
         assert_eq!(
             engine.core_state(5),
-            CoreState::Assigned {
-                vm_id: 10,
-                vcpu: 1
-            }
+            CoreState::Assigned { vm_id: 10, vcpu: 1 }
         );
         assert_eq!(pcpu_owners.read_owner(4).0, 10_001);
         assert_eq!(pcpu_owners.read_owner(5).0, 10_002);
@@ -769,10 +764,7 @@ mod tests {
         engine.poll_once(2_000);
         assert_eq!(
             engine.core_state(4),
-            CoreState::Assigned {
-                vm_id: 10,
-                vcpu: 0
-            }
+            CoreState::Assigned { vm_id: 10, vcpu: 0 }
         );
         assert_eq!(
             engine.core_state(5),
@@ -785,9 +777,7 @@ mod tests {
             }
         );
         assert_eq!(
-            donor_page.vcpus[1]
-                .revoke_requested
-                .load(Ordering::Acquire),
+            donor_page.vcpus[1].revoke_requested.load(Ordering::Acquire),
             1
         );
         assert_eq!(
@@ -807,10 +797,7 @@ mod tests {
 
         assert_eq!(
             engine.core_state(5),
-            CoreState::Assigned {
-                vm_id: 20,
-                vcpu: 0
-            }
+            CoreState::Assigned { vm_id: 20, vcpu: 0 }
         );
         assert_eq!(
             donor_page.vcpus[1]
@@ -819,9 +806,7 @@ mod tests {
             0
         );
         assert_eq!(
-            donor_page.vcpus[1]
-                .assigned_pcpu
-                .load(Ordering::Acquire),
+            donor_page.vcpus[1].assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
         );
         assert_eq!(pcpu_owners.read_owner(5).0, 20_001);
@@ -888,10 +873,7 @@ mod tests {
         engine.poll_once(30_000);
         assert_eq!(
             engine.core_state(4),
-            CoreState::Assigned {
-                vm_id: 20,
-                vcpu: 1
-            }
+            CoreState::Assigned { vm_id: 20, vcpu: 1 }
         );
         assert_eq!(
             donor_page.vcpus[0]

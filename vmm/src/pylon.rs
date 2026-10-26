@@ -23,9 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::mmap::MmapRegionError;
-use vm_memory::{
-    Address, GuestAddress, GuestMemoryRegion, GuestRegionCollectionError, MmapRegion,
-};
+use vm_memory::{Address, GuestAddress, GuestMemoryRegion, GuestRegionCollectionError, MmapRegion};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -364,8 +362,8 @@ impl PylonVmmState {
             max_cores: self.config.max_cores.unwrap_or(self.max_vcpus),
             priority_weight: self.config.priority_weight,
         };
-        let mut json_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
+        let mut json_bytes =
+            serde_json::to_vec(&payload).map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
         json_bytes.push(b'\n');
 
         let mut fds = Vec::with_capacity(1 + 2 * (self.max_vcpus as usize));
@@ -404,8 +402,7 @@ impl PylonVmmState {
 
         let gpa = GuestAddress(self.config.gpa);
         let region = Arc::new(
-            GuestRegionMmap::new(mmap_region, gpa)
-                .ok_or(Error::GuestRegionNew(self.config.gpa))?,
+            GuestRegionMmap::new(mmap_region, gpa).ok_or(Error::GuestRegionNew(self.config.gpa))?,
         );
 
         *guest_memory = guest_memory
