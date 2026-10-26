@@ -32,6 +32,7 @@ use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
 
 use crate::landlock::LandlockAccess;
+use crate::pylon;
 use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 96;
@@ -205,6 +206,9 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     #[error("Error parsing CPUID overrides")]
     InvalidCpuidOverride(#[source] CpuidOverrideParseError),
+    /// Error parsing Pylon options
+    #[error("Error parsing --pylon")]
+    ParsePylon(#[source] pylon::Error),
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -578,6 +582,7 @@ pub struct VmParams<'a> {
     pub fw_cfg_config: Option<&'a str>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<&'a str>,
+    pub pylon: Option<&'a str>,
 }
 
 impl<'a> VmParams<'a> {
@@ -654,6 +659,11 @@ impl<'a> VmParams<'a> {
             args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
         #[cfg(feature = "ivshmem")]
         let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
+        let pylon: Option<&str> = args
+            .try_get_one::<String>("pylon")
+            .ok()
+            .flatten()
+            .map(String::as_str);
         VmParams {
             cpus,
             memory,
@@ -699,6 +709,7 @@ impl<'a> VmParams<'a> {
             fw_cfg_config,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            pylon,
         }
     }
 }
@@ -4176,6 +4187,12 @@ impl VmConfig {
             ivshmem,
         };
         config.validate().map_err(Error::Validation)?;
+        pylon::parse_and_configure(
+            vm_params.pylon,
+            config.cpus.boot_vcpus,
+            config.cpus.max_vcpus,
+        )
+        .map_err(Error::ParsePylon)?;
         Ok(config)
     }
 

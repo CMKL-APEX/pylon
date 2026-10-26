@@ -64,7 +64,9 @@ use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdMemorySource, UffdRange,
 };
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
-use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, prefault, userfaultfd};
+use crate::{
+    GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, prefault, pylon, userfaultfd,
+};
 
 struct UffdHandler {
     stop_event: EventFd,
@@ -468,6 +470,10 @@ pub enum Error {
     /// Failed to prefault memory
     #[error("Failed to prefault memory")]
     PrefaultMemory(#[source] io::Error),
+
+    /// Error initializing Pylon shared memory
+    #[error("Error initializing Pylon shared memory")]
+    Pylon(#[source] pylon::Error),
 }
 
 impl From<UffdError> for Error {
@@ -2191,6 +2197,10 @@ impl MemoryManager {
                 }
             }
 
+            let mut next_memory_slot = 0;
+            pylon::setup_memory_region(&vm, &mut guest_memory, &mut next_memory_slot)
+                .map_err(Error::Pylon)?;
+
             let mut hotplug_slots = Vec::with_capacity(HOTPLUG_COUNT);
             hotplug_slots.resize_with(HOTPLUG_COUNT, HotPlugState::default);
 
@@ -2203,7 +2213,7 @@ impl MemoryManager {
                 guest_memory,
                 boot_guest_memory,
                 hotplug_slots,
-                0,
+                next_memory_slot,
                 0,
                 0,
             )

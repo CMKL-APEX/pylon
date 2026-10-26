@@ -101,7 +101,7 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
 use crate::vm_config::{CoreScheduling, CpusConfig};
-use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
+use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap, pylon};
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -1387,6 +1387,7 @@ impl CpuManager {
                         .expect("Failed to register vcpu signal handler");
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
+                    pylon::on_vcpu_thread_start(vcpu_id);
 
                     panic::catch_unwind(move || {
                         loop {
@@ -1506,6 +1507,8 @@ impl CpuManager {
                                     break;
                                 }
                             }
+                            drop(vcpu);
+                            pylon::check_and_park_vcpu(vcpu_id);
 
                             // We've been told to terminate
                             if vcpus_kill_signalled.load(Ordering::SeqCst)
@@ -1720,6 +1723,8 @@ impl CpuManager {
 
         // Toggle the vCPUs pause boolean
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
+
+        pylon::shutdown_all();
 
         // Unpark all the VCPU threads.
         for state in self.vcpu_states.lock().unwrap().iter() {
