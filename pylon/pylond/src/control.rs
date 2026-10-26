@@ -1,0 +1,327 @@
+// Copyright © 2026 CMKL-APEX
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+use std::fs;
+use std::io::{self, Read, Write};
+use std::mem::{size_of, zeroed};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::{Path, PathBuf};
+use std::ptr::{copy_nonoverlapping, null_mut};
+use std::sync::Arc;
+
+use log::{info, warn};
+use pylon_abi::MAX_VCPUS;
+use tokio::io::Interest;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+
+use crate::{
+    Error, VmHandle, VmRegistrationRequest, VmRegistrationResponse, VmSnapshot,
+    pin_current_thread_to_core,
+};
+
+/// Maximum number of file descriptors passed in a single `SCM_RIGHTS` registration message
+/// (`1` shared memory fd + `MAX_VCPUS` kick irqfds + `MAX_VCPUS` wake eventfds = 129).
+pub const MAX_REGISTRATION_FDS: usize = 1 + 2 * MAX_VCPUS;
+
+/// Maximum JSON payload size for a `VmRegistrationRequest`.
+const MAX_PAYLOAD_BYTES: usize = 4096;
+
+/// Plane 1: Control Plane Unix domain socket server.
+///
+/// Runs on Host Core 0, accepts incoming VM registrations with `SCM_RIGHTS` file descriptors,
+/// memory-maps each VM's `PylonSharedPage`, and publishes immutable `Arc<Vec<VmHandle>>`
+/// snapshots to Plane 2 via `ArcSwap`.
+pub struct ControlPlane {
+    socket_path: PathBuf,
+    vm_snapshot: Arc<VmSnapshot>,
+}
+
+impl ControlPlane {
+    /// Creates a new `ControlPlane` bound to `socket_path` and updating `vm_snapshot`.
+    pub fn new(socket_path: impl Into<PathBuf>, vm_snapshot: Arc<VmSnapshot>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            vm_snapshot,
+        }
+    }
+
+    /// Returns a reference to the shared `VmSnapshot` (`ArcSwap<Vec<VmHandle>>`).
+    pub fn vm_snapshot(&self) -> &Arc<VmSnapshot> {
+        &self.vm_snapshot
+    }
+
+    /// Pins the calling thread to Host Core 0 and runs the asynchronous registration server
+    /// until `shutdown_rx` signals `true`.
+    pub async fn run(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), Error> {
+        if let Err(err) = pin_current_thread_to_core(0) {
+            warn!("Plane 1 could not pin to Core 0: {err}");
+        }
+
+        if let Some(parent) = self.socket_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+        if self.socket_path.exists() {
+            fs::remove_file(&self.socket_path).map_err(Error::Io)?;
+        }
+
+        let listener = UnixListener::bind(&self.socket_path).map_err(Error::Io)?;
+        info!(
+            "Plane 1 (Control) listening on {}",
+            self.socket_path.display()
+        );
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                accept_res = listener.accept() => {
+                    let (stream, _) = accept_res.map_err(Error::Io)?;
+                    let snapshot = Arc::clone(&self.vm_snapshot);
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_client_connection(stream, snapshot).await {
+                            warn!("Failed to handle VM registration client: {err}");
+                        }
+                    });
+                }
+            }
+        }
+
+        let _ = fs::remove_file(&self.socket_path);
+        Ok(())
+    }
+
+    /// Registers a `VmHandle` directly into the `ArcSwap` snapshot, replacing any existing entry
+    /// with the same `vm_id`.
+    pub fn publish_vm_handle(vm_snapshot: &VmSnapshot, handle: VmHandle) {
+        let current = vm_snapshot.load();
+        let mut next: Vec<VmHandle> = current
+            .iter()
+            .filter(|existing| existing.vm_id() != handle.vm_id())
+            .cloned()
+            .collect();
+        next.push(handle);
+        vm_snapshot.store(Arc::new(next));
+    }
+}
+
+async fn handle_client_connection(
+    stream: UnixStream,
+    vm_snapshot: Arc<VmSnapshot>,
+) -> Result<(), Error> {
+    let (req, mut fds) = recv_registration_async(&stream).await?;
+
+    let expected_vcpus = req.num_vcpus as usize;
+    let expected_fds = 1 + 2 * expected_vcpus;
+    let response = if fds.len() == expected_fds {
+        let shm_fd = fds.remove(0);
+        let wake_eventfds = fds.split_off(expected_vcpus);
+        let kick_irqfds = fds;
+
+        match VmHandle::new(&req, shm_fd, kick_irqfds, wake_eventfds) {
+            Ok(handle) => {
+                info!(
+                    "Registered VM {} (vcpus={}, min_cores={}, max_cores={}, weight={})",
+                    req.vm_id, req.num_vcpus, req.min_cores, req.max_cores, req.priority_weight
+                );
+                ControlPlane::publish_vm_handle(&vm_snapshot, handle);
+                VmRegistrationResponse {
+                    accepted: true,
+                    message: "registered".to_owned(),
+                }
+            }
+            Err(err) => VmRegistrationResponse {
+                accepted: false,
+                message: err.to_string(),
+            },
+        }
+    } else {
+        VmRegistrationResponse {
+            accepted: false,
+            message: format!("expected {expected_fds} FDs, got {}", fds.len()),
+        }
+    };
+
+    send_response_async(&stream, &response).await
+}
+
+async fn recv_registration_async(
+    stream: &UnixStream,
+) -> Result<(VmRegistrationRequest, Vec<OwnedFd>), Error> {
+    loop {
+        stream
+            .ready(Interest::READABLE)
+            .await
+            .map_err(Error::Io)?;
+        match stream.try_io(Interest::READABLE, || {
+            recv_msg_with_fds(stream.as_raw_fd())
+        }) {
+            Ok((payload, fds)) => {
+                let req: VmRegistrationRequest =
+                    serde_json::from_slice(&payload).map_err(Error::Json)?;
+                return Ok((req, fds));
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+}
+
+async fn send_response_async(
+    stream: &UnixStream,
+    resp: &VmRegistrationResponse,
+) -> Result<(), Error> {
+    let encoded = serde_json::to_vec(resp).map_err(Error::Json)?;
+    let mut written = 0usize;
+    while written < encoded.len() {
+        stream
+            .ready(Interest::WRITABLE)
+            .await
+            .map_err(Error::Io)?;
+        match stream.try_write(&encoded[written..]) {
+            Ok(n) => written += n,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+    Ok(())
+}
+
+/// Synchronous client helper that sends a `VmRegistrationRequest` and its `SCM_RIGHTS` file
+/// descriptors (`shm_fd`, `kick_irqfds`, `wake_eventfds`) to `pylond` and reads the response.
+pub fn send_registration(
+    socket_path: &Path,
+    req: &VmRegistrationRequest,
+    shm_fd: RawFd,
+    kick_irqfds: &[RawFd],
+    wake_eventfds: &[RawFd],
+) -> Result<VmRegistrationResponse, Error> {
+    let mut stream = StdUnixStream::connect(socket_path).map_err(Error::Io)?;
+    let payload = serde_json::to_vec(req).map_err(Error::Json)?;
+
+    let mut all_fds = Vec::with_capacity(1 + kick_irqfds.len() + wake_eventfds.len());
+    all_fds.push(shm_fd);
+    all_fds.extend_from_slice(kick_irqfds);
+    all_fds.extend_from_slice(wake_eventfds);
+
+    send_msg_with_fds(stream.as_raw_fd(), &payload, &all_fds).map_err(Error::Io)?;
+    stream.flush().map_err(Error::Io)?;
+
+    let mut resp_buf = Vec::new();
+    stream.read_to_end(&mut resp_buf).map_err(Error::Io)?;
+    let resp: VmRegistrationResponse = serde_json::from_slice(&resp_buf).map_err(Error::Json)?;
+    Ok(resp)
+}
+
+/// Sends a datagram/stream message with `SCM_RIGHTS` file descriptors over a Unix socket.
+pub fn send_msg_with_fds(sock_fd: RawFd, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    if fds.len() > MAX_REGISTRATION_FDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many file descriptors for SCM_RIGHTS",
+        ));
+    }
+
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast::<libc::c_void>(),
+        iov_len: payload.len(),
+    };
+
+    let fd_bytes = size_of_val(fds);
+    // SAFETY: `CMSG_SPACE` is a pure arithmetic macro computing the required buffer size.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    // SAFETY: `msghdr` is plain-old-data and safe to zero-initialize.
+    let mut msg: libc::msghdr = unsafe { zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+
+    if !fds.is_empty() {
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+        msg.msg_controllen = cmsg_space;
+
+        // SAFETY: `msg` has a properly sized `msg_control` buffer for `fd_bytes` of ancillary data.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as usize;
+            let data_ptr = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+            copy_nonoverlapping(fds.as_ptr(), data_ptr, fds.len());
+        }
+    }
+
+    // SAFETY: `sock_fd` is a valid socket fd and `msg` points to valid stack/heap buffers.
+    let sent = unsafe { libc::sendmsg(sock_fd, &raw const msg, libc::MSG_NOSIGNAL) };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Receives a message payload and any attached `SCM_RIGHTS` file descriptors from a Unix socket.
+pub fn recv_msg_with_fds(sock_fd: RawFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    let mut payload_buf = vec![0u8; MAX_PAYLOAD_BYTES];
+    let mut iov = libc::iovec {
+        iov_base: payload_buf.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: payload_buf.len(),
+    };
+
+    let max_fd_bytes = MAX_REGISTRATION_FDS * size_of::<RawFd>();
+    // SAFETY: `CMSG_SPACE` is a pure arithmetic macro computing the required buffer size.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(max_fd_bytes as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    // SAFETY: `msghdr` is plain-old-data and safe to zero-initialize.
+    let mut msg: libc::msghdr = unsafe { zeroed() };
+    msg.msg_name = null_mut();
+    msg.msg_namelen = 0;
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = cmsg_space;
+
+    // SAFETY: `sock_fd` is a valid socket fd and `msg` points to valid mutable buffers.
+    let n = unsafe { libc::recvmsg(sock_fd, &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection before sending registration",
+        ));
+    }
+
+    payload_buf.truncate(n as usize);
+    let mut received_fds = Vec::new();
+
+    // SAFETY: Iterating over ancillary control headers populated by `recvmsg` within `cmsg_buf`.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data_ptr = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                let base_len = libc::CMSG_LEN(0) as usize;
+                let data_bytes = (*cmsg).cmsg_len.saturating_sub(base_len);
+                let fd_count = data_bytes / size_of::<RawFd>();
+                for idx in 0..fd_count {
+                    let raw_fd = data_ptr.add(idx).read_unaligned();
+                    received_fds.push(OwnedFd::from_raw_fd(raw_fd));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+        }
+    }
+
+    Ok((payload_buf, received_fds))
+}
