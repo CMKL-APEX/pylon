@@ -1,4 +1,6 @@
-# Contributor Covenant Code of Conduct
+# Contributor Covenant Code of Conduct (`CMKL-APEX/pylon`)
+
+> **Note:** This Code of Conduct governs contributions and interactions within the **Pylon** project (`https://github.com/CMKL-APEX/pylon`). All project governance, issues, and pull requests remain within `CMKL-APEX/pylon` unless the project owner explicitly states otherwise.
 
 ## Our Pledge
 

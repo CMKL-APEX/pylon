@@ -1,3 +1,13 @@
+# Pylon (`CMKL-APEX/pylon`)
+
+> [!IMPORTANT]
+> **Pylon Project Scope (`CMKL-APEX/pylon`):**
+> **Pylon** is the microsecond-scale elastic Virtual Machine Monitor (VMM) and host CPU core arbitration subsystem for the **Glidex Cloud** suite, built as a surgical fork of Cloud Hypervisor.
+> - Architectural specifications live in [`spec/`](spec/00-architecture.md) and standalone Pylon crates live in [`pylon/`](pylon/).
+> - **All changes, pushes, pull requests, and issues must remain in [`CMKL-APEX/pylon`](https://github.com/CMKL-APEX/pylon)** and must **NOT** be pushed, submitted as PRs, or filed as issues to upstream `cloud-hypervisor/cloud-hypervisor` unless the project owner explicitly states otherwise.
+
+---
+
 - [1. What is Cloud Hypervisor?](#1-what-is-cloud-hypervisor)
   - [Objectives](#objectives)
     - [High Level](#high-level)
@@ -376,9 +386,13 @@ not limited to container/serverless or client workloads.
 The Cloud Hypervisor community thanks the communities of both the Firecracker
 and crosvm projects for their excellent work.
 
-# 5. Community
+# 5. Community & Contributions (`CMKL-APEX/pylon`)
 
-The Cloud Hypervisor project follows the governance, and community guidelines
+All contributions, pull requests, and issues for this fork are managed directly in the [`CMKL-APEX/pylon`](https://github.com/CMKL-APEX/pylon) repository. Do **not** push branches, open pull requests, or file issues against upstream `cloud-hypervisor/cloud-hypervisor` unless explicitly instructed by the project owner. See [CONTRIBUTING.md](CONTRIBUTING.md) and [MAINTAINERS.md](MAINTAINERS.md) for details.
+
+### Upstream Cloud Hypervisor Community (Reference Only)
+
+The upstream Cloud Hypervisor project follows the governance, and community guidelines
 described in the [Community](https://github.com/cloud-hypervisor/community)
 repository.
 

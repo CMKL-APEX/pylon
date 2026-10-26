@@ -1,4 +1,7 @@
-# Cloud Hypervisor Security Policy
+# Pylon (`CMKL-APEX/pylon`) Security Policy
+
+> **Repository Scope:**
+> Security issues and vulnerabilities affecting **Pylon** (`CMKL-APEX/pylon`) must be reported to the `CMKL-APEX/pylon` project owners (via [`CMKL-APEX/pylon` Security Advisories](https://github.com/CMKL-APEX/pylon/security/advisories)) and **not** filed as public issues or sent to upstream `cloud-hypervisor/cloud-hypervisor` unless the project owner explicitly instructs otherwise.
 
 ## What Is A Vulnerability?
 

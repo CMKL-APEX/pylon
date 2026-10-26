@@ -1,12 +1,19 @@
-# GitHub Codeowners File
+# GitHub Codeowners File for Pylon (CMKL-APEX/pylon)
 #
-# Used to assign reviewers to PRs. The group
-# @cloud-hypervisor/cloud-hypervisor-reviewers is always assigned. Further,
-# we assign selected domain experts. Last matching rule wins.
+# All changes, PRs, and reviews remain within the CMKL-APEX/pylon repository.
+# Do NOT open PRs or route reviews to upstream cloud-hypervisor/cloud-hypervisor
+# unless the project owner explicitly instructs otherwise.
 #
 # KEEP THIS IN SYNC WITH MAINTAINERS.md!
 
-* @cloud-hypervisor/cloud-hypervisor-reviewers
+* @CMKL-APEX
+
+# Pylon Subsystem & VMM Hooks
+/spec/ @CMKL-APEX
+/pylon/ @CMKL-APEX
+/vmm/src/pylon.rs @CMKL-APEX
+
+# Upstream Cloud Hypervisor reference owners (retained for upstream sync context only):
 
 # Hypervisor backends
 /hypervisor/src/kvm/ @likebreath @phip1611 @rbradford @cloud-hypervisor/cloud-hypervisor-reviewers

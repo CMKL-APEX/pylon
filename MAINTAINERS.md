@@ -1,8 +1,19 @@
-# Maintainers
+# Maintainers (`CMKL-APEX/pylon`)
 
 <!-- KEEP THIS IN SYNC WITH CODEOWNERS -->
 
-People with merge permission are listed in the
+> **Repository Policy:**
+> This repository (`https://github.com/CMKL-APEX/pylon`) is maintained by **CMKL-APEX**. All changes, branches, pull requests, and issues remain in `CMKL-APEX/pylon` and must **not** be pushed or submitted to upstream `cloud-hypervisor/cloud-hypervisor` unless the project owner explicitly instructs otherwise.
+
+## Pylon Project Owner & Maintainers
+
+- **CMKL-APEX** (`@CMKL-APEX`) — Pylon architecture (`spec/`), `pylon/*` crates (`pylon-abi`, `pylond`, `scx-pylon`), and VMM integration (`vmm/src/pylon.rs`).
+
+---
+
+## Upstream Cloud Hypervisor Maintainers (Reference Only)
+
+People with merge permission on upstream Cloud Hypervisor are listed in the
 [maintainers team](https://github.com/orgs/cloud-hypervisor/teams/cloud-hypervisor-maintainers).
 
 In this document, "maintainer" has a broader meaning: it also includes

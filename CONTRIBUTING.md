@@ -1,6 +1,10 @@
-# Contributing to Cloud Hypervisor
+# Contributing to Pylon (`CMKL-APEX/pylon`)
 
-Cloud Hypervisor is an open source project licensed under the [Apache v2
+> [!IMPORTANT]
+> **Repository Boundary Policy:**
+> This repository is **Pylon** (`https://github.com/CMKL-APEX/pylon`), a surgical fork of Cloud Hypervisor. All commits, branches, pushes, pull requests, and issues **must remain within `CMKL-APEX/pylon`** (`origin`) and **must NOT** be pushed, submitted as PRs, or filed as issues to upstream `cloud-hypervisor/cloud-hypervisor` unless the project owner explicitly instructs otherwise.
+
+Pylon (and its upstream Cloud Hypervisor base) is an open source project licensed under the [Apache v2
 License](https://opensource.org/licenses/Apache-2.0) and the [BSD 3
 Clause](https://opensource.org/licenses/BSD-3-Clause) license. Individual files
 contain details of their licensing and changes to that file are under the same
@@ -172,29 +176,24 @@ commit-by-commit review. For example, include a brief motivation and, where
 useful, benchmark results or testing notes. Include links to issues and other
 discussions, if relevant.
 
-Cloud Hypervisor uses the “fork-and-pull” development model. Follow these steps if
-you want to merge your changes to `cloud-hypervisor`:
+Pylon uses the branch-and-pull development model within `CMKL-APEX/pylon`. Follow these steps if
+you want to merge your changes to `CMKL-APEX/pylon`:
 
-1. Fork the [cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) project
-   into your github organization.
-1. Within your fork, create a branch for your contribution.
-1. [Create a pull request](https://help.github.com/articles/creating-a-pull-request-from-a-fork/)
-   against the main branch of the Cloud Hypervisor repository.
+1. Create a feature branch within `CMKL-APEX/pylon` (keeping `main` clean).
+1. Push your branch to `origin` (`https://github.com/CMKL-APEX/pylon`) — **never** push or open a PR to `upstream` (`cloud-hypervisor/cloud-hypervisor`) unless the project owner explicitly instructs otherwise.
+1. Create a pull request against the `main` branch of `CMKL-APEX/pylon`.
 1. Each commit must comply with the Commit Hygiene guidelines above.
 1. A pull request should address a single component or concern to keep review
    focused and approvals straightforward.
-1. Once the pull request is approved it can be integrated.
+1. Once the pull request is approved by the Pylon project owner it can be integrated.
 
 Please squash any changes done during review already into the corresponding
 commits instead of pushing `<component>: addressing review for A`-style commits.
 
 ## Issue tracking
 
-If you have a problem, please let us know. We recommend using
-[github issues](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/new) for formally
-reporting and documenting them.
-
-To quickly and informally bring something up to us, you can also reach out on [Slack](https://cloud-hypervisor.slack.com).
+If you have a problem, please report it in the
+[CMKL-APEX/pylon GitHub issues](https://github.com/CMKL-APEX/pylon/issues) tracker. Do **not** file Pylon issues on the upstream `cloud-hypervisor/cloud-hypervisor` issue tracker unless the project owner explicitly requests it.
 
 ## Closing issues
 
