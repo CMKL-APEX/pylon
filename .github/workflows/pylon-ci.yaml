@@ -1,0 +1,127 @@
+name: Pylon CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - 'feat/**'
+      - 'pylon/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  commit-checks:
+    name: Commit & DCO Checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Set up Python 3.10
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+      - name: Install gitlint and dco-check
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade gitlint dco-check
+      - name: Check DCO Signed-off-by trailers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dco-check -e "49699333+dependabot[bot]@users.noreply.github.com"
+      - name: Lint git commit messages
+        run: |
+          gitlint --commits "origin/$GITHUB_BASE_REF.."
+
+  fmt-and-clippy:
+    name: Rustfmt & Clippy (Pylon + VMM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install BPF & VMM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq \
+            build-essential \
+            clang \
+            llvm \
+            libelf-dev \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --all -- --check
+      - name: Run Clippy on Pylon crates and VMM hooks
+        run: |
+          cargo clippy \
+            -p pylon-abi \
+            -p pylond \
+            -p scx-pylon \
+            -p vmm \
+            -p cloud-hypervisor \
+            --features kvm \
+            --tests \
+            -- -D warnings
+
+  pylon-tests:
+    name: Pylon Unit & Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install BPF & VMM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq \
+            build-essential \
+            clang \
+            llvm \
+            libelf-dev \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Test pylon-abi (#![no_std] ABI & layout assertions)
+        run: cargo test -p pylon-abi -- --nocapture
+      - name: Test pylond (Control Plane & Matrix Engine)
+        run: cargo test -p pylond -- --nocapture
+      - name: Test scx-pylon (BPF compilation & BPF_F_MMAPABLE wrapper)
+        run: cargo test -p scx-pylon -- --nocapture
+      - name: Test VMM Pylon module & CLI configuration
+        run: |
+          cargo test -p vmm --features kvm --lib pylon -- --nocapture
+          cargo test -p vmm --features kvm --lib config -- --nocapture
+          cargo test -p cloud-hypervisor --features kvm --bin cloud-hypervisor -- --nocapture
+      - name: Build release binaries (pylond & cloud-hypervisor)
+        run: |
+          cargo build --release -p pylon-abi -p pylond -p scx-pylon -p cloud-hypervisor --features cloud-hypervisor/kvm
