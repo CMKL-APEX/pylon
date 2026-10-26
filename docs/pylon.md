@@ -99,17 +99,21 @@ sudo apt-get install -y clang llvm libelf-dev zlib1g-dev pkg-config
 # 1. Test the #![no_std] shared memory ABI and compile-time layout assertions
 cargo test -p pylon-abi
 
-# 2. Test the two-plane pylond arbiter daemon (Control Plane + Matrix Engine)
+# 2. Test the two-plane pylond arbiter daemon and full-stack end-to-end tests
 cargo test -p pylond
+cargo test -p pylond --test e2e_pylon -- --nocapture
 
-# 3. Test the scx-pylon BPF object build and userspace BPF_F_MMAPABLE map wrapper
+# 3. Run the Pylon vs. ACPI CPU Hotplug workload benchmark
+cargo run --release -p pylond --bin pylon-bench
+
+# 4. Test the scx-pylon BPF object build and userspace BPF_F_MMAPABLE map wrapper
 cargo test -p scx-pylon
 
-# 4. Test VMM Pylon config parsing, GPA shared memory mapping, and fast-park lifecycle
+# 5. Test VMM Pylon config parsing, GPA shared memory mapping, and fast-park lifecycle
 cargo test -p vmm --features kvm --lib pylon
 cargo test -p vmm --features kvm --lib config
 cargo test -p cloud-hypervisor --features kvm --bin cloud-hypervisor
 
-# 5. Run Clippy across all Pylon and VMM crates
+# 6. Run Clippy across all Pylon and VMM crates
 cargo clippy -p pylon-abi -p pylond -p scx-pylon -p vmm -p cloud-hypervisor --features kvm --tests -- -D warnings
 ```

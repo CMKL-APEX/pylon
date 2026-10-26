@@ -32,6 +32,9 @@ default-members = [
   "rate_limiter",
   "serial_buffer",
   # "test_infra",
+  "pylon/pylon-abi",
+  "pylon/pylond",
+  "pylon/scx-pylon",
   "tracer",
   "vhost_user_block",
   "vhost_user_net",
@@ -41,9 +44,6 @@ default-members = [
   "vm-migration",
   "vm-virtio",
   "vmm",
-  "pylon/pylon-abi",
-  "pylon/pylond",
-  "pylon/scx-pylon",
 ]
 members = [
   "api_client",
@@ -58,6 +58,9 @@ members = [
   "option_parser",
   "pci",
   "performance-metrics",
+  "pylon/pylon-abi",
+  "pylon/pylond",
+  "pylon/scx-pylon",
   "rate_limiter",
   "serial_buffer",
   "test_infra",
@@ -70,9 +73,6 @@ members = [
   "vm-migration",
   "vm-virtio",
   "vmm",
-  "pylon/pylon-abi",
-  "pylon/pylond",
-  "pylon/scx-pylon",
 ]
 package.edition = "2024"
 # Minimum buildable version:

@@ -1,9 +1,18 @@
 [package]
 authors = ["The Cloud Hypervisor Authors"]
+default-run = "pylond"
 edition.workspace = true
 name = "pylond"
 rust-version.workspace = true
 version = "0.1.0"
+
+[[bin]]
+name = "pylond"
+path = "src/main.rs"
+
+[[bin]]
+name = "pylon-bench"
+path = "src/bin/pylon_bench.rs"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -17,7 +26,18 @@ pylon-abi = { path = "../pylon-abi" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+scx-pylon = { path = "../scx-pylon" }
 
 [lints]
 workspace = true

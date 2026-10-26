@@ -2012,6 +2012,7 @@ dependencies = [
  "log",
  "memmap2",
  "pylon-abi",
+ "scx-pylon",
  "serde",
  "serde_json",
  "thiserror",

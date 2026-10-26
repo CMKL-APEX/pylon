@@ -25,6 +25,10 @@ fn main() {
             cmd.arg("-I").arg(dir);
         }
     }
+    let multiarch_include = PathBuf::from("/usr/include/x86_64-linux-gnu");
+    if multiarch_include.is_dir() {
+        cmd.arg("-I").arg(multiarch_include);
+    }
 
     let status = cmd
         .status()

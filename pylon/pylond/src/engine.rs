@@ -35,11 +35,12 @@ pub const DEFAULT_TPAUSE_CYCLES: u64 = 1000;
 pub fn detect_waitpkg() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        let leaf0 = __cpuid_count(0, 0);
+        // SAFETY: `cpuid` leaf 0 and leaf 7 are always safe to query on x86_64 processors.
+        #[allow(unused_unsafe)]
+        let (leaf0, leaf7) = unsafe { (__cpuid_count(0, 0), __cpuid_count(7, 0)) };
         if leaf0.eax < 7 {
             return false;
         }
-        let leaf7 = __cpuid_count(7, 0);
         (leaf7.ecx & (1 << 5)) != 0
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -93,7 +94,11 @@ pub fn pause_cycles(now_tsc: u64, cycles: u64, has_waitpkg: bool) {
                 tpause_waitpkg(0, target);
             }
         } else {
-            _mm_pause();
+            // SAFETY: `_mm_pause` (`pause`) is always safe to execute on x86_64 processors.
+            #[allow(unused_unsafe)]
+            unsafe {
+                _mm_pause();
+            }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]

@@ -477,9 +477,9 @@ mod tests {
         // SAFETY: `mmap` is page-aligned and 8192 bytes, matching `PylonSharedPage`.
         let page = unsafe { &mut *(mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
         page.init(vm_id, num_vcpus, tsc_khz);
-        for vcpu_idx in 0..(num_vcpus as usize) {
+        for (vcpu_idx, slot) in page.vcpus.iter().enumerate().take(num_vcpus as usize) {
             let tid = (vm_id as u32) * 1000 + (vcpu_idx as u32) + 1;
-            page.vcpus[vcpu_idx].host_tid.store(tid, Ordering::Release);
+            slot.host_tid.store(tid, Ordering::Release);
         }
         owned
     }
