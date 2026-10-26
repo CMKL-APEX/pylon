@@ -879,4 +879,151 @@ mod tests {
         // 1 shm_fd + 2 kick_eventfds + 2 wake_eventfds = 5 FDs
         assert_eq!(fds_read, 5);
     }
+
+    #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+    #[test]
+    fn test_e2e_real_kvm_vm_pylon_shared_gpa_and_fast_park() {
+        use hypervisor::{HypervisorVmConfig, VmExit};
+        use vm_memory::{Bytes, GuestMemoryBackend};
+
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-kvm-e2e-pylon");
+        // Map Pylon shared page at GPA 0x8000 so 16-bit real-mode guest code can address it directly.
+        let cfg = PylonConfig::parse(&format!(
+            "shm={},gpa=0x8000,vm_id=42,initial_active_vcpus=1",
+            shm_path.display()
+        ))
+        .unwrap();
+        let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+
+        let Ok(hv) = hypervisor::new() else {
+            eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
+            return;
+        };
+        let vm = hv
+            .create_vm(HypervisorVmConfig::default())
+            .expect("failed to create KVM VM");
+
+        let code_gpa = GuestAddress(0x1000);
+        let mut guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
+        for (index, region) in guest_mem.iter().enumerate() {
+            // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
+            unsafe {
+                vm.create_user_memory_region(
+                    index as u32,
+                    region.start_addr().raw_value(),
+                    region.len().try_into().unwrap(),
+                    region.as_ptr(),
+                    false,
+                    false,
+                    MemoryVisibility::Shared,
+                )
+                .expect("failed to register guest code memory region");
+            }
+        }
+
+        let mut next_slot = 1u32;
+        state
+            .setup_gpa_mapping(&vm, &mut guest_mem, &mut next_slot)
+            .expect("failed to map Pylon shared page into KVM guest GPA 0x8000");
+        assert_eq!(next_slot, 2);
+
+        // 16-bit x86 guest code at GPA 0x1000 interacting with PylonSharedPage at GPA 0x8000:
+        // - 0x8000: PylonHeader.magic (low 16 bits == 0x4D31, "1M")
+        // - 0x8040: PylonTelemetry.runnable_threads (u32)
+        // - 0x8060: PylonTelemetry.guest_heartbeat (u64)
+        // - 0x80A0: PylonVcpuSlot[0].revoke_requested (u8, offset 128 + 32 = 160 = 0xA0)
+        let guest_code: [u8; 32] = [
+            0xA1, 0x00, 0x80, // mov ax, [0x8000]
+            0xC7, 0x06, 0x40, 0x80, 0x03, 0x00, // mov word ptr [0x8040], 3
+            // loop (0x1009):
+            0xFF, 0x06, 0x60, 0x80, // inc word ptr [0x8060]
+            0x80, 0x3E, 0xA0, 0x80, 0x01, // cmp byte ptr [0x80A0], 1
+            0x75, 0xF5, // jne 0x1009
+            0xF4, // hlt (1st exit -> VMM fast-park on revoke_requested == 1)
+            // after wakeup (0x1015):
+            0xFF, 0x06, 0x60, 0x80, // inc word ptr [0x8060]
+            0xC7, 0x06, 0x40, 0x80, 0x07, 0x00, // mov word ptr [0x8040], 7
+            0xF4, // hlt (2nd exit -> test complete)
+        ];
+        guest_mem
+            .write_slice(&guest_code, code_gpa)
+            .expect("failed to write guest code");
+
+        let state_vcpu = Arc::clone(&state);
+        let vcpu_thread = thread::spawn(move || {
+            let mut vcpu = vm
+                .create_vcpu(0, None, Default::default())
+                .expect("failed to create KVM vCPU 0");
+
+            let mut sregs = vcpu.get_sregs().expect("get_sregs");
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            sregs.ds.base = 0;
+            sregs.ds.selector = 0;
+            vcpu.set_sregs(&sregs).expect("set_sregs");
+
+            let mut regs = vcpu.get_regs().expect("get_regs");
+            regs.set_rip(0x1000);
+            regs.set_rflags(0x2);
+            vcpu.set_regs(&regs).expect("set_regs");
+
+            state_vcpu.on_vcpu_thread_start(0);
+
+            // First KVM_RUN: guest updates telemetry and spins until host sets revoke_requested = 1, then executes HLT.
+            match vcpu.run().expect("1st vcpu.run failed") {
+                VmExit::Reset | VmExit::Ignore => {}
+                other => panic!("unexpected 1st VM exit: {other:?}"),
+            }
+
+            // VMM fast-park hook: sees revoke_requested == 1, parks in VCPU_STATE_PARKED until woken via wake_eventfd.
+            assert!(state_vcpu.check_and_park_vcpu(0));
+
+            // Second KVM_RUN after host wakeup: guest writes runnable_threads = 7 and executes final HLT.
+            match vcpu.run().expect("2nd vcpu.run failed") {
+                VmExit::Reset | VmExit::Ignore => {}
+                other => panic!("unexpected 2nd VM exit: {other:?}"),
+            }
+
+            vcpu.get_regs().expect("get_regs after 2nd run").get_rax()
+        });
+
+        let page = state.shared_page();
+        let slot0 = state.vcpu_slot(0).unwrap();
+
+        // 1. Wait for the KVM guest to write runnable_threads = 3 and increment guest_heartbeat via GPA 0x8000.
+        for _ in 0..200 {
+            if page.telemetry.runnable_threads.load(Ordering::Acquire) == 3
+                && page.telemetry.guest_heartbeat.load(Ordering::Acquire) > 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(page.telemetry.runnable_threads.load(Ordering::Acquire), 3);
+        assert!(page.telemetry.guest_heartbeat.load(Ordering::Acquire) > 0);
+        assert_ne!(slot0.host_tid.load(Ordering::Acquire), 0);
+
+        // 2. Request cooperative revocation from the host; guest sees [0x80A0] == 1, executes HLT, and VMM parks vCPU 0.
+        slot0.revoke_requested.store(1, Ordering::Release);
+
+        for _ in 0..200 {
+            if slot0.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 0);
+        assert_eq!(slot0.yield_count.load(Ordering::Acquire), 1);
+
+        // 3. Wake the parked KVM vCPU thread via wake_eventfd and verify it resumes KVM execution.
+        state.wake_vcpu(0).unwrap();
+        let guest_rax = vcpu_thread.join().expect("KVM vCPU thread panicked");
+
+        // Verify the guest read PylonHeader.magic[0..2] (0x4D31) from GPA 0x8000 and updated runnable_threads = 7.
+        assert_eq!(guest_rax & 0xFFFF, 0x4D31);
+        assert_eq!(page.telemetry.runnable_threads.load(Ordering::Acquire), 7);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+    }
 }
