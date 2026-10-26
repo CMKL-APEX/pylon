@@ -41,6 +41,9 @@ default-members = [
   "vm-migration",
   "vm-virtio",
   "vmm",
+  "pylon/pylon-abi",
+  "pylon/pylond",
+  "pylon/scx-pylon",
 ]
 members = [
   "api_client",
@@ -67,6 +70,9 @@ members = [
   "vm-migration",
   "vm-virtio",
   "vmm",
+  "pylon/pylon-abi",
+  "pylon/pylond",
+  "pylon/scx-pylon",
 ]
 package.edition = "2024"
 # Minimum buildable version:
