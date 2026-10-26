@@ -1,0 +1,12 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "pylond"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+pylon-abi = { path = "../pylon-abi" }
+
+[lints]
+workspace = true
