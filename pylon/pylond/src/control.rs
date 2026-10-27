@@ -6,6 +6,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, zeroed};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
@@ -19,8 +20,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
 use crate::{
-    Error, VmHandle, VmRegistrationRequest, VmRegistrationResponse, VmSnapshot,
-    pin_current_thread_to_core,
+    Error, VmHandle, VmPolicyUpdateRequest, VmPolicyUpdateResponse, VmRegistrationRequest,
+    VmRegistrationResponse, VmSnapshot, pin_current_thread_to_core,
 };
 
 /// Maximum number of file descriptors passed in a single `SCM_RIGHTS` registration message
@@ -117,62 +118,108 @@ async fn handle_client_connection(
     stream: UnixStream,
     vm_snapshot: Arc<VmSnapshot>,
 ) -> Result<(), Error> {
-    let (req, mut fds) = recv_registration_async(&stream).await?;
+    let (payload, mut fds) = recv_msg_with_fds_async(&stream).await?;
 
-    let expected_vcpus = req.num_vcpus as usize;
-    let expected_fds = 1 + 2 * expected_vcpus;
-    let response = if fds.len() == expected_fds {
-        let shm_fd = fds.remove(0);
-        let wake_eventfds = fds.split_off(expected_vcpus);
-        let kick_irqfds = fds;
-
-        match VmHandle::new(&req, shm_fd, kick_irqfds, wake_eventfds) {
-            Ok(handle) => {
-                info!(
-                    "Registered VM {} (vcpus={}, min_cores={}, max_cores={}, weight={})",
-                    req.vm_id, req.num_vcpus, req.min_cores, req.max_cores, req.priority_weight
-                );
-                ControlPlane::publish_vm_handle(&vm_snapshot, handle);
-                VmRegistrationResponse {
-                    accepted: true,
-                    message: "registered".to_owned(),
-                }
+    if fds.is_empty() {
+        match serde_json::from_slice::<VmPolicyUpdateRequest>(&payload) {
+            Ok(req) => {
+                let snapshot = vm_snapshot.load();
+                let resp = if let Some(vm) = snapshot.iter().find(|v| v.vm_id() == req.vm_id) {
+                    match vm.update_policy(req.min_cores, req.max_cores, req.priority_weight) {
+                        Ok((min, max, weight)) => {
+                            info!(
+                                "Updated policy for VM {} (min_cores={}, max_cores={}, weight={})",
+                                req.vm_id, min, max, weight
+                            );
+                            VmPolicyUpdateResponse {
+                                accepted: true,
+                                message: "policy updated".to_owned(),
+                                min_cores: Some(min),
+                                max_cores: Some(max),
+                                priority_weight: Some(weight),
+                            }
+                        }
+                        Err(err) => VmPolicyUpdateResponse {
+                            accepted: false,
+                            message: err.to_string(),
+                            min_cores: None,
+                            max_cores: None,
+                            priority_weight: None,
+                        },
+                    }
+                } else {
+                    VmPolicyUpdateResponse {
+                        accepted: false,
+                        message: format!("VM {} not found", req.vm_id),
+                        min_cores: None,
+                        max_cores: None,
+                        priority_weight: None,
+                    }
+                };
+                send_json_response_async(&stream, &resp).await
             }
-            Err(err) => VmRegistrationResponse {
-                accepted: false,
-                message: err.to_string(),
-            },
+            Err(err) => {
+                let resp = VmPolicyUpdateResponse {
+                    accepted: false,
+                    message: format!("invalid control request: {err}"),
+                    min_cores: None,
+                    max_cores: None,
+                    priority_weight: None,
+                };
+                send_json_response_async(&stream, &resp).await
+            }
         }
     } else {
-        VmRegistrationResponse {
-            accepted: false,
-            message: format!("expected {expected_fds} FDs, got {}", fds.len()),
-        }
-    };
+        let req: VmRegistrationRequest = serde_json::from_slice(&payload).map_err(Error::Json)?;
+        let expected_vcpus = req.num_vcpus as usize;
+        let expected_fds = 1 + 2 * expected_vcpus;
+        let response = if fds.len() == expected_fds {
+            let shm_fd = fds.remove(0);
+            let wake_eventfds = fds.split_off(expected_vcpus);
+            let kick_irqfds = fds;
 
-    send_response_async(&stream, &response).await
+            match VmHandle::new(&req, shm_fd, kick_irqfds, wake_eventfds) {
+                Ok(handle) => {
+                    info!(
+                        "Registered VM {} (vcpus={}, min_cores={}, max_cores={}, weight={})",
+                        req.vm_id, req.num_vcpus, req.min_cores, req.max_cores, req.priority_weight
+                    );
+                    ControlPlane::publish_vm_handle(&vm_snapshot, handle);
+                    VmRegistrationResponse {
+                        accepted: true,
+                        message: "registered".to_owned(),
+                    }
+                }
+                Err(err) => VmRegistrationResponse {
+                    accepted: false,
+                    message: err.to_string(),
+                },
+            }
+        } else {
+            VmRegistrationResponse {
+                accepted: false,
+                message: format!("expected {expected_fds} FDs, got {}", fds.len()),
+            }
+        };
+
+        send_json_response_async(&stream, &response).await
+    }
 }
 
-async fn recv_registration_async(
-    stream: &UnixStream,
-) -> Result<(VmRegistrationRequest, Vec<OwnedFd>), Error> {
+async fn recv_msg_with_fds_async(stream: &UnixStream) -> Result<(Vec<u8>, Vec<OwnedFd>), Error> {
     loop {
         stream.ready(Interest::READABLE).await.map_err(Error::Io)?;
         match stream.try_io(Interest::READABLE, || recv_msg_with_fds(stream.as_raw_fd())) {
-            Ok((payload, fds)) => {
-                let req: VmRegistrationRequest =
-                    serde_json::from_slice(&payload).map_err(Error::Json)?;
-                return Ok((req, fds));
-            }
+            Ok(res) => return Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
             Err(err) => return Err(Error::Io(err)),
         }
     }
 }
 
-async fn send_response_async(
+async fn send_json_response_async<T: serde::Serialize>(
     stream: &UnixStream,
-    resp: &VmRegistrationResponse,
+    resp: &T,
 ) -> Result<(), Error> {
     let encoded = serde_json::to_vec(resp).map_err(Error::Json)?;
     let mut written = 0usize;
@@ -210,6 +257,25 @@ pub fn send_registration(
     let mut resp_buf = Vec::new();
     stream.read_to_end(&mut resp_buf).map_err(Error::Io)?;
     let resp: VmRegistrationResponse = serde_json::from_slice(&resp_buf).map_err(Error::Json)?;
+    Ok(resp)
+}
+
+/// Synchronous client helper that sends a `VmPolicyUpdateRequest` over `/run/pylon/pylond.sock`
+/// and reads the `VmPolicyUpdateResponse`.
+pub fn send_policy_update(
+    socket_path: &Path,
+    req: &VmPolicyUpdateRequest,
+) -> Result<VmPolicyUpdateResponse, Error> {
+    let mut stream = StdUnixStream::connect(socket_path).map_err(Error::Io)?;
+    let payload = serde_json::to_vec(req).map_err(Error::Json)?;
+
+    send_msg_with_fds(stream.as_raw_fd(), &payload, &[]).map_err(Error::Io)?;
+    stream.flush().map_err(Error::Io)?;
+    let _ = stream.shutdown(Shutdown::Write);
+
+    let mut resp_buf = Vec::new();
+    stream.read_to_end(&mut resp_buf).map_err(Error::Io)?;
+    let resp: VmPolicyUpdateResponse = serde_json::from_slice(&resp_buf).map_err(Error::Json)?;
     Ok(resp)
 }
 
