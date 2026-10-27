@@ -20,11 +20,11 @@ use memmap2::MmapMut;
 use pylon_abi::{
     PCPU_UNASSIGNED, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
 };
-use pylond::control::{ControlPlane, send_registration};
+use pylond::control::{ControlPlane, send_policy_update, send_registration};
 use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, read_tsc};
 use pylond::{
-    CoreState, PcpuOwnerTable, VmRegistrationRequest, VmSnapshot, create_eventfd, read_eventfd,
-    write_eventfd,
+    CoreState, PcpuOwnerTable, VmPolicyUpdateRequest, VmRegistrationRequest, VmSnapshot,
+    create_eventfd, read_eventfd, write_eventfd,
 };
 use scx_pylon::{PCPU_OWNER_MAP_BYTES, PcpuOwnerMap, ScxPylonUserspace};
 use tokio::runtime::Builder;
@@ -662,5 +662,73 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
     let _ = control_thread.join();
     donor.shutdown();
     recipient.shutdown();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_e2e_live_policy_update_and_engine_convergence() {
+    let temp_dir = temp_dir().join(format!("pylon-e2e-policy-{}", process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    let socket_path = temp_dir.join("pylond-policy.sock");
+    let _pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+    let vm_snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let control_plane = ControlPlane::new(&socket_path, Arc::clone(&vm_snapshot));
+
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let control_thread = thread::spawn(move || {
+        rt.block_on(control_plane.run(shutdown_rx))
+            .expect("ControlPlane failed");
+    });
+
+    wait_until(
+        Duration::from_secs(2),
+        || socket_path.exists(),
+        "ControlPlane socket creation",
+    );
+
+    let vm = SimulatedVmm::spawn_and_register(
+        &temp_dir,
+        &socket_path,
+        201,
+        4,
+        1,  // initial min_cores
+        4,  // initial max_cores
+        50, // initial priority_weight
+        true,
+    );
+
+    let snapshot = vm_snapshot.load();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].min_cores(), 1);
+    assert_eq!(snapshot[0].max_cores(), 4);
+    assert_eq!(snapshot[0].priority_weight(), 50);
+
+    // Live update policy: min=2, max=3, weight=300
+    let update_req = VmPolicyUpdateRequest {
+        vm_id: 201,
+        min_cores: Some(2),
+        max_cores: Some(3),
+        priority_weight: Some(300),
+    };
+    let update_resp = send_policy_update(&socket_path, &update_req).expect("policy update failed");
+    assert!(update_resp.accepted);
+    assert_eq!(update_resp.min_cores, Some(2));
+    assert_eq!(update_resp.max_cores, Some(3));
+    assert_eq!(update_resp.priority_weight, Some(300));
+
+    // Verify snapshot reflects the new policy without reconnecting or re-registering
+    assert_eq!(snapshot[0].min_cores(), 2);
+    assert_eq!(snapshot[0].max_cores(), 3);
+    assert_eq!(snapshot[0].priority_weight(), 300);
+
+    let _ = shutdown_tx.send(true);
+    let _ = control_thread.join();
+    vm.shutdown();
     let _ = fs::remove_dir_all(&temp_dir);
 }

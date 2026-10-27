@@ -44,6 +44,9 @@ pub enum Error {
     #[error("Invalid registration request for VM {vm_id}: {reason}")]
     InvalidRegistration { vm_id: u64, reason: String },
 
+    #[error("Invalid policy update for VM {vm_id}: {reason}")]
+    InvalidPolicyUpdate { vm_id: u64, reason: String },
+
     #[error("Invalid file descriptor count: got {actual}, expected {expected}")]
     InvalidFdCount { actual: usize, expected: usize },
 
@@ -183,13 +186,38 @@ pub struct VmRegistrationResponse {
     pub message: String,
 }
 
+/// JSON payload sent over `/run/pylon/pylond.sock` to update a running VM's elastic policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmPolicyUpdateRequest {
+    pub vm_id: u64,
+    #[serde(default)]
+    pub min_cores: Option<u32>,
+    #[serde(default)]
+    pub max_cores: Option<u32>,
+    #[serde(default)]
+    pub priority_weight: Option<u32>,
+}
+
+/// JSON response returned by `pylond` after processing a `VmPolicyUpdateRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmPolicyUpdateResponse {
+    pub accepted: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_cores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_weight: Option<u32>,
+}
+
 #[derive(Debug)]
 struct VmHandleInner {
     vm_id: u64,
     num_vcpus: u32,
-    min_cores: u32,
-    max_cores: u32,
-    priority_weight: u32,
+    min_cores: AtomicU32,
+    max_cores: AtomicU32,
+    priority_weight: AtomicU32,
     shm_mmap: MmapMut,
     kick_irqfds: Vec<OwnedFd>,
     wake_eventfds: Vec<OwnedFd>,
@@ -252,9 +280,9 @@ impl VmHandle {
             inner: Arc::new(VmHandleInner {
                 vm_id: req.vm_id,
                 num_vcpus: req.num_vcpus,
-                min_cores: req.min_cores,
-                max_cores: req.max_cores,
-                priority_weight: req.priority_weight.max(1),
+                min_cores: AtomicU32::new(req.min_cores),
+                max_cores: AtomicU32::new(req.max_cores),
+                priority_weight: AtomicU32::new(req.priority_weight.max(1)),
                 shm_mmap,
                 kick_irqfds,
                 wake_eventfds,
@@ -281,17 +309,51 @@ impl VmHandle {
 
     #[inline]
     pub fn min_cores(&self) -> u32 {
-        self.inner.min_cores
+        self.inner.min_cores.load(Ordering::Acquire)
     }
 
     #[inline]
     pub fn max_cores(&self) -> u32 {
-        self.inner.max_cores
+        self.inner.max_cores.load(Ordering::Acquire)
     }
 
     #[inline]
     pub fn priority_weight(&self) -> u32 {
-        self.inner.priority_weight
+        self.inner.priority_weight.load(Ordering::Acquire)
+    }
+
+    /// Dynamically updates the elastic core bounds and scheduling weight for this VM.
+    pub fn update_policy(
+        &self,
+        min_cores: Option<u32>,
+        max_cores: Option<u32>,
+        priority_weight: Option<u32>,
+    ) -> Result<(u32, u32, u32), Error> {
+        let cur_min = self.inner.min_cores.load(Ordering::Acquire);
+        let cur_max = self.inner.max_cores.load(Ordering::Acquire);
+        let cur_weight = self.inner.priority_weight.load(Ordering::Acquire);
+
+        let new_min = min_cores.unwrap_or(cur_min);
+        let new_max = max_cores.unwrap_or(cur_max);
+        let new_weight = priority_weight.unwrap_or(cur_weight).max(1);
+
+        if new_max == 0 || new_min > new_max || new_max > self.inner.num_vcpus {
+            return Err(Error::InvalidPolicyUpdate {
+                vm_id: self.inner.vm_id,
+                reason: format!(
+                    "invalid core bounds min_cores={} max_cores={} num_vcpus={}",
+                    new_min, new_max, self.inner.num_vcpus
+                ),
+            });
+        }
+
+        self.inner.min_cores.store(new_min, Ordering::Release);
+        self.inner.max_cores.store(new_max, Ordering::Release);
+        self.inner
+            .priority_weight
+            .store(new_weight, Ordering::Release);
+
+        Ok((new_min, new_max, new_weight))
     }
 
     /// Returns a reference to the memory-mapped `PylonSharedPage`.
@@ -447,7 +509,7 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
-    use crate::control::{ControlPlane, send_registration};
+    use crate::control::{ControlPlane, send_policy_update, send_registration};
     use crate::engine::{MatrixEngine, pause_cycles, read_tsc};
 
     struct TestVmRig {
@@ -599,6 +661,32 @@ mod tests {
 
         vm.wake_vcpu(3).unwrap();
         assert_eq!(read_eventfd(rig.wake_fds[3].as_raw_fd()).unwrap(), 1);
+
+        // Verify live policy update over Plane 1 socket without SCM_RIGHTS.
+        let update_req = VmPolicyUpdateRequest {
+            vm_id: 101,
+            min_cores: Some(2),
+            max_cores: Some(3),
+            priority_weight: Some(250),
+        };
+        let sock_for_update = sock_path.clone();
+        let update_resp = spawn_blocking(move || send_policy_update(&sock_for_update, &update_req))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            update_resp.accepted,
+            "policy update rejected: {}",
+            update_resp.message
+        );
+        assert_eq!(update_resp.min_cores, Some(2));
+        assert_eq!(update_resp.max_cores, Some(3));
+        assert_eq!(update_resp.priority_weight, Some(250));
+
+        assert_eq!(vm.min_cores(), 2);
+        assert_eq!(vm.max_cores(), 3);
+        assert_eq!(vm.priority_weight(), 250);
 
         let _ = shutdown_tx.send(true);
         let _ = control_task.await.unwrap();
