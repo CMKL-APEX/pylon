@@ -817,11 +817,6 @@ fn start_vmm(
     )
     .map_err(Error::StartVmmThread)?;
 
-    // Spawn workers first so they do not inherit main's narrower filter.
-    if !main_seccomp_filter.is_empty() {
-        seccompiler::apply_filter(&main_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
-    }
-
     // API endpoints (HTTP, D-Bus) are set up at this point (if API socket is
     // configured)
     event!("vmm", "started");
@@ -863,6 +858,12 @@ fn start_vmm(
 
         Ok(())
     })();
+
+    // Apply main thread seccomp filter after CLI parsing and initial VM create/boot
+    // have completed, and before waiting on the VMM thread.
+    if !main_seccomp_filter.is_empty() {
+        seccompiler::apply_filter(&main_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+    }
 
     if r.is_err()
         && let Err(e) = exit_evt.write(1)
