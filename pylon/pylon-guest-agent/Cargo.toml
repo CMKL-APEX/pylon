@@ -1,0 +1,24 @@
+[package]
+authors = ["CMKL-APEX"]
+description = "Guest-side cooperative core elasticity and telemetry agent for Pylon VMs"
+edition.workspace = true
+license = "Apache-2.0"
+name = "pylon-guest-agent"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+memmap2 = "0.9"
+pylon-abi = { path = "../pylon-abi" }
+signal-hook = "0.4"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

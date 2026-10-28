@@ -54,6 +54,7 @@ class TitleStartsWithComponent(LineRule):
             'performance-metrics',
             'pylon',
             'pylon-abi',
+            'pylon-guest-agent',
             'pylond',
             'rate_limiter',
             'README',
