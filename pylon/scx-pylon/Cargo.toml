@@ -5,12 +5,19 @@ name = "scx-pylon"
 rust-version.workspace = true
 version = "0.1.0"
 
+[[bin]]
+name = "scx_pylon"
+path = "src/main.rs"
+
 [dependencies]
+clap = { workspace = true, features = ["derive"] }
+env_logger = { workspace = true }
 libbpf-rs = "0.24"
 libbpf-sys = { version = "1.4", features = ["vendored-libbpf"] }
 libc = { workspace = true }
 log = { workspace = true }
 memmap2 = "0.9"
+signal-hook = "0.4"
 thiserror = { workspace = true }
 
 [lints]

@@ -252,6 +252,11 @@ impl PcpuOwnerMap {
         }
         None
     }
+
+    /// Consumes the `PcpuOwnerMap` and returns the underlying `MmapMut`.
+    pub fn into_mmap(self) -> MmapMut {
+        self.mmap
+    }
 }
 
 /// Userspace loader and handle for the `scx_pylon` `sched_ext` BPF dispatcher.
@@ -379,6 +384,11 @@ impl ScxPylonUserspace {
     #[inline]
     pub const fn owner_map(&self) -> &PcpuOwnerMap {
         &self.owner_map
+    }
+
+    /// Consumes the loader handle and returns the `PcpuOwnerMap`, BPF `Link`, and `Object`.
+    pub fn into_parts(self) -> (PcpuOwnerMap, Link, Object) {
+        (self.owner_map, self._link, self._obj)
     }
 }
 

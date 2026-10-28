@@ -10,22 +10,10 @@
  * to a Recipient vCPU thread.
  */
 
-typedef unsigned int __u32;
-typedef int __s32;
-typedef unsigned long long __u64;
-
-#define BPF_MAP_TYPE_ARRAY 2
-#define BPF_FUNC_map_lookup_elem 1
-
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-#define __ksym __attribute__((section(".ksyms")))
-#define __weak __attribute__((weak))
-
-#ifndef BPF_F_MMAPABLE
-#define BPF_F_MMAPABLE (1U << 10)
-#endif
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 #define MAX_PCPUS 256
 
@@ -42,22 +30,6 @@ typedef unsigned long long __u64;
 /* Flags in struct pcpu_owner_entry */
 #define PCPU_OWNER_FLAG_ACTIVE (1U << 0)
 #define PCPU_OWNER_FLAG_PREEMPT (1U << 1)
-
-/* Minimal task_struct representation for BPF CO-RE / sched_ext hooks */
-struct task_struct {
-    int pid;
-    int tgid;
-    unsigned int flags;
-} __attribute__((preserve_access_index));
-
-/* BPF helper declarations */
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)BPF_FUNC_map_lookup_elem;
-
-/* sched_ext kfunc declarations (weak ksym externs for BPF compilation & BTF emission) */
-extern void scx_bpf_dsq_insert(struct task_struct *p, __u64 dsq_id, __u64 slice, __u64 enq_flags) __weak __ksym;
-extern void scx_bpf_kick_cpu(__s32 cpu, __u64 flags) __weak __ksym;
-extern struct task_struct *bpf_task_from_pid(__s32 pid) __weak __ksym;
-extern void bpf_task_release(struct task_struct *p) __weak __ksym;
 
 struct pcpu_owner_entry {
     __u32 target_tid;
@@ -79,7 +51,7 @@ struct {
  * assigned pCPU and insert directly into SCX_DSQ_LOCAL.
  */
 SEC("struct_ops/pylon_select_cpu")
-__s32 pylon_select_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags)
+s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
     __u32 task_tid = (__u32)p->pid;
 
@@ -100,14 +72,15 @@ __s32 pylon_select_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags)
         struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
         if (entry && entry->target_tid == task_tid && task_tid != 0) {
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_INF, wake_flags);
-            if ((__s32)cpu != prev_cpu) {
-                scx_bpf_kick_cpu((__s32)cpu, SCX_KICK_PREEMPT);
+            if ((s32)cpu != prev_cpu) {
+                scx_bpf_kick_cpu((s32)cpu, SCX_KICK_PREEMPT);
             }
-            return (__s32)cpu;
+            return (s32)cpu;
         }
     }
 
-    return prev_cpu;
+    bool is_idle = false;
+    return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
 
 /*
@@ -118,7 +91,7 @@ __s32 pylon_select_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags)
  * target_tid was replaced (e.g., deadline expired), preempt prev immediately.
  */
 SEC("struct_ops/pylon_dispatch")
-void pylon_dispatch(__s32 cpu, struct task_struct *prev)
+void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
 {
     if (cpu < 0 || cpu >= MAX_PCPUS) {
         return;
@@ -142,24 +115,30 @@ void pylon_dispatch(__s32 cpu, struct task_struct *prev)
     }
 
     /* Acquire the target vCPU task by kernel TID (pid) and dispatch to SCX_DSQ_LOCAL */
-    struct task_struct *target = bpf_task_from_pid((__s32)target_tid);
+    struct task_struct *target = bpf_task_from_pid((s32)target_tid);
     if (target) {
         scx_bpf_dsq_insert(target, SCX_DSQ_LOCAL, SCX_SLICE_INF, 0);
         bpf_task_release(target);
     }
 }
 
-struct sched_ext_ops {
-    __s32 (*select_cpu)(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags);
-    void (*dispatch)(__s32 cpu, struct task_struct *prev);
-    __u64 flags;
-    char name[128];
-};
+SEC("struct_ops/pylon_init")
+s32 BPF_PROG(pylon_init)
+{
+    return 0;
+}
+
+SEC("struct_ops/pylon_exit")
+void BPF_PROG(pylon_exit, struct scx_exit_info *info)
+{
+}
 
 SEC(".struct_ops.link")
 struct sched_ext_ops pylon_ops = {
     .select_cpu = (void *)pylon_select_cpu,
     .dispatch = (void *)pylon_dispatch,
+    .init = (void *)pylon_init,
+    .exit = (void *)pylon_exit,
     .name = "pylon",
 };
 

@@ -16,7 +16,16 @@ fn main() {
 
     let mut cmd = Command::new("clang");
     cmd.args([
-        "-target", "bpf", "-O2", "-g", "-Wall", "-Werror", "-c", bpf_src, "-o",
+        "-target",
+        "bpf",
+        "-O2",
+        "-g",
+        "-Wall",
+        "-Werror",
+        "-Wno-missing-declarations",
+        "-c",
+        bpf_src,
+        "-o",
     ])
     .arg(&out_obj);
 
