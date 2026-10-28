@@ -12,7 +12,7 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use memmap2::MmapMut;
@@ -211,6 +211,39 @@ pub struct VmPolicyUpdateResponse {
     pub priority_weight: Option<u32>,
 }
 
+/// Statistics and real-time metering for a registered VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmStats {
+    pub vm_id: u64,
+    pub num_vcpus: u32,
+    pub min_cores: u32,
+    pub max_cores: u32,
+    pub priority_weight: u32,
+    pub current_cores: u32,
+    pub allocated_core_microseconds: u64,
+    pub cooperative_yields: u64,
+    pub forced_preemptions: u64,
+    pub runnable_threads: u32,
+}
+
+/// JSON payload sent over `/run/pylon/pylond.sock` to query VM statistics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmStatsRequest {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub vm_id: Option<u64>,
+}
+
+/// JSON response returned by `pylond` after processing a `VmStatsRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmStatsResponse {
+    pub accepted: bool,
+    #[serde(default)]
+    pub message: String,
+    pub vms: Vec<VmStats>,
+}
+
 #[derive(Debug)]
 struct VmHandleInner {
     vm_id: u64,
@@ -218,6 +251,9 @@ struct VmHandleInner {
     min_cores: AtomicU32,
     max_cores: AtomicU32,
     priority_weight: AtomicU32,
+    allocated_core_usec: AtomicU64,
+    cooperative_yield_count: AtomicU64,
+    forced_preempt_count: AtomicU64,
     shm_mmap: MmapMut,
     kick_irqfds: Vec<OwnedFd>,
     wake_eventfds: Vec<OwnedFd>,
@@ -283,6 +319,9 @@ impl VmHandle {
                 min_cores: AtomicU32::new(req.min_cores),
                 max_cores: AtomicU32::new(req.max_cores),
                 priority_weight: AtomicU32::new(req.priority_weight.max(1)),
+                allocated_core_usec: AtomicU64::new(0),
+                cooperative_yield_count: AtomicU64::new(0),
+                forced_preempt_count: AtomicU64::new(0),
                 shm_mmap,
                 kick_irqfds,
                 wake_eventfds,
@@ -320,6 +359,48 @@ impl VmHandle {
     #[inline]
     pub fn priority_weight(&self) -> u32 {
         self.inner.priority_weight.load(Ordering::Acquire)
+    }
+
+    /// Cumulative physical core-microseconds allocated to this VM.
+    #[inline]
+    pub fn allocated_core_usec(&self) -> u64 {
+        self.inner.allocated_core_usec.load(Ordering::Acquire)
+    }
+
+    /// Atomically accumulates physical core-microseconds allocated to this VM.
+    #[inline]
+    pub fn add_allocated_core_usec(&self, delta: u64) {
+        self.inner
+            .allocated_core_usec
+            .fetch_add(delta, Ordering::AcqRel);
+    }
+
+    /// Cumulative number of voluntary cooperative yields performed by this VM.
+    #[inline]
+    pub fn cooperative_yield_count(&self) -> u64 {
+        self.inner.cooperative_yield_count.load(Ordering::Acquire)
+    }
+
+    /// Atomically increments the voluntary cooperative yield count for this VM.
+    #[inline]
+    pub fn record_cooperative_yield(&self) {
+        self.inner
+            .cooperative_yield_count
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Cumulative number of forced preemptions (hard deadline expirations) on this VM.
+    #[inline]
+    pub fn forced_preempt_count(&self) -> u64 {
+        self.inner.forced_preempt_count.load(Ordering::Acquire)
+    }
+
+    /// Atomically increments the forced preemption count for this VM.
+    #[inline]
+    pub fn record_forced_preempt(&self) {
+        self.inner
+            .forced_preempt_count
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     /// Dynamically updates the elastic core bounds and scheduling weight for this VM.

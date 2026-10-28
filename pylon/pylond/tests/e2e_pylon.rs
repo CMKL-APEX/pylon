@@ -20,7 +20,9 @@ use memmap2::MmapMut;
 use pylon_abi::{
     PCPU_UNASSIGNED, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
 };
-use pylond::control::{ControlPlane, send_policy_update, send_registration};
+use pylond::control::{
+    ControlPlane, query_vm_stats, run_prometheus_server, send_policy_update, send_registration,
+};
 use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, read_tsc};
 use pylond::{
     CoreState, PcpuOwnerTable, VmPolicyUpdateRequest, VmRegistrationRequest, VmSnapshot,
@@ -726,6 +728,190 @@ fn test_e2e_live_policy_update_and_engine_convergence() {
     assert_eq!(snapshot[0].min_cores(), 2);
     assert_eq!(snapshot[0].max_cores(), 3);
     assert_eq!(snapshot[0].priority_weight(), 300);
+
+    let _ = shutdown_tx.send(true);
+    let _ = control_thread.join();
+    vm.shutdown();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_e2e_observability_metering_and_socket_stats() {
+    let temp_dir = temp_dir().join(format!("pylon-e2e-stats-{}", process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    let socket_path = temp_dir.join("pylond-stats.sock");
+    let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+    let vm_snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let control_plane = ControlPlane::new(&socket_path, Arc::clone(&vm_snapshot));
+
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let control_thread = thread::spawn(move || {
+        rt.block_on(control_plane.run(shutdown_rx))
+            .expect("ControlPlane failed");
+    });
+
+    wait_until(
+        Duration::from_secs(2),
+        || socket_path.exists(),
+        "ControlPlane socket creation",
+    );
+
+    let vm = SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 301, 2, 1, 2, 100, true);
+    let page = vm.shared_page();
+
+    let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
+
+    // VM 301 demands 2 cores
+    page.telemetry.runnable_threads.store(2, Ordering::Release);
+    let start_tsc = read_tsc();
+    engine.poll_once(start_tsc);
+
+    assert_eq!(page.vcpus[0].assigned_pcpu.load(Ordering::Acquire), 2);
+    assert_eq!(page.vcpus[1].assigned_pcpu.load(Ordering::Acquire), 3);
+    assert_eq!(
+        engine.core_state(2),
+        CoreState::Assigned {
+            vm_id: 301,
+            vcpu: 0
+        }
+    );
+    assert_eq!(
+        engine.core_state(3),
+        CoreState::Assigned {
+            vm_id: 301,
+            vcpu: 1
+        }
+    );
+
+    // Advance simulated TSC by 50,000 cycles (~25 us at 2GHz)
+    let next_tsc = start_tsc.saturating_add(50_000);
+    engine.poll_once(next_tsc);
+
+    // Query stats over Unix domain socket
+    let stats_resp = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
+    assert!(stats_resp.accepted);
+    assert_eq!(stats_resp.vms.len(), 1);
+    let vm_stats = &stats_resp.vms[0];
+    assert_eq!(vm_stats.vm_id, 301);
+    assert_eq!(vm_stats.current_cores, 2);
+    assert_eq!(vm_stats.runnable_threads, 2);
+    assert!(
+        vm_stats.allocated_core_microseconds > 0,
+        "expected core-microseconds > 0, got {}",
+        vm_stats.allocated_core_microseconds
+    );
+
+    // Now simulate vCPU 1 voluntarily idling / parking
+    page.vcpus[1]
+        .state
+        .store(VCPU_STATE_PARKED, Ordering::Release);
+    page.telemetry.runnable_threads.store(1, Ordering::Release);
+
+    let park_tsc = next_tsc.saturating_add(50_000);
+    engine.poll_once(park_tsc);
+
+    // Core 3 should be reclaimed to Idle
+    assert_eq!(engine.core_state(3), CoreState::Idle);
+    assert_eq!(
+        page.vcpus[1].assigned_pcpu.load(Ordering::Acquire),
+        PCPU_UNASSIGNED
+    );
+
+    // Query stats again to verify current_cores decreased to 1
+    let stats_resp2 = query_vm_stats(&socket_path, None).expect("query stats failed");
+    assert!(stats_resp2.accepted);
+    assert_eq!(stats_resp2.vms.len(), 1);
+    assert_eq!(stats_resp2.vms[0].current_cores, 1);
+    assert_eq!(stats_resp2.vms[0].runnable_threads, 1);
+
+    let _ = shutdown_tx.send(true);
+    let _ = control_thread.join();
+    vm.shutdown();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_e2e_prometheus_metrics_http_export() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let temp_dir = temp_dir().join(format!("pylon-e2e-prom-{}", process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    let socket_path = temp_dir.join("pylond-prom.sock");
+    let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+    let vm_snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let control_plane = ControlPlane::new(&socket_path, Arc::clone(&vm_snapshot));
+
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    // Bind Prometheus server to random localhost port (0 assigns an ephemeral port)
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+    let metrics_port = metrics_listener.local_addr().expect("local addr").port();
+    drop(metrics_listener);
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
+
+    let metrics_snapshot = Arc::clone(&vm_snapshot);
+    let metrics_shutdown = shutdown_rx.clone();
+    let prom_addr = metrics_addr.clone();
+
+    let control_thread = thread::spawn(move || {
+        let prom_fut = run_prometheus_server(prom_addr, metrics_snapshot, metrics_shutdown);
+        let control_fut = control_plane.run(shutdown_rx);
+        rt.block_on(async move {
+            let (control_res, _) = tokio::join!(control_fut, prom_fut);
+            let _ = control_res;
+        });
+    });
+
+    wait_until(
+        Duration::from_secs(2),
+        || socket_path.exists(),
+        "ControlPlane socket creation",
+    );
+
+    let vm = SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 401, 2, 1, 2, 150, true);
+    let page = vm.shared_page();
+
+    let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
+
+    page.telemetry.runnable_threads.store(2, Ordering::Release);
+    let start_tsc = read_tsc();
+    engine.poll_once(start_tsc);
+
+    let next_tsc = start_tsc.saturating_add(60_000);
+    engine.poll_once(next_tsc);
+
+    // Scrape Prometheus HTTP endpoint
+    let mut client = TcpStream::connect(&metrics_addr).expect("connect to metrics endpoint");
+    client
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write http request");
+    client.flush().expect("flush");
+
+    let mut body = String::new();
+    client.read_to_string(&mut body).expect("read response");
+
+    assert!(
+        body.contains("HTTP/1.1 200 OK"),
+        "expected 200 OK, got: {body}"
+    );
+    assert!(body.contains("pylon_vm_allocated_cores{vm_id=\"401\"} 2"));
+    assert!(body.contains("pylon_vm_runnable_threads{vm_id=\"401\"} 2"));
+    assert!(body.contains("pylon_vm_min_cores{vm_id=\"401\"} 1"));
+    assert!(body.contains("pylon_vm_max_cores{vm_id=\"401\"} 2"));
+    assert!(body.contains("pylon_vm_core_microseconds_total{vm_id=\"401\"}"));
 
     let _ = shutdown_tx.send(true);
     let _ = control_thread.join();

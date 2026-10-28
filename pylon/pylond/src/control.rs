@@ -5,23 +5,25 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, size_of_val, zeroed};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr::{copy_nonoverlapping, null_mut};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use log::{info, warn};
-use pylon_abi::MAX_VCPUS;
+use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, VCPU_STATE_PARKED};
 use tokio::io::Interest;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::watch;
 
 use crate::{
     Error, VmHandle, VmPolicyUpdateRequest, VmPolicyUpdateResponse, VmRegistrationRequest,
-    VmRegistrationResponse, VmSnapshot, pin_current_thread_to_core,
+    VmRegistrationResponse, VmSnapshot, VmStats, VmStatsRequest, VmStatsResponse,
+    pin_current_thread_to_core,
 };
 
 /// Maximum number of file descriptors passed in a single `SCM_RIGHTS` registration message
@@ -121,6 +123,50 @@ async fn handle_client_connection(
     let (payload, mut fds) = recv_msg_with_fds_async(&stream).await?;
 
     if fds.is_empty() {
+        if let Ok(stats_req) = serde_json::from_slice::<VmStatsRequest>(&payload)
+            && (stats_req.action.as_deref() == Some("stats")
+                || stats_req.action.as_deref() == Some("metrics")
+                || stats_req.action.as_deref() == Some("status"))
+        {
+            let snapshot = vm_snapshot.load();
+            let mut vms_stats = Vec::new();
+            for vm in snapshot.iter() {
+                if let Some(target_id) = stats_req.vm_id
+                    && vm.vm_id() != target_id
+                {
+                    continue;
+                }
+                let page = vm.shared_page();
+                let mut current_cores = 0u32;
+                let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+                for vcpu_slot in page.vcpus.iter().take(num_vcpus) {
+                    if vcpu_slot.assigned_pcpu.load(Ordering::Acquire) != PCPU_UNASSIGNED
+                        && vcpu_slot.state.load(Ordering::Acquire) != VCPU_STATE_PARKED
+                    {
+                        current_cores += 1;
+                    }
+                }
+                vms_stats.push(VmStats {
+                    vm_id: vm.vm_id(),
+                    num_vcpus: vm.num_vcpus(),
+                    min_cores: vm.min_cores(),
+                    max_cores: vm.max_cores(),
+                    priority_weight: vm.priority_weight(),
+                    current_cores,
+                    allocated_core_microseconds: vm.allocated_core_usec(),
+                    cooperative_yields: vm.cooperative_yield_count(),
+                    forced_preemptions: vm.forced_preempt_count(),
+                    runnable_threads: page.telemetry.runnable_threads.load(Ordering::Acquire),
+                });
+            }
+            let resp = VmStatsResponse {
+                accepted: true,
+                message: "stats retrieved".to_owned(),
+                vms: vms_stats,
+            };
+            return send_json_response_async(&stream, &resp).await;
+        }
+
         match serde_json::from_slice::<VmPolicyUpdateRequest>(&payload) {
             Ok(req) => {
                 let snapshot = vm_snapshot.load();
@@ -279,6 +325,26 @@ pub fn send_policy_update(
     Ok(resp)
 }
 
+/// Synchronous client helper that queries `pylond` over `/run/pylon/pylond.sock`
+/// for real-time VM statistics and core residency metering.
+pub fn query_vm_stats(socket_path: &Path, vm_id: Option<u64>) -> Result<VmStatsResponse, Error> {
+    let mut stream = StdUnixStream::connect(socket_path).map_err(Error::Io)?;
+    let req = VmStatsRequest {
+        action: Some("stats".to_string()),
+        vm_id,
+    };
+    let payload = serde_json::to_vec(&req).map_err(Error::Json)?;
+
+    send_msg_with_fds(stream.as_raw_fd(), &payload, &[]).map_err(Error::Io)?;
+    stream.flush().map_err(Error::Io)?;
+    let _ = stream.shutdown(Shutdown::Write);
+
+    let mut resp_buf = Vec::new();
+    stream.read_to_end(&mut resp_buf).map_err(Error::Io)?;
+    let resp: VmStatsResponse = serde_json::from_slice(&resp_buf).map_err(Error::Json)?;
+    Ok(resp)
+}
+
 /// Sends a datagram/stream message with `SCM_RIGHTS` file descriptors over a Unix socket.
 pub fn send_msg_with_fds(sock_fd: RawFd, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
     if fds.len() > MAX_REGISTRATION_FDS {
@@ -382,4 +448,104 @@ pub fn recv_msg_with_fds(sock_fd: RawFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> 
     }
 
     Ok((payload_buf, received_fds))
+}
+
+/// Runs a lightweight asynchronous Prometheus HTTP metrics exporter on `bind_addr`.
+pub async fn run_prometheus_server(
+    bind_addr: String,
+    vm_snapshot: Arc<VmSnapshot>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let listener = match TcpListener::bind(&bind_addr).await {
+        Ok(l) => {
+            info!("Prometheus metrics server listening on http://{bind_addr}/metrics");
+            l
+        }
+        Err(err) => {
+            warn!("Failed to bind Prometheus metrics server on {bind_addr}: {err}");
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            accept_res = listener.accept() => {
+                let (mut stream, _) = match accept_res {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        warn!("Metrics listener accept error: {err}");
+                        continue;
+                    }
+                };
+                let snapshot = Arc::clone(&vm_snapshot);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let path = req_str
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    if path == "/metrics" || path == "/" {
+                        let mut body = String::new();
+                        body.push_str("# HELP pylon_vm_allocated_cores Current physical cores assigned to VM\n");
+                        body.push_str("# TYPE pylon_vm_allocated_cores gauge\n");
+                        body.push_str("# HELP pylon_vm_core_microseconds_total Total physical core microseconds allocated to VM\n");
+                        body.push_str("# TYPE pylon_vm_core_microseconds_total counter\n");
+                        body.push_str("# HELP pylon_vm_cooperative_yields_total Total voluntary cooperative core yields\n");
+                        body.push_str("# TYPE pylon_vm_cooperative_yields_total counter\n");
+                        body.push_str("# HELP pylon_vm_forced_preemptions_total Total forced preemptions when grace period expired\n");
+                        body.push_str("# TYPE pylon_vm_forced_preemptions_total counter\n");
+                        body.push_str("# HELP pylon_vm_runnable_threads Current guest runnable threads\n");
+                        body.push_str("# TYPE pylon_vm_runnable_threads gauge\n");
+                        body.push_str("# HELP pylon_vm_min_cores Minimum configured physical cores\n");
+                        body.push_str("# TYPE pylon_vm_min_cores gauge\n");
+                        body.push_str("# HELP pylon_vm_max_cores Maximum configured physical cores\n");
+                        body.push_str("# TYPE pylon_vm_max_cores gauge\n");
+
+                        let vms = snapshot.load();
+                        for vm in vms.iter() {
+                            let vid = vm.vm_id();
+                            let page = vm.shared_page();
+                            let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+                            let mut current_cores = 0u32;
+                            for vcpu_slot in page.vcpus.iter().take(num_vcpus) {
+                                if vcpu_slot.assigned_pcpu.load(Ordering::Acquire) != PCPU_UNASSIGNED
+                                    && vcpu_slot.state.load(Ordering::Acquire) != VCPU_STATE_PARKED
+                                {
+                                    current_cores += 1;
+                                }
+                            }
+                            let runnable = page.telemetry.runnable_threads.load(Ordering::Acquire);
+                            body.push_str(&format!("pylon_vm_allocated_cores{{vm_id=\"{vid}\"}} {current_cores}\n"));
+                            body.push_str(&format!("pylon_vm_core_microseconds_total{{vm_id=\"{vid}\"}} {}\n", vm.allocated_core_usec()));
+                            body.push_str(&format!("pylon_vm_cooperative_yields_total{{vm_id=\"{vid}\"}} {}\n", vm.cooperative_yield_count()));
+                            body.push_str(&format!("pylon_vm_forced_preemptions_total{{vm_id=\"{vid}\"}} {}\n", vm.forced_preempt_count()));
+                            body.push_str(&format!("pylon_vm_runnable_threads{{vm_id=\"{vid}\"}} {runnable}\n"));
+                            body.push_str(&format!("pylon_vm_min_cores{{vm_id=\"{vid}\"}} {}\n", vm.min_cores()));
+                            body.push_str(&format!("pylon_vm_max_cores{{vm_id=\"{vid}\"}} {}\n", vm.max_cores()));
+                        }
+
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        }
+    }
 }
