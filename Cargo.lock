@@ -2001,6 +2001,21 @@ name = "pylon-abi"
 version = "0.1.0"
 
 [[package]]
+name = "pylon-guest-agent"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "libc",
+ "log",
+ "memmap2",
+ "pylon-abi",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pylond"
 version = "0.1.0"
 dependencies = [
