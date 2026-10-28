@@ -14,7 +14,7 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use log::info;
 use memmap2::MmapMut;
-use pylond::control::ControlPlane;
+use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::MatrixEngine;
 use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
 use tokio::runtime::Builder;
@@ -43,6 +43,14 @@ struct CliArgs {
     /// Attach the live kernel sched_ext BPF dispatcher (scx-pylon).
     #[arg(long)]
     enable_scx: bool,
+
+    /// Optional TCP port to expose Prometheus metrics over HTTP (e.g. 9100).
+    #[arg(long)]
+    metrics_port: Option<u16>,
+
+    /// Host address for Prometheus metrics HTTP server.
+    #[arg(long, default_value = "127.0.0.1")]
+    metrics_addr: String,
 }
 
 fn parse_core_list(spec: &str) -> Result<Vec<usize>> {
@@ -123,7 +131,15 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build Plane 1 Tokio runtime")?;
 
-    let control = ControlPlane::new(args.socket, vm_snapshot);
+    let control = ControlPlane::new(args.socket, Arc::clone(&vm_snapshot));
+    if let Some(port) = args.metrics_port {
+        let bind_addr = format!("{}:{}", args.metrics_addr, port);
+        let metrics_snapshot = Arc::clone(&vm_snapshot);
+        let metrics_shutdown = shutdown_rx.clone();
+        rt.spawn(async move {
+            run_prometheus_server(bind_addr, metrics_snapshot, metrics_shutdown).await;
+        });
+    }
     let control_res = rt.block_on(control.run(shutdown_rx));
 
     stop_flag.store(true, Ordering::Release);

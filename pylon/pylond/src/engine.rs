@@ -154,6 +154,7 @@ pub struct MatrixEngine {
     core_states: [CoreState; MAX_PCPUS],
     managed_pcpus: [bool; MAX_PCPUS],
     eval_buf: [VmDemandEval; MAX_TRACKED_VMS],
+    core_last_metered_tsc: [u64; MAX_PCPUS],
     has_waitpkg: bool,
 }
 
@@ -178,6 +179,7 @@ impl MatrixEngine {
             core_states: [CoreState::Idle; MAX_PCPUS],
             managed_pcpus,
             eval_buf: [VmDemandEval::EMPTY; MAX_TRACKED_VMS],
+            core_last_metered_tsc: [0; MAX_PCPUS],
             has_waitpkg,
         }
     }
@@ -193,6 +195,7 @@ impl MatrixEngine {
     pub fn set_core_state(&mut self, pcpu_id: usize, state: CoreState) {
         if pcpu_id < MAX_PCPUS {
             self.core_states[pcpu_id] = state;
+            self.core_last_metered_tsc[pcpu_id] = 0;
         }
     }
 
@@ -264,6 +267,12 @@ impl MatrixEngine {
         }
 
         // =====================================================================
+        // Phase 0: Reclaim Idled Cores & Meter Core-Microsecond Residency
+        // =====================================================================
+        self.reclaim_idle_assigned_cores(vms, vm_count, now_tsc);
+        self.meter_core_residency(vms, vm_count, now_tsc);
+
+        // =====================================================================
         // Phase 1: Demand & Zero-Core Wakeup Evaluation
         // =====================================================================
         self.evaluate_demand_phase1(vms, vm_count, now_tsc);
@@ -277,6 +286,78 @@ impl MatrixEngine {
         // Phase 3: Match Hungry VMs with Idle or Donor Cores
         // =====================================================================
         self.match_hungry_vms_phase3(vms, vm_count, now_tsc);
+    }
+
+    fn reclaim_idle_assigned_cores(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
+        let mut pcpu = 0usize;
+        while pcpu < MAX_PCPUS {
+            if self.managed_pcpus[pcpu]
+                && let CoreState::Assigned { vm_id, vcpu } = self.core_states[pcpu]
+                && let Some(vm) = Self::find_vm(vms, vm_count, vm_id)
+            {
+                let slot = &vm.shared_page().vcpus[vcpu as usize];
+                if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
+                    && slot.revoke_requested.load(Ordering::Acquire) == 0
+                {
+                    let last_tsc = self.core_last_metered_tsc[pcpu];
+                    if last_tsc > 0 && now_tsc > last_tsc {
+                        let tsc_khz = if vm.shared_page().header.tsc_khz > 0 {
+                            vm.shared_page().header.tsc_khz
+                        } else {
+                            DEFAULT_TSC_KHZ
+                        };
+                        let usec = ((now_tsc - last_tsc) * 1000) / tsc_khz;
+                        if usec > 0 {
+                            vm.add_allocated_core_usec(usec);
+                        }
+                    }
+                    self.core_states[pcpu] = CoreState::Idle;
+                    self.pcpu_owners.write_owner(pcpu, 0, 0);
+                    self.core_last_metered_tsc[pcpu] = 0;
+                    slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+                }
+            }
+            pcpu += 1;
+        }
+    }
+
+    fn meter_core_residency(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
+        let mut pcpu = 0usize;
+        while pcpu < MAX_PCPUS {
+            if self.managed_pcpus[pcpu] {
+                let vm_id = match self.core_states[pcpu] {
+                    CoreState::Assigned { vm_id, .. } => Some(vm_id),
+                    CoreState::Revoking { donor_vm_id, .. } => Some(donor_vm_id),
+                    CoreState::Idle => None,
+                };
+                if let Some(vid) = vm_id {
+                    let last_tsc = self.core_last_metered_tsc[pcpu];
+                    if last_tsc > 0 && now_tsc > last_tsc {
+                        if let Some(vm) = Self::find_vm(vms, vm_count, vid) {
+                            let tsc_khz = if vm.shared_page().header.tsc_khz > 0 {
+                                vm.shared_page().header.tsc_khz
+                            } else {
+                                DEFAULT_TSC_KHZ
+                            };
+                            let elapsed_cycles = now_tsc - last_tsc;
+                            let usec = (elapsed_cycles * 1000) / tsc_khz;
+                            if usec > 0 {
+                                vm.add_allocated_core_usec(usec);
+                                let remainder_cycles = (usec * tsc_khz) / 1000;
+                                self.core_last_metered_tsc[pcpu] = last_tsc + remainder_cycles;
+                            }
+                        } else {
+                            self.core_last_metered_tsc[pcpu] = now_tsc;
+                        }
+                    } else if last_tsc == 0 {
+                        self.core_last_metered_tsc[pcpu] = now_tsc;
+                    }
+                } else {
+                    self.core_last_metered_tsc[pcpu] = 0;
+                }
+            }
+            pcpu += 1;
+        }
     }
 
     fn evaluate_demand_phase1(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
@@ -374,6 +455,9 @@ impl MatrixEngine {
                                 .forced_preempt_count
                                 .fetch_add(1, Ordering::AcqRel);
                             donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+                            donor.record_forced_preempt();
+                        } else {
+                            donor.record_cooperative_yield();
                         }
                         donor_slot.revoke_requested.store(0, Ordering::Release);
                         donor_slot
@@ -396,6 +480,7 @@ impl MatrixEngine {
                             vm_id: recipient_vm_id,
                             vcpu: recipient_vcpu,
                         };
+                        self.core_last_metered_tsc[pcpu] = now_tsc;
 
                         if let Some(eval_idx) = self.find_eval_idx(vm_count, recipient_vm_id) {
                             self.eval_buf[eval_idx].incoming_cores =
@@ -406,6 +491,7 @@ impl MatrixEngine {
                 } else {
                     self.core_states[pcpu] = CoreState::Idle;
                     self.pcpu_owners.write_owner(pcpu, 0, 0);
+                    self.core_last_metered_tsc[pcpu] = 0;
                 }
             }
             pcpu += 1;
@@ -452,6 +538,7 @@ impl MatrixEngine {
                         vm_id: recipient_eval.vm_id,
                         vcpu: recipient_vcpu,
                     };
+                    self.core_last_metered_tsc[idle_pcpu] = now_tsc;
                     self.eval_buf[order_idx].assigned_cores += 1;
                     continue;
                 }
