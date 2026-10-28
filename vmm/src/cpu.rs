@@ -46,7 +46,7 @@ use hypervisor::StandardRegisters;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::arch::aarch64::gic::Vgic;
 #[cfg(target_arch = "aarch64")]
-use hypervisor::arch::aarch64::regs::{AARCH64_PMU_IRQ, MPIDR_EL1};
+use hypervisor::arch::aarch64::regs::{AARCH64_GIC_MAINT_IRQ, AARCH64_PMU_IRQ, MPIDR_EL1};
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 use hypervisor::arch::aarch64::regs::{ID_AA64MMFR0_EL1, TCR_EL1, TTBR1_EL1};
 #[cfg(target_arch = "aarch64")]
@@ -59,6 +59,8 @@ use hypervisor::arch::x86::SpecialRegisters;
 use hypervisor::arch::x86::msr_index;
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{CpuIdEntry, VcpuMsrConfigUpdate};
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+use hypervisor::kvm::{Cap, KvmVm};
 #[cfg(feature = "mshv")]
 use hypervisor::mshv;
 use hypervisor::{CpuState, HypervisorCpuError, VmExit, VmOps};
@@ -108,7 +110,6 @@ use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap, pylon};
 /// For example, to extrace 2 bits from offset 1 (zero based) of `6u64`,
 /// following expression should return 3 (`0b11`):
 /// `extract_bits_64!(0b0000_0110u64, 1, 2)`
-///
 macro_rules! extract_bits_64 {
     ($value: tt, $offset: tt, $length: tt) => {
         ($value >> $offset) & (!0u64 >> (64 - $length))
@@ -487,6 +488,8 @@ pub struct Vcpu {
     // The hypervisor abstracted CPU.
     vcpu: Box<dyn hypervisor::Vcpu>,
     id: u32,
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "kvm")), expect(unused))]
+    vm: Arc<dyn hypervisor::Vm>,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
 }
@@ -510,7 +513,7 @@ impl Vcpu {
     pub fn new(
         id: u32,
         apic_id: u32,
-        vm: &dyn hypervisor::Vm,
+        vm: Arc<dyn hypervisor::Vm>,
         vm_ops: Option<Arc<dyn VmOps>>,
         #[cfg(target_arch = "x86_64")] cpu_vendor: CpuVendor,
         #[cfg(target_arch = "x86_64")] msr_config_update: Option<VcpuMsrConfigUpdate>,
@@ -527,6 +530,7 @@ impl Vcpu {
         Ok(Vcpu {
             vcpu,
             id,
+            vm,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
         })
@@ -542,6 +546,7 @@ impl Vcpu {
     pub fn configure(
         &mut self,
         boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
+        #[cfg(target_arch = "aarch64")] nested: bool,
         #[cfg(target_arch = "x86_64")] cpuid: Vec<CpuIdEntry>,
         #[cfg(target_arch = "x86_64")] kvm_hyperv: bool,
         #[cfg(target_arch = "x86_64")] topology: (u16, u16, u16, u16),
@@ -549,8 +554,12 @@ impl Vcpu {
         #[cfg(feature = "igvm")] igvm_enabled: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "aarch64")]
-        self.finalize(&[])?;
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        {
+            self.finalize(&[])?;
+            arch::configure_vcpu(self.vcpu.as_ref(), self.id, boot_setup, nested)
+                .map_err(Error::VcpuConfiguration)?;
+        }
+        #[cfg(target_arch = "riscv64")]
         arch::configure_vcpu(self.vcpu.as_ref(), self.id, boot_setup)
             .map_err(Error::VcpuConfiguration)?;
         info!("Configuring vCPU: cpu_id = {}", self.id);
@@ -587,14 +596,14 @@ impl Vcpu {
 
     /// Initializes an aarch64 specific vcpu for booting Linux.
     #[cfg(target_arch = "aarch64")]
-    pub fn init(&self, vm: &dyn hypervisor::Vm) -> Result<()> {
+    pub fn init(&self, vm: &dyn hypervisor::Vm, nested: bool) -> Result<()> {
         let mut kvi = self.vcpu.create_vcpu_init();
 
         vm.get_preferred_target(&mut kvi)
             .map_err(Error::VcpuArmPreferredTarget)?;
 
         self.vcpu
-            .vcpu_set_processor_features(vm, &mut kvi, self.id)
+            .vcpu_set_processor_features(vm, &mut kvi, self.id, nested)
             .map_err(Error::VcpuSetProcessorFeatures)?;
 
         self.vcpu.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
@@ -625,6 +634,13 @@ impl Vcpu {
         #[allow(clippy::nonminimal_bool)]
         let sve_supported =
             is_aarch64_feature_detected!("sve") || is_aarch64_feature_detected!("sve2");
+        #[cfg(feature = "kvm")]
+        let sve_supported = sve_supported
+            && self
+                .vm
+                .as_any()
+                .downcast_ref::<KvmVm>()
+                .is_none_or(|vm| vm.check_extension(Cap::ArmSve));
         if sve_supported {
             let finalized_features = self.vcpu.vcpu_get_finalized_features();
             self.vcpu
@@ -671,9 +687,7 @@ impl Vcpu {
             .map_err(Error::SetupSevSnpRegs)
     }
 
-    ///
     /// Sets the vCPU's GIC redistributor base address.
-    ///
     #[cfg(target_arch = "aarch64")]
     pub fn set_gic_redistributor_addr(
         &self,
@@ -1050,7 +1064,7 @@ impl CpuManager {
         let vcpu = Vcpu::new(
             cpu_id,
             x2apic_id,
-            self.vm.as_ref(),
+            Arc::clone(&self.vm),
             Some(Arc::clone(&self.vm_ops)),
             #[cfg(target_arch = "x86_64")]
             self.hypervisor.get_cpu_vendor(),
@@ -1059,7 +1073,7 @@ impl CpuManager {
         )?;
 
         #[cfg(target_arch = "aarch64")]
-        vcpu.init(self.vm.as_ref())?;
+        vcpu.init(self.vm.as_ref(), self.config.nested)?;
 
         let vcpu = Arc::new(Mutex::new(vcpu));
 
@@ -1120,13 +1134,16 @@ impl CpuManager {
             self.igvm_enabled,
         )?;
 
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        #[cfg(target_arch = "aarch64")]
+        vcpu.configure(boot_setup, self.config.nested)?;
+
+        #[cfg(target_arch = "riscv64")]
         vcpu.configure(boot_setup)?;
 
         Ok(())
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     pub fn nested(&self) -> bool {
         self.config.nested
     }
@@ -1624,7 +1641,17 @@ impl CpuManager {
     ) -> Result<Vec<Arc<Mutex<Vcpu>>>> {
         trace_scoped!("create_boot_vcpus");
 
-        self.create_vcpus(self.boot_vcpus(), snapshot)
+        let num_vcpus = self.boot_vcpus();
+        #[cfg(all(feature = "kvm", feature = "sev_snp"))]
+        let num_vcpus =
+            if self.sev_snp_enabled && self.hypervisor.hypervisor_type() == HypervisorType::Kvm {
+                // Create all SEV-SNP vCPUs before SNP_LAUNCH_FINISH.
+                self.max_vcpus()
+            } else {
+                num_vcpus
+            };
+
+        self.create_vcpus(num_vcpus, snapshot)
     }
 
     // Starts all the vCPUs that the VM is booting with. Blocks until all vCPUs are running.
@@ -1881,7 +1908,11 @@ impl CpuManager {
                     base_address: 0,
                     gicv_base_address: 0,
                     gich_base_address: 0,
-                    vgic_interrupt: 0,
+                    vgic_interrupt: if self.nested() {
+                        AARCH64_GIC_MAINT_IRQ
+                    } else {
+                        0
+                    },
                     gicr_base_address: 0,
                     mpidr: mpidr & mpidr_mask,
                     proc_power_effi_class: 0,
@@ -2214,7 +2245,6 @@ impl CpuManager {
         Ok(gpa)
     }
 
-    ///
     /// On AArch64, `translate_gva` API is not provided by KVM. We implemented
     /// it in VMM by walking through translation tables.
     ///
@@ -2229,7 +2259,6 @@ impl CpuManager {
     /// - FEAT_LPA
     /// - FEAT_LVA
     /// - FEAT_LPA2
-    ///
     #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
     fn translate_gva(
         &self,
@@ -3669,6 +3698,7 @@ mod tests {
 mod tests {
     #[cfg(feature = "kvm")]
     use std::mem::offset_of;
+    use std::sync::Arc;
 
     use arch::layout;
     use hypervisor::arch::aarch64::mpidr_from_vcpu_id;
@@ -3693,13 +3723,14 @@ mod tests {
         let vcpu = vm.create_vcpu(0, None).unwrap();
 
         // Must fail when vcpu is not initialized yet.
-        vcpu.setup_regs(0, 0x0, layout::FDT_START.0).unwrap_err();
+        vcpu.setup_regs(0, 0x0, layout::FDT_START.0, false)
+            .unwrap_err();
 
         let mut kvi = vcpu.create_vcpu_init();
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu.vcpu_init(&kvi).unwrap();
 
-        vcpu.setup_regs(0, 0x0, layout::FDT_START.0).unwrap();
+        vcpu.setup_regs(0, 0x0, layout::FDT_START.0, false).unwrap();
     }
 
     #[test]
@@ -3732,11 +3763,11 @@ mod tests {
             (17, 0x8000_0101),
             (255, 0x8000_0f0f),
         ] {
-            let vcpu = Vcpu::new(id, id, vm.as_ref(), None).unwrap();
+            let vcpu = Vcpu::new(id, id, Arc::clone(&vm), None).unwrap();
             assert_eq!(mpidr_from_vcpu_id(id as u64), expected, "vCPU {id}");
 
             // Must be what the hypervisor itself calculates.
-            vcpu.init(vm.as_ref()).unwrap();
+            vcpu.init(vm.as_ref(), false).unwrap();
             vcpu.finalize_sve().unwrap();
             vcpu.verify_mpidr();
         }

@@ -158,13 +158,27 @@ mod common_parallel {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", not(feature = "mshv"))
+    ))]
     fn test_nested_virtualization_on() {
+        #[cfg(target_arch = "aarch64")]
+        if fs::read_to_string("/proc/cmdline")
+            .expect("Failed to read /proc/cmdline")
+            .split_ascii_whitespace()
+            .rev()
+            .find_map(|arg| arg.strip_prefix("kvm-arm.mode="))
+            != Some("nested")
+        {
+            eprintln!("SKIPPED: host kernel was not booted with kvm-arm.mode=nested");
+            return;
+        }
         _test_nested_virtualization(true);
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn test_nested_virtualization_off() {
         _test_nested_virtualization(false);
     }
@@ -250,6 +264,75 @@ mod common_parallel {
     fn test_power_button() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         _test_power_button(&guest, false);
+    }
+
+    fn test_reboot(reboot_method: Option<&str>) {
+        let mut guest = basic_regular_guest!(JAMMY_IMAGE_NAME).with_cpu(2);
+        if let Some(method) = reboot_method {
+            guest.kernel_cmdline = Some(format!("{DIRECT_KERNEL_BOOT_CMDLINE} reboot={method}"));
+        }
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--event-monitor", &format!("path={event_path}")])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            guest.reboot_linux(0);
+            guest.reboot_linux(1);
+
+            // Count VMM boots too: an extra reset before userspace starts
+            // might not appear in the guest's boot history.
+            let boot_events = parse_event_file(&event_path)
+                .iter()
+                .filter(|event| {
+                    event["source"] == "vm"
+                        && matches!(event["event"].as_str(), Some("booted" | "rebooted"))
+                })
+                .count();
+            assert_eq!(boot_events, 3);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_reboot_default() {
+        test_reboot(None);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_reboot_acpi() {
+        test_reboot(Some("acpi"));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_reboot_keyboard() {
+        test_reboot(Some("kbd"));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_reboot_bios() {
+        test_reboot(Some("bios"));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_reboot_triple_fault() {
+        test_reboot(Some("triple"));
     }
 
     #[test]
@@ -6840,7 +6923,15 @@ mod common_parallel {
         src_vm_cmd
             .args([
                 "--cpus",
-                format!("boot={boot_vcpus},max={max_vcpus}").as_str(),
+                format!(
+                    "boot={boot_vcpus},max={max_vcpus}{}",
+                    if cfg!(target_arch = "aarch64") {
+                        ",nested=off"
+                    } else {
+                        ""
+                    }
+                )
+                .as_str(),
             ])
             .args(memory_param)
             .default_kernel_cmdline()
@@ -7108,11 +7199,17 @@ mod common_parallel {
             .port()
     }
 
+    /// Development-only certificates for TLS migrations, valid for
+    /// `localhost` and `127.0.0.1`.
+    const TLS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_data/tls");
+
     /// Properties of `send-migration` that the TCP helpers pass on; `None`
     /// keeps the default of the VMM.
     #[derive(Default)]
     struct SendMigrationOptions {
         postcopy: bool,
+        /// Use TLS for sender and receiver.
+        tls: bool,
         downtime_ms: Option<u64>,
         timeout_s: Option<u64>,
         timeout_strategy: Option<TimeoutStrategy>,
@@ -7173,7 +7270,10 @@ mod common_parallel {
         let migration_port = get_available_port();
         let host_ip = "127.0.0.1";
 
-        let receive_arg = format!("receiver_url=tcp:0.0.0.0:{migration_port}");
+        let mut receive_arg = format!("receiver_url=tcp:0.0.0.0:{migration_port}");
+        if options.tls {
+            receive_arg.push_str(&format!(",tls_dir={TLS_DIR}"));
+        }
 
         // Start the 'receive-migration' command on the destination
         let mut receive_migration = Command::new(clh_command("ch-remote"))
@@ -7188,7 +7288,7 @@ mod common_parallel {
             .spawn()
             .unwrap();
 
-        if !wait_for_sequential_events_str(
+        if !wait_for_latest_events_exact_str(
             Duration::from_secs(30),
             &["migration-receive-ready"],
             dest_event_path,
@@ -7204,6 +7304,9 @@ mod common_parallel {
             format!("destination_url=tcp:{host_ip}:{migration_port},connections={connections}");
         if options.postcopy {
             params.push_str(",memory_mode=postcopy");
+        }
+        if options.tls {
+            params.push_str(&format!(",tls_dir={TLS_DIR}"));
         }
         if let Some(downtime_ms) = options.downtime_ms {
             params.push_str(&format!(",downtime_ms={downtime_ms}"));
@@ -7263,7 +7366,7 @@ mod common_parallel {
             .spawn()
             .unwrap();
 
-        if !wait_for_sequential_events_str(
+        if !wait_for_latest_events_exact_str(
             Duration::from_secs(3),
             &["migration-receive-ready"],
             dest_event_path,
@@ -7571,7 +7674,7 @@ mod common_parallel {
         handle_child_output(r, &dest_output);
     }
 
-    fn _test_live_migration_tcp(connections: NonZeroU32) {
+    fn _test_live_migration_tcp(connections: NonZeroU32, tls: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let console_text = String::from("On a branch floating down river a cricket, singing.");
@@ -7645,7 +7748,10 @@ mod common_parallel {
                     &dest_api_socket,
                     &dest_event_path,
                     connections,
-                    &SendMigrationOptions::default(),
+                    &SendMigrationOptions {
+                        tls,
+                        ..Default::default()
+                    },
                 ),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
@@ -7672,6 +7778,7 @@ mod common_parallel {
                 "Source VM was not terminated successfully.",
             );
         }
+        let src_output = src_child.wait_with_output().unwrap();
 
         // After live migration, ensure the destination VM is running normally
         let r = panic::catch_unwind(|| {
@@ -7694,6 +7801,158 @@ mod common_parallel {
             assert!(String::from_utf8_lossy(&dest_output.stdout).contains(&console_text));
         });
         handle_child_output(r, &dest_output);
+
+        if tls {
+            let r = panic::catch_unwind(|| {
+                assert!(
+                    String::from_utf8_lossy(&src_output.stderr)
+                        .contains("TLS handshake (client-side/sender) successful")
+                );
+            });
+            handle_child_output(r, &src_output);
+            let r = panic::catch_unwind(|| {
+                assert!(
+                    String::from_utf8_lossy(&dest_output.stderr)
+                        .contains("TLS handshake (server-side/receiver) successful")
+                );
+            });
+            handle_child_output(r, &dest_output);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TlsOnlyOn {
+        Sender,
+        Receiver,
+    }
+
+    /// Verifies that a TCP migration fails without falling back to plain TCP
+    /// when only one side uses TLS, and that the source VM keeps running.
+    fn _test_live_migration_tcp_tls_one_sided(tls_only_on: TlsOnlyOn) {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let net_params = guest.default_net_string();
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let src_event_path = format!("{event_path}.src");
+        let dest_event_path = format!("{event_path}.dst");
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let dest_api_socket = format!("{src_api_socket}.dest");
+
+        let tls_arg = format!(",tls_dir={TLS_DIR}");
+        let (send_tls_arg, receive_tls_arg) = match tls_only_on {
+            TlsOnlyOn::Sender => (tls_arg.as_str(), ""),
+            TlsOnlyOn::Receiver => ("", tls_arg.as_str()),
+        };
+
+        let mut src_child = GuestCommand::new(&guest)
+            .args(["--memory", "size=1G"])
+            .default_kernel_cmdline()
+            .default_disks()
+            .args(["--net", net_params.as_str()])
+            .args(["--api-socket", &src_api_socket])
+            .args(["--event-monitor", format!("path={src_event_path}").as_str()])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .args([
+                "--event-monitor",
+                format!("path={dest_event_path}").as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            let migration_port = get_available_port();
+            let mut receive_migration = Command::new(clh_command("ch-remote"))
+                .args([
+                    &format!("--api-socket={dest_api_socket}"),
+                    "receive-migration",
+                    &format!("receiver_url=tcp:0.0.0.0:{migration_port}{receive_tls_arg}"),
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            assert!(wait_for_latest_events_exact_str(
+                Duration::from_secs(30),
+                &["migration-receive-ready"],
+                &dest_event_path
+            ));
+
+            // send-migration only dispatches the migration, it reports the
+            // failure through the event monitor.
+            let send_migration = Command::new(clh_command("ch-remote"))
+                .args([
+                    &format!("--api-socket={src_api_socket}"),
+                    "send-migration",
+                    &format!("destination_url=tcp:127.0.0.1:{migration_port}{send_tls_arg}"),
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            assert!(wait_for_migration_command(send_migration, "send_migration"));
+
+            // The timeout also catches both sides waiting on each other.
+            let receive_status = receive_migration
+                .wait_timeout(Duration::from_secs(60))
+                .unwrap();
+            if receive_status.is_none() {
+                let _ = receive_migration.kill();
+                let _ = receive_migration.wait();
+            }
+            assert!(
+                receive_status.is_some_and(|status| !status.success()),
+                "receive-migration should fail: {receive_status:?}"
+            );
+
+            assert!(wait_for_sequential_events_str(
+                Duration::from_secs(30),
+                &["migration-failed"],
+                &src_event_path
+            ));
+            assert!(wait_for_sequential_events_str(
+                Duration::from_secs(30),
+                &["migration-receive-failed"],
+                &dest_event_path
+            ));
+
+            assert_eq!(vm_state(&src_api_socket), "Running");
+            guest.ssh_command("true").unwrap();
+        });
+
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occurred during one-sided TLS live-migration",
+            );
+        }
+
+        let _ = src_child.kill();
+        let _ = dest_child.kill();
+        let src_output = src_child.wait_with_output().unwrap();
+        let dest_output = dest_child.wait_with_output().unwrap();
+
+        // The migration must fail in the TLS setup, not later in the protocol.
+        let (output, expected_error) = match tls_only_on {
+            TlsOnlyOn::Sender => (&src_output, "Error creating TLS migration stream"),
+            TlsOnlyOn::Receiver => (&dest_output, "Failed to accept TLS migration connection"),
+        };
+        let r = panic::catch_unwind(|| {
+            assert!(String::from_utf8_lossy(&output.stderr).contains(expected_error));
+        });
+        handle_child_output(r, output);
     }
 
     // Postcopy live migration. Verifies the destination boots a guest
@@ -8288,12 +8547,32 @@ mod common_parallel {
 
     #[test]
     fn test_live_migration_tcp() {
-        _test_live_migration_tcp(NonZeroU32::new(1).unwrap());
+        _test_live_migration_tcp(NonZeroU32::new(1).unwrap(), false);
     }
 
     #[test]
     fn test_live_migration_tcp_parallel_connections() {
-        _test_live_migration_tcp(NonZeroU32::new(8).unwrap());
+        _test_live_migration_tcp(NonZeroU32::new(8).unwrap(), false);
+    }
+
+    #[test]
+    fn test_live_migration_tcp_tls() {
+        _test_live_migration_tcp(NonZeroU32::new(1).unwrap(), true);
+    }
+
+    #[test]
+    fn test_live_migration_tcp_tls_parallel_connections() {
+        _test_live_migration_tcp(NonZeroU32::new(8).unwrap(), true);
+    }
+
+    #[test]
+    fn test_live_migration_tcp_tls_only_sender() {
+        _test_live_migration_tcp_tls_one_sided(TlsOnlyOn::Sender);
+    }
+
+    #[test]
+    fn test_live_migration_tcp_tls_only_receiver() {
+        _test_live_migration_tcp_tls_one_sided(TlsOnlyOn::Receiver);
     }
 
     #[test]
@@ -11440,7 +11719,15 @@ mod common_sequential {
         src_vm_cmd
             .args([
                 "--cpus",
-                format!("boot={boot_vcpus},max={max_vcpus}").as_str(),
+                format!(
+                    "boot={boot_vcpus},max={max_vcpus}{}",
+                    if cfg!(target_arch = "aarch64") {
+                        ",nested=off"
+                    } else {
+                        ""
+                    }
+                )
+                .as_str(),
             ])
             .args(memory_param)
             .default_kernel_cmdline()
@@ -11640,7 +11927,15 @@ mod common_sequential {
         src_vm_cmd
             .args([
                 "--cpus",
-                format!("boot={boot_vcpus},max={max_vcpus}").as_str(),
+                format!(
+                    "boot={boot_vcpus},max={max_vcpus}{}",
+                    if cfg!(target_arch = "aarch64") {
+                        ",nested=off"
+                    } else {
+                        ""
+                    }
+                )
+                .as_str(),
             ])
             .args(memory_param)
             .default_kernel_cmdline()

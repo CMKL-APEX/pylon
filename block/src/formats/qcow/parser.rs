@@ -74,6 +74,8 @@ pub enum Error {
     InvalidClusterIndex,
     #[error("Invalid cluster size")]
     InvalidClusterSize,
+    #[error("Invalid header length: {0}")]
+    InvalidHeaderLength(u32),
     #[error("Invalid index")]
     InvalidIndex,
     #[error("Invalid L1 table offset")]
@@ -116,6 +118,8 @@ pub enum Error {
     UnsupportedBackingFileFormat(String),
     #[error("Unsupported compression type")]
     UnsupportedCompressionType,
+    #[error("Unsupported encryption method: {0}")]
+    UnsupportedCryptMethod(u32),
     #[error("Unsupported qcow2 feature(s)")]
     UnsupportedFeature(#[source] MissingFeatureError),
     #[error("Unsupported refcount order")]
@@ -1043,6 +1047,25 @@ mod tests {
             .expect("Failed to create header.");
         try_open_qcow_header(&header, false)
             .expect("Failed to create QcowDisk from default header");
+    }
+
+    #[test]
+    fn header_with_unsupported_crypt_method_is_rejected() {
+        for mut header in [valid_header_v2(), valid_header_v3()] {
+            header[32..36].copy_from_slice(&1u32.to_be_bytes());
+            let err = QcowHeader::new(&basic_file(&header)).unwrap_err();
+            assert!(matches!(err, Error::UnsupportedCryptMethod(1)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn header_with_invalid_v3_length_is_rejected() {
+        for bad in [V2_BARE_HEADER_SIZE, 0xffff_ffff] {
+            let mut header = valid_header_v3();
+            header[100..104].copy_from_slice(&bad.to_be_bytes());
+            let err = QcowHeader::new(&basic_file(&header)).unwrap_err();
+            assert!(matches!(err, Error::InvalidHeaderLength(_)), "{err:?}");
+        }
     }
 
     #[test]

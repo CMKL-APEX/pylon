@@ -67,10 +67,199 @@ mod common_cvm {
         _test_virtio_vsock(&guest, false);
     }
 
+    fn test_virtio_fs(hotplug: bool) {
+        use std::time::Duration;
+        use std::{fs, panic};
+
+        let guest = basic_cvm_guest!(JAMMY_IMAGE_NAME);
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let shared_dir = guest.tmp_dir.as_path().join("virtiofs_shared");
+        fs::create_dir(&shared_dir).unwrap();
+        // Exercise transfers spanning multiple pages, with a partial final page.
+        let data: Vec<u8> = (0..128 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        fs::write(shared_dir.join("input"), &data).unwrap();
+
+        let (mut daemon_child, socket_path) =
+            prepare_virtiofsd(&guest.tmp_dir, shared_dir.to_str().unwrap());
+        let fs_params =
+            format!("socket={socket_path},tag=myfs,id=myfs0,num_queues=1,queue_size=1024");
+        let mut command = GuestCommand::new(&guest);
+        command
+            .default_cpus()
+            .args([
+                "--memory",
+                &format!("{},shared=on", guest.default_memory_string()),
+            ])
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--api-socket", &api_socket])
+            .args(["--event-monitor", &format!("path={event_path}")]);
+        if !hotplug {
+            command.args(["--fs", &fs_params]);
+        }
+        let mut child = command.capture_output().spawn().unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            if hotplug {
+                assert!(remote_command(&api_socket, "add-fs", Some(&fs_params)));
+            }
+            guest
+                .wait_for_ssh_command(
+                    "mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir",
+                    Duration::from_secs(10),
+                )
+                .unwrap();
+
+            guest
+                .ssh_command(
+                    "sudo dd if=mount_dir/input of=/tmp/virtiofs-input bs=4096 status=none && \
+                     sudo dd if=/tmp/virtiofs-input of=mount_dir/output bs=4096 conv=fsync status=none && \
+                     sudo cmp /tmp/virtiofs-input mount_dir/output",
+                )
+                .unwrap();
+            assert_eq!(fs::read(shared_dir.join("output")).unwrap(), data);
+
+            guest
+                .ssh_command("sudo mv mount_dir/output mount_dir/renamed")
+                .unwrap();
+            assert!(!shared_dir.join("output").exists());
+            assert_eq!(fs::read(shared_dir.join("renamed")).unwrap(), data);
+            guest
+                .ssh_command("sudo rm mount_dir/renamed && sudo umount mount_dir")
+                .unwrap();
+            assert!(!shared_dir.join("renamed").exists());
+
+            if hotplug {
+                assert!(remote_command(&api_socket, "remove-device", Some("myfs0")));
+                let removed_event = MetaEvent {
+                    event: "device-removed".to_string(),
+                    device_id: Some("myfs0".to_string()),
+                };
+                assert!(wait_for_sequential_events(
+                    Duration::from_secs(10),
+                    &[&removed_event],
+                    &event_path,
+                ));
+            }
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        let _ = daemon_child.kill();
+        let _ = daemon_child.wait();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_virtio_fs_boot() {
+        test_virtio_fs(false);
+    }
+
+    #[test]
+    fn test_virtio_fs_hotplug() {
+        test_virtio_fs(true);
+    }
+
     #[test]
     fn test_multi_cpu() {
         let guest = basic_cvm_guest!(JAMMY_IMAGE_NAME);
         _test_multi_cpu(&guest);
+    }
+
+    #[cfg(all(feature = "kvm", feature = "fw_cfg"))]
+    fn test_cpu_resize(boot_vcpus: u8, max_vcpus: u8) {
+        use std::panic;
+        use std::time::Duration;
+
+        assert!(boot_vcpus > 0 && boot_vcpus < max_vcpus);
+        let cpu_range = |vcpus: u8| {
+            if vcpus == 1 {
+                "0".to_string()
+            } else {
+                format!("0-{}", vcpus - 1)
+            }
+        };
+        let guest = basic_cvm_guest!(JAMMY_IMAGE_NAME).with_cpu(u32::from(boot_vcpus));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let mut command = GuestCommand::new(&guest);
+        command
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", &format!("boot={boot_vcpus},max={max_vcpus}")])
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net();
+        let mut child = command.capture_output().spawn().unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert_eq!(guest.get_cpu_count().unwrap(), u32::from(boot_vcpus));
+            assert_eq!(
+                guest
+                    .ssh_command("cat /sys/devices/system/cpu/present")
+                    .unwrap()
+                    .trim(),
+                cpu_range(boot_vcpus)
+            );
+
+            for desired_vcpus in [max_vcpus, boot_vcpus] {
+                assert!(resize_command(
+                    &api_socket,
+                    Some(desired_vcpus),
+                    None,
+                    None,
+                    None
+                ));
+                let present = cpu_range(desired_vcpus);
+                assert!(
+                    wait_until(Duration::from_secs(10), || {
+                        guest
+                            .ssh_command("cat /sys/devices/system/cpu/present")
+                            .is_ok_and(|cpus| cpus.trim() == present)
+                    }),
+                    "Guest CPU presence did not change to {present}"
+                );
+                if desired_vcpus == max_vcpus {
+                    for cpu in boot_vcpus..max_vcpus {
+                        // Do not repeat a failed AP start: report the first
+                        // failure together with the guest's kernel log.
+                        ssh_command_ip(
+                            &format!("echo 1 | sudo tee /sys/devices/system/cpu/cpu{cpu}/online"),
+                            &guest.network.guest_ip0,
+                            1,
+                            DEFAULT_SSH_TIMEOUT,
+                        )
+                        .unwrap_or_else(|error| {
+                            let dmesg = guest.ssh_command("sudo dmesg").unwrap_or_default();
+                            panic!("Failed to online CPU {cpu}: {error:?}\n{dmesg}");
+                        });
+                    }
+                }
+                assert!(wait_until(Duration::from_secs(10), || {
+                    guest.get_cpu_count().unwrap_or_default() == u32::from(desired_vcpus)
+                }));
+                // Run work on every CPU to check that inserted CPUs execute.
+                guest
+                    .ssh_command(&format!(
+                        "for cpu in $(seq 0 {}); do taskset -c $cpu true || exit 1; done",
+                        desired_vcpus - 1
+                    ))
+                    .unwrap();
+            }
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(all(feature = "kvm", feature = "fw_cfg"))]
+    fn test_cpu_hotplug() {
+        test_cpu_resize(2, 4);
     }
 
     #[test]

@@ -430,9 +430,23 @@ impl QcowHeader {
             }
         }
 
+        // Encryption is not implemented; refuse to treat ciphertext as plain data.
+        if header.crypt_method != 0 {
+            return Err(Error::UnsupportedCryptMethod(header.crypt_method));
+        }
+
         // Everything below derives from the cluster size. Validate it before it is used.
         if !(MIN_CLUSTER_BITS..=MAX_CLUSTER_BITS).contains(&header.cluster_bits) {
             return Err(Error::InvalidClusterSize);
+        }
+
+        if version == 3 {
+            let cluster_size = 1u64 << header.cluster_bits;
+            if u64::from(header.header_size) < u64::from(V3_BARE_HEADER_SIZE)
+                || u64::from(header.header_size) > cluster_size
+            {
+                return Err(Error::InvalidHeaderLength(header.header_size));
+            }
         }
 
         if header.backing_file_size > MAX_BACKING_FILE_SIZE {

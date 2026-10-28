@@ -102,6 +102,9 @@ pub enum Error {
     Loader(#[source] loader::Error),
     #[error("Parameter too large for parameter area")]
     ParameterTooLarge,
+    #[cfg(feature = "mshv")]
+    #[error("Invalid CPUID page at GPA 0x{0:x} in IGVM file")]
+    InvalidCpuidPage(u64),
     #[error("Error importing isolated pages")]
     ImportIsolatedPages(#[source] hypervisor::HypervisorVmError),
     #[error("Error completing importing isolated pages")]
@@ -218,7 +221,6 @@ fn import_parameter(
     Ok(())
 }
 
-///
 /// Extract guest policy from the IGVM initialization headers.
 #[cfg(feature = "sev_snp")]
 pub(crate) fn extract_guest_policy(igvm_file: &IgvmFile) -> Option<igvm_defs::SnpPolicy> {
@@ -232,9 +234,7 @@ pub(crate) fn extract_guest_policy(igvm_file: &IgvmFile) -> Option<igvm_defs::Sn
     None
 }
 
-///
 /// Extract sev_features from the boot CPU (vp_index 0) VMSA.
-///
 #[cfg(feature = "sev_snp")]
 pub(crate) fn extract_sev_features(igvm_file: &IgvmFile) -> u64 {
     for header in igvm_file.directives() {
@@ -247,7 +247,6 @@ pub(crate) fn extract_sev_features(igvm_file: &IgvmFile) -> u64 {
     0
 }
 
-///
 /// Load the given IGVM file to guest memory.
 /// Right now it only supports SNP based isolation.
 /// We can boot legacy VM with an igvm file without
@@ -296,7 +295,7 @@ pub(crate) fn load_igvm(
     let command_line = CString::new(cmdline).map_err(Error::InvalidCommandLine)?;
     let memory = memory_manager.lock().as_ref().unwrap().guest_memory();
     let mut gpas: Vec<GpaPages> = Vec::new();
-    let proc_count = cpu_manager.lock().unwrap().vcpus().len() as u32;
+    let proc_count = cpu_manager.lock().unwrap().boot_vcpus();
 
     #[cfg(feature = "sev_snp")]
     let mut host_data_contents = [0; 32];
@@ -393,31 +392,40 @@ pub(crate) fn load_igvm(
                     IgvmPageDataType::CPUID_DATA => {
                         #[cfg(feature = "mshv")]
                         if hypervisor_type == HypervisorType::Mshv {
-                            // SAFETY: CPUID is readonly
-                            unsafe {
-                                let cpuid_page_p = data.as_mut_ptr().cast();
-                                let cpuid_page: &mut hv_psp_cpuid_page = &mut *cpuid_page_p;
-                                for i in 0..cpuid_page.count {
-                                    let leaf = cpuid_page.cpuid_leaf_info[i as usize];
-                                    let mut in_leaf = cpu_manager
-                                        .lock()
-                                        .unwrap()
-                                        .get_cpuid_leaf(
-                                            0,
-                                            leaf.eax_in,
-                                            leaf.ecx_in,
-                                            leaf.xfem_in,
-                                            leaf.xss_in,
-                                        )
-                                        .unwrap();
-                                    if leaf.eax_in == 1 {
-                                        in_leaf[2] &= 0x7FFFFFFF;
-                                    }
-                                    cpuid_page.cpuid_leaf_info[i as usize].eax_out = in_leaf[0];
-                                    cpuid_page.cpuid_leaf_info[i as usize].ebx_out = in_leaf[1];
-                                    cpuid_page.cpuid_leaf_info[i as usize].ecx_out = in_leaf[2];
-                                    cpuid_page.cpuid_leaf_info[i as usize].edx_out = in_leaf[3];
+                            // The page data comes from the IGVM file, which may
+                            // leave it empty (a zero page).
+                            if data.len() < size_of::<hv_psp_cpuid_page>() {
+                                return Err(Error::InvalidCpuidPage(*gpa));
+                            }
+                            // SAFETY: `data` is an owned buffer holding at least
+                            // size_of::<hv_psp_cpuid_page>() bytes, checked above.
+                            // hv_psp_cpuid_page is packed, so it has no alignment
+                            // requirement, and any bit pattern is a valid value.
+                            let cpuid_page: &mut hv_psp_cpuid_page =
+                                unsafe { &mut *data.as_mut_ptr().cast() };
+                            if cpuid_page.count as usize > cpuid_page.cpuid_leaf_info.len() {
+                                return Err(Error::InvalidCpuidPage(*gpa));
+                            }
+                            for i in 0..cpuid_page.count {
+                                let leaf = cpuid_page.cpuid_leaf_info[i as usize];
+                                let mut in_leaf = cpu_manager
+                                    .lock()
+                                    .unwrap()
+                                    .get_cpuid_leaf(
+                                        0,
+                                        leaf.eax_in,
+                                        leaf.ecx_in,
+                                        leaf.xfem_in,
+                                        leaf.xss_in,
+                                    )
+                                    .unwrap();
+                                if leaf.eax_in == 1 {
+                                    in_leaf[2] &= 0x7FFFFFFF;
                                 }
+                                cpuid_page.cpuid_leaf_info[i as usize].eax_out = in_leaf[0];
+                                cpuid_page.cpuid_leaf_info[i as usize].ebx_out = in_leaf[1];
+                                cpuid_page.cpuid_leaf_info[i as usize].ecx_out = in_leaf[2];
+                                cpuid_page.cpuid_leaf_info[i as usize].edx_out = in_leaf[3];
                             }
                         }
                         gpas.push(GpaPages {

@@ -477,7 +477,8 @@ pub fn start_vmm_thread(
     exit_event: EventFd,
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
-    no_shutdown: bool,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
@@ -517,7 +518,8 @@ pub fn start_vmm_thread(
                     vmm_seccomp_action,
                     hypervisor,
                     exit_event,
-                    no_shutdown,
+                    shutdown_action,
+                    reset_action,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -694,6 +696,28 @@ impl VmOwnership {
     }
 }
 
+/// Action to take when the guest requests shutdown.
+#[derive(Default, Clone, Copy)]
+pub enum GuestShutdownAction {
+    /// Shut down the VM and exit the VMM.
+    #[default]
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
+/// Action to take when the guest requests a reset.
+#[derive(Default, Clone, Copy)]
+pub enum GuestResetAction {
+    /// Reset the VM.
+    #[default]
+    ResetVm,
+    /// Shut down the VM and exit the VMM.
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -717,7 +741,8 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     console_socket_listener: Option<Arc<LockedUnixListener>>,
-    no_shutdown: bool,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     check_migration_evt: EventFd,
 }
 
@@ -882,7 +907,8 @@ impl Vmm {
         seccomp_action: SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
-        no_shutdown: bool,
+        shutdown_action: GuestShutdownAction,
+        reset_action: GuestResetAction,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -942,7 +968,8 @@ impl Vmm {
             console_info: None,
             serial_socket_listener: None,
             console_socket_listener: None,
-            no_shutdown,
+            shutdown_action,
+            reset_action,
             check_migration_evt,
         })
     }
@@ -2241,17 +2268,31 @@ impl Vmm {
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        self.vm_reboot().map_err(Error::VmReboot)?;
+                        match self.reset_action {
+                            GuestResetAction::ResetVm => {
+                                self.vm_reboot().map_err(Error::VmReboot)?;
+                            }
+                            GuestResetAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestResetAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
+                        }
                     }
                     EpollDispatch::GuestExit => {
                         info!("VM guest exit event");
                         self.guest_exit_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        if self.no_shutdown {
-                            self.vm_shutdown().map_err(Error::VmShutdown)?;
-                        } else {
-                            self.vmm_shutdown().map_err(Error::VmmShutdown)?;
-                            break 'outer;
+                        match self.shutdown_action {
+                            GuestShutdownAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestShutdownAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
                         }
                     }
                     EpollDispatch::ActivateVirtioDevices => {
@@ -2737,13 +2778,6 @@ impl RequestHandler for Vmm {
             .activate_evt
             .try_clone()
             .map_err(VmError::EventFdClone)?;
-
-        // The Linux kernel fires off an i8042 reset after doing the ACPI reset so there may be
-        // an event sitting in the shared reset_evt. Without doing this we get very early reboots
-        // during the boot process.
-        if self.reset_evt.read().is_ok() {
-            warn!("Spurious second reset event received. Ignoring.");
-        }
 
         self.console_info =
             Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
@@ -3593,7 +3627,8 @@ mod tests {
             SeccompAction::Allow,
             hypervisor::new().unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
-            false,
+            GuestShutdownAction::default(),
+            GuestResetAction::default(),
         )
         .unwrap()
     }
