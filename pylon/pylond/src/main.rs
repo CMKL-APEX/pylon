@@ -39,6 +39,10 @@ struct CliArgs {
     /// Optional path to a memory-mapped `pylon_pcpu_owners` backing file.
     #[arg(long)]
     pcpu_map_file: Option<PathBuf>,
+
+    /// Attach the live kernel sched_ext BPF dispatcher (scx-pylon).
+    #[arg(long)]
+    enable_scx: bool,
 }
 
 fn parse_core_list(spec: &str) -> Result<Vec<usize>> {
@@ -75,7 +79,16 @@ fn main() -> Result<()> {
         args.socket.display()
     );
 
-    let pcpu_owners = if let Some(ref path) = args.pcpu_map_file {
+    let (pcpu_owners, _scx_handle) = if args.enable_scx {
+        info!("Loading and attaching scx_pylon sched_ext BPF dispatcher to kernel...");
+        let scx = scx_pylon::ScxPylonUserspace::load_and_attach()
+            .context("failed to load and attach scx_pylon sched_ext dispatcher")?;
+        let (owner_map, link, obj) = scx.into_parts();
+        info!("scx_pylon attached successfully; kernel sched_ext is active");
+        let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
+            .context("failed to create PcpuOwnerTable from scx_pylon mmap")?;
+        (Arc::new(table), Some((link, obj)))
+    } else if let Some(ref path) = args.pcpu_map_file {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -83,9 +96,9 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to open pcpu map file {}", path.display()))?;
         // SAFETY: `file` is opened read/write for the shared `PcpuOwnerEntry` table.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Arc::new(PcpuOwnerTable::from_mmap(mmap)?)
+        (Arc::new(PcpuOwnerTable::from_mmap(mmap)?), None)
     } else {
-        Arc::new(PcpuOwnerTable::new_in_memory())
+        (Arc::new(PcpuOwnerTable::new_in_memory()), None)
     };
 
     let vm_snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));

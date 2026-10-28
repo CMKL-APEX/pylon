@@ -4,6 +4,7 @@
 extend-exclude = [
   "hypervisor/src/kvm/x86_64/mod.rs",
   "resources/linux-config-*",
+  "pylon/scx-pylon/src/bpf/vmlinux.h",
 ]
 
 [default.extend-words]
