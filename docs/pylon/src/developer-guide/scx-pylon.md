@@ -39,20 +39,80 @@ doesn't read it.
 
 **`select_cpu(p, prev_cpu, wake_flags)`**, when a task wakes:
 
-1. If `prev_cpu`'s owner is `p`, insert `p` into that CPU's local
-   dispatch queue with an infinite slice and return `prev_cpu`.
-2. Otherwise scan all 256 entries for one owned by `p`. If found, insert
-   `p` there the same way, and kick that CPU with `SCX_KICK_PREEMPT` if
-   it isn't `prev_cpu`.
+1. If `prev_cpu`'s owner is `p`, return `prev_cpu`.
+2. Otherwise scan all 256 entries for one owned by `p`, and return that
+   CPU if found.
 3. Otherwise use `scx_bpf_select_cpu_dfl`, the default placement.
 
-**`dispatch(cpu, prev)`**, when a CPU needs work: if the CPU has an
-owner and `prev` isn't it, kick the CPU with `SCX_KICK_PREEMPT`. Then
-take a reference to the owner task with `bpf_task_from_pid`, insert it
-into the local queue with an infinite slice, and release the reference.
+A task found as an owner is marked in task-local storage with its VMM
+process's tgid: its *domain*.
 
-`init` and `exit` do nothing. There's no `enqueue`, so `sched_ext`'s
-default behavior queues every other task.
+**`enqueue(p, enq_flags)`** puts each task on one of three kinds of
+queue:
+
+- The owner of its CPU goes on that CPU's owner queue (DSQ id = CPU)
+  with an infinite slice, and the CPU is kicked with
+  `SCX_KICK_PREEMPT`. This is what preempts a donor whose CPU was given
+  to a recipient.
+- Another vCPU thread with a domain goes on the vCPU queue. If it owns
+  a CPU elsewhere, that CPU is kicked.
+- Everything else goes on the host queue.
+
+A task with migration disabled stays on its CPU's local queue. With
+`SCX_ENQ_LAST`, the CPU has already decided to idle with `p` runnable,
+so `enqueue` kicks it to schedule again.
+
+**`dispatch(cpu, prev)`**, when a CPU needs work, tries in order:
+
+1. The CPU's owner queue. Tasks that no longer own the CPU are moved to
+   the vCPU or host queue.
+2. The vCPU queue, skipping threads that own another CPU.
+3. The host queue.
+
+Each step only dispatches what the SMT claims allow. If nothing fits,
+the CPU idles.
+
+## SMT isolation
+
+Kernel core scheduling (`PR_SCHED_CORE`) can't be used with
+`sched_ext` on kernels that lack the upstream fixes for
+4c95380701f5 (issue #15). So `scx_pylon` does the job itself for managed
+vCPU threads: while a CPU runs a vCPU of VM *A*, its SMT siblings run
+only vCPUs of *A* or nothing.
+
+Each CPU publishes a claim in `cpu_claim[]`: idle, host, or a domain
+(tgid).
+
+- `dispatch` publishes the claim before checking the siblings. Two
+  siblings claiming at once each see the other's claim.
+- `running` records the task actually running, and `update_idle` clears
+  the claim.
+- The order is: a domain beats host, and between two domains the
+  lower-numbered CPU wins. The winner kicks the loser with
+  `SCX_KICK_PREEMPT`, and the loser's next `dispatch` backs off.
+- When a domain claim ends, the siblings are kicked to look for work
+  again.
+
+The siblings come from `pylon_smt_next`, a ring (next CPU on the same
+core) that `load_and_attach()` fills from
+`/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list` before
+attaching. When `scx_pylon` is attached, `pylond` gives the engine the
+same ring. It then never assigns two VMs sibling threads of one core,
+and prefers the free thread of a core the VM already holds.
+
+Not isolated:
+
+- tasks of higher sched classes (RT, deadline, stop);
+- interrupts and softirqs;
+- tasks with migration disabled, which are short and pinned.
+
+Kernel core scheduling doesn't isolate interrupts either. A host task
+that can only run on a fenced CPU waits until the vCPU next to it
+stops. If that takes longer than the watchdog timeout, the kernel ejects
+the scheduler.
+
+The flags are `SCX_OPS_ENQ_LAST`, `SCX_OPS_ENQ_EXITING`,
+`SCX_OPS_ENQ_MIGRATION_DISABLED` and `SCX_OPS_KEEP_BUILTIN_IDLE`.
 
 ### Costs and open points
 
@@ -61,10 +121,13 @@ default behavior queues every other task.
   that own nothing. A reverse map (thread ID to CPU) would make it one
   lookup.
 - An infinite slice means an owner runs until it blocks. Other tasks
-  queued on that CPU wait, and the kernel's stall watchdog can eject
-  the scheduler if they wait too long.
+  queued on that CPU, or pinned to its siblings, wait. The kernel's
+  stall watchdog can eject the scheduler if they wait too long.
 - The program is attached for the whole host (`.name = "pylon"`, no
   partial-switch flag), so every `SCHED_NORMAL` task goes through it.
+- Two VMs on sibling threads (only possible without `pylond`'s
+  placement, for example with VMs it doesn't manage) take turns badly:
+  the lower-numbered CPU's VM wins for as long as its vCPU runs.
 
 None of these has been measured yet.
 
@@ -88,8 +151,8 @@ SPDX header.
 `ScxPylonUserspace` in `src/lib.rs` wraps `libbpf-rs`:
 
 - `open_embedded()` opens the embedded object.
-- `load_and_attach()` loads it, attaches the `struct_ops` link, and maps
-  `pylon_pcpu_owners`.
+- `load_and_attach()` loads it, fills `pylon_smt_next`, attaches the
+  `struct_ops` link, and maps `pylon_pcpu_owners`.
 - `into_parts()` hands `pylond` the mapping (as its owner table), the
   link and the object. `pylond` keeps the link alive for its lifetime.
   The kernel detaches the scheduler when the link's descriptor closes,

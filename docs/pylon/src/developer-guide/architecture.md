@@ -88,8 +88,9 @@ When a managed CPU is idle (the fast path):
 4. **VMM.** The parked thread's blocking read returns. It sets
    `state = RUNNING` and enters `KVM_RUN`.
 5. **Kernel.** With `scx_pylon` attached, `select_cpu` finds the thread
-   in the owner table and queues it on the owned CPU with an unlimited
-   slice. Without it, the fair scheduler places the thread.
+   in the owner table and `enqueue` queues it on the owned CPU with an
+   unlimited slice. That CPU's SMT siblings then run only vCPUs of the
+   same VM or nothing. Without it, the fair scheduler places the thread.
 
 When no managed CPU is idle, the engine takes one from a donor:
 

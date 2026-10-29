@@ -48,7 +48,7 @@ Line counts include tests and were taken on 2026-10-29.
 
 | File | Contents |
 |---|---|
-| `src/bpf/scx_pylon.bpf.c` | The `sched_ext` scheduler: the `pylon_pcpu_owners` map, `select_cpu`, `dispatch`. |
+| `src/bpf/scx_pylon.bpf.c` | The `sched_ext` scheduler: the `pylon_pcpu_owners` and `pylon_smt_next` maps, the owner, vCPU and host queues, and SMT isolation. |
 | `src/bpf/vmlinux.h` | Kernel type definitions for the BPF build (generated; excluded from linters). |
 | `build.rs` | Compiles the BPF object with `clang -target bpf` into `OUT_DIR`. |
 | `src/lib.rs` | `ScxPylonUserspace` (open, load, attach) and `PcpuOwnerMap`, the userspace view of the map. |
