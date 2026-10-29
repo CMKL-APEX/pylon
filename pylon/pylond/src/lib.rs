@@ -1062,6 +1062,69 @@ mod tests {
     }
 
     #[test]
+    fn test_plane2_park_timer_wakes_zero_core_vm_on_due_vcpu() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
+
+        // An idle VM whose vCPUs 1 and 3 parked with guest timers armed, published by the VMM
+        // in host TSC: vCPU 3's is due first.
+        let vm = build_test_vm(1, 4, 0, 4, 1);
+        let page = vm.handle.shared_page();
+        page.vcpus[1]
+            .park_timer_deadline_tsc
+            .store(50_000, Ordering::Release);
+        page.vcpus[3]
+            .park_timer_deadline_tsc
+            .store(5_000, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, vm.handle.clone());
+
+        // Nothing is due yet, and the guest has nothing to run.
+        engine.poll_once(4_000);
+        assert_eq!(engine.core_state(2), CoreState::Idle);
+
+        // vCPU 3's timer is due: it gets a core so the interrupt can fire.
+        engine.poll_once(6_000);
+        assert_eq!(
+            engine.core_state(2),
+            CoreState::Assigned { vm_id: 1, vcpu: 3 }
+        );
+        assert_eq!(read_eventfd(vm.wake_fds[3].as_raw_fd()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_plane2_head_wait_uses_guest_tsc_offset() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
+
+        // Two VMs each want one core and there is one. VM 1 has been waiting since host TSC
+        // 900,000; VM 2 since host TSC 100, but its guest TSC runs 10,000,000 cycles ahead of
+        // the host's, so it wrote 10,000,100. Read as host TSC, that lies in the future and
+        // VM 2 would look like it had just started waiting.
+        let vm1 = build_test_vm(1, 1, 0, 1, 1);
+        let vm2 = build_test_vm(2, 1, 0, 1, 1);
+        for (vm, head_wait, offset) in [(&vm1, 900_000u64, 0u64), (&vm2, 10_000_100, 10_000_000)] {
+            let page = vm.handle.shared_page();
+            page.vcpus[0]
+                .guest_tsc_offset
+                .store(offset, Ordering::Release);
+            page.telemetry
+                .head_wait_tsc
+                .store(head_wait, Ordering::Release);
+            page.telemetry.runnable_threads.store(1, Ordering::Release);
+        }
+        ControlPlane::publish_vm_handle(&snapshot, vm1.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, vm2.handle.clone());
+
+        engine.poll_once(1_000_000);
+        assert_eq!(
+            engine.core_state(2),
+            CoreState::Assigned { vm_id: 2, vcpu: 0 }
+        );
+    }
+
+    #[test]
     fn test_plane2_phase2_and_phase3_cooperative_and_forced_preemption() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
