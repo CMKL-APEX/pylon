@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val, zeroed};
@@ -45,6 +46,57 @@ pub struct ControlPlane {
     vm_snapshot: Arc<VmSnapshot>,
     socket_mode: Option<u32>,
     socket_gid: Option<u32>,
+    vcpu_domains: Option<Box<dyn VcpuDomainTable>>,
+}
+
+/// Where Plane 1 lists registered VMs' vCPU threads with their VMM's PID: `scx_pylon`'s
+/// `pylon_vcpu_dom` map, which makes `scx_pylon` keep a listed thread's SMT siblings apart
+/// before the thread ever owns a pCPU.
+pub trait VcpuDomainTable: Send + Sync {
+    /// Lists thread `tid` as a vCPU of the VMM process `pid`.
+    fn insert(&self, tid: u32, pid: u32) -> scx_pylon::Result<()>;
+    /// Removes thread `tid`.
+    fn remove(&self, tid: u32) -> scx_pylon::Result<()>;
+}
+
+impl VcpuDomainTable for scx_pylon::VcpuDomainMap {
+    fn insert(&self, tid: u32, pid: u32) -> scx_pylon::Result<()> {
+        scx_pylon::VcpuDomainMap::insert(self, tid, pid)
+    }
+
+    fn remove(&self, tid: u32) -> scx_pylon::Result<()> {
+        scx_pylon::VcpuDomainMap::remove(self, tid)
+    }
+}
+
+/// Brings `table` in line with `current`, the vCPU threads of the registered VMs by thread
+/// ID, with their VMM's PID. `listed` holds what the table holds, so only changes are
+/// written. A thread that fails to be listed is tried again next time.
+pub fn sync_vcpu_domains(
+    table: &dyn VcpuDomainTable,
+    listed: &mut HashMap<u32, u32>,
+    current: HashMap<u32, u32>,
+) {
+    listed.retain(|tid, pid| {
+        if current.get(tid) == Some(pid) {
+            return true;
+        }
+        if let Err(err) = table.remove(*tid) {
+            warn!("Failed to remove vCPU thread {tid} from scx_pylon: {err}");
+        }
+        false
+    });
+    for (tid, pid) in current {
+        if listed.contains_key(&tid) {
+            continue;
+        }
+        match table.insert(tid, pid) {
+            Ok(()) => {
+                listed.insert(tid, pid);
+            }
+            Err(err) => warn!("Failed to list vCPU thread {tid} in scx_pylon: {err}"),
+        }
+    }
 }
 
 /// How often Plane 1 looks for VMs whose VMM has exited.
@@ -58,7 +110,15 @@ impl ControlPlane {
             vm_snapshot,
             socket_mode: None,
             socket_gid: None,
+            vcpu_domains: None,
         }
+    }
+
+    /// Lists registered VMs' vCPU threads in `table`, so `scx_pylon` isolates them from the
+    /// start. The list is brought up to date once a second.
+    pub fn with_vcpu_domains(mut self, table: impl VcpuDomainTable + 'static) -> Self {
+        self.vcpu_domains = Some(Box::new(table));
+        self
     }
 
     /// Sets the socket's permission bits and group once it is created. Without them, the
@@ -106,6 +166,7 @@ impl ControlPlane {
 
         let mut prune = interval(VM_PRUNE_INTERVAL);
         prune.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut listed_vcpus = HashMap::new();
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -115,6 +176,15 @@ impl ControlPlane {
                 }
                 _ = prune.tick() => {
                     Self::remove_exited_vms(&self.vm_snapshot);
+                    if let Some(table) = &self.vcpu_domains {
+                        let current = self
+                            .vm_snapshot
+                            .load()
+                            .iter()
+                            .flat_map(VmHandle::vcpu_threads)
+                            .collect();
+                        sync_vcpu_domains(table.as_ref(), &mut listed_vcpus, current);
+                    }
                 }
                 accept_res = listener.accept() => {
                     let (stream, _) = accept_res.map_err(Error::Io)?;
@@ -658,5 +728,72 @@ pub async fn run_prometheus_server(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// A `VcpuDomainTable` that records its contents and can refuse inserts.
+    #[derive(Default)]
+    struct FakeTable {
+        entries: Mutex<HashMap<u32, u32>>,
+        refuse: Mutex<bool>,
+    }
+
+    impl VcpuDomainTable for FakeTable {
+        fn insert(&self, tid: u32, pid: u32) -> scx_pylon::Result<()> {
+            if *self.refuse.lock().unwrap() {
+                return Err(scx_pylon::Error::Io(io::Error::other("map full")));
+            }
+            self.entries.lock().unwrap().insert(tid, pid);
+            Ok(())
+        }
+
+        fn remove(&self, tid: u32) -> scx_pylon::Result<()> {
+            self.entries.lock().unwrap().remove(&tid);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sync_vcpu_domains_follows_the_registered_threads() {
+        let table = FakeTable::default();
+        let mut listed = HashMap::new();
+
+        sync_vcpu_domains(
+            &table,
+            &mut listed,
+            HashMap::from([(10, 1), (11, 1), (20, 2)]),
+        );
+        assert_eq!(
+            *table.entries.lock().unwrap(),
+            HashMap::from([(10, 1), (11, 1), (20, 2)])
+        );
+
+        // VM 2 is gone, VM 1 lost a thread, and thread 11's ID now belongs to VM 3.
+        sync_vcpu_domains(&table, &mut listed, HashMap::from([(10, 1), (11, 3)]));
+        assert_eq!(
+            *table.entries.lock().unwrap(),
+            HashMap::from([(10, 1), (11, 3)])
+        );
+        assert_eq!(listed, *table.entries.lock().unwrap());
+    }
+
+    #[test]
+    fn sync_vcpu_domains_retries_a_failed_insert() {
+        let table = FakeTable::default();
+        let mut listed = HashMap::new();
+
+        *table.refuse.lock().unwrap() = true;
+        sync_vcpu_domains(&table, &mut listed, HashMap::from([(10, 1)]));
+        assert!(listed.is_empty());
+
+        *table.refuse.lock().unwrap() = false;
+        sync_vcpu_domains(&table, &mut listed, HashMap::from([(10, 1)]));
+        assert_eq!(*table.entries.lock().unwrap(), HashMap::from([(10, 1)]));
     }
 }

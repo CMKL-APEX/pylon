@@ -231,12 +231,21 @@ fn main() -> Result<()> {
     // give two VMs sibling threads of one core.
     let smt_ring = scx.as_ref().map(|_| scx_pylon::host_smt_ring());
 
-    let (pcpu_owners, _scx_handle) = if let Some(scx) = scx {
+    let (pcpu_owners, vcpu_domains, _scx_handle) = if let Some(scx) = scx {
+        // Plane 1 lists registered vCPU threads here, so scx_pylon isolates them before they
+        // own a pCPU.
+        let vcpu_domains = scx
+            .vcpu_domain_map()
+            .context("failed to open scx_pylon's vCPU thread map")?;
         let (owner_map, link, guard_links, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
         let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
             .context("failed to create PcpuOwnerTable from scx_pylon mmap")?;
-        (Arc::new(table), Some((link, guard_links, obj)))
+        (
+            Arc::new(table),
+            Some(vcpu_domains),
+            Some((link, guard_links, obj)),
+        )
     } else if let Some(ref path) = args.pcpu_map_file {
         let file = OpenOptions::new()
             .read(true)
@@ -245,9 +254,9 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to open pcpu map file {}", path.display()))?;
         // SAFETY: `file` is opened read/write for the shared `PcpuOwnerEntry` table.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-        (Arc::new(PcpuOwnerTable::from_mmap(mmap)?), None)
+        (Arc::new(PcpuOwnerTable::from_mmap(mmap)?), None, None)
     } else {
-        (Arc::new(PcpuOwnerTable::new_in_memory()), None)
+        (Arc::new(PcpuOwnerTable::new_in_memory()), None, None)
     };
 
     let vm_snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
@@ -278,8 +287,11 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build Plane 1 Tokio runtime")?;
 
-    let control = ControlPlane::new(args.socket, Arc::clone(&vm_snapshot))
+    let mut control = ControlPlane::new(args.socket, Arc::clone(&vm_snapshot))
         .with_socket_permissions(args.socket_mode, args.socket_group);
+    if let Some(vcpu_domains) = vcpu_domains {
+        control = control.with_vcpu_domains(vcpu_domains);
+    }
     if let Some(port) = args.metrics_port {
         let bind_addr = format!("{}:{}", args.metrics_addr, port);
         let metrics_snapshot = Arc::clone(&vm_snapshot);

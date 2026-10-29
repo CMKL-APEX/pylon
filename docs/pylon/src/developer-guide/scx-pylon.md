@@ -45,14 +45,21 @@ doesn't read it.
 3. Otherwise use `scx_bpf_select_cpu_dfl`, the default placement.
 
 A task found as an owner is marked in task-local storage with its VMM
-process's tgid: its *domain*.
+process's tgid: its *domain*. A vCPU thread gets its domain earlier, at
+its first `enqueue`, when `pylond` has listed it in `pylon_vcpu_dom`.
+`pylond`'s control plane keeps that map, thread ID to VMM tgid, in line
+with the registered VMs' shared pages every second. `enqueue` checks the
+tgid too, so a thread ID reused by another process isn't tagged. A vCPU
+is therefore isolated whether or not it ever owns a CPU, which matters
+because `pylond` only gives CPUs to vCPUs that start parked
+(`initial_active_vcpus`).
 
 **`enqueue(p, enq_flags)`** puts each task on one of three kinds of
 queue:
 
 - The owner of its CPU goes on that CPU's owner queue (DSQ id = CPU)
-  with a 20 ms slice, and the CPU is kicked with `SCX_KICK_PREEMPT`. This is what preempts a donor whose CPU was given
-  to a recipient.
+  with a 20 ms slice, and the CPU is kicked with `SCX_KICK_PREEMPT`.
+  This is what preempts a donor whose CPU was given to a recipient.
 - Another vCPU thread with a domain goes on the vCPU queue. If it owns
   a CPU elsewhere, that CPU is kicked.
 - A host task allowed on only one CPU, such as a per-CPU kworker, goes
@@ -84,8 +91,8 @@ Kernel core scheduling (`PR_SCHED_CORE`) can't be used with
 vCPU threads: while a CPU runs a vCPU of VM *A*, its SMT siblings run
 only vCPUs of *A* or nothing.
 
-Each CPU publishes a claim in `cpu_claim[]`: idle, host, or a domain
-(tgid).
+Each CPU publishes a claim in `cpu_claim[]`: idle, host, pinned (a host
+task allowed on only that CPU), or a domain (tgid).
 
 - `dispatch` publishes the claim before checking the siblings. Two
   siblings claiming at once each see the other's claim.
@@ -94,8 +101,13 @@ Each CPU publishes a claim in `cpu_claim[]`: idle, host, or a domain
 - The order is: a domain beats host, and between two domains the
   lower-numbered CPU wins. The winner kicks the loser with
   `SCX_KICK_PREEMPT`, and the loser's next `dispatch` backs off.
-- When a domain claim ends, the siblings are kicked to look for work
-  again.
+- A pinned task can't go anywhere else, so it runs without checking its
+  siblings. Instead, a domain yields to it, and `running` kicks the
+  siblings whose domain claims yield when a pinned task starts. The
+  exception is a CPU's owner: it doesn't yield, or a busy pinned task
+  next to it would keep it waiting until the watchdog fired.
+- When a domain or pinned claim ends, the siblings are kicked to look
+  for work again.
 
 The siblings come from `pylon_smt_next`, a ring (next CPU on the same
 core) that `load_and_attach()` fills from
@@ -109,9 +121,10 @@ Not isolated:
 - tasks of higher sched classes (RT, deadline, stop);
 - interrupts and softirqs;
 - tasks with migration disabled, which are short and pinned;
-- host tasks allowed on only one CPU, mostly per-CPU kernel threads.
-  They can't wait for the CPU or its siblings to free up: a busy vCPU
-  may never block, and the kernel's watchdog would eject the scheduler.
+- host tasks allowed on only one CPU, mostly per-CPU kernel threads,
+  when they run on an owned CPU or next to its owner. They can't wait
+  for the owner to block: a busy vCPU may never block, and the kernel's
+  watchdog would eject the scheduler.
 
 Kernel core scheduling doesn't isolate interrupts either.
 

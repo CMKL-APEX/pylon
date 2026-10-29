@@ -77,8 +77,10 @@ So, on such a kernel, `pylond` guards `scx_pylon`:
 - While attached, it refuses requests for new cookies. Cloud
   Hypervisor then fails to start a VM with `Error enabling core
   scheduling`. Start such VMs with `--cpus ...,core_scheduling=off`.
-  `scx_pylon` keeps SMT siblings apart for VMs that `pylond` manages;
-  VMs it doesn't manage get no SMT isolation from each other.
+  `scx_pylon` keeps SMT siblings apart for VMs that `pylond` manages,
+  from about a second after each vCPU thread starts, whether or not the
+  vCPU has a CPU of its own. VMs it doesn't manage get no SMT isolation
+  from each other.
 
 `pylond` logs its decision at startup, for example `Core scheduling:
 kernel lacks the sched_ext core-scheduling fixes (pylon#15); scx_pylon

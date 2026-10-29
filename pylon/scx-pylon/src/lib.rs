@@ -12,7 +12,9 @@ use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapFlags, MapType, Object, ObjectBuilder, OpenObject};
+use libbpf_rs::{
+    AsRawLibbpf, Link, MapCore, MapFlags, MapHandle, MapType, Object, ObjectBuilder, OpenObject,
+};
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
@@ -28,6 +30,9 @@ pub const PCPU_OWNERS_MAP_NAME: &str = "pylon_pcpu_owners";
 
 /// Name of the SMT sibling ring array map inside `scx_pylon.bpf.o`.
 pub const SMT_NEXT_MAP_NAME: &str = "pylon_smt_next";
+
+/// Name of the hash map of registered vCPU threads inside `scx_pylon.bpf.o`.
+pub const VCPU_DOM_MAP_NAME: &str = "pylon_vcpu_dom";
 
 /// Name of the core scheduling guard array map inside `scx_pylon.bpf.o`.
 pub const GUARD_MAP_NAME: &str = "pylon_guard";
@@ -346,6 +351,30 @@ pub fn host_smt_ring() -> [u32; MAX_PCPUS] {
     })
 }
 
+/// The `pylon_vcpu_dom` map: vCPU threads of registered VMs, by thread ID, with the tgid of
+/// their VMM process. `scx_pylon` treats a listed thread as a managed vCPU, and so keeps its
+/// SMT siblings apart, before it ever owns a pCPU.
+pub struct VcpuDomainMap {
+    map: MapHandle,
+}
+
+impl VcpuDomainMap {
+    /// Lists thread `tid` as a vCPU of the VMM process `tgid`.
+    pub fn insert(&self, tid: u32, tgid: u32) -> Result<()> {
+        self.map
+            .update(&tid.to_ne_bytes(), &tgid.to_ne_bytes(), MapFlags::ANY)
+            .map_err(Error::Bpf)
+    }
+
+    /// Removes thread `tid`. Removing a thread that isn't listed succeeds.
+    pub fn remove(&self, tid: u32) -> Result<()> {
+        match self.map.delete(&tid.to_ne_bytes()) {
+            Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => Ok(()),
+            res => res.map_err(Error::Bpf),
+        }
+    }
+}
+
 /// Userspace loader and handle for the `scx_pylon` `sched_ext` BPF dispatcher.
 pub struct ScxPylonUserspace {
     _obj: Object,
@@ -583,6 +612,20 @@ impl ScxPylonUserspace {
     #[inline]
     pub const fn owner_map(&self) -> &PcpuOwnerMap {
         &self.owner_map
+    }
+
+    /// Returns a handle to the map of registered vCPU threads. It keeps its own file
+    /// descriptor, so it outlives `self`.
+    pub fn vcpu_domain_map(&self) -> Result<VcpuDomainMap> {
+        let map = self
+            ._obj
+            .maps()
+            .find(|m| m.name() == VCPU_DOM_MAP_NAME)
+            .ok_or(Error::MissingMap {
+                map_name: VCPU_DOM_MAP_NAME,
+            })?;
+        let handle = MapHandle::try_from(&map).map_err(Error::Bpf)?;
+        Ok(VcpuDomainMap { map: handle })
     }
 
     /// Consumes the loader handle and returns the `PcpuOwnerMap`, the struct_ops

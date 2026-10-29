@@ -50,11 +50,13 @@
 
 /*
  * Per-CPU claims: what a CPU runs or is about to run. CLAIM_NONE is idle,
- * CLAIM_HOST is a task that isn't a managed vCPU, and any other value is the
- * tgid of the VMM process whose vCPU thread runs there.
+ * CLAIM_HOST is a task that isn't a managed vCPU, CLAIM_PINNED is such a
+ * task allowed on only this CPU, and any other value is the tgid of the VMM
+ * process whose vCPU thread runs there.
  */
 #define CLAIM_NONE 0U
 #define CLAIM_HOST 0xffffffffU
+#define CLAIM_PINNED 0xfffffffeU
 
 #define BPF_FOR_EACH_ITER (&___it)
 
@@ -101,8 +103,21 @@ struct {
     __type(value, __u32);
 } pylon_smt_next SEC(".maps");
 
+/*
+ * vCPU threads of registered VMs, written by pylond: thread ID to the tgid of
+ * its VMM process. A listed thread is a managed vCPU even before it owns a
+ * pCPU, so it is SMT-isolated from the start.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, __u32);
+} pylon_vcpu_dom SEC(".maps");
+
 struct pylon_task_ctx {
-    /* tgid of the VMM process once the task has owned a pCPU, else 0 */
+    /* tgid of the VMM process once the task has owned a pCPU or pylond has
+     * listed it in pylon_vcpu_dom, else 0 */
     __u32 dom;
     /* Last pCPU found owned by the task */
     __s32 owned_cpu;
@@ -226,6 +241,31 @@ static __always_inline void mark_owner(struct task_struct *p, s32 cpu)
     }
 }
 
+/*
+ * Returns @p's context if @p is a managed vCPU thread, tagging it on first
+ * sight when pylond lists it in pylon_vcpu_dom. The tgid check skips a stale
+ * entry whose thread ID now belongs to another process.
+ */
+static struct pylon_task_ctx *vcpu_ctx(struct task_struct *p)
+{
+    struct pylon_task_ctx *tctx = task_ctx(p);
+    if (tctx && tctx->dom) {
+        return tctx;
+    }
+
+    __u32 tid = (__u32)p->pid;
+    __u32 *tgid = bpf_map_lookup_elem(&pylon_vcpu_dom, &tid);
+    if (!tgid || *tgid != (__u32)p->tgid) {
+        return NULL;
+    }
+    tctx = bpf_task_storage_get(&pylon_task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (tctx) {
+        tctx->dom = *tgid;
+        tctx->owned_cpu = -1;
+    }
+    return tctx;
+}
+
 static __always_inline __u32 read_claim(s32 cpu)
 {
     /* Unsigned: clang folds a signed check, and the verifier then sees an
@@ -268,24 +308,32 @@ static void set_claim(s32 cpu, __u32 claim)
 /*
  * Whether @claim on @cpu yields to @other on its SMT sibling @sib. A managed
  * claim beats a host claim, and between two managed VMs the lower-numbered
- * CPU wins. The order is total, so two siblings never both back off.
+ * CPU wins. A pinned host task can't be moved away, so a managed claim
+ * yields to it, unless it is the pCPU's @owner: an owner that yielded to a
+ * busy pinned task would wait until the watchdog fired. Host and pinned
+ * claims don't conflict. Only `running` sets a pinned claim, without checking
+ * siblings, so among claims that are checked the order is total, and two
+ * siblings never both back off.
  */
-static __always_inline bool yields_to(s32 cpu, __u32 claim, s32 sib, __u32 other)
+static __always_inline bool yields_to(s32 cpu, __u32 claim, s32 sib, __u32 other, bool owner)
 {
     if (other == CLAIM_NONE || other == claim) {
         return false;
     }
-    if (claim == CLAIM_HOST) {
-        return true;
+    if (claim == CLAIM_HOST || claim == CLAIM_PINNED) {
+        return other != CLAIM_HOST && other != CLAIM_PINNED;
     }
     if (other == CLAIM_HOST) {
         return false;
+    }
+    if (other == CLAIM_PINNED) {
+        return !owner;
     }
     return sib < cpu;
 }
 
 /* Whether a sibling of @cpu holds a claim that @claim yields to. */
-static bool fenced(s32 cpu, __u32 claim)
+static bool fenced(s32 cpu, __u32 claim, bool owner)
 {
     s32 sib = cpu;
 
@@ -294,42 +342,47 @@ static bool fenced(s32 cpu, __u32 claim)
         if (sib == cpu) {
             break;
         }
-        if (yields_to(cpu, claim, sib, read_claim(sib))) {
+        if (yields_to(cpu, claim, sib, read_claim(sib), owner)) {
             return true;
         }
     }
     return false;
 }
 
+/* Kicks the SMT siblings of @cpu whose claims yield to @claim, so they back off. */
+static void kick_siblings(s32 cpu, __u32 claim)
+{
+    s32 sib = cpu;
+
+    for (int i = 0; i < MAX_SMT; i++) {
+        sib = smt_next(sib);
+        if (sib == cpu) {
+            break;
+        }
+        if (yields_to(sib, read_claim(sib), cpu, claim, false)) {
+            scx_bpf_kick_cpu(sib, SCX_KICK_PREEMPT);
+        }
+    }
+}
+
 /*
  * Publishes @claim for @cpu, then checks its SMT siblings. Publishing before
  * checking means two siblings claiming at once see each other. On success,
- * siblings running something incompatible are kicked so they back off. On
- * failure the claim is withdrawn.
+ * siblings whose claims yield to @claim are kicked so they back off. On
+ * failure the claim is withdrawn. @owner is set when @cpu's owner claims it.
  */
-static bool claim_cpu(s32 cpu, __u32 claim)
+static bool claim_cpu(s32 cpu, __u32 claim, bool owner)
 {
     if (cpu < 0 || cpu >= MAX_PCPUS) {
         return true;
     }
 
     set_claim(cpu, claim);
-    if (fenced(cpu, claim)) {
+    if (fenced(cpu, claim, owner)) {
         set_claim(cpu, CLAIM_NONE);
         return false;
     }
-
-    s32 sib = cpu;
-    for (int i = 0; i < MAX_SMT; i++) {
-        sib = smt_next(sib);
-        if (sib == cpu) {
-            break;
-        }
-        __u32 other = read_claim(sib);
-        if (other != CLAIM_NONE && other != claim) {
-            scx_bpf_kick_cpu(sib, SCX_KICK_PREEMPT);
-        }
-    }
+    kick_siblings(cpu, claim);
     return true;
 }
 
@@ -342,7 +395,7 @@ static void kick_idle_cpu(struct task_struct *p, __u32 claim)
             return;
         }
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-        if (!fenced(cpu, claim)) {
+        if (!fenced(cpu, claim, false)) {
             return;
         }
     }
@@ -404,11 +457,11 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         mark_owner(p, cpu);
         scx_bpf_dsq_insert(p, (u64)cpu, PYLON_OWNER_SLICE, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-    } else if ((tctx = task_ctx(p)) && tctx->dom) {
+    } else if ((tctx = vcpu_ctx(p))) {
         scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
         if (owns_cpu(p, tctx->owned_cpu)) {
             scx_bpf_kick_cpu(tctx->owned_cpu, SCX_KICK_PREEMPT);
-        } else if (fenced(cpu, tctx->dom)) {
+        } else if (fenced(cpu, tctx->dom, false)) {
             kick_idle_cpu(p, tctx->dom);
         }
     } else if (p->nr_cpus_allowed == 1) {
@@ -416,7 +469,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
     } else {
         scx_bpf_dsq_insert(p, PYLON_HOST_DSQ, SCX_SLICE_DFL, enq_flags);
-        if (fenced(cpu, CLAIM_HOST)) {
+        if (fenced(cpu, CLAIM_HOST, false)) {
             kick_idle_cpu(p, CLAIM_HOST);
         }
     }
@@ -443,7 +496,7 @@ static bool dispatch_owner(s32 cpu)
 
     bpf_for_each(scx_dsq, p, (u64)cpu, 0) {
         if (!dispatched && tid != 0 && (__u32)p->pid == tid) {
-            if (claim_cpu(cpu, task_claim(p)) &&
+            if (claim_cpu(cpu, task_claim(p), true) &&
                 scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
                 dispatched = true;
             }
@@ -481,7 +534,7 @@ static bool dispatch_vcpu(s32 cpu)
         if (tctx->owned_cpu != cpu && owns_cpu(p, tctx->owned_cpu)) {
             continue;
         }
-        if (claim_cpu(cpu, tctx->dom ? tctx->dom : CLAIM_HOST) &&
+        if (claim_cpu(cpu, tctx->dom ? tctx->dom : CLAIM_HOST, false) &&
             scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
             return true;
         }
@@ -506,7 +559,7 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
     if (dispatch_vcpu(cpu)) {
         return;
     }
-    if (claim_cpu(cpu, CLAIM_HOST) && scx_bpf_dsq_move_to_local(PYLON_HOST_DSQ)) {
+    if (claim_cpu(cpu, CLAIM_HOST, false) && scx_bpf_dsq_move_to_local(PYLON_HOST_DSQ)) {
         return;
     }
     /* Nothing to run: the CPU goes idle. */
@@ -517,14 +570,25 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
  * scx_ops.running(p)
  *
  * Record what this CPU runs, including tasks that the kernel queued locally
- * without asking the scheduler. The claim isn't cleared when a task stops:
+ * without asking the scheduler. A pinned host task runs without checking
+ * its siblings, so it kicks the vCPUs that yield to it. The claim isn't cleared when a task stops:
  * dispatch has already claimed for the next task by then, and the CPU going
  * idle clears it.
  */
 SEC("struct_ops/pylon_running")
 void BPF_PROG(pylon_running, struct task_struct *p)
 {
-    set_claim(scx_bpf_task_cpu(p), task_claim(p));
+    __u32 claim = task_claim(p);
+
+    s32 cpu = scx_bpf_task_cpu(p);
+
+    if (claim == CLAIM_HOST && p->nr_cpus_allowed == 1) {
+        claim = CLAIM_PINNED;
+    }
+    set_claim(cpu, claim);
+    if (claim == CLAIM_PINNED) {
+        kick_siblings(cpu, claim);
+    }
 }
 
 /*
