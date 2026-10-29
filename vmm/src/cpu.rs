@@ -1504,10 +1504,6 @@ impl CpuManager {
                                     VmExit::Ignore => {}
                                     VmExit::Hyperv => {}
                                     VmExit::Reset => {
-                                        drop(vcpu);
-                                        if pylon::check_and_park_vcpu(vcpu_id) {
-                                            continue;
-                                        }
                                         info!("VmExit::Reset");
                                         vcpu_run_interrupted.store(true, Ordering::SeqCst);
                                         reset_evt.write(1).unwrap();
