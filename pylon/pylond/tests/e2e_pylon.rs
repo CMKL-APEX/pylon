@@ -23,7 +23,7 @@ use pylon_abi::{
 use pylond::control::{
     ControlPlane, query_vm_stats, run_prometheus_server, send_policy_update, send_registration,
 };
-use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, read_tsc};
+use pylond::engine::{DEFAULT_TSC_KHZ, FORCE_HANDOFF_US, MatrixEngine, read_tsc};
 use pylond::{
     CoreState, PcpuOwnerTable, VmPolicyUpdateRequest, VmRegistrationRequest, VmSnapshot,
     create_eventfd, read_eventfd, write_eventfd,
@@ -215,6 +215,7 @@ impl SimulatedVmm {
             min_cores,
             max_cores,
             priority_weight,
+            kick_signal: None,
         };
         let kick_raws: Vec<RawFd> = kick_fds.iter().map(AsRawFd::as_raw_fd).collect();
         let wake_raws: Vec<RawFd> = wake_fds.iter().map(AsRawFd::as_raw_fd).collect();
@@ -641,18 +642,33 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
         .load(Ordering::Acquire);
     assert!(deadline > base_tsc);
 
-    // 3. Advance TSC past the 8 us deadline while donor remains in `VCPU_STATE_RUNNING`.
+    // 3. Advance TSC past the 8 us deadline while donor remains in `VCPU_STATE_RUNNING`. The
+    //    revocation counts as forced, but pylond keeps waiting for the VMM to park the donor and
+    //    never writes the donor's `state` itself.
+    let donor_tid = donor_page.vcpus[0].host_tid.load(Ordering::Acquire);
     engine.poll_once(deadline + 1);
-
+    assert_eq!(pcpu_owners.read_owner(4).0, donor_tid);
     assert_eq!(
-        donor_page.vcpus[0]
-            .forced_preempt_count
-            .load(Ordering::Acquire),
-        1,
-        "Donor vCPU 0 forced_preempt_count must increment when 8 us deadline expires"
+        donor_page.vcpus[0].state.load(Ordering::Acquire),
+        VCPU_STATE_RUNNING
     );
+    let stats = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
+    assert_eq!(
+        stats.vms[0].forced_preemptions, 1,
+        "Donor forced_preemptions must increment when the 8 us deadline expires"
+    );
+
+    // 4. The simulated donor registered no kick signal and never parks, so the core moves
+    //    FORCE_HANDOFF_US after the deadline and counts as a handoff without park.
+    let tsc_khz = match donor_page.header.tsc_khz {
+        0 => DEFAULT_TSC_KHZ,
+        khz => khz,
+    };
+    engine.poll_once(deadline + FORCE_HANDOFF_US * tsc_khz / 1000);
     let recip_tid = recip_page.vcpus[0].host_tid.load(Ordering::Acquire);
     assert_eq!(pcpu_owners.read_owner(4).0, recip_tid);
+    let stats = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
+    assert_eq!(stats.vms[0].handoffs_without_park, 1);
 
     wait_until(
         Duration::from_secs(2),
@@ -807,7 +823,9 @@ fn test_e2e_observability_metering_and_socket_stats() {
         vm_stats.allocated_core_microseconds
     );
 
-    // Now simulate vCPU 1 voluntarily idling / parking
+    // Now simulate vCPU 1 voluntarily idling / parking. Like the VMM, bump `yield_count`
+    // before publishing `PARKED`: that is how pylond tells a park from a not-yet-woken vCPU.
+    page.vcpus[1].yield_count.fetch_add(1, Ordering::AcqRel);
     page.vcpus[1]
         .state
         .store(VCPU_STATE_PARKED, Ordering::Release);

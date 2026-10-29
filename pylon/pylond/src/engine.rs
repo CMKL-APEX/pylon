@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{info, warn};
-use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_WAKING};
+use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonVcpuSlot, VCPU_STATE_PARKED};
 
 use crate::{
     CoreState, Error, MAX_PCPUS, PcpuOwnerTable, VmHandle, VmSnapshot, pin_current_thread_to_core,
@@ -25,6 +25,14 @@ pub const DEFAULT_TSC_KHZ: u64 = 3_000_000;
 
 /// Default revocation grace period in microseconds (`spec/00-architecture.md` & `spec/02-pylond-arbiter.md`).
 pub const REVOKE_GRACE_PERIOD_US: u64 = 8;
+
+/// How long after a revocation's deadline `pylond` keeps waiting for the donor to park before it
+/// hands the core over anyway (`spec/06-guest-kick-path.md` §4.5).
+pub const FORCE_HANDOFF_US: u64 = 50;
+
+/// Interval at which `pylond` re-sends the kick signal to a donor that hasn't parked. A signal
+/// that lands while the vCPU thread is outside `KVM_RUN` doesn't stop its next guest entry.
+pub const REVOKE_RESIGNAL_US: u64 = 10;
 
 /// Default `_tpause` delay in TSC cycles (~300-400 ns on a 3 GHz core).
 pub const DEFAULT_TPAUSE_CYCLES: u64 = 1000;
@@ -155,6 +163,13 @@ pub struct MatrixEngine {
     managed_pcpus: [bool; MAX_PCPUS],
     eval_buf: [VmDemandEval; MAX_TRACKED_VMS],
     core_last_metered_tsc: [u64; MAX_PCPUS],
+    /// The assigned vCPU's `yield_count` when its core was assigned: a higher count means the
+    /// VMM has parked it since, so the core can be reclaimed.
+    assigned_yield_count: [u64; MAX_PCPUS],
+    /// TSC at which a `Revoking` core's revocation was requested (0 if none).
+    revoke_requested_tsc: [u64; MAX_PCPUS],
+    /// TSC at which the donor was last signalled after its deadline passed (0 if not yet).
+    revoke_signalled_tsc: [u64; MAX_PCPUS],
     has_waitpkg: bool,
 }
 
@@ -180,6 +195,9 @@ impl MatrixEngine {
             managed_pcpus,
             eval_buf: [VmDemandEval::EMPTY; MAX_TRACKED_VMS],
             core_last_metered_tsc: [0; MAX_PCPUS],
+            assigned_yield_count: [0; MAX_PCPUS],
+            revoke_requested_tsc: [0; MAX_PCPUS],
+            revoke_signalled_tsc: [0; MAX_PCPUS],
             has_waitpkg,
         }
     }
@@ -234,9 +252,7 @@ impl MatrixEngine {
         while bitmap != 0 {
             let vcpu_idx = bitmap.trailing_zeros() as usize;
             let bit = 1u64 << vcpu_idx;
-            if vcpu_idx < num_vcpus
-                && page.vcpus[vcpu_idx].state.load(Ordering::Acquire) == VCPU_STATE_PARKED
-            {
+            if vcpu_idx < num_vcpus && Self::is_unassigned_parked(&page.vcpus[vcpu_idx]) {
                 page.telemetry
                     .stranded_work_bitmap
                     .fetch_and(!bit, Ordering::AcqRel);
@@ -247,12 +263,55 @@ impl MatrixEngine {
 
         let mut idx = 0usize;
         while idx < num_vcpus {
-            if page.vcpus[idx].state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
+            if Self::is_unassigned_parked(&page.vcpus[idx]) {
                 return Some(idx as u8);
             }
             idx += 1;
         }
         None
+    }
+
+    /// A vCPU is free to receive a core when it is parked and no core is on its way to it.
+    /// `pylond` doesn't write `state` (`spec/06-guest-kick-path.md` §3), so a vCPU that was just
+    /// assigned stays `PARKED` until its thread wakes; `assigned_pcpu` tells the two apart.
+    #[inline]
+    fn is_unassigned_parked(slot: &PylonVcpuSlot) -> bool {
+        slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
+            && slot.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
+    }
+
+    /// Converts microseconds to TSC cycles at `tsc_khz`.
+    #[inline]
+    fn us_to_cycles(usec: u64, tsc_khz: u64) -> u64 {
+        tsc_khz.saturating_mul(usec) / 1000
+    }
+
+    /// The TSC rate in `vm`'s header, or `DEFAULT_TSC_KHZ` if it's unset.
+    #[inline]
+    fn tsc_khz_of(vm: &VmHandle) -> u64 {
+        match vm.shared_page().header.tsc_khz {
+            0 => DEFAULT_TSC_KHZ,
+            khz => khz,
+        }
+    }
+
+    /// Gives `pcpu` to `vcpu` of `vm`: publishes the owner, records the assignment, and wakes
+    /// the vCPU thread. The VMM moves the vCPU from `PARKED` to `RUNNING` when it wakes.
+    fn assign_pcpu(&mut self, pcpu: usize, vm: &VmHandle, vcpu: u8, now_tsc: u64) {
+        let slot = &vm.shared_page().vcpus[vcpu as usize];
+        let tid = slot.host_tid.load(Ordering::Acquire);
+        self.pcpu_owners.write_owner(pcpu, tid, 0);
+        self.assigned_yield_count[pcpu] = slot.yield_count.load(Ordering::Acquire);
+        slot.assigned_pcpu.store(pcpu as u8, Ordering::Release);
+        let _ = vm.wake_vcpu(vcpu as usize);
+
+        self.core_states[pcpu] = CoreState::Assigned {
+            vm_id: vm.vm_id(),
+            vcpu,
+        };
+        self.core_last_metered_tsc[pcpu] = now_tsc;
+        self.revoke_requested_tsc[pcpu] = 0;
+        self.revoke_signalled_tsc[pcpu] = 0;
     }
 
     /// Executes one full 3-phase arbitration sweep at timestamp `now_tsc`.
@@ -296,8 +355,11 @@ impl MatrixEngine {
                 && let Some(vm) = Self::find_vm(vms, vm_count, vm_id)
             {
                 let slot = &vm.shared_page().vcpus[vcpu as usize];
+                // The VMM bumps `yield_count` before publishing `PARKED`, so a parked vCPU
+                // whose count moved has given the core back since it was assigned.
                 if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
                     && slot.revoke_requested.load(Ordering::Acquire) == 0
+                    && slot.yield_count.load(Ordering::Acquire) != self.assigned_yield_count[pcpu]
                 {
                     let last_tsc = self.core_last_metered_tsc[pcpu];
                     if last_tsc > 0 && now_tsc > last_tsc {
@@ -445,42 +507,56 @@ impl MatrixEngine {
 
                 if let (Some(donor), Some(recipient)) = (donor_vm, recipient_vm) {
                     let donor_slot = &donor.shared_page().vcpus[donor_vcpu as usize];
-                    let donor_state = donor_slot.state.load(Ordering::Acquire);
-                    let parked = donor_state == VCPU_STATE_PARKED;
-                    let expired = now_tsc >= deadline_tsc;
+                    let tsc_khz = Self::tsc_khz_of(donor);
+                    let signalled_tsc = self.revoke_signalled_tsc[pcpu];
+                    // Only the VMM writes `PARKED`, once the donor thread has left `KVM_RUN`
+                    // (`spec/06-guest-kick-path.md` §3).
+                    let parked = donor_slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED;
 
-                    if parked || expired {
-                        if expired && !parked {
-                            donor_slot
-                                .forced_preempt_count
-                                .fetch_add(1, Ordering::AcqRel);
-                            donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+                    if !parked && now_tsc >= deadline_tsc {
+                        // Interrupt the donor's `KVM_RUN` so the VMM force-parks it, and repeat
+                        // in case a signal lands while the thread is outside `KVM_RUN`.
+                        if signalled_tsc == 0 {
                             donor.record_forced_preempt();
-                        } else {
+                        }
+                        if signalled_tsc == 0
+                            || now_tsc
+                                >= signalled_tsc
+                                    .saturating_add(Self::us_to_cycles(REVOKE_RESIGNAL_US, tsc_khz))
+                        {
+                            let _ = donor.signal_vcpu(donor_vcpu as usize);
+                            self.revoke_signalled_tsc[pcpu] = now_tsc;
+                        }
+                    }
+
+                    let hand_over = if parked {
+                        if signalled_tsc == 0 {
                             donor.record_cooperative_yield();
                         }
-                        donor_slot.revoke_requested.store(0, Ordering::Release);
+                        let requested_tsc = self.revoke_requested_tsc[pcpu];
+                        if requested_tsc != 0 && now_tsc > requested_tsc {
+                            donor.record_park_latency_us(
+                                (now_tsc - requested_tsc).saturating_mul(1000) / tsc_khz,
+                            );
+                        }
+                        true
+                    } else if now_tsc
+                        >= deadline_tsc
+                            .saturating_add(Self::us_to_cycles(FORCE_HANDOFF_US, tsc_khz))
+                    {
+                        // The donor still hasn't parked; give the core away regardless and let
+                        // `scx_pylon` preempt the donor thread. It parks at its next exit.
+                        donor.record_handoff_without_park();
+                        true
+                    } else {
+                        false
+                    };
+
+                    if hand_over {
                         donor_slot
                             .assigned_pcpu
                             .store(PCPU_UNASSIGNED, Ordering::Release);
-
-                        let recipient_slot =
-                            &recipient.shared_page().vcpus[recipient_vcpu as usize];
-                        let recipient_tid = recipient_slot.host_tid.load(Ordering::Acquire);
-                        self.pcpu_owners.write_owner(pcpu, recipient_tid, 0);
-                        recipient_slot
-                            .assigned_pcpu
-                            .store(pcpu as u8, Ordering::Release);
-                        recipient_slot
-                            .state
-                            .store(VCPU_STATE_WAKING, Ordering::Release);
-                        let _ = recipient.wake_vcpu(recipient_vcpu as usize);
-
-                        self.core_states[pcpu] = CoreState::Assigned {
-                            vm_id: recipient_vm_id,
-                            vcpu: recipient_vcpu,
-                        };
-                        self.core_last_metered_tsc[pcpu] = now_tsc;
+                        self.assign_pcpu(pcpu, recipient, recipient_vcpu, now_tsc);
 
                         if let Some(eval_idx) = self.find_eval_idx(vm_count, recipient_vm_id) {
                             self.eval_buf[eval_idx].incoming_cores =
@@ -489,9 +565,18 @@ impl MatrixEngine {
                         }
                     }
                 } else {
+                    // One side is gone: drop the revocation and release the recipient's
+                    // reservation so it can be matched again.
+                    if let Some(recipient) = recipient_vm {
+                        recipient.shared_page().vcpus[recipient_vcpu as usize]
+                            .assigned_pcpu
+                            .store(PCPU_UNASSIGNED, Ordering::Release);
+                    }
                     self.core_states[pcpu] = CoreState::Idle;
                     self.pcpu_owners.write_owner(pcpu, 0, 0);
                     self.core_last_metered_tsc[pcpu] = 0;
+                    self.revoke_requested_tsc[pcpu] = 0;
+                    self.revoke_signalled_tsc[pcpu] = 0;
                 }
             }
             pcpu += 1;
@@ -523,22 +608,7 @@ impl MatrixEngine {
 
                 // 1. Fast Path: Check for an Idle physical core.
                 if let Some(idle_pcpu) = self.find_idle_pcpu() {
-                    let recipient_slot = &recipient_vm.shared_page().vcpus[recipient_vcpu as usize];
-                    let recipient_tid = recipient_slot.host_tid.load(Ordering::Acquire);
-                    self.pcpu_owners.write_owner(idle_pcpu, recipient_tid, 0);
-                    recipient_slot
-                        .assigned_pcpu
-                        .store(idle_pcpu as u8, Ordering::Release);
-                    recipient_slot
-                        .state
-                        .store(VCPU_STATE_WAKING, Ordering::Release);
-                    let _ = recipient_vm.wake_vcpu(recipient_vcpu as usize);
-
-                    self.core_states[idle_pcpu] = CoreState::Assigned {
-                        vm_id: recipient_eval.vm_id,
-                        vcpu: recipient_vcpu,
-                    };
-                    self.core_last_metered_tsc[idle_pcpu] = now_tsc;
+                    self.assign_pcpu(idle_pcpu, recipient_vm, recipient_vcpu, now_tsc);
                     self.eval_buf[order_idx].assigned_cores += 1;
                     continue;
                 }
@@ -553,13 +623,10 @@ impl MatrixEngine {
                 let donor_eval = self.eval_buf[donor_eval_idx];
                 let donor_vm = &vms[donor_eval.vm_idx];
                 let donor_page = donor_vm.shared_page();
-                let tsc_khz = if donor_page.header.tsc_khz > 0 {
-                    donor_page.header.tsc_khz
-                } else {
-                    DEFAULT_TSC_KHZ
-                };
-                let eight_us_in_cycles = (tsc_khz * REVOKE_GRACE_PERIOD_US) / 1000;
-                let deadline_tsc = now_tsc.saturating_add(eight_us_in_cycles);
+                let deadline_tsc = now_tsc.saturating_add(Self::us_to_cycles(
+                    REVOKE_GRACE_PERIOD_US,
+                    Self::tsc_khz_of(donor_vm),
+                ));
 
                 let donor_slot = &donor_page.vcpus[donor_vcpu as usize];
                 donor_slot
@@ -575,6 +642,12 @@ impl MatrixEngine {
                     recipient_vcpu,
                     deadline_tsc,
                 };
+                self.revoke_requested_tsc[donor_pcpu] = now_tsc;
+                self.revoke_signalled_tsc[donor_pcpu] = 0;
+                // Reserve the recipient vCPU so later matches don't pick it for another core.
+                recipient_vm.shared_page().vcpus[recipient_vcpu as usize]
+                    .assigned_pcpu
+                    .store(donor_pcpu as u8, Ordering::Release);
                 self.eval_buf[donor_eval_idx].assigned_cores = self.eval_buf[donor_eval_idx]
                     .assigned_cores
                     .saturating_sub(1);

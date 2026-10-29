@@ -8,11 +8,11 @@ pub mod engine;
 
 use core::array::from_fn;
 use std::fs::File;
-use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::{io, ptr};
 
 use arc_swap::ArcSwap;
 use memmap2::MmapMut;
@@ -49,6 +49,22 @@ pub enum Error {
 
     #[error("Invalid file descriptor count: got {actual}, expected {expected}")]
     InvalidFdCount { actual: usize, expected: usize },
+
+    #[error("Failed to open a pidfd for VMM process {pid}")]
+    PidfdOpen {
+        pid: i32,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("Failed to signal vCPU {vcpu} thread {tid} of VMM process {pid}")]
+    SignalVcpu {
+        vcpu: usize,
+        tid: u32,
+        pid: i32,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("vCPU index {vcpu} out of bounds (num_vcpus = {num_vcpus})")]
     VcpuOutOfBounds { vcpu: usize, num_vcpus: u32 },
@@ -177,6 +193,11 @@ pub struct VmRegistrationRequest {
     pub min_cores: u32,
     pub max_cores: u32,
     pub priority_weight: u32,
+    /// Signal that interrupts a vCPU's `KVM_RUN` in the registering VMM (its `SIGRTMIN`, which
+    /// depends on the VMM's libc). `pylond` sends it when a revocation's deadline passes
+    /// (`spec/06-guest-kick-path.md` §4.4). Without it, `pylond` never signals the VMM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kick_signal: Option<i32>,
 }
 
 /// JSON response returned by `pylond` after processing a `VmRegistrationRequest`.
@@ -224,6 +245,9 @@ pub struct VmStats {
     pub cooperative_yields: u64,
     pub forced_preemptions: u64,
     pub runnable_threads: u32,
+    /// Revocations where the core was handed over although the donor never parked.
+    #[serde(default)]
+    pub handoffs_without_park: u64,
 }
 
 /// JSON payload sent over `/run/pylon/pylond.sock` to query VM statistics.
@@ -254,6 +278,13 @@ struct VmHandleInner {
     allocated_core_usec: AtomicU64,
     cooperative_yield_count: AtomicU64,
     forced_preempt_count: AtomicU64,
+    handoff_without_park_count: AtomicU64,
+    park_latency: ParkLatencyHistogram,
+    kick_signal: Option<i32>,
+    /// The registering VMM's PID from `SO_PEERCRED` (0 if unknown), and a pidfd that keeps
+    /// referring to that process, so a reused PID is never signalled.
+    vmm_pid: i32,
+    vmm_pidfd: Option<OwnedFd>,
     shm_mmap: MmapMut,
     kick_irqfds: Vec<OwnedFd>,
     wake_eventfds: Vec<OwnedFd>,
@@ -293,6 +324,14 @@ impl VmHandle {
                 ),
             });
         }
+        if let Some(signal) = req.kick_signal
+            && !(libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signal)
+        {
+            return Err(Error::InvalidRegistration {
+                vm_id: req.vm_id,
+                reason: format!("kick_signal {signal} is not a real-time signal"),
+            });
+        }
         let expected_vcpus = req.num_vcpus as usize;
         if kick_irqfds.len() != expected_vcpus || wake_eventfds.len() != expected_vcpus {
             return Err(Error::InvalidFdCount {
@@ -322,6 +361,11 @@ impl VmHandle {
                 allocated_core_usec: AtomicU64::new(0),
                 cooperative_yield_count: AtomicU64::new(0),
                 forced_preempt_count: AtomicU64::new(0),
+                handoff_without_park_count: AtomicU64::new(0),
+                park_latency: ParkLatencyHistogram::default(),
+                kick_signal: req.kick_signal,
+                vmm_pid: 0,
+                vmm_pidfd: None,
                 shm_mmap,
                 kick_irqfds,
                 wake_eventfds,
@@ -401,6 +445,105 @@ impl VmHandle {
         self.inner
             .forced_preempt_count
             .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Cumulative number of revocations handed over although the donor vCPU never parked.
+    #[inline]
+    pub fn handoff_without_park_count(&self) -> u64 {
+        self.inner
+            .handoff_without_park_count
+            .load(Ordering::Acquire)
+    }
+
+    /// Atomically increments the handoff-without-park count for this VM.
+    #[inline]
+    pub fn record_handoff_without_park(&self) {
+        self.inner
+            .handoff_without_park_count
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records the time from a revocation request to the donor vCPU parking.
+    #[inline]
+    pub fn record_park_latency_us(&self, usec: u64) {
+        self.inner.park_latency.record(usec);
+    }
+
+    /// Returns the revocation-to-park latency histogram for this VM.
+    #[inline]
+    pub fn park_latency(&self) -> &ParkLatencyHistogram {
+        &self.inner.park_latency
+    }
+
+    /// Binds this freshly registered VM to the VMM process `pid` that registered it, so
+    /// `signal_vcpu` can reach its vCPU threads. Opens a pidfd so a reused PID is never signalled.
+    pub fn with_vmm_pid(mut self, pid: i32) -> Result<Self, Error> {
+        // SAFETY: `pidfd_open` takes a PID and flags and returns a new file descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(Error::PidfdOpen {
+                pid,
+                source: io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: `fd` is a new pidfd owned by nothing else.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+        let vm_id = self.inner.vm_id;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::InvalidRegistration {
+            vm_id,
+            reason: "VM handle is already shared".to_owned(),
+        })?;
+        inner.vmm_pid = pid;
+        inner.vmm_pidfd = Some(pidfd);
+        Ok(self)
+    }
+
+    /// Sends the VMM's `kick_signal` to the thread of `vcpu_idx`, interrupting its `KVM_RUN`
+    /// (`spec/06-guest-kick-path.md` §4.4). Returns `Ok(false)` without sending when the VMM gave
+    /// no signal, its PID is unknown, the vCPU's thread ID isn't known yet, or the VMM has exited.
+    pub fn signal_vcpu(&self, vcpu_idx: usize) -> Result<bool, Error> {
+        let slot = self
+            .shared_page()
+            .vcpus
+            .get(vcpu_idx)
+            .filter(|_| vcpu_idx < self.inner.num_vcpus as usize)
+            .ok_or(Error::VcpuOutOfBounds {
+                vcpu: vcpu_idx,
+                num_vcpus: self.inner.num_vcpus,
+            })?;
+        let tid = slot.host_tid.load(Ordering::Acquire);
+        let (Some(signal), Some(pidfd)) = (self.inner.kick_signal, &self.inner.vmm_pidfd) else {
+            return Ok(false);
+        };
+        if tid == 0 {
+            return Ok(false);
+        }
+        // SAFETY: `pidfd_send_signal` with signal 0 only checks that the process behind `pidfd`
+        // still exists; the null `info` pointer is allowed.
+        let alive = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                0,
+                ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } == 0;
+        if !alive {
+            return Ok(false);
+        }
+        let pid = self.inner.vmm_pid;
+        // SAFETY: `tgkill` takes plain integers and only signals `tid` if it is a thread of `pid`.
+        let ret = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid as libc::pid_t, signal) };
+        if ret != 0 {
+            return Err(Error::SignalVcpu {
+                vcpu: vcpu_idx,
+                tid,
+                pid,
+                source: io::Error::last_os_error(),
+            });
+        }
+        Ok(true)
     }
 
     /// Dynamically updates the elastic core bounds and scheduling weight for this VM.
@@ -483,6 +626,61 @@ impl VmHandle {
                 num_vcpus: self.inner.num_vcpus,
             })?;
         write_eventfd(fd.as_raw_fd())
+    }
+}
+
+/// Upper bounds, in microseconds, of the revocation-to-park latency histogram buckets.
+pub const PARK_LATENCY_BUCKETS_US: [u64; 11] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+
+/// Allocation-free histogram of revocation-to-park latencies, in microseconds. Written by
+/// Plane 2, read by the Prometheus exporter.
+#[derive(Debug)]
+pub struct ParkLatencyHistogram {
+    /// Per-bucket counts (not cumulative); the last entry counts values above every bound.
+    buckets: [AtomicU64; PARK_LATENCY_BUCKETS_US.len() + 1],
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Default for ParkLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: from_fn(|_| AtomicU64::new(0)),
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ParkLatencyHistogram {
+    /// Records one latency of `usec` microseconds.
+    pub fn record(&self, usec: u64) {
+        let idx = PARK_LATENCY_BUCKETS_US
+            .iter()
+            .position(|&bound| usec <= bound)
+            .unwrap_or(PARK_LATENCY_BUCKETS_US.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(usec, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Cumulative counts for each bound in `PARK_LATENCY_BUCKETS_US`, then for `+Inf`.
+    pub fn cumulative_buckets(&self) -> [u64; PARK_LATENCY_BUCKETS_US.len() + 1] {
+        let mut total = 0u64;
+        from_fn(|i| {
+            total += self.buckets[i].load(Ordering::Relaxed);
+            total
+        })
+    }
+
+    /// Sum of all recorded latencies, in microseconds.
+    pub fn sum_us(&self) -> u64 {
+        self.sum_us.load(Ordering::Relaxed)
+    }
+
+    /// Number of recorded latencies.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Acquire)
     }
 }
 
@@ -581,10 +779,11 @@ mod tests {
     use std::ffi::CString;
     use std::path::PathBuf;
     use std::process::id as process_id;
-    use std::sync::atomic::AtomicU64;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use pylon_abi::{PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_RUNNING, VCPU_STATE_WAKING};
+    use pylon_abi::{PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_RUNNING};
     use tokio::sync::watch;
     use tokio::task::spawn_blocking;
     use tokio::time::sleep;
@@ -640,6 +839,7 @@ mod tests {
             min_cores,
             max_cores,
             priority_weight,
+            kick_signal: None,
         };
         let shm_fd = create_memfd_shared_page(vm_id, num_vcpus, 3_000_000);
         let mut kick_fds = Vec::with_capacity(num_vcpus as usize);
@@ -825,11 +1025,12 @@ mod tests {
             engine.core_state(2),
             CoreState::Assigned { vm_id: 1, vcpu: 2 }
         );
+        // `pylond` doesn't write `state`; the vCPU stays PARKED until its thread wakes.
         assert_eq!(
             vm_timer.handle.shared_page().vcpus[2]
                 .state
                 .load(Ordering::Acquire),
-            VCPU_STATE_WAKING
+            VCPU_STATE_PARKED
         );
         assert_eq!(
             vm_timer.handle.shared_page().vcpus[2]
@@ -849,7 +1050,7 @@ mod tests {
             vm_rx.handle.shared_page().vcpus[1]
                 .state
                 .load(Ordering::Acquire),
-            VCPU_STATE_WAKING
+            VCPU_STATE_PARKED
         );
         assert_eq!(pcpu_owners.read_owner(3).0, 2002);
         assert_eq!(read_eventfd(vm_rx.wake_fds[1].as_raw_fd()).unwrap(), 1);
@@ -968,12 +1169,11 @@ mod tests {
             engine.core_state(5),
             CoreState::Assigned { vm_id: 20, vcpu: 0 }
         );
-        assert_eq!(
-            donor_page.vcpus[1]
-                .forced_preempt_count
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(donor.handle.cooperative_yield_count(), 1);
+        assert_eq!(donor.handle.forced_preempt_count(), 0);
+        // 3,000 cycles at 3 GHz from the request (2,000) to the park (5,000) is 1 us.
+        assert_eq!(donor.handle.park_latency().count(), 1);
+        assert_eq!(donor.handle.park_latency().sum_us(), 1);
         assert_eq!(
             donor_page.vcpus[1].assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
@@ -987,7 +1187,7 @@ mod tests {
         );
         assert_eq!(
             recipient_page.vcpus[0].state.load(Ordering::Acquire),
-            VCPU_STATE_WAKING
+            VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[0].as_raw_fd()).unwrap(), 1);
 
@@ -1038,18 +1238,41 @@ mod tests {
             }
         );
 
-        // Poll at deadline (now_tsc = 30,000): Donor vCPU 0 is forcibly preempted!
+        // Poll at the deadline (now_tsc = 30,000): the revocation is forced, but the core stays
+        // with the donor until the VMM has parked it. `pylond` leaves the donor's slot alone.
         engine.poll_once(30_000);
+        assert!(matches!(engine.core_state(4), CoreState::Revoking { .. }));
+        assert_eq!(donor.handle.forced_preempt_count(), 1);
         assert_eq!(
-            engine.core_state(4),
-            CoreState::Assigned { vm_id: 20, vcpu: 1 }
+            donor_page.vcpus[0].state.load(Ordering::Acquire),
+            VCPU_STATE_RUNNING
+        );
+        assert_eq!(
+            donor_page.vcpus[0].revoke_requested.load(Ordering::Acquire),
+            1
         );
         assert_eq!(
             donor_page.vcpus[0]
                 .forced_preempt_count
                 .load(Ordering::Acquire),
-            1
+            0
         );
+
+        // The VMM force-parks the donor at its next exit; the core then moves.
+        donor_page.vcpus[0]
+            .revoke_requested
+            .store(0, Ordering::Release);
+        donor_page.vcpus[0]
+            .state
+            .store(VCPU_STATE_PARKED, Ordering::Release);
+        engine.poll_once(40_000);
+        assert_eq!(
+            engine.core_state(4),
+            CoreState::Assigned { vm_id: 20, vcpu: 1 }
+        );
+        assert_eq!(donor.handle.forced_preempt_count(), 1);
+        assert_eq!(donor.handle.cooperative_yield_count(), 1);
+        assert_eq!(donor.handle.handoff_without_park_count(), 0);
         assert_eq!(pcpu_owners.read_owner(4).0, 20_002);
         assert_eq!(
             recipient_page.vcpus[1]
@@ -1059,9 +1282,162 @@ mod tests {
         );
         assert_eq!(
             recipient_page.vcpus[1].state.load(Ordering::Acquire),
-            VCPU_STATE_WAKING
+            VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[1].as_raw_fd()).unwrap(), 1);
+    }
+
+    static KICK_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn count_kick_signal(_: libc::c_int) {
+        KICK_SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wait_for_kick_signals(at_least: u64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while KICK_SIGNALS_SEEN.load(Ordering::SeqCst) < at_least {
+            assert!(Instant::now() < deadline, "vCPU thread wasn't signalled");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn test_plane2_deadline_signals_donor_and_hands_over_after_bound() {
+        // A real-time signal no other test uses, with a counting handler.
+        let kick_signal = libc::SIGRTMIN() + 3;
+        // SAFETY: installs a handler that only increments an atomic, which is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = zeroed();
+            action.sa_sigaction = count_kick_signal as *const () as usize;
+            assert_eq!(libc::sigaction(kick_signal, &action, ptr::null_mut()), 0);
+        }
+
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
+
+        let mut donor = build_test_vm(30, 1, 0, 1, 1);
+        donor.req.kick_signal = Some(kick_signal);
+        let donor_handle = VmHandle::new(
+            &donor.req,
+            donor.shm_fd.try_clone().unwrap(),
+            donor
+                .kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            donor
+                .wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_vmm_pid(process_id() as i32)
+        .unwrap();
+        let recipient = build_test_vm(40, 1, 0, 1, 1);
+
+        // The donor's vCPU thread: a thread of this process that just sleeps.
+        let stop = Arc::new(AtomicBool::new(false));
+        let tid = Arc::new(AtomicU64::new(0));
+        let vcpu_thread = {
+            let stop = Arc::clone(&stop);
+            let tid = Arc::clone(&tid);
+            thread::spawn(move || {
+                // SAFETY: `gettid` has no preconditions.
+                tid.store(unsafe { libc::gettid() } as u64, Ordering::SeqCst);
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        while tid.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        let donor_slot = &donor_handle.shared_page().vcpus[0];
+        donor_slot
+            .host_tid
+            .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
+        donor_slot
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        donor_slot.revoke_requested.store(1, Ordering::Release);
+
+        ControlPlane::publish_vm_handle(&snapshot, donor_handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, recipient.handle.clone());
+        engine.set_core_state(
+            6,
+            CoreState::Revoking {
+                donor_vm_id: 30,
+                donor_vcpu: 0,
+                recipient_vm_id: 40,
+                recipient_vcpu: 0,
+                deadline_tsc: 1_000,
+            },
+        );
+
+        // At 3 GHz: the signal is resent every 10 us (30,000 cycles) and the core is handed
+        // over 50 us (150,000 cycles) after the deadline.
+        let before = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
+        engine.poll_once(1_000);
+        wait_for_kick_signals(before + 1);
+        assert_eq!(donor_handle.forced_preempt_count(), 1);
+        assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
+
+        engine.poll_once(1_000 + 29_999);
+        engine.poll_once(1_000 + 30_000);
+        wait_for_kick_signals(before + 2);
+        assert_eq!(donor_handle.forced_preempt_count(), 1);
+        assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
+
+        // The donor never parks: the core moves anyway, counted separately.
+        engine.poll_once(1_000 + 150_000);
+        assert_eq!(
+            engine.core_state(6),
+            CoreState::Assigned { vm_id: 40, vcpu: 0 }
+        );
+        assert_eq!(donor_handle.handoff_without_park_count(), 1);
+        assert_eq!(donor_handle.park_latency().count(), 0);
+        assert_eq!(donor_slot.revoke_requested.load(Ordering::Acquire), 1);
+        assert_eq!(
+            donor_slot.assigned_pcpu.load(Ordering::Acquire),
+            PCPU_UNASSIGNED
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        vcpu_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_registration_rejects_non_realtime_kick_signal() {
+        let mut rig = build_test_vm(50, 1, 0, 1, 1);
+        rig.req.kick_signal = Some(libc::SIGKILL);
+        let err = VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            vec![rig.kick_fds[0].try_clone().unwrap()],
+            vec![rig.wake_fds[0].try_clone().unwrap()],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRegistration { vm_id: 50, .. }));
+    }
+
+    #[test]
+    fn test_park_latency_histogram_buckets() {
+        let histogram = ParkLatencyHistogram::default();
+        for usec in [0, 1, 3, 8, 9, 5_000] {
+            histogram.record(usec);
+        }
+        let cumulative = histogram.cumulative_buckets();
+        // le=1: {0, 1}; le=4: +3; le=8: +8; le=16: +9; +Inf: +5,000.
+        assert_eq!(cumulative[0], 2);
+        assert_eq!(cumulative[2], 3);
+        assert_eq!(cumulative[3], 4);
+        assert_eq!(cumulative[4], 5);
+        assert_eq!(cumulative[PARK_LATENCY_BUCKETS_US.len() - 1], 5);
+        assert_eq!(cumulative[PARK_LATENCY_BUCKETS_US.len()], 6);
+        assert_eq!(histogram.count(), 6);
+        assert_eq!(histogram.sum_us(), 5_021);
     }
 
     #[test]
