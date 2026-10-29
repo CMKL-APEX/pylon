@@ -22,6 +22,7 @@
 | **Track G** | `main` (`f44b3fd87`) | `pylon/pylon-guest-agent`: userspace telemetry & cooperation daemon | Coordinator | `DONE` ⚠️ | `cargo test -p pylon-guest-agent`. Its revocation handling is unsafe (P4); spec 06 S3 makes it telemetry-only. |
 | **E2E** | `main` (`d2c1485b2`, `dff66af86`) | `pylond/tests/e2e_pylon.rs`, real-KVM VMM test, `pylon-bench` (Pylon vs. ACPI hotplug) | Coordinator | `DONE` | `cargo test -p pylond --test e2e_pylon`; `cargo run --release -p pylond --bin pylon-bench -- --quick` |
 | **CI** | `main` (`45b35ba6d`, `e03b59cb7`) → re-enable in progress | `.github/workflows/pylon-ci.yaml`; upstream `ci.yaml` targets & feature matrix | Coordinator | `IN_PROGRESS` | See [CI Coverage](#ci-coverage) |
+| **Docs** | `docs/pylon-book` | Pylon book in `docs/pylon/` (mdBook) and `pylon-docs.yaml`, publishing to `gh-pages` | Coordinator | `IN_PROGRESS` | `mdbook build docs/pylon` |
 | **Track 4** | *TBD* | Spec 06 S1–S4, S6: VMM park decision table, `pylond` forced-park via `tgkill`, `pylon-kick` PCI device + MSI-X kick FDs, latency metrics | *Unassigned* | `NOT_STARTED` | Per step in `spec/06-guest-kick-path.md §8` |
 | **Track 5** | *TBD* | Spec 06 S5: `pylon/guest/linux` `pv-pylon` kernel module | *Unassigned* | `NOT_STARTED` | Guest integration test (spec 06 §8) |
 
@@ -39,6 +40,21 @@ These were found while drafting `spec/06-guest-kick-path.md`; full details are i
 | P4 | The guest agent marks other vCPUs `PARKED` and clears `revoke_requested` while those vCPUs are still running. | Track 4 S3 |
 | P5 | On deadline expiry, `pylond` writes `PARKED`/clears `revoke_requested` for a still-runnable vCPU. | Track 4 S2 |
 | P6 | `PylonVcpuSlot::state` has three writers and no ownership rules. | Spec 06 §3 (S1–S3) |
+
+## Known Issues (Other)
+
+Found on 2026-10-29 while writing the Pylon book (`docs/pylon/`). The `K` prefix keeps them apart from spec 06's `P1`–`P6`. None has a track yet. The book's *Status and roadmap* page describes their user-visible effects.
+
+| ID | Summary | Evidence | Proposed fix |
+| :- | :--- | :--- | :--- |
+| K1 | No producer for `next_timer_tsc`, `stranded_work_bitmap`, `in_critical_section` or the host RX doorbell (`VmHandle::host_rx_doorbell`). Zero-core wakeups, stranded-work preference and critical-section-aware donor selection never trigger outside tests. | Only test code stores to them (`pylond/src/lib.rs`, `tests/e2e_pylon.rs`). The guest agent writes only `runnable_threads`, `head_wait_tsc` and `guest_heartbeat`. | Guest fields: spec 06 Track 5 (`pv-pylon`). RX doorbell: needs a host-side design (virtio-net/vDPA backend hook). |
+| K2 | `PylonHeader::tsc_khz` is hard-coded to `DEFAULT_TSC_KHZ` (3,000,000). The 8 µs grace period and core-µs metering are only correct on a 3 GHz TSC. | `vmm/src/pylon.rs` `PylonVmmState::new`. | Query the TSC rate (`KVM_GET_TSC_KHZ` on a vCPU, or host CPUID/sysfs) and write it to the header. |
+| K3 | Mixed time bases: the guest writes `head_wait_tsc` (and, when implemented, `next_timer_tsc`) from the guest TSC, while `pylond` compares it with the host TSC. Under KVM the two differ by the VM's TSC offset, which skews urgency and would make timer wakeups fire at the wrong time. | `pylon-guest-agent/src/lib.rs` `update_telemetry`; `pylond/src/engine.rs` `evaluate_demand_phase1`. | Decide on one time base for ABI v2: either the VMM publishes the TSC offset in the header and `pylond` converts, or the guest writes durations instead of timestamps. |
+| K4 | The shared page is inserted into `GuestMemoryMmap`, so on x86_64 `generate_ram_ranges` reports it to the guest as an 8 KiB E820 RAM range at `0xFEDF_0000`, overlapping the `E820_RESERVED` 32-bit hole. How direct boot, firmware boot and guests resolve the overlap is unverified. | `vmm/src/pylon.rs` `setup_gpa_mapping`; `arch/src/x86_64/mod.rs` `generate_ram_ranges`, `generate_e820_memory_map`. | Short term: keep the region out of the E820 RAM ranges. Long term: spec 06 §9 (page in the `pylon-kick` BAR). |
+| K5 | `pylond` doesn't set its socket's owner or mode, so with root's umask it is `0755` and non-root VMMs can't register. Anyone who can write to it can register VMs, change any VM's policy and read all stats. | `pylond/src/control.rs` `ControlPlane::run` (bind without `chmod`/`chown`). | `--socket-group`/`--socket-mode` options, or systemd socket activation. |
+| K6 | `pylond` never removes a VM. A VM that exits keeps its registration, and managed CPUs assigned to its still-`RUNNING` vCPUs are never reclaimed (reclaim needs `PARKED`). Two VMs with the default `vm_id=1` silently replace each other. | No deregistration path in `pylond/src/control.rs`; `reclaim_idle_assigned_cores` in `engine.rs`; `PylonConfig::parse` default `vm_id = 1`. *(From code reading; not yet observed on a host.)* | Detect VMM exit (keep the registration connection open, or a pidfd from `SO_PEERCRED`, which spec 06 §4.4 already records) and deregister; reject duplicate `vm_id`s instead of replacing. |
+
+Measured context: `pylon-bench` (2026-10-29, AMD EPYC 9124, no `WAITPKG`) shows a 138 µs mean scale-out with threads standing in for vCPUs, far above the ~3–6 µs handoff target in spec 00. The cause hasn't been investigated; see the book's *Performance and benchmarks* page.
 
 ---
 
@@ -107,6 +123,7 @@ These were found while drafting `spec/06-guest-kick-path.md`; full details are i
 | `virtio-villain` | Re-enabled (GitHub-hosted runner with KVM) | ⚠️ Not verified |
 | `integration-x86-64-pr` | **Still disabled** (`garm-noble-16` self-hosted runner) | — |
 | `integration-x86-64-mq`, `-graviton`, `-vfio`, `-windows`, `-mshv-x86-64`, `-sev-snp` | Unchanged (merge-queue/push only; self-hosted runners) | — |
+| `pylon-docs.yaml` | New: builds the book on PRs that touch `docs/pylon/`; publishes `gh-pages` from `main` | ✅ `mdbook build docs/pylon` (mdBook 0.5.4), all internal links and anchors resolve |
 | `integration-metrics.yaml` | Gated on `github.repository == 'cloud-hypervisor/cloud-hypervisor'`; it used to queue forever on fork `main` pushes (`garm-jammy-16` runner absent) | — |
 
 **Follow-ups:**

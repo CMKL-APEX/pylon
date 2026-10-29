@@ -1,0 +1,100 @@
+name: Pylon Docs
+
+# Builds the Pylon book (docs/pylon/README.md) on pull requests and keeps
+# the site as an artifact. On main, publishes it to the gh-pages branch:
+# the landing page in docs/pylon/site at the root and the book under
+# docs/ (https://cmkl-apex.github.io/pylon/). The branch holds one
+# commit; each deploy replaces it.
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'docs/pylon/**'
+      - '.github/workflows/pylon-docs.yaml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/pylon/**'
+      - '.github/workflows/pylon-docs.yaml'
+  workflow_dispatch:
+
+# The build only reads the repository; deploy alone writes gh-pages.
+permissions:
+  contents: read
+
+env:
+  MDBOOK_VERSION: 0.5.4
+
+jobs:
+  build:
+    name: Build the Pylon book
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache mdBook
+        id: mdbook-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/mdbook
+          key: mdbook-${{ runner.os }}-${{ runner.arch }}-${{ env.MDBOOK_VERSION }}
+      - name: Install Rust toolchain
+        if: steps.mdbook-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install mdBook
+        if: steps.mdbook-cache.outputs.cache-hit != 'true'
+        run: cargo install mdbook --version "${MDBOOK_VERSION}" --locked
+      - name: Build the book
+        run: mdbook build docs/pylon
+      - name: Assemble the site
+        run: |
+          set -eufo pipefail
+          mkdir -p target/pylon-site
+          cp -r docs/pylon/site/. target/pylon-site/
+          cp -r target/docs/pylon target/pylon-site/docs
+          # Serve the files as they are; no Jekyll processing.
+          touch target/pylon-site/.nojekyll
+      - name: Upload the site
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pylon-docs-site
+          path: target/pylon-site
+          include-hidden-files: true
+
+  deploy:
+    name: Publish to gh-pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: pylon-gh-pages
+      cancel-in-progress: false
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the site
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pylon-docs-site
+          path: ${{ runner.temp }}/pylon-site
+      - name: Replace gh-pages with the site
+        env:
+          SITE_DIR: ${{ runner.temp }}/pylon-site
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -eufo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan pylon-gh-pages
+          git rm -rfq .
+          git clean -fdxq
+          cp -r "${SITE_DIR}/." .
+          git add -A
+          git commit -q -m "Publish Pylon docs from ${SOURCE_SHA}"
+          git push --force origin HEAD:refs/heads/gh-pages

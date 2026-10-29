@@ -1,0 +1,24 @@
+# The Pylon book (docs/pylon/README.md).
+[book]
+title = "Pylon"
+description = "Microsecond core elasticity for Cloud Hypervisor VMs: design, enhancements and implementation"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/docs/pylon"
+create-missing = false
+
+[output.html]
+# Where the Pylon Docs workflow publishes it (gh-pages): https://cmkl-apex.github.io/pylon/docs/
+site-url = "/pylon/docs/"
+git-repository-url = "https://github.com/CMKL-APEX/pylon"
+edit-url-template = "https://github.com/CMKL-APEX/pylon/edit/main/docs/pylon/{path}"
+
+# Pages written as README.md are published as index.html, but links to
+# them render as README.html: send those to index.html.
+[output.html.redirect]
+"/user-guide/README.html" = "index.html"
+"/operator-guide/README.html" = "index.html"
+"/developer-guide/README.html" = "index.html"
+"/reference/README.html" = "index.html"
