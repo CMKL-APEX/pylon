@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
 
 pub const MAX_VCPUS: usize = 64;
 pub const PYLON_MAGIC: u64 = 0x5059_4C4F_4E56_4D31; // "PYLONVM1"
-pub const PYLON_ABI_VERSION: u32 = 1;
+pub const PYLON_ABI_VERSION: u32 = 2; // 1 until spec 06 S3: same layout, stricter writer rules
 
 /// vCPU execution states in PylonVcpuSlot::state
 pub const VCPU_STATE_PARKED: u8 = 0;

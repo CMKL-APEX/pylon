@@ -7,11 +7,13 @@ Look for these lines in the VMM's log:
 | VMM log | Cause | Fix |
 |---|---|---|
 | `Pylon: daemon socket ... does not exist yet` | `pylond` wasn't running when the VM started. | Start `pylond` first, then restart the VM. VMs register only at start. |
-| `Pylon: failed to register VM ... with pylond` with *Permission denied* | The VMM's user can't write to the socket. | Set the socket's group and mode ([Running pylond](pylond.md#the-control-socket)). |
+| `Pylon: failed to register VM ... with pylond` with *Permission denied* | The VMM's user can't write to the socket. | Start `pylond` with `--socket-group` and `--socket-mode` ([Running pylond](pylond.md#the-control-socket)). |
 | neither | `socket=` is missing from `--pylon`. | Add it. |
 
-Also check that two VMs don't share a `vm_id`. The second registration
-replaces the first, so only one of them is listed.
+Also check that two VMs don't share a `vm_id`. `pylond` rejects the
+second while the first VM's VMM runs, and logs `Rejected registration
+of VM <id>: ... a running VMM already registered this vm_id`. The VMM
+doesn't see the rejection, so look in `pylond`'s log.
 
 ## Parked vCPUs never wake
 
@@ -72,11 +74,13 @@ host. Check `cat /sys/kernel/sched_ext/root/ops`. Restart `pylond` with
 If the kernel ejected the scheduler later, `dmesg` says why (for
 example a runnable task stall). `pylond` keeps running without it.
 
-## Managed CPUs stay assigned after a VM exits
+## A VM's CPUs after it exits
 
-`pylond` isn't told when a VM exits, and may keep CPUs assigned to that
-VM's running vCPUs. Restart `pylond` to recover them
-([Status](../status.md#what-doesnt-work-yet)).
+`pylond` notices within about a second that a VM's VMM has exited (it
+holds a pidfd for each VMM), logs `VMM of VM <id> exited; removed its
+registration`, and frees the CPUs the VM held. A VM registered without
+peer credentials can't be tracked this way, but every VMM registering
+over the Unix socket has them.
 
 ## Collecting information for a bug report
 

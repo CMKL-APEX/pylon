@@ -27,19 +27,13 @@ host cores 0 and 1 for itself. Keep those three sets apart: don't list
 0 or 1 in `--cores`.
 
 ```bash
-sudo mkdir -p /run/pylon
-sudo ./target/release/pylond --socket /run/pylon/pylond.sock --cores 2-7
+sudo ./target/release/pylond --socket /run/pylon/pylond.sock --cores 2-7 \
+    --socket-group "$(id -gn)" --socket-mode 660
 ```
 
-`pylond` creates the socket with the process umask (as root, that
-makes it `0755`), so other users can't connect to it. In another
-terminal, let your own group use it. Do this again each time `pylond`
-starts, because it recreates the socket:
-
-```bash
-sudo chgrp "$(id -gn)" /run/pylon/pylond.sock
-sudo chmod g+rw /run/pylon/pylond.sock
-```
+`--socket-group` and `--socket-mode` let your own group, and so your
+non-root VMM, use the socket. Without them, the socket keeps root's
+umask (`0755`), and only root can connect.
 
 On a kernel with `sched_ext`, `pylond` also attaches the `scx_pylon`
 scheduler. **That scheduler then schedules every task on the host, not
@@ -67,7 +61,7 @@ parked. The VM registers with `pylond`, which can then wake parked vCPUs
 when there's demand.
 
 **Give every VM its own `vm_id`.** It defaults to `1`, and `pylond`
-replaces an existing registration that has the same id.
+rejects a VM whose id is already registered by a running VMM.
 
 ## 4. Look at it
 

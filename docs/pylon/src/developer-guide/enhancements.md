@@ -99,7 +99,7 @@ handler, so `KVM_RUN` returns `EINTR`, the KVM backend reports
 maps the page, allocates the vectors, keeps `in_critical_section` up to
 date, and in its interrupt handler arranges to park at the next safe
 point. It also has to make other vCPUs treat parked ones as preempted.
-`pylon-guest-agent` becomes telemetry-only.
+`pylon-guest-agent` is already telemetry-only (S3).
 
 ## Implementation steps
 
@@ -107,14 +107,15 @@ point. It also has to make other vCPUs treat parked ones as preempted.
 |---|---|---|
 | S1 | VMM: the decision table; remove the `Reset` hook. **Done.** | P2, P3 |
 | S2 | `pylond`: stop writing `state`; `SO_PEERCRED`; `tgkill` on deadline; wait for `PARKED`; latency metric. **Done.** | P5, P6 (`pylond`'s part) |
-| S3 | Guest agent telemetry-only; ABI version 2. | P4 |
+| S3 | Guest agent telemetry-only; ABI version 2. **Done.** | P4, P6 |
 | S4 | The `pylon-kick` device and its MSI-X `eventfd`s; register with `pylond` after the device exists. | P1 |
 | S5 | The `pv-pylon` kernel module. | — |
 | S6 | End-to-end latency: kick to `PARKED`, and revocation to recipient running. | — |
 
-S1–S3 don't depend on the device or the module and can land first.
-After them, every park is a forced park. That's honest about where
-things stand, and the metrics will show it.
+S1–S3 didn't depend on the device or the module and have landed. Now
+every contended revocation ends in a forced park. That's honest about
+where things stand, and the metrics show it. S4 needs a decision on
+Q1.
 
 ## Open questions
 
@@ -139,11 +140,13 @@ These are from spec 06 §10:
 | Item | Notes |
 |---|---|
 | Move the shared page into the `pylon-kick` BAR | Removes the fixed address and the E820 overlap (spec 06 §9). |
-| Write the real TSC rate | Query KVM's TSC frequency instead of writing 3 GHz into the header. |
 | One time base | Decide whether the guest writes guest-TSC values and `pylond` converts them with the VM's TSC offset, or the ABI uses another clock. |
-| Deregistration | Tell `pylond` when a VM exits, so it can reclaim the VM's CPUs. |
 | Reconnect | Let a VMM register again after `pylond` restarts (Q5). |
 | Lifecycle | Reject snapshot, restore and migration with `--pylon`, explicitly, until they're designed (spec 06 §7). |
 | aarch64 | A counter abstraction (`CNTVCT_EL0`) in place of the TSC in `pylond`, and a check of the shared page's address against the aarch64 layout. |
 | `scx_pylon` lookup | A thread-ID-to-CPU map, so `select_cpu` doesn't scan all 256 entries. |
-| Socket permissions | Let `pylond` set its socket's owner and mode itself. |
+
+Done since the first draft of this list: the real TSC rate (`pylond`
+measures the host's; K2), removing exited VMs and freeing their CPUs
+(K6), rejecting duplicate `vm_id`s, and `--socket-group`/`--socket-mode`
+(K5).

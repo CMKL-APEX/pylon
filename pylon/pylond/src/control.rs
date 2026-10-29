@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val, zeroed};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{PermissionsExt, chown};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr::{copy_nonoverlapping, null_mut};
@@ -19,6 +20,7 @@ use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, VCPU_STATE_PARKED};
 use tokio::io::Interest;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::watch;
+use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::{
     Error, PARK_LATENCY_BUCKETS_US, VmHandle, VmPolicyUpdateRequest, VmPolicyUpdateResponse,
@@ -41,7 +43,12 @@ const MAX_PAYLOAD_BYTES: usize = 4096;
 pub struct ControlPlane {
     socket_path: PathBuf,
     vm_snapshot: Arc<VmSnapshot>,
+    socket_mode: Option<u32>,
+    socket_gid: Option<u32>,
 }
+
+/// How often Plane 1 looks for VMs whose VMM has exited.
+const VM_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl ControlPlane {
     /// Creates a new `ControlPlane` bound to `socket_path` and updating `vm_snapshot`.
@@ -49,7 +56,18 @@ impl ControlPlane {
         Self {
             socket_path: socket_path.into(),
             vm_snapshot,
+            socket_mode: None,
+            socket_gid: None,
         }
+    }
+
+    /// Sets the socket's permission bits and group once it is created. Without them, the
+    /// socket keeps the process umask and group, which root's umask makes unwritable for
+    /// non-root VMMs.
+    pub fn with_socket_permissions(mut self, mode: Option<u32>, gid: Option<u32>) -> Self {
+        self.socket_mode = mode;
+        self.socket_gid = gid;
+        self
     }
 
     /// Returns a reference to the shared `VmSnapshot` (`ArcSwap<Vec<VmHandle>>`).
@@ -74,17 +92,29 @@ impl ControlPlane {
         }
 
         let listener = UnixListener::bind(&self.socket_path).map_err(Error::Io)?;
+        if let Some(gid) = self.socket_gid {
+            chown(&self.socket_path, None, Some(gid)).map_err(Error::Io)?;
+        }
+        if let Some(mode) = self.socket_mode {
+            fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(mode))
+                .map_err(Error::Io)?;
+        }
         info!(
             "Plane 1 (Control) listening on {}",
             self.socket_path.display()
         );
 
+        let mut prune = interval(VM_PRUNE_INTERVAL);
+        prune.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
+                }
+                _ = prune.tick() => {
+                    Self::remove_exited_vms(&self.vm_snapshot);
                 }
                 accept_res = listener.accept() => {
                     let (stream, _) = accept_res.map_err(Error::Io)?;
@@ -100,6 +130,23 @@ impl ControlPlane {
 
         let _ = fs::remove_file(&self.socket_path);
         Ok(())
+    }
+
+    /// Removes VMs whose VMM process has exited. Plane 2 then frees their cores. Returns the
+    /// number removed.
+    pub fn remove_exited_vms(vm_snapshot: &VmSnapshot) -> usize {
+        let current = vm_snapshot.load();
+        let (exited, alive): (Vec<VmHandle>, Vec<VmHandle>) = current
+            .iter()
+            .cloned()
+            .partition(|vm| vm.vmm_exited() == Some(true));
+        for vm in &exited {
+            info!("VMM of VM {} exited; removed its registration", vm.vm_id());
+        }
+        if !exited.is_empty() {
+            vm_snapshot.store(Arc::new(alive));
+        }
+        exited.len()
     }
 
     /// Registers a `VmHandle` directly into the `ArcSwap` snapshot, replacing any existing entry
@@ -235,6 +282,21 @@ async fn handle_client_connection(
                         _ => Ok(handle),
                     }
                 });
+            // A `vm_id` stays taken while the VMM that registered it runs: replacing it would
+            // leave that VM unmanaged. Plane 1 runs on one thread, and nothing below awaits,
+            // so this check and the publish can't interleave with another registration.
+            let taken = vm_snapshot
+                .load()
+                .iter()
+                .any(|vm| vm.vm_id() == req.vm_id && vm.vmm_exited() != Some(true));
+            let handle = if taken {
+                Err(Error::InvalidRegistration {
+                    vm_id: req.vm_id,
+                    reason: "a running VMM already registered this vm_id".to_owned(),
+                })
+            } else {
+                handle
+            };
             match handle {
                 Ok(handle) => {
                     info!(
@@ -247,10 +309,14 @@ async fn handle_client_connection(
                         message: "registered".to_owned(),
                     }
                 }
-                Err(err) => VmRegistrationResponse {
-                    accepted: false,
-                    message: err.to_string(),
-                },
+                Err(err) => {
+                    // The VMM doesn't wait for the reply, so say it here.
+                    warn!("Rejected registration of VM {}: {err}", req.vm_id);
+                    VmRegistrationResponse {
+                        accepted: false,
+                        message: err.to_string(),
+                    }
+                }
             }
         } else {
             VmRegistrationResponse {

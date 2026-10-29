@@ -19,7 +19,7 @@ use signal_hook::flag;
 #[derive(Parser, Debug)]
 #[command(
     name = "pylon-guest-agent",
-    about = "Pylon Guest Cooperation & Telemetry Daemon",
+    about = "Pylon guest telemetry daemon",
     version
 )]
 struct Args {

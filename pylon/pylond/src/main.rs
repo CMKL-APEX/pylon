@@ -3,11 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::time::Duration;
+use std::{io, mem, ptr, result, thread};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -15,7 +17,7 @@ use clap::Parser;
 use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
-use pylond::engine::MatrixEngine;
+use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, calibrate_tsc_khz};
 use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -50,6 +52,14 @@ struct CliArgs {
     #[arg(long)]
     no_scx: bool,
 
+    /// Permission bits for the control socket, in octal (e.g. 660). Default: the process umask.
+    #[arg(long, value_parser = parse_socket_mode)]
+    socket_mode: Option<u32>,
+
+    /// Group (name or GID) to own the control socket, for VMMs that don't run as root.
+    #[arg(long, value_parser = parse_group)]
+    socket_group: Option<u32>,
+
     /// Optional TCP port to expose Prometheus metrics over HTTP (e.g. 9100).
     #[arg(long)]
     metrics_port: Option<u16>,
@@ -57,6 +67,51 @@ struct CliArgs {
     /// Host address for Prometheus metrics HTTP server.
     #[arg(long, default_value = "127.0.0.1")]
     metrics_addr: String,
+}
+
+fn parse_socket_mode(spec: &str) -> result::Result<u32, String> {
+    let mode = u32::from_str_radix(spec.trim_start_matches("0o"), 8)
+        .map_err(|e| format!("invalid octal mode {spec:?}: {e}"))?;
+    if mode > 0o777 {
+        return Err(format!("mode {spec} has bits beyond 0777"));
+    }
+    Ok(mode)
+}
+
+/// Resolves a group name or numeric GID.
+fn parse_group(spec: &str) -> result::Result<u32, String> {
+    if let Ok(gid) = spec.parse::<u32>() {
+        return Ok(gid);
+    }
+    let name = CString::new(spec).map_err(|_| format!("invalid group name {spec:?}"))?;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    loop {
+        // SAFETY: all-zero is a valid `group`, which `getgrnam_r` fills in.
+        let mut group: libc::group = unsafe { mem::zeroed() };
+        let mut found: *mut libc::group = ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated, and `group`, `buf` and `found` are valid for writes
+        // of the sizes passed; `getgrnam_r` is the reentrant form.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                &mut group,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        match rc {
+            0 if found.is_null() => return Err(format!("no group named {spec:?}")),
+            0 => return Ok(group.gr_gid),
+            libc::ERANGE if buf.len() < 1024 * 1024 => buf.resize(buf.len() * 2, 0),
+            err => {
+                return Err(format!(
+                    "looking up group {spec:?}: {}",
+                    io::Error::from_raw_os_error(err)
+                ));
+            }
+        }
+    }
 }
 
 fn parse_core_list(spec: &str) -> Result<Vec<usize>> {
@@ -111,6 +166,13 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = CliArgs::parse();
     let tenant_pcpus = parse_core_list(&args.cores)?;
+
+    // VMMs leave the header's TSC rate unset, so measure the host's once.
+    let host_tsc_khz = calibrate_tsc_khz(Duration::from_millis(50));
+    match host_tsc_khz {
+        Some(tsc_khz) => info!("Host TSC rate: {tsc_khz} kHz"),
+        None => warn!("Could not measure the host TSC rate; assuming {DEFAULT_TSC_KHZ} kHz"),
+    }
     info!(
         "Starting pylond: socket={}, tenant_pcpus={tenant_pcpus:?}",
         args.socket.display()
@@ -168,6 +230,9 @@ fn main() -> Result<()> {
         .name("pylond-engine".to_owned())
         .spawn(move || {
             let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus);
+            if let Some(tsc_khz) = host_tsc_khz {
+                engine.set_host_tsc_khz(tsc_khz);
+            }
             engine.run(&engine_stop)
         })
         .context("failed to spawn Plane 2 engine thread")?;
@@ -178,7 +243,8 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build Plane 1 Tokio runtime")?;
 
-    let control = ControlPlane::new(args.socket, Arc::clone(&vm_snapshot));
+    let control = ControlPlane::new(args.socket, Arc::clone(&vm_snapshot))
+        .with_socket_permissions(args.socket_mode, args.socket_group);
     if let Some(port) = args.metrics_port {
         let bind_addr = format!("{}:{}", args.metrics_addr, port);
         let metrics_snapshot = Arc::clone(&vm_snapshot);
@@ -205,6 +271,24 @@ mod tests {
 
     fn args(flags: &[&str]) -> CliArgs {
         CliArgs::try_parse_from(iter::once("pylond").chain(flags.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn socket_mode_and_group_parse() {
+        assert_eq!(parse_socket_mode("660"), Ok(0o660));
+        assert_eq!(parse_socket_mode("0o640"), Ok(0o640));
+        parse_socket_mode("1777").unwrap_err();
+        parse_socket_mode("rw").unwrap_err();
+        assert_eq!(parse_group("0"), Ok(0));
+        assert_eq!(parse_group("root"), Ok(0));
+        parse_group("no-such-group-pylon").unwrap_err();
+    }
+
+    #[test]
+    fn socket_options_reach_the_parser() {
+        let parsed = args(&["--socket-mode", "660", "--socket-group", "0"]);
+        assert_eq!(parsed.socket_mode, Some(0o660));
+        assert_eq!(parsed.socket_group, Some(0));
     }
 
     #[test]

@@ -39,11 +39,12 @@ VMMs register on it, and you use it to change policy and read stats
 ([Policy and monitoring](monitoring.md)).
 
 At start, `pylond` removes any file already at that path and creates
-the socket with the process umask. It doesn't set the socket's owner or
-mode, so set them yourself after it starts (see the [systemd
-unit](installation.md#a-systemd-unit-for-pylond)). Anyone who can write
-to the socket can register VMs, change any VM's policy and read every
-VM's stats. Give access only to the users your VMMs run as.
+the socket. `--socket-group` (a group name or GID) and `--socket-mode`
+(octal, such as `660`) set its group and permissions; without them it
+keeps `pylond`'s umask and group, which as root means only root can
+connect. Anyone who can write to the socket can register VMs, change any
+VM's policy and read every VM's stats. Give access only to the users
+your VMMs run as (see the [systemd unit](installation.md#a-systemd-unit-for-pylond)).
 
 ## Start order
 

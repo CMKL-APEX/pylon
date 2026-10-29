@@ -43,7 +43,8 @@ Attached descriptors, in order: the shared page's file, then
 
 | Response | When |
 |---|---|
-| `{"accepted": true, "message": "registered"}` | The page's header is valid. Any VM already registered with the same `vm_id` is replaced. |
+| `{"accepted": true, "message": "registered"}` | The page's header is valid and the `vm_id` is free. An earlier registration of the same `vm_id` is replaced only if its VMM has exited. |
+| `{"accepted": false, "message": "...a running VMM already registered this vm_id"}` | Another VM with this `vm_id` is registered, and its VMM is still running. |
 | `{"accepted": false, "message": "expected <n> FDs, got <m>"}` | Wrong number of descriptors. |
 | `{"accepted": false, "message": "<error>"}` | The page couldn't be mapped, its header is invalid, `kick_signal` isn't a real-time signal, or a pidfd for the peer couldn't be opened. |
 
