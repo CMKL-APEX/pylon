@@ -163,10 +163,14 @@ static __always_inline void mark_owner(struct task_struct *p, s32 cpu)
 
 static __always_inline __u32 read_claim(s32 cpu)
 {
-    if (cpu < 0 || cpu >= MAX_PCPUS) {
+    /* Unsigned: clang folds a signed check, and the verifier then sees an
+     * unbounded index. A negative cpu becomes large and is refused too. */
+    __u32 i = (__u32)cpu;
+
+    if (i >= MAX_PCPUS) {
         return CLAIM_NONE;
     }
-    return *(volatile __u32 *)&cpu_claim[cpu];
+    return *(volatile __u32 *)&cpu_claim[i];
 }
 
 /*
@@ -175,11 +179,13 @@ static __always_inline __u32 read_claim(s32 cpu)
  */
 static void set_claim(s32 cpu, __u32 claim)
 {
-    if (cpu < 0 || cpu >= MAX_PCPUS) {
+    __u32 i = (__u32)cpu;
+
+    if (i >= MAX_PCPUS) {
         return;
     }
 
-    __u32 old = __atomic_exchange_n(&cpu_claim[cpu], claim, __ATOMIC_SEQ_CST);
+    __u32 old = __atomic_exchange_n(&cpu_claim[i], claim, __ATOMIC_SEQ_CST);
     if (old == CLAIM_NONE || old == CLAIM_HOST || old == claim) {
         return;
     }
