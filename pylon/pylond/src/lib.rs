@@ -516,6 +516,23 @@ impl VmHandle {
         Some(ret != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
     }
 
+    /// The VM's started vCPU threads, as `(thread ID, VMM process ID)` pairs. Empty when the
+    /// registration had no PID.
+    pub fn vcpu_threads(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let pid = u32::try_from(self.inner.vmm_pid).unwrap_or(0);
+        let num_vcpus = if pid == 0 {
+            0
+        } else {
+            (self.inner.num_vcpus as usize).min(MAX_VCPUS)
+        };
+        self.shared_page().vcpus[..num_vcpus]
+            .iter()
+            .filter_map(move |slot| {
+                let tid = slot.host_tid.load(Ordering::Acquire);
+                (tid != 0).then_some((tid, pid))
+            })
+    }
+
     /// Sends the VMM's `kick_signal` to the thread of `vcpu_idx`, interrupting its `KVM_RUN`
     /// (`spec/06-guest-kick-path.md` §4.4). Returns `Ok(false)` without sending when the VMM gave
     /// no signal, its PID is unknown, the vCPU's thread ID isn't known yet, or the VMM has exited.
@@ -1353,6 +1370,38 @@ mod tests {
             VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[1].as_raw_fd()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_vcpu_threads_lists_started_vcpus_with_the_vmm_pid() {
+        let rig = build_test_vm(50, 3, 0, 1, 1);
+        // Only vCPU 1's thread has started.
+        for (idx, slot) in rig.handle.shared_page().vcpus[..3].iter().enumerate() {
+            let tid = if idx == 1 { 4242 } else { 0 };
+            slot.host_tid.store(tid, Ordering::Release);
+        }
+        // Without a PID, the threads can't be tied to a process.
+        assert_eq!(rig.handle.vcpu_threads().count(), 0);
+
+        let handle = VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            rig.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            rig.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_vmm_pid(process_id() as i32)
+        .unwrap();
+        assert_eq!(
+            handle.vcpu_threads().collect::<Vec<_>>(),
+            [(4242, process_id())]
+        );
     }
 
     static KICK_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);

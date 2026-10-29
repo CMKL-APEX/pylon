@@ -26,7 +26,7 @@ struct {
 - **`scx_ops.select_cpu(p, prev_cpu, wake_flags)`:**
   If task `p->pid` matches a `target_tid` in `pylon_pcpu_owners`, return that assigned `pCPU`. `enqueue` puts it on that pCPU's owner queue.
 - **`scx_ops.enqueue(p, enq_flags)`:**
-  The owner of a pCPU goes on that pCPU's queue (DSQ id = CPU) with an infinite slice and preempts whatever runs there. That includes a donor vCPU whose `target_tid` was replaced. Other managed vCPU threads go on a shared vCPU queue, and other tasks go on a host queue.
+  The owner of a pCPU goes on that pCPU's queue (DSQ id = CPU) with a 20 ms slice and preempts whatever runs there. That includes a donor vCPU whose `target_tid` was replaced. Other managed vCPU threads go on a shared vCPU queue. Tasks with migration disabled, and host tasks allowed on only one CPU, go on that CPU's local queue; the kernel runs them before asking `dispatch`, so a pinned kworker waits at most one owner slice and the stall watchdog doesn't fire. Other tasks go on a host queue.
 - **`scx_ops.dispatch(cpu, prev)`:**
   Run the pCPU's owner if it is queued. Otherwise take a task from the vCPU queue or the host queue, but only one that the SMT isolation rules below allow.
 
@@ -34,12 +34,12 @@ struct {
 
 `scx_pylon` keeps SMT siblings apart for managed vCPU threads, in place of kernel core scheduling (`PR_SCHED_CORE`). Using sched_ext together with core scheduling hangs kernels that lack the upstream fixes for 4c95380701f5 (issue #15); see the guard below.
 
-- A task's *domain* is its VMM process's tgid once it has owned a pCPU, and *host* otherwise.
-- Each CPU publishes a claim before it runs work: idle, host, or a domain. The claim is set in `dispatch` and `running`, and cleared when the CPU goes idle (`update_idle`).
-- A CPU only runs work whose claim matches all its siblings' claims or sits next to idle siblings. A domain claim beats a host claim. Between two domains, the lower-numbered CPU wins. The loser is kicked with `SCX_KICK_PREEMPT` and idles.
+- A task's *domain* is its VMM process's tgid once it has owned a pCPU or `pylond` has listed it, and *host* otherwise. `pylond` lists the vCPU threads of registered VMs in `pylon_vcpu_dom` (thread ID to VMM tgid), checking every second, so a vCPU is isolated from its first enqueue after that, owned or not. `enqueue` checks the tgid, so a stale entry for a reused thread ID tags nothing.
+- Each CPU publishes a claim before it runs work: idle, host, pinned (a host task allowed on only that CPU), or a domain. The claim is set in `dispatch` and `running`, and cleared when the CPU goes idle (`update_idle`).
+- A CPU only runs work whose claim matches all its siblings' claims or sits next to idle siblings. A domain claim beats a host claim. Between two domains, the lower-numbered CPU wins. The loser is kicked with `SCX_KICK_PREEMPT` and idles. A pinned task can't move, so it runs without checking, and a domain yields to it and is kicked when it starts, except the CPU's owner, which would otherwise wait for as long as a busy pinned task runs.
 - The siblings come from `pylon_smt_next`, a ring that userspace fills from `thread_siblings_list` before attaching.
 - `pylond` doesn't give two VMs sibling threads of one core while `scx_pylon` is attached, so the cross-domain tie-break doesn't keep a VM's vCPU waiting.
-- Not isolated: tasks of higher sched classes (RT, deadline, stop), interrupts and softirqs, and tasks with migration disabled. Kernel core scheduling doesn't isolate interrupts either.
+- Not isolated: tasks of higher sched classes (RT, deadline, stop), interrupts and softirqs, tasks with migration disabled, and host tasks allowed on only one CPU (mostly per-CPU kernel threads) next to a pCPU's owner or on its own pCPU. Kernel core scheduling doesn't isolate interrupts either.
 
 ### Core Scheduling Guard
 
