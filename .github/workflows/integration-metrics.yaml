@@ -7,6 +7,9 @@ on:
 jobs:
   build:
     name: Tests (Metrics)
+    # The self-hosted runner and publish key exist only upstream; forks
+    # would queue this job forever.
+    if: github.repository == 'cloud-hypervisor/cloud-hypervisor'
     runs-on: garm-jammy-16
     env:
       METRICS_PUBLISH_KEY: ${{ secrets.METRICS_PUBLISH_KEY }}
