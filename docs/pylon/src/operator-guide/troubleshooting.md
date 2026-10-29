@@ -70,6 +70,18 @@ host. Check `cat /sys/kernel/sched_ext/root/ops`. Restart `pylond` with
 |---|---|
 | no `sched_ext` message at all | The kernel has no `/sys/kernel/sched_ext` (it wasn't built with `CONFIG_SCHED_CLASS_EXT`), or `--no-scx` or `--pcpu-map-file` was given. |
 | `scx_pylon not attached, using the in-memory pCPU table: ...` | Attaching failed. The error after the colon says why: commonly missing privileges, or another `sched_ext` scheduler already attached. |
+| `... Thread <tid> (<name>) has a core scheduling cookie` | The core scheduling guard found a process using core scheduling, such as a Cloud Hypervisor VM without `core_scheduling=off` ([Core scheduling](sched-ext.md#core-scheduling)). |
+| `... BPF LSM is not active` | The guard can't refuse new cookies on this kernel. Boot with `bpf` in `lsm=`, or pass `--core-sched-deny off`. |
+
+If `dmesg` shows `core scheduling turned on by pid <pid>`, a process got
+a core scheduling cookie while `scx_pylon` was attached (possible only
+with `--core-sched-deny off`), and `scx_pylon` disabled itself.
+
+## A VM fails to start with `Error enabling core scheduling`
+
+`scx_pylon` is attached with the core scheduling guard, which refuses
+core scheduling. Start the VM with `--cpus ...,core_scheduling=off`
+([Core scheduling](sched-ext.md#core-scheduling)).
 
 If the kernel ejected the scheduler later, `dmesg` says why (for
 example a runnable task stall). `pylond` keeps running without it.

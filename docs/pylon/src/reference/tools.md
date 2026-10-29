@@ -7,6 +7,7 @@ Inspect or test the `sched_ext` scheduler without `pylond`. Built with
 
 ```text
 scx_pylon [--verify-only] [--status] [--attach] [--shm <path>]
+          [--core-sched-guard <auto|on|off>] [--core-sched-deny <eperm|enodev|off>]
 ```
 
 | Option | Meaning |
@@ -15,6 +16,7 @@ scx_pylon [--verify-only] [--status] [--attach] [--shm <path>]
 | `--status` | Print the kernel's `sched_ext` state (`state`, `enable_seq`, `nr_rejected`) and exit. With `--shm`, also print the owner table from that file. |
 | `--shm <path>` | A file-backed owner table, for `--status`. |
 | `--attach`, or no option | Attach the scheduler and hold it until `SIGINT` or `SIGTERM`. Nothing writes its owner table, so this is for testing the BPF program only. Needs root, and fails if another `sched_ext` scheduler (including `pylond`'s) is attached. |
+| `--core-sched-guard`, `--core-sched-deny` | As for [`pylond`](pylond.md). |
 
 ## pylon-guest-agent
 

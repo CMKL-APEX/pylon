@@ -32,7 +32,7 @@ struct {
 
 ### SMT Isolation
 
-`scx_pylon` keeps SMT siblings apart for managed vCPU threads, in place of kernel core scheduling (`PR_SCHED_CORE`). Using sched_ext together with core scheduling hangs kernels that lack the upstream fixes for 4c95380701f5 (issue #15).
+`scx_pylon` keeps SMT siblings apart for managed vCPU threads, in place of kernel core scheduling (`PR_SCHED_CORE`). Using sched_ext together with core scheduling hangs kernels that lack the upstream fixes for 4c95380701f5 (issue #15); see the guard below.
 
 - A task's *domain* is its VMM process's tgid once it has owned a pCPU, and *host* otherwise.
 - Each CPU publishes a claim before it runs work: idle, host, or a domain. The claim is set in `dispatch` and `running`, and cleared when the CPU goes idle (`update_idle`).
@@ -40,6 +40,19 @@ struct {
 - The siblings come from `pylon_smt_next`, a ring that userspace fills from `thread_siblings_list` before attaching.
 - `pylond` doesn't give two VMs sibling threads of one core while `scx_pylon` is attached, so the cross-domain tie-break doesn't keep a VM's vCPU waiting.
 - Not isolated: tasks of higher sched classes (RT, deadline, stop), interrupts and softirqs, and tasks with migration disabled. Kernel core scheduling doesn't isolate interrupts either.
+
+### Core Scheduling Guard
+
+Kernel core scheduling is one host-wide switch: it turns on as soon as any task has a cookie, from any VMM or user. On kernels without upstream f2da9587118d and d954004205c1, sched_ext then corrupts `rq->core_pick` and the rq clock, which ends in a NULL dereference in `pick_next_task()` or a hard hang (issue #15). With the guard, `scx_pylon` never runs while a cookie exists:
+
+- **Kernel check** (`coresched::KernelCoreSched::detect`): `PR_SCHED_CORE_GET` fails with `EINVAL` without `CONFIG_SCHED_CORE` and with `ENODEV` without SMT; no cookie can exist then. Otherwise the kernel has the fix if its BTF has `struct scx_rq` member `lock_drop_seq` (added by f2da9587118d, which d954004205c1 needs). This doesn't show 3dd52416e44a, ff0545e0c263 or 680edc7f23ad, which add no such mark.
+- **`--core-sched-guard`:** `auto` (default) guards kernels that can core-schedule and lack the fix; `on` also guards kernels that have it; `off` never guards.
+- **At attach**, in this order:
+  1. The `lsm/task_prctl` program `pylon_task_prctl` refuses every `PR_SCHED_CORE` command except `GET`, with `EPERM` or `ENODEV` (`--core-sched-deny`; `off` doesn't load it). It needs the kernel booted with the bpf LSM (`/sys/kernel/security/lsm`), or attaching fails.
+  2. The `fentry/sched_core_get` program `pylon_sched_core_get` records the tgid of a task that gets a new cookie in the `pylon_guard` map.
+  3. Every thread in `/proc` is checked with `PR_SCHED_CORE_GET`. A cookie, or a tgid recorded by step 2, fails the attach.
+  4. The `struct_ops` link is attached.
+- **After attach**, if the watcher records a tgid (possible only with `--core-sched-deny=off`), `dispatch` calls `scx_bpf_exit()` once, naming that pid, and the kernel falls back to the fair scheduler. The bug can still hit until the disable completes.
 
 ---
 

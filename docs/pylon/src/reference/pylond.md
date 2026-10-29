@@ -3,6 +3,7 @@
 ```text
 pylond [--socket <path>] [--socket-group <group>] [--socket-mode <mode>]
        [--cores <list>] [--enable-scx | --no-scx]
+       [--core-sched-guard <auto|on|off>] [--core-sched-deny <eperm|enodev|off>]
        [--pcpu-map-file <path>] [--metrics-port <port>] [--metrics-addr <addr>]
 ```
 
@@ -14,6 +15,8 @@ pylond [--socket <path>] [--socket-group <group>] [--socket-mode <mode>]
 | `--cores <list>` | `2-7` | Managed host CPUs: a comma-separated list of CPUs and ranges, such as `2-7` or `4-15,20-31`. Must not include 0 or 1, which `pylond` uses itself. |
 | `--enable-scx` | off | Attach `scx_pylon`, or exit with an error if it can't be attached. Conflicts with `--no-scx`. |
 | `--no-scx` | off | Never attach `scx_pylon`. |
+| `--core-sched-guard <mode>` | `auto` | Keep `scx_pylon` away from kernel core scheduling: `auto` on kernels that lack the fix for issue #15, `on` on every kernel that can core-schedule, `off` never ([Core scheduling](../operator-guide/sched-ext.md#core-scheduling)). |
+| `--core-sched-deny <answer>` | `eperm` | With the guard, what a process asking for a core scheduling cookie gets while `scx_pylon` is attached: `eperm`, `enodev`, or `off` to let it through and disable `scx_pylon`. `eperm` and `enodev` need the bpf LSM. |
 | `--pcpu-map-file <path>` | none | Keep the pCPU owner table in this existing file instead of in memory. Turns off automatic `scx_pylon` attachment. |
 | `--metrics-port <port>` | none | Serve Prometheus metrics over HTTP on this port. |
 | `--metrics-addr <addr>` | `127.0.0.1` | Address for the metrics server. |

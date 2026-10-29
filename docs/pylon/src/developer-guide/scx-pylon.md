@@ -111,6 +111,37 @@ that can only run on a fenced CPU waits until the vCPU next to it
 stops. If that takes longer than the watchdog timeout, the kernel ejects
 the scheduler.
 
+## Core scheduling guard
+
+Kernel core scheduling turns on for the whole host as soon as any task
+has a cookie, for example a stock Cloud Hypervisor VM, which asks for
+one by default (`core_scheduling=vm`). On kernels without upstream
+f2da9587118d and d954004205c1, `sched_ext` then corrupts the
+core-scheduling pick, which ends in a NULL dereference in
+`pick_next_task()` or a hard hang (issue #15). The guard keeps
+`scx_pylon` from running while any cookie exists. It lives in
+`src/coresched.rs` and two more BPF programs:
+
+- `KernelCoreSched::detect()` decides whether the kernel needs it.
+  `PR_SCHED_CORE_GET` fails with `EINVAL` without `CONFIG_SCHED_CORE`
+  and with `ENODEV` without SMT. Otherwise the kernel has the fix if
+  its BTF has `struct scx_rq` member `lock_drop_seq`, which
+  f2da9587118d adds and d954004205c1 depends on.
+- `pylon_task_prctl` (`lsm/task_prctl`) refuses every `PR_SCHED_CORE`
+  command except `GET`. It reads its answer, `EPERM` or `ENODEV`, from
+  the `pylon_guard` map. `task_prctl` programs run as modify-return, so
+  returning 0 lets the `prctl` go on as usual.
+- `pylon_sched_core_get` (`fentry/sched_core_get`) records the tgid of
+  a task that gets a new cookie anyway. `dispatch` then calls
+  `scx_bpf_exit()` once with that pid, and the kernel falls back to the
+  fair scheduler.
+
+`load_and_attach(Some(deny))` attaches the LSM program and the watcher
+first, then checks every thread with `PR_SCHED_CORE_GET`, and only then
+attaches the scheduler. Both programs are left out of the load without
+the guard (and the LSM program with `CookieDenial::Off`), since kernels
+without `CONFIG_SCHED_CORE` have no `sched_core_get()`.
+
 The flags are `SCX_OPS_ENQ_LAST`, `SCX_OPS_ENQ_EXITING`,
 `SCX_OPS_ENQ_MIGRATION_DISABLED` and `SCX_OPS_KEEP_BUILTIN_IDLE`.
 
@@ -151,10 +182,11 @@ SPDX header.
 `ScxPylonUserspace` in `src/lib.rs` wraps `libbpf-rs`:
 
 - `open_embedded()` opens the embedded object.
-- `load_and_attach()` loads it, fills `pylon_smt_next`, attaches the
-  `struct_ops` link, and maps `pylon_pcpu_owners`.
+- `load_and_attach(guard)` loads it, fills `pylon_smt_next`, sets up
+  the core scheduling guard if asked, attaches the `struct_ops` link,
+  and maps `pylon_pcpu_owners`.
 - `into_parts()` hands `pylond` the mapping (as its owner table), the
-  link and the object. `pylond` keeps the link alive for its lifetime.
+  link, the guard's links and the object. `pylond` keeps the link alive for its lifetime.
   The kernel detaches the scheduler when the link's descriptor closes,
   including when `pylond` dies.
 
