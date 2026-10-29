@@ -49,7 +49,7 @@ BPF program make it up:
 
 | Set | Where | Read it for |
 |---|---|---|
-| This book | [`docs/pylon/src`](https://github.com/CMKL-APEX/pylon/blob/main/docs/pylon/src/SUMMARY.md), published at <https://cmkl-apex.github.io/pylon/docs/> | What Pylon does, how to run it, and, in this guide, how it's built. |
+| This book | `docs/pylon/src` in the repository, published at <https://cmkl-apex.github.io/pylon/docs/> | What Pylon does, how to run it, and, in this guide, how it's built. |
 | Design specs | [`spec/`](https://github.com/CMKL-APEX/pylon/tree/main/spec) | The authority on *why*: contracts between components, field layouts, the implementation plan and status. Code comments cite them as `spec/<file>.md`. |
 | API reference (rustdoc) | Built locally with `cargo doc` | Every crate's types and functions. |
 

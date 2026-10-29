@@ -101,7 +101,7 @@ mdbook serve docs/pylon     # http://localhost:3000
 ```
 
 Rules for what goes where are in
-[`docs/pylon/README.md`](https://github.com/CMKL-APEX/pylon/blob/main/docs/pylon/README.md).
+`docs/pylon/README.md` in the repository.
 In short: user and operator pages describe shipped behavior only,
 developer pages may link into specs and code with full GitHub URLs,
 and every benchmark figure names its date, hardware and whether it was
