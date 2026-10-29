@@ -1,6 +1,8 @@
 # Specification 06: Guest Kick & Cooperative Park Path
 
-> **Status:** `DRAFT` — design for review. Nothing in this document is implemented yet.
+> **Status:** `DRAFT` — design for review. Steps S1 (§4.4, the VMM's park decision) and
+> S2 (§4.4–§4.5, `pylond`'s forced park) are implemented; the rest isn't. Where the
+> implementation refined the design, the affected sections say so.
 > Tracked as **Track 4** (VMM/pylond) and **Track 5** (guest kernel) in
 > `spec/05-implementation-status.md`.
 
@@ -183,12 +185,28 @@ to always meaning reset (fixes P2).
 The forced exit comes from `pylond`, as follows. The control plane records the
 VMM's PID from `SO_PEERCRED` on the registration socket (tokio
 `UnixStream::peer_cred()`). On deadline expiry, Plane 2 calls
-`tgkill(vmm_pid, host_tid, SIGRTMIN)`. Cloud Hypervisor already installs a no-op
-`SIGRTMIN` handler on vCPU threads (`vmm/src/cpu.rs` `handle_signal`), so this
-interrupts `KVM_RUN` without other side effects. Requirements: `pylond` runs as
-the same UID as the VMM or holds `CAP_KILL`. It must also check that
-`host_tid` still belongs to `vmm_pid`; using `tgkill` instead of `tkill` gives
-that check against TID reuse.
+`tgkill(vmm_pid, host_tid, kick_signal)`. Cloud Hypervisor already installs a
+no-op `SIGRTMIN` handler on vCPU threads (`vmm/src/cpu.rs` `handle_signal`), so
+this interrupts `KVM_RUN` without other side effects. Requirements: `pylond`
+runs as the same UID as the VMM or holds `CAP_KILL`. Using `tgkill` instead of
+`tkill` only signals `host_tid` if it is a thread of `vmm_pid`.
+
+*As implemented (S2):*
+
+- **The VMM names the signal.** `SIGRTMIN` depends on the libc (glibc and musl
+  reserve different numbers of real-time signals), and a real-time signal
+  without a handler terminates the process. So the VMM sends its own
+  `SIGRTMIN()` as `kick_signal` in the registration message. `pylond`
+  rejects a registration whose `kick_signal` isn't a real-time signal, and
+  never signals a VMM that didn't send one (an older VMM).
+- **PID reuse.** At registration, `pylond` opens a pidfd for the peer PID
+  (`VmHandle::with_vmm_pid`). Before each `tgkill`, it checks with
+  `pidfd_send_signal(pidfd, 0)` that the process still exists, so a PID
+  reused after the VMM exits is never signalled.
+- **The VMM's post-exit hook** treats `now >= revoke_deadline_tsc` with
+  `revoke_requested == 1` as a forced park, reading the host TSC. `pylond`
+  sends the signal no earlier than the deadline, so the VMM always sees it as
+  passed.
 
 ### 4.5 `pylond` Phase 2 Changes
 
@@ -203,6 +221,38 @@ that check against TID reuse.
   zero in healthy operation.
 - Metering: record kick→`PARKED` latency per VM (p50/p99) using the Prometheus
   exporter from `7bd0b5815`.
+
+*As implemented (S2), with these refinements:*
+
+- **Per-core arrays instead of a new `CoreState` variant.** `MatrixEngine`
+  keeps `revoke_requested_tsc` and `revoke_signalled_tsc` per managed CPU, so
+  `CoreState` and its users are unchanged.
+- **The signal is resent** every `REVOKE_RESIGNAL_US` (10 µs) until the donor
+  parks. A signal that arrives while the vCPU thread is outside `KVM_RUN`
+  (handling an exit) is consumed by the no-op handler and doesn't stop the
+  next guest entry, so a single signal can be lost.
+- **`FORCE_HANDOFF_US` (50 µs) counts from the deadline**, which is when the
+  first signal is sent.
+- **Counting.** A revocation is counted as forced once, when its deadline
+  passes, and as cooperative when the donor parked before that. The park
+  latency (request to `PARKED`) goes into a per-VM histogram,
+  `pylon_vm_park_latency_microseconds`, with buckets from 1 µs to 1,024 µs.
+  `handoffs_without_park` is in the stats response and in
+  `pylon_vm_handoffs_without_park_total`.
+- **`pylond` no longer writes `WAKING`** (§3). Two things depended on it, and
+  now use `pylond`-owned or VMM-owned fields instead:
+  - *Not picking a vCPU twice.* A vCPU is free for a core only while it is
+    `PARKED` **and** its `assigned_pcpu` is unassigned. The engine sets
+    `assigned_pcpu` when it assigns a core, and also when it starts a
+    revocation for a recipient, to reserve it. It releases the reservation if
+    the revocation is abandoned.
+  - *Not reclaiming a core whose vCPU hasn't woken yet.* The engine records
+    the vCPU's `yield_count` at assignment and reclaims the core only when the
+    vCPU is `PARKED` with a higher count. The VMM increments `yield_count`
+    before publishing `PARKED`.
+- **The VMM initializes every slot's `assigned_pcpu` to `PCPU_UNASSIGNED`.**
+  It used to leave the zeroed value, CPU 0, which the reservation check would
+  read as taken.
 
 ### 4.6 Guest Side Requirements (`pylon/guest/`, Track 5)
 

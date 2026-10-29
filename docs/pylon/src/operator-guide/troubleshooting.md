@@ -40,7 +40,20 @@ load. This is a known open question in the design (spec 06, Q2).
 
 That's expected for now: the guest isn't told about revocations, so
 donors don't park within the grace period
-([Status](../status.md#what-doesnt-work-yet)).
+([Status](../status.md#what-doesnt-work-yet)). `pylond` then signals the
+donor's vCPU thread and the VMM parks it.
+
+## Handoffs without park are above zero
+
+`pylond` gave a core away because the donor hadn't parked 50 µs after
+its deadline, although it was signalled. Check:
+
+- **The VMM is a version from before `kick_signal`.** Such a VMM
+  registers without one, so `pylond` can't signal it. Upgrade it.
+- **`pylond` can't signal the VMM.** It needs the same user as the VMM,
+  or `CAP_KILL`.
+- **The vCPU thread is stuck outside `KVM_RUN`**, for example in a slow
+  device exit. The donor parks at its next exit; look at the VMM's log.
 
 ## The host feels sluggish after pylond starts
 

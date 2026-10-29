@@ -40,9 +40,15 @@ microsecond. That figure hasn't been measured; see
 ## Phase 0: reclaim and meter
 
 **Reclaim.** For each `Assigned` CPU whose vCPU is `PARKED` with no
-revocation pending, the vCPU gave the core up by itself. The engine
-meters the time since the last sample, clears the CPU's owner entry,
-sets the slot's `assigned_pcpu` to unassigned, and marks the CPU `Idle`.
+revocation pending, and whose `yield_count` has gone up since the core
+was assigned, the vCPU gave the core up by itself. The engine meters
+the time since the last sample, clears the CPU's owner entry, sets the
+slot's `assigned_pcpu` to unassigned, and marks the CPU `Idle`.
+
+The `yield_count` check matters because `pylond` doesn't write `state`:
+a vCPU that has just been given a core stays `PARKED` until its thread
+wakes. The VMM increments `yield_count` before it publishes `PARKED`, so
+only a vCPU that has run and parked again is reclaimed.
 
 **Meter.** For each `Assigned` or `Revoking` CPU, the engine adds the
 elapsed time to the owning (or donating) VM's `allocated_core_usec`:
@@ -87,22 +93,34 @@ rest, priority weight scales how long a thread has waited.
 
 ## Phase 2: revocations in flight
 
-For each `Revoking` CPU, the engine checks the donor's slot:
+For each `Revoking` CPU, the engine checks the donor's slot. Only the
+VMM writes `PARKED`, once the donor's thread has left `KVM_RUN`, so
+`PARKED` means the donor has really stopped.
 
-- **Donor `PARKED`:** a *cooperative yield*. It's counted on the donor VM.
-- **Deadline passed:** a *forced preemption*. The engine increments the
-  slot's `forced_preempt_count`, writes `state = PARKED` itself, and
-  counts it on the donor VM.
-- **Neither:** wait for the next sweep.
+| Donor | Time | Action |
+|---|---|---|
+| `PARKED`, never signalled | any | A *cooperative yield*. Hand the CPU over. |
+| `PARKED`, signalled | any | The VMM force-parked it. Hand the CPU over (already counted as forced). |
+| not parked | before the deadline | Wait. |
+| not parked | deadline passed | A *forced preemption*, counted once. Send the VMM's `kick_signal` to the donor's thread with `tgkill`, and again every `REVOKE_RESIGNAL_US` (10 µs). `KVM_RUN` returns `EINTR` and the VMM's post-exit hook force-parks the vCPU. |
+| not parked | `FORCE_HANDOFF_US` (50 µs) after the deadline | Hand the CPU over anyway, counted as a *handoff without park*. `scx_pylon` preempts the donor thread, which parks at its next exit. |
 
-When the revocation finishes either way, the engine clears
-`revoke_requested`, unassigns the donor, writes the recipient's thread
-ID to the CPU's owner entry, sets the recipient slot's `assigned_pcpu`
-and `state = WAKING`, writes its wake `eventfd`, and marks the CPU
-`Assigned` to the recipient.
+The signal is resent because one that arrives while the vCPU thread is
+outside `KVM_RUN` (handling an exit) doesn't stop the next guest entry.
+`pylond` signals only a VMM that registered a `kick_signal`, and checks
+through a pidfd that the VMM process still exists before each
+`tgkill`.
 
-Writing `PARKED` for a donor that hasn't parked is one of the known
-problems ([Enhancements](enhancements.md#problems-in-the-current-revocation-path)).
+Handing the CPU over unassigns the donor (`assigned_pcpu`), writes the
+recipient's thread ID to the CPU's owner entry, sets the recipient
+slot's `assigned_pcpu`, writes its wake `eventfd`, and marks the CPU
+`Assigned` to the recipient. When the donor parked, the time from the
+revocation request to `PARKED` goes into the VM's park latency
+histogram. The engine doesn't touch the donor's `state` or
+`revoke_requested`; the VMM clears `revoke_requested` when it parks.
+
+If either VM has gone, the engine drops the revocation, marks the CPU
+`Idle`, and releases the recipient's reservation.
 
 ## Phase 3: matching
 
@@ -111,9 +129,11 @@ in-place insertion sort over at most 64 entries). Then, for each VM in
 that order, while it needs more cores (desired minus committed):
 
 1. **Pick a vCPU.** `select_parked_vcpu` takes the lowest set bit of
-   `stranded_work_bitmap` whose vCPU is parked (clearing that bit), or
-   else the lowest-numbered parked vCPU. If the VM has none parked,
-   move on to the next VM.
+   `stranded_work_bitmap` whose vCPU is free (clearing that bit), or
+   else the lowest-numbered free vCPU. A vCPU is *free* when it is
+   `PARKED` and its `assigned_pcpu` is unassigned; a vCPU with a CPU on
+   its way is still `PARKED` but already assigned or reserved. If the VM
+   has no free vCPU, move on to the next VM.
 2. **Fast path.** If a managed CPU is `Idle`, assign it (as in phase 2's
    hand-over) and continue.
 3. **Preemption path.** Otherwise choose a donor with
@@ -140,9 +160,10 @@ Among eligible donors, the engine prefers, in order:
 It then sets the donor slot's `revoke_deadline_tsc` to now plus
 `REVOKE_GRACE_PERIOD_US` (8 µs, converted with the donor's `tsc_khz`),
 stores `revoke_requested = 1`, writes the donor's kick `eventfd`, and
-marks the CPU `Revoking`. The recipient's incoming count goes up, and the
-donor's assigned count goes down, so later decisions in the same sweep
-see the change.
+marks the CPU `Revoking`. It reserves the recipient vCPU by setting its
+`assigned_pcpu` to that CPU, so no other match picks it. The recipient's
+incoming count goes up, and the donor's assigned count goes down, so
+later decisions in the same sweep see the change.
 
 ## The owner table
 
@@ -164,7 +185,12 @@ even when the kernel reads it.
 |---|---|---|
 | `allocated_core_usec` | `VmHandle` | Phase 0 |
 | `cooperative_yield_count` | `VmHandle` | Phase 2 |
-| `forced_preempt_count` | `VmHandle` and the slot | Phase 2 |
+| `forced_preempt_count` | `VmHandle` | Phase 2, when a deadline passes |
+| `handoff_without_park_count` | `VmHandle` | Phase 2 |
+| `park_latency` (histogram, µs) | `VmHandle` | Phase 2, when a donor parks |
+
+The slot's own `forced_preempt_count` belongs to the VMM, which
+increments it when it force-parks a vCPU.
 
 Plane 1 reads them for the [stats request](../reference/control-socket.md#stats)
 and the [metrics](../reference/metrics.md).

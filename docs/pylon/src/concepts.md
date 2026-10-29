@@ -33,8 +33,8 @@ next timer fires.
 |---|---|
 | `RUNNING` | The vCPU thread runs guest code. |
 | `PARKED` | The vCPU thread is blocked in the VMM, waiting to be woken. It uses no CPU. |
-| `WAKING` | `pylond` has given the vCPU a core and signalled it to wake. |
-| `PARKING` | Defined for a guest that is about to park (see [Enhancements](developer-guide/enhancements.md)); not used yet. |
+| `WAKING` | Defined but no longer written: a vCPU that has just been given a core stays `PARKED` until its thread wakes and the VMM writes `RUNNING`. |
+| `PARKING` | The guest asks to park this vCPU. The VMM parks it at its next exit to userspace. No guest component writes it yet (see [Enhancements](developer-guide/enhancements.md)). |
 
 **Park and wake.** *Parking* a vCPU blocks its host thread on an
 `eventfd` instead of running `KVM_RUN`. *Waking* it writes that
@@ -49,9 +49,12 @@ vCPU that owns it. `scx_pylon` reads that table.
 **Revoke.** To move a core from a *donor* VM to a *recipient* VM,
 `pylond` sets the donor vCPU's `revoke_requested` flag and gives it a
 **grace period** of 8 µs to park. A donor that parks in time has made a
-**cooperative yield**. One that doesn't is **forcibly preempted** when
-the deadline passes. See [Status and roadmap](status.md) for how much of
-this path works today.
+**cooperative yield**. When the deadline passes, the revocation counts
+as a **forced preemption**: `pylond` signals the donor's thread so the
+VMM parks it, and hands the core over once it has. If the donor still
+hasn't parked 50 µs later, `pylond` hands the core over anyway, which is
+counted as a **handoff without park**. See [Status and roadmap](status.md)
+for how much of this path works today.
 
 **Critical section.** The guest sets a vCPU's `in_critical_section`
 while it holds a spinlock, handles an interrupt or has preemption

@@ -13,29 +13,33 @@ planned. It reflects `main` as of 2026-10-29. The detailed tracker is
 | Registration | The VMM registers with `pylond` at boot, passing the shared page and per-vCPU `eventfd`s. |
 | Waking parked vCPUs | `pylond` wakes a parked vCPU when its VM has demand and a managed CPU is idle. |
 | Taking back idle cores | When a vCPU parks on its own, `pylond` reclaims its core. |
+| Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. |
 | Arbitration | Demand evaluation, urgency ordering and donor selection run every tick (see [The arbitration engine](developer-guide/arbitration.md)). |
 | Runtime policy | `min_cores`, `max_cores` and `priority_weight` can be changed over the control socket. |
-| Metering | Core-microseconds, cooperative yields and forced preemptions per VM, over the socket and as Prometheus metrics. |
+| Metering | Core-microseconds, cooperative yields, forced preemptions, handoffs without park and revocation-to-park latency per VM, over the socket and as Prometheus metrics. |
 | `scx_pylon` | Attaches to a `sched_ext` kernel and runs each managed CPU's assigned vCPU thread. `pylond` attaches it automatically when the kernel supports it. |
 
 ## What doesn't work yet
 
 **Cooperative revocation.** Taking a core from a VM that is still
-running doesn't work end to end. These are the gaps:
+running works, but never cooperatively yet:
 
 - The per-vCPU "kick" that should interrupt the donor vCPU isn't
   connected to a guest interrupt, so the guest isn't told about a
   revocation.
-- The VMM's park check doesn't wait for the guest to leave a critical
-  section, so a vCPU can be parked while it holds a guest lock.
-- `pylon-guest-agent` and `pylond` can mark a vCPU as parked while it
-  is still running.
+- No guest component writes `PARKING` to agree to park.
+- `pylon-guest-agent` can mark a vCPU as parked while it is still
+  running.
 
-Until this is fixed, **don't count on revocations being cooperative**,
-and expect `forced_preemptions` to be the normal outcome when cores are
-contended. The design that fixes it is in
-[Enhancements](developer-guide/enhancements.md) (spec 06, tracks 4
-and 5).
+The host side is in place. The VMM parks a vCPU only when the guest
+asks to (by writing `PARKING`) or when the revocation's deadline has
+passed, so it no longer parks a vCPU that may hold a guest lock. When a
+deadline passes, `pylond` signals the donor's thread so the VMM parks it,
+and moves the core once it has. So today **every contended revocation
+is a forced preemption**: expect `forced_preemptions` to grow, and
+`handoffs_without_park` to stay at zero. The design for the cooperative
+part is in [Enhancements](developer-guide/enhancements.md) (spec 06,
+tracks 4 and 5).
 
 **Other gaps** (tracked as K1–K6 in the status tracker's
 [known issues](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md#known-issues-other)):

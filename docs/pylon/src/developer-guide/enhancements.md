@@ -72,14 +72,26 @@ The `VmExit::Reset` hook is removed.
 
 ### Forced park: a signal from pylond
 
-When a deadline passes, `pylond` sends `tgkill(vmm_pid, host_tid,
-SIGRTMIN)` once (spec 06 §4.4–4.5). Cloud Hypervisor's vCPU threads
-already ignore `SIGRTMIN` with a no-op handler, so `KVM_RUN` returns
-`EINTR`, the KVM backend reports `VmExit::Ignore`, and the post-exit
-hook force-parks. `pylond` learns the VMM's PID from `SO_PEERCRED` at
-registration. It hands the CPU over only once the VMM has written
-`PARKED`. As a last resort it hands it over 50 µs after the signal,
-counted separately as `handoff_without_park`.
+**Implemented (S2).** When a deadline passes, `pylond` sends
+`tgkill(vmm_pid, host_tid, kick_signal)` (spec 06 §4.4–4.5). Cloud
+Hypervisor's vCPU threads already ignore `SIGRTMIN` with a no-op
+handler, so `KVM_RUN` returns `EINTR`, the KVM backend reports
+`VmExit::Ignore`, and the post-exit hook force-parks. Details:
+
+- The VMM sends its own `SIGRTMIN()` as `kick_signal` when it registers,
+  because the number depends on the libc. `pylond` accepts only a
+  real-time signal, and doesn't signal a VMM that sent none.
+- `pylond` learns the VMM's PID from `SO_PEERCRED` and opens a pidfd for
+  it. Before each signal it checks the process still exists, so a reused
+  PID is never signalled.
+- The signal is resent every 10 µs, because one that arrives while the
+  thread is outside `KVM_RUN` doesn't stop the next guest entry.
+- `pylond` hands the CPU over only once the VMM has written `PARKED`. As a
+  last resort it hands it over 50 µs after the deadline, counted
+  separately as a handoff without park.
+- `pylond` no longer writes `WAKING`. It reserves a recipient through
+  `assigned_pcpu` and reclaims a core only after the vCPU's `yield_count`
+  has moved ([The arbitration engine](arbitration.md#phase-2-revocations-in-flight)).
 
 ### The guest kernel module
 
@@ -93,8 +105,8 @@ point. It also has to make other vCPUs treat parked ones as preempted.
 
 | Step | Scope | Fixes |
 |---|---|---|
-| S1 | VMM: the decision table; remove the `Reset` hook. | P2, P3 |
-| S2 | `pylond`: stop writing `state`; `SO_PEERCRED`; `tgkill` on deadline; wait for `PARKED`; latency metric. | P5, P6 |
+| S1 | VMM: the decision table; remove the `Reset` hook. **Done.** | P2, P3 |
+| S2 | `pylond`: stop writing `state`; `SO_PEERCRED`; `tgkill` on deadline; wait for `PARKED`; latency metric. **Done.** | P5, P6 (`pylond`'s part) |
 | S3 | Guest agent telemetry-only; ABI version 2. | P4 |
 | S4 | The `pylon-kick` device and its MSI-X `eventfd`s; register with `pylond` after the device exists. | P1 |
 | S5 | The `pv-pylon` kernel module. | — |

@@ -46,6 +46,12 @@ and registering with `pylond`). Building the state during option
 parsing is a side effect in an unusual place: it happens before the VM
 exists, and spec 06 moves registration later for that reason.
 
+The registration message carries `kick_signal`: the VMM's own
+`SIGRTMIN()`, the signal its vCPU threads have a no-op handler for.
+`pylond` sends it to a donor vCPU whose revocation deadline has passed.
+`PylonVmmState::new` also sets every slot's `assigned_pcpu` to
+`PCPU_UNASSIGNED`, which `pylond` reads as "no core on its way".
+
 ### Memory: `setup_memory_region`
 
 Called from `MemoryManager::new` in `vmm/src/memory_manager.rs`. It
@@ -65,22 +71,32 @@ the slot's `host_tid`. For `vcpu_id >= initial_active_vcpus`, it sets
 ### After each exit: `check_and_park_vcpu`
 
 Called in the vCPU run loop after the vCPU lock is dropped, on every
-exit to userspace. If the slot's `revoke_requested` is `1`, it clears
-the flag, sets `PARKED`, increments `yield_count`, blocks on the wake
-`eventfd`, and sets `RUNNING` again on wakeup (unless shutting down).
+exit to userspace. It applies the decision table from spec 06 §4.4
+(`park_decision`):
 
-It's also called from the `VmExit::Reset` arm. If it parks there, the
-loop continues instead of resetting the VM.
+| `state` | `revoke_requested` | Deadline | Action |
+|---|---|---|---|
+| `PARKING` | any | any | Cooperative park |
+| other | 1 | `now >= revoke_deadline_tsc` | Forced park |
+| other | 1 | not passed | Keep running: the guest hasn't agreed and may hold a lock |
+| other | 0 | — | Keep running |
 
-Both hooks have problems
-([Enhancements](enhancements.md#problems-in-the-current-revocation-path)):
+`now` is the host TSC, the clock `pylond` writes deadlines in. To park,
+it clears `revoke_requested`, increments `yield_count` (and
+`forced_preempt_count` for a forced park), records `last_yield_tsc`,
+publishes `PARKED` with `Release`, blocks on the wake `eventfd`, and
+sets `RUNNING` again on wakeup (unless shutting down).
 
-- Under KVM with an in-kernel LAPIC, a running vCPU exits to userspace
-  only for MMIO, PIO and similar, so the check runs late and unpredictably.
-- It doesn't consult `in_critical_section`.
-- The `Reset` arm was meant for HLT exits, which KVM handles in the
-  kernel. KVM also reports a triple fault as `Reset`, so a triple fault
-  during a revocation is swallowed.
+Under KVM with an in-kernel LAPIC, a running vCPU exits to userspace
+only for MMIO, PIO, signals and similar, so on its own this check runs
+at unpredictable times. Spec 06 adds the two exits that make it timely:
+the guest's park doorbell (S4) and `pylond`'s signal when a deadline
+passes (S2).
+
+Before S1, this hook parked on any exit while `revoke_requested` was
+set, and was also called from the `VmExit::Reset` arm, where KVM
+reports triple faults. Both are gone
+([Enhancements](enhancements.md#problems-in-the-current-revocation-path)).
 
 ### Shutdown: `shutdown_all`
 
@@ -110,8 +126,13 @@ Pausing a VM with parked vCPUs hasn't been tested.
 
 ## Tests
 
-`cargo test -p vmm --features kvm --lib pylon` runs seven tests covering
+`cargo test -p vmm --features kvm --lib pylon` runs eleven tests covering
 option parsing, page initialization, thread-ID registration, initial
-parking, park and wake, shutdown, and daemon registration over a real
-socket. One test boots a minimal real-mode KVM guest that reads and
-writes the shared page, so it needs `/dev/kvm`.
+parking, every row of the park decision table, cooperative and forced
+parks, and daemon registration over a real socket. A second real-KVM
+test runs a guest that never agrees to park, sends its vCPU thread
+`SIGRTMIN` with `tgkill` as `pylond` does, and checks that `KVM_RUN`
+returns and the VMM force-parks the vCPU. One test boots a minimal real-mode KVM guest that reads and writes
+the shared page and parks cooperatively by writing `PARKING` and
+executing `HLT`. Without an in-kernel irqchip, `HLT` exits to
+userspace and stands in for the park doorbell. It needs `/dev/kvm`.

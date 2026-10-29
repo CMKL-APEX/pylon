@@ -53,7 +53,8 @@ echo '{"action":"stats","vm_id":17}' | socat - UNIX-CONNECT:/run/pylon/pylond.so
       "current_cores": 3,
       "allocated_core_microseconds": 81234567,
       "cooperative_yields": 12, "forced_preemptions": 4,
-      "runnable_threads": 5
+      "runnable_threads": 5,
+      "handoffs_without_park": 0
     }
   ]
 }
@@ -64,7 +65,8 @@ echo '{"action":"stats","vm_id":17}' | socat - UNIX-CONNECT:/run/pylon/pylond.so
 | `current_cores` | vCPUs that have a managed CPU and aren't parked. |
 | `allocated_core_microseconds` | Total time managed CPUs have been assigned to this VM, in core-microseconds, since it registered. |
 | `cooperative_yields` | Revocations where the donor vCPU parked within the grace period. |
-| `forced_preemptions` | Revocations where the grace period ran out. |
+| `forced_preemptions` | Revocations where the grace period ran out. `pylond` then signals the donor's vCPU thread so the VMM parks it. |
+| `handoffs_without_park` | Revocations where the donor still hadn't parked 50 µs after the deadline, so the core moved anyway. Should stay at 0. |
 | `runnable_threads` | What the guest last reported. `0` if nothing in the guest reports it. |
 
 Counters start at zero when the VM registers and are lost when `pylond`
@@ -98,6 +100,8 @@ Useful queries:
 |---|---|
 | Cores each VM uses now | `pylon_vm_allocated_cores` |
 | Average cores per VM over 5 minutes | `rate(pylon_vm_core_microseconds_total[5m]) / 1e6` |
+| p99 revocation-to-park latency per VM | `histogram_quantile(0.99, sum by (vm_id, le) (rate(pylon_vm_park_latency_microseconds_bucket[5m])))` |
+| Cores handed over without a park | `increase(pylon_vm_handoffs_without_park_total[1h])` |
 | Share of revocations that were forced | `rate(pylon_vm_forced_preemptions_total[5m]) / (rate(pylon_vm_forced_preemptions_total[5m]) + rate(pylon_vm_cooperative_yields_total[5m]))` |
 
 While cooperative revocation is incomplete
