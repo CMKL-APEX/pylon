@@ -1404,9 +1404,14 @@ impl CpuManager {
                         .expect("Failed to register vcpu signal handler");
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
-                    pylon::on_vcpu_thread_start(vcpu_id);
+                    pylon::on_vcpu_thread_start(vcpu_id, || {
+                        pylon::read_guest_tsc(vcpu.lock().unwrap().vcpu.as_ref())
+                    });
 
                     panic::catch_unwind(move || {
+                        // `vcpu` is shadowed by its lock guard inside the loop.
+                        let read_guest_timer =
+                            || pylon::read_guest_tsc_deadline(vcpu.lock().unwrap().vcpu.as_ref());
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1525,7 +1530,7 @@ impl CpuManager {
                                 }
                             }
                             drop(vcpu);
-                            pylon::check_and_park_vcpu(vcpu_id);
+                            pylon::check_and_park_vcpu(vcpu_id, read_guest_timer);
 
                             // We've been told to terminate
                             if vcpus_kill_signalled.load(Ordering::SeqCst)
