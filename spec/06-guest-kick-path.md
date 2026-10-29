@@ -1,8 +1,9 @@
 # Specification 06: Guest Kick & Cooperative Park Path
 
-> **Status:** `DRAFT` — design for review. Steps S1 (§4.4, the VMM's park decision) and
-> S2 (§4.4–§4.5, `pylond`'s forced park) are implemented; the rest isn't. Where the
-> implementation refined the design, the affected sections say so.
+> **Status:** `DRAFT` — design for review. Steps S1 (§4.4, the VMM's park decision),
+> S2 (§4.4–§4.5, `pylond`'s forced park) and S3 (§3, §4.6: telemetry-only guest agent,
+> ABI version 2) are implemented; the rest isn't. Where the implementation refined the
+> design, the affected sections say so.
 > Tracked as **Track 4** (VMM/pylond) and **Track 5** (guest kernel) in
 > `spec/05-implementation-status.md`.
 
