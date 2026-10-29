@@ -10,12 +10,21 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub const MAX_VCPUS: usize = 64;
 pub const PYLON_MAGIC: u64 = 0x5059_4C4F_4E56_4D31; // "PYLONVM1"
-pub const PYLON_ABI_VERSION: u32 = 1;
+/// ABI version in `PylonHeader::version`.
+///
+/// Version 2 keeps version 1's layout and changes who may write which field
+/// (`spec/06-guest-kick-path.md` §3): see the field docs of [`PylonVcpuSlot`].
+pub const PYLON_ABI_VERSION: u32 = 2;
 
-/// vCPU execution states in `PylonVcpuSlot::state`
+/// vCPU execution states in `PylonVcpuSlot::state`.
+///
+/// The vCPU's thread is blocked in the VMM, outside `KVM_RUN`. Written by the VMM.
 pub const VCPU_STATE_PARKED: u8 = 0;
+/// The vCPU runs guest code. Written by the VMM.
 pub const VCPU_STATE_RUNNING: u8 = 1;
+/// The guest asks to park this vCPU at its next exit. Written by the guest, for its own vCPU.
 pub const VCPU_STATE_PARKING: u8 = 2;
+/// Reserved. No longer written by `pylond`; a vCPU given a core stays `PARKED` until it wakes.
 pub const VCPU_STATE_WAKING: u8 = 3;
 
 /// Sentinel value indicating no physical CPU is assigned to a vCPU slot.
@@ -36,6 +45,8 @@ pub struct PylonHeader {
     pub version: u32,
     pub num_vcpus: u32,
     pub vm_id: u64,
+    /// TSC rate in kHz, or 0 if the writer doesn't know it. `pylond` then uses the host TSC
+    /// rate it measures itself.
     pub tsc_khz: u64,
     pub _reserved: [u8; 32],
 }
@@ -123,28 +134,33 @@ impl Default for PylonTelemetry {
 #[derive(Debug)]
 pub struct PylonVcpuSlot {
     // --- Lower 32B: Written by Guest / VMM vCPU thread ---
-    /// Current vCPU state (VCPU_STATE_*).
+    /// Current vCPU state (`VCPU_STATE_*`). The guest writes only `RUNNING -> PARKING`, for
+    /// its own vCPU; the VMM writes every other transition. `pylond` never writes it.
     pub state: AtomicU8,
     /// Non-zero when the guest vCPU holds a spinlock, is in an IRQ handler, or has preemption disabled.
     pub in_critical_section: AtomicU8,
     pub _pad_guest: [u8; 6],
-    /// TSC when the guest last yielded this vCPU.
+    /// Host TSC when the VMM last parked this vCPU. Written by the VMM.
     pub last_yield_tsc: AtomicU64,
-    /// Number of cooperative yields performed by this vCPU.
+    /// Number of times the VMM parked this vCPU, cooperatively or forced. Written by the VMM,
+    /// before it publishes `VCPU_STATE_PARKED`.
     pub yield_count: AtomicU64,
     pub _reserved_guest: [u8; 8],
 
     // --- Upper 32B: Written by Host (pylond & VMM init) ---
-    /// Set to 1 by pylond when requesting this vCPU to yield its physical core.
+    /// Set to 1 by `pylond` when requesting this vCPU to yield its physical core; cleared by
+    /// the VMM when it parks the vCPU.
     pub revoke_requested: AtomicU8,
-    /// Physical CPU core ID (pCPU) currently assigned to this vCPU by pylond.
+    /// Physical CPU core ID (pCPU) assigned to this vCPU, or reserved for it during a
+    /// revocation, by `pylond`; `PCPU_UNASSIGNED` if none. The VMM initializes it.
     pub assigned_pcpu: AtomicU8,
     pub _pad_host: [u8; 2],
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
     pub host_tid: AtomicU32,
-    /// Hard TSC deadline after which pylond will forcibly preempt the vCPU if it hasn't parked.
+    /// Host TSC deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
+    /// Written by `pylond` before it sets `revoke_requested`.
     pub revoke_deadline_tsc: AtomicU64,
-    /// Number of forced preemptions (deadline violations) on this vCPU.
+    /// Number of times the VMM force-parked this vCPU. Written by the VMM.
     pub forced_preempt_count: AtomicU64,
     pub _reserved_host: [u8; 8],
 }
