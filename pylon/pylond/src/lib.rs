@@ -498,6 +498,24 @@ impl VmHandle {
         Ok(self)
     }
 
+    /// Whether the VMM process that registered this VM has exited: `Some(true)` or
+    /// `Some(false)` when it is known through a pidfd, `None` when the registration had no PID.
+    pub fn vmm_exited(&self) -> Option<bool> {
+        let pidfd = self.inner.vmm_pidfd.as_ref()?;
+        // SAFETY: `pidfd_send_signal` with signal 0 only checks that the process behind `pidfd`
+        // still exists; the null `info` pointer is allowed.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                0,
+                ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        Some(ret != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+    }
+
     /// Sends the VMM's `kick_signal` to the thread of `vcpu_idx`, interrupting its `KVM_RUN`
     /// (`spec/06-guest-kick-path.md` §4.4). Returns `Ok(false)` without sending when the VMM gave
     /// no signal, its PID is unknown, the vCPU's thread ID isn't known yet, or the VMM has exited.
@@ -512,24 +530,10 @@ impl VmHandle {
                 num_vcpus: self.inner.num_vcpus,
             })?;
         let tid = slot.host_tid.load(Ordering::Acquire);
-        let (Some(signal), Some(pidfd)) = (self.inner.kick_signal, &self.inner.vmm_pidfd) else {
+        let Some(signal) = self.inner.kick_signal else {
             return Ok(false);
         };
-        if tid == 0 {
-            return Ok(false);
-        }
-        // SAFETY: `pidfd_send_signal` with signal 0 only checks that the process behind `pidfd`
-        // still exists; the null `info` pointer is allowed.
-        let alive = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                pidfd.as_raw_fd(),
-                0,
-                ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        } == 0;
-        if !alive {
+        if tid == 0 || self.vmm_exited() != Some(false) {
             return Ok(false);
         }
         let pid = self.inner.vmm_pid;
@@ -777,11 +781,12 @@ pub fn pin_current_thread_to_core(core_id: usize) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
-    use std::process::id as process_id;
+    use std::process::{Command, id as process_id};
     use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::thread;
     use std::time::{Duration, Instant};
+    use std::{fs, thread};
 
     use pylon_abi::{PCPU_UNASSIGNED, VCPU_STATE_PARKED, VCPU_STATE_RUNNING};
     use tokio::sync::watch;
@@ -790,7 +795,7 @@ mod tests {
 
     use super::*;
     use crate::control::{ControlPlane, send_policy_update, send_registration};
-    use crate::engine::{MatrixEngine, pause_cycles, read_tsc};
+    use crate::engine::{MatrixEngine, calibrate_tsc_khz, pause_cycles, read_tsc};
 
     struct TestVmRig {
         req: VmRegistrationRequest,
@@ -1406,6 +1411,118 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         vcpu_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_plane1_rejects_duplicate_vm_id_while_vmm_runs() {
+        let sock_path = unique_socket_path("dup");
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        // SAFETY: `getegid` has no preconditions.
+        let gid = unsafe { libc::getegid() };
+        let control = Arc::new(
+            ControlPlane::new(sock_path.clone(), Arc::clone(&snapshot))
+                .with_socket_permissions(Some(0o660), Some(gid)),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let control_task = {
+            let control = Arc::clone(&control);
+            tokio::spawn(async move { control.run(shutdown_rx).await })
+        };
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // The socket gets the requested mode and group.
+        let meta = fs::metadata(&sock_path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o660);
+        assert_eq!(meta.gid(), gid);
+
+        // Both registrations come from this process, so the first VMM is still running.
+        let register = |vm_id: u64| {
+            let sock = sock_path.clone();
+            async move {
+                let rig = build_test_vm(vm_id, 1, 0, 1, 1);
+                spawn_blocking(move || {
+                    send_registration(
+                        &sock,
+                        &rig.req,
+                        rig.shm_fd.as_raw_fd(),
+                        &[rig.kick_fds[0].as_raw_fd()],
+                        &[rig.wake_fds[0].as_raw_fd()],
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        assert!(register(80).await.accepted);
+        let second = register(80).await;
+        assert!(!second.accepted);
+        assert!(
+            second.message.contains("already registered"),
+            "{}",
+            second.message
+        );
+        assert_eq!(snapshot.load().len(), 1);
+        assert_eq!(snapshot.load()[0].vmm_exited(), Some(false));
+
+        let _ = shutdown_tx.send(true);
+        control_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_exited_vmm_is_removed_and_its_cores_freed() {
+        // A VMM that has exited: a child process, reaped after its pidfd is open.
+        let mut child = Command::new("true").spawn().unwrap();
+        let exited_rig = build_test_vm(90, 1, 0, 1, 1);
+        let exited = VmHandle::new(
+            &exited_rig.req,
+            exited_rig.shm_fd.try_clone().unwrap(),
+            vec![exited_rig.kick_fds[0].try_clone().unwrap()],
+            vec![exited_rig.wake_fds[0].try_clone().unwrap()],
+        )
+        .unwrap()
+        .with_vmm_pid(child.id() as i32)
+        .unwrap();
+        child.wait().unwrap();
+        assert_eq!(exited.vmm_exited(), Some(true));
+        // It is never signalled.
+        exited.shared_page().vcpus[0]
+            .host_tid
+            .store(child.id(), Ordering::Release);
+        assert!(!exited.signal_vcpu(0).unwrap());
+
+        let unknown = build_test_vm(91, 1, 0, 1, 1).handle;
+        assert_eq!(unknown.vmm_exited(), None);
+
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        ControlPlane::publish_vm_handle(&snapshot, exited);
+        ControlPlane::publish_vm_handle(&snapshot, unknown);
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
+        engine.set_core_state(7, CoreState::Assigned { vm_id: 90, vcpu: 0 });
+        pcpu_owners.write_owner(7, 90_001, 0);
+
+        assert_eq!(ControlPlane::remove_exited_vms(&snapshot), 1);
+        let ids: Vec<u64> = snapshot.load().iter().map(VmHandle::vm_id).collect();
+        assert_eq!(ids, vec![91]);
+
+        // Plane 2 frees the core the removed VM held, even with no VMs left at all.
+        snapshot.store(Arc::new(Vec::new()));
+        engine.poll_once(1_000);
+        assert_eq!(engine.core_state(7), CoreState::Idle);
+        assert_eq!(pcpu_owners.read_owner(7).0, 0);
+    }
+
+    #[test]
+    fn test_calibrated_tsc_rate_is_plausible() {
+        let tsc_khz = calibrate_tsc_khz(Duration::from_millis(20)).expect("x86_64 has a TSC");
+        // Any x86_64 TSC from the last two decades runs between 500 MHz and 10 GHz.
+        assert!((500_000..10_000_000).contains(&tsc_khz), "{tsc_khz} kHz");
     }
 
     #[test]
