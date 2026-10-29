@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::fs::OpenOptions;
+use std::array::from_fn;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -11,7 +12,7 @@ use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapType, Object, ObjectBuilder, OpenObject};
+use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapFlags, MapType, Object, ObjectBuilder, OpenObject};
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
@@ -20,6 +21,9 @@ pub const MAX_PCPUS: usize = 256;
 
 /// Name of the `BPF_F_MMAPABLE` array map inside `scx_pylon.bpf.o`.
 pub const PCPU_OWNERS_MAP_NAME: &str = "pylon_pcpu_owners";
+
+/// Name of the SMT sibling ring array map inside `scx_pylon.bpf.o`.
+pub const SMT_NEXT_MAP_NAME: &str = "pylon_smt_next";
 
 /// Name of the `sched_ext_ops` struct_ops map inside `scx_pylon.bpf.o`.
 pub const SCX_OPS_MAP_NAME: &str = "pylon_ops";
@@ -259,6 +263,56 @@ impl PcpuOwnerMap {
     }
 }
 
+/// Parses a kernel CPU list such as `"0,16"` or `"0-3,8"`. Returns `None` if
+/// it is malformed.
+pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for range in list.trim().split(',').filter(|r| !r.is_empty()) {
+        match range.split_once('-') {
+            Some((first, last)) => {
+                let first: usize = first.parse().ok()?;
+                let last: usize = last.parse().ok()?;
+                if first > last {
+                    return None;
+                }
+                cpus.extend(first..=last);
+            }
+            None => cpus.push(range.parse().ok()?),
+        }
+    }
+    Some(cpus)
+}
+
+/// Builds the SMT sibling ring for `pylon_smt_next`: each CPU maps to the
+/// next CPU on the same core, wrapping around, or to itself if it has no
+/// siblings. `siblings(cpu)` returns the CPU's `thread_siblings_list`.
+pub fn smt_ring(siblings: impl Fn(usize) -> Option<String>) -> [u32; MAX_PCPUS] {
+    let mut ring: [u32; MAX_PCPUS] = from_fn(|cpu| cpu as u32);
+    for (cpu, next) in ring.iter_mut().enumerate() {
+        let Some(mut core) = siblings(cpu).as_deref().and_then(parse_cpu_list) else {
+            continue;
+        };
+        core.retain(|&c| c < MAX_PCPUS);
+        core.sort_unstable();
+        core.dedup();
+        if let Some(pos) = core.iter().position(|&c| c == cpu) {
+            *next = core[(pos + 1) % core.len()] as u32;
+        }
+    }
+    ring
+}
+
+/// Reads the host's SMT sibling ring from
+/// `/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list`.
+pub fn host_smt_ring() -> [u32; MAX_PCPUS] {
+    smt_ring(|cpu| {
+        fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ))
+        .ok()
+    })
+}
+
 /// Userspace loader and handle for the `scx_pylon` `sched_ext` BPF dispatcher.
 pub struct ScxPylonUserspace {
     _obj: Object,
@@ -363,6 +417,30 @@ impl ScxPylonUserspace {
             PcpuOwnerMap::from_map_fd(bpf_map.as_fd())?
         };
 
+        // The ring must be in place before attaching: without it every CPU
+        // looks like a core of its own and siblings aren't kept apart.
+        let smt_map =
+            obj.maps()
+                .find(|m| m.name() == SMT_NEXT_MAP_NAME)
+                .ok_or(Error::MissingMap {
+                    map_name: SMT_NEXT_MAP_NAME,
+                })?;
+        let ring = host_smt_ring();
+        for (cpu, next) in ring.iter().enumerate() {
+            smt_map
+                .update(
+                    &(cpu as u32).to_ne_bytes(),
+                    &next.to_ne_bytes(),
+                    MapFlags::ANY,
+                )
+                .map_err(Error::Bpf)?;
+        }
+        let smt_cpus = ring
+            .iter()
+            .enumerate()
+            .filter(|&(cpu, &next)| next as usize != cpu)
+            .count();
+
         let mut ops_map = obj
             .maps_mut()
             .find(|m| m.name() == SCX_OPS_MAP_NAME)
@@ -371,7 +449,10 @@ impl ScxPylonUserspace {
             })?;
         let link = ops_map.attach_struct_ops().map_err(Error::Bpf)?;
 
-        log::info!("scx_pylon loaded and attached; mapped {MAX_PCPUS} pCPU owner slots");
+        log::info!(
+            "scx_pylon loaded and attached; mapped {MAX_PCPUS} pCPU owner slots, \
+             {smt_cpus} CPUs with SMT siblings"
+        );
 
         Ok(Self {
             _obj: obj,
@@ -429,9 +510,55 @@ mod tests {
             prog_names.iter().any(|n| n == "pylon_select_cpu"),
             "Expected pylon_select_cpu program in {prog_names:?}"
         );
+        for prog in [
+            "pylon_dispatch",
+            "pylon_enqueue",
+            "pylon_running",
+            "pylon_update_idle",
+        ] {
+            assert!(
+                prog_names.iter().any(|n| n == prog),
+                "Expected {prog} program in {prog_names:?}"
+            );
+        }
         assert!(
-            prog_names.iter().any(|n| n == "pylon_dispatch"),
-            "Expected pylon_dispatch program in {prog_names:?}"
+            open_obj.maps().any(|m| m.name() == SMT_NEXT_MAP_NAME),
+            "Expected {SMT_NEXT_MAP_NAME} map"
+        );
+    }
+
+    #[test]
+    fn test_parse_cpu_list() {
+        assert_eq!(parse_cpu_list("0,16\n"), Some(vec![0, 16]));
+        assert_eq!(parse_cpu_list("4-7,12"), Some(vec![4, 5, 6, 7, 12]));
+        assert_eq!(parse_cpu_list("3"), Some(vec![3]));
+        assert_eq!(parse_cpu_list("2-1"), None);
+        assert_eq!(parse_cpu_list("a"), None);
+    }
+
+    #[test]
+    fn test_smt_ring() {
+        // Two threads per core, siblings 16 apart, as on an EPYC 9124.
+        let ring = smt_ring(|cpu| (cpu < 32).then(|| format!("{},{}", cpu % 16, cpu % 16 + 16)));
+        assert_eq!(ring[0], 16);
+        assert_eq!(ring[16], 0);
+        assert_eq!(ring[15], 31);
+        assert_eq!(ring[31], 15);
+        // CPUs without topology are their own core.
+        assert_eq!(ring[32], 32);
+        assert_eq!(ring[255], 255);
+
+        // Four threads per core form a ring.
+        let ring =
+            smt_ring(|cpu| (cpu < 8).then(|| format!("{}-{}", cpu / 4 * 4, cpu / 4 * 4 + 3)));
+        assert_eq!(&ring[..8], &[1, 2, 3, 0, 5, 6, 7, 4]);
+
+        // SMT off: every CPU lists only itself.
+        let ring = smt_ring(|cpu| Some(cpu.to_string()));
+        assert!(
+            ring.iter()
+                .enumerate()
+                .all(|(cpu, &next)| next as usize == cpu)
         );
     }
 

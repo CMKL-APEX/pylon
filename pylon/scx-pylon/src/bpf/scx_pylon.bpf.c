@@ -8,6 +8,10 @@
  * Bypasses standard Linux sched_fair (EEVDF) wakeup latency and runqueue lock
  * contention when handing off a physical core (pCPU) from a Donor vCPU thread
  * to a Recipient vCPU thread.
+ *
+ * It also keeps SMT siblings apart: while a CPU runs a managed vCPU thread,
+ * its SMT siblings only run vCPU threads of the same VMM process or nothing.
+ * This replaces kernel core scheduling (PR_SCHED_CORE) for managed vCPUs.
  */
 
 #include "vmlinux.h"
@@ -16,6 +20,10 @@
 #include <bpf/bpf_core_read.h>
 
 #define MAX_PCPUS 256
+/* Longest SMT sibling ring followed in pylon_smt_next */
+#define MAX_SMT 8
+/* Most tasks examined per dispatch in the vCPU queue */
+#define MAX_VCPU_SCAN 32
 
 /* sched_ext DSQ and slice constants */
 #define SCX_DSQ_FLAG_BUILTIN (1ULL << 63)
@@ -26,6 +34,24 @@
 /* sched_ext kick flags */
 #define SCX_KICK_IDLE (1ULL << 0)
 #define SCX_KICK_PREEMPT (1ULL << 1)
+
+/*
+ * Custom DSQs. DSQ `cpu` (0..MAX_PCPUS-1) holds the owner of that pCPU,
+ * PYLON_VCPU_DSQ holds managed vCPU threads away from their pCPU, and
+ * PYLON_HOST_DSQ holds every other task.
+ */
+#define PYLON_HOST_DSQ 1024ULL
+#define PYLON_VCPU_DSQ 1025ULL
+
+/*
+ * Per-CPU claims: what a CPU runs or is about to run. CLAIM_NONE is idle,
+ * CLAIM_HOST is a task that isn't a managed vCPU, and any other value is the
+ * tgid of the VMM process whose vCPU thread runs there.
+ */
+#define CLAIM_NONE 0U
+#define CLAIM_HOST 0xffffffffU
+
+#define BPF_FOR_EACH_ITER (&___it)
 
 /* Flags in struct pcpu_owner_entry */
 #define PCPU_OWNER_FLAG_ACTIVE (1U << 0)
@@ -45,10 +71,217 @@ struct {
 } pylon_pcpu_owners SEC(".maps");
 
 /*
+ * SMT sibling ring, written by userspace before attaching: the next CPU on
+ * the same core, or the CPU itself when it has no siblings.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_PCPUS);
+    __type(key, __u32);
+    __type(value, __u32);
+} pylon_smt_next SEC(".maps");
+
+struct pylon_task_ctx {
+    /* tgid of the VMM process once the task has owned a pCPU, else 0 */
+    __u32 dom;
+    /* Last pCPU found owned by the task */
+    __s32 owned_cpu;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct pylon_task_ctx);
+} pylon_task_ctx SEC(".maps");
+
+__u32 cpu_claim[MAX_PCPUS];
+
+static __always_inline bool owns_cpu(struct task_struct *p, s32 cpu)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS || p->pid == 0) {
+        return false;
+    }
+    __u32 key = (__u32)cpu;
+    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
+    return entry && entry->target_tid == (__u32)p->pid;
+}
+
+/*
+ * Whether @p can't leave its CPU. BPF programs run with migration disabled,
+ * so a count of one on the current task is the program's own.
+ */
+static __always_inline bool is_migration_disabled(const struct task_struct *p)
+{
+    if (p->migration_disabled == 1) {
+        return bpf_get_current_task_btf() != p;
+    }
+    return p->migration_disabled;
+}
+
+static __always_inline __u32 owner_tid(s32 cpu)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS) {
+        return 0;
+    }
+    __u32 key = (__u32)cpu;
+    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
+    return entry ? entry->target_tid : 0;
+}
+
+static __always_inline s32 smt_next(s32 cpu)
+{
+    __u32 key = (__u32)cpu;
+    __u32 *next = bpf_map_lookup_elem(&pylon_smt_next, &key);
+    if (!next || *next >= MAX_PCPUS) {
+        return cpu;
+    }
+    return (s32)*next;
+}
+
+static __always_inline struct pylon_task_ctx *task_ctx(struct task_struct *p)
+{
+    return bpf_task_storage_get(&pylon_task_ctx, p, 0, 0);
+}
+
+static __always_inline __u32 task_claim(struct task_struct *p)
+{
+    struct pylon_task_ctx *tctx = task_ctx(p);
+    return tctx && tctx->dom ? tctx->dom : CLAIM_HOST;
+}
+
+/* Marks @p as a managed vCPU thread that owns @cpu. */
+static __always_inline void mark_owner(struct task_struct *p, s32 cpu)
+{
+    struct pylon_task_ctx *tctx =
+        bpf_task_storage_get(&pylon_task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (tctx) {
+        tctx->dom = (__u32)p->tgid;
+        tctx->owned_cpu = cpu;
+    }
+}
+
+static __always_inline __u32 read_claim(s32 cpu)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS) {
+        return CLAIM_NONE;
+    }
+    return *(volatile __u32 *)&cpu_claim[cpu];
+}
+
+/*
+ * Sets @cpu's claim. When a managed claim ends, wakes the SMT siblings it
+ * kept idle so they look for work again.
+ */
+static void set_claim(s32 cpu, __u32 claim)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS) {
+        return;
+    }
+
+    __u32 old = __atomic_exchange_n(&cpu_claim[cpu], claim, __ATOMIC_SEQ_CST);
+    if (old == CLAIM_NONE || old == CLAIM_HOST || old == claim) {
+        return;
+    }
+
+    s32 sib = cpu;
+    for (int i = 0; i < MAX_SMT; i++) {
+        sib = smt_next(sib);
+        if (sib == cpu) {
+            break;
+        }
+        scx_bpf_kick_cpu(sib, SCX_KICK_IDLE);
+    }
+}
+
+/*
+ * Whether @claim on @cpu yields to @other on its SMT sibling @sib. A managed
+ * claim beats a host claim, and between two managed VMs the lower-numbered
+ * CPU wins. The order is total, so two siblings never both back off.
+ */
+static __always_inline bool yields_to(s32 cpu, __u32 claim, s32 sib, __u32 other)
+{
+    if (other == CLAIM_NONE || other == claim) {
+        return false;
+    }
+    if (claim == CLAIM_HOST) {
+        return true;
+    }
+    if (other == CLAIM_HOST) {
+        return false;
+    }
+    return sib < cpu;
+}
+
+/* Whether a sibling of @cpu holds a claim that @claim yields to. */
+static bool fenced(s32 cpu, __u32 claim)
+{
+    s32 sib = cpu;
+
+    for (int i = 0; i < MAX_SMT; i++) {
+        sib = smt_next(sib);
+        if (sib == cpu) {
+            break;
+        }
+        if (yields_to(cpu, claim, sib, read_claim(sib))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Publishes @claim for @cpu, then checks its SMT siblings. Publishing before
+ * checking means two siblings claiming at once see each other. On success,
+ * siblings running something incompatible are kicked so they back off. On
+ * failure the claim is withdrawn.
+ */
+static bool claim_cpu(s32 cpu, __u32 claim)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS) {
+        return true;
+    }
+
+    set_claim(cpu, claim);
+    if (fenced(cpu, claim)) {
+        set_claim(cpu, CLAIM_NONE);
+        return false;
+    }
+
+    s32 sib = cpu;
+    for (int i = 0; i < MAX_SMT; i++) {
+        sib = smt_next(sib);
+        if (sib == cpu) {
+            break;
+        }
+        __u32 other = read_claim(sib);
+        if (other != CLAIM_NONE && other != claim) {
+            scx_bpf_kick_cpu(sib, SCX_KICK_PREEMPT);
+        }
+    }
+    return true;
+}
+
+/* Wakes an idle CPU that may run @p when @p's own CPU can't. */
+static void kick_idle_cpu(struct task_struct *p, __u32 claim)
+{
+    for (int i = 0; i < MAX_SMT; i++) {
+        s32 cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+        if (cpu < 0) {
+            return;
+        }
+        scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+        if (!fenced(cpu, claim)) {
+            return;
+        }
+    }
+}
+
+/*
  * scx_ops.select_cpu(p, prev_cpu, wake_flags)
  *
  * If task p->pid matches a target_tid in pylon_pcpu_owners, return that
- * assigned pCPU and insert directly into SCX_DSQ_LOCAL.
+ * assigned pCPU; enqueue then puts it on that pCPU's owner queue.
  */
 SEC("struct_ops/pylon_select_cpu")
 s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -56,13 +289,9 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
     __u32 task_tid = (__u32)p->pid;
 
     /* Fast check: does prev_cpu already belong to this vCPU thread? */
-    if (prev_cpu >= 0 && prev_cpu < MAX_PCPUS) {
-        __u32 key = (__u32)prev_cpu;
-        struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
-        if (entry && entry->target_tid == task_tid && task_tid != 0) {
-            scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_INF, wake_flags);
-            return prev_cpu;
-        }
+    if (owns_cpu(p, prev_cpu)) {
+        mark_owner(p, prev_cpu);
+        return prev_cpu;
     }
 
     /* Bounded scan over physical CPU slots to locate assigned pCPU for p->pid */
@@ -71,10 +300,7 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
         __u32 key = cpu;
         struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
         if (entry && entry->target_tid == task_tid && task_tid != 0) {
-            scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_INF, wake_flags);
-            if ((s32)cpu != prev_cpu) {
-                scx_bpf_kick_cpu((s32)cpu, SCX_KICK_PREEMPT);
-            }
+            mark_owner(p, (s32)cpu);
             return (s32)cpu;
         }
     }
@@ -84,48 +310,178 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
 }
 
 /*
+ * scx_ops.enqueue(p, enq_flags)
+ *
+ * The owner of a pCPU goes on that pCPU's queue and preempts whatever runs
+ * there. Other managed vCPU threads go on the vCPU queue and wake their own
+ * pCPU if they own one. A task that can't migrate stays on its CPU.
+ * Everything else goes on the host queue.
+ */
+SEC("struct_ops/pylon_enqueue")
+void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
+{
+    s32 cpu = scx_bpf_task_cpu(p);
+    struct pylon_task_ctx *tctx;
+
+    if (is_migration_disabled(p)) {
+        /* Short and pinned: it runs whatever the siblings run. */
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+    } else if (owns_cpu(p, cpu)) {
+        mark_owner(p, cpu);
+        scx_bpf_dsq_insert(p, (u64)cpu, SCX_SLICE_INF, enq_flags);
+        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+    } else if ((tctx = task_ctx(p)) && tctx->dom) {
+        scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
+        if (owns_cpu(p, tctx->owned_cpu)) {
+            scx_bpf_kick_cpu(tctx->owned_cpu, SCX_KICK_PREEMPT);
+        } else if (fenced(cpu, tctx->dom)) {
+            kick_idle_cpu(p, tctx->dom);
+        }
+    } else {
+        scx_bpf_dsq_insert(p, PYLON_HOST_DSQ, SCX_SLICE_DFL, enq_flags);
+        if (fenced(cpu, CLAIM_HOST)) {
+            kick_idle_cpu(p, CLAIM_HOST);
+        }
+    }
+
+    /*
+     * ENQ_LAST: this CPU has already decided to idle with @p runnable.
+     * Kick it so it schedules again once idle.
+     */
+    if (enq_flags & SCX_ENQ_LAST) {
+        scx_bpf_kick_cpu(cpu, 0);
+    }
+}
+
+/*
+ * Dispatches this pCPU's owner if it is queued, and moves any other task
+ * left on the owner queue (its ownership changed) to the queue it now
+ * belongs on. Returns true if the owner was dispatched.
+ */
+static bool dispatch_owner(s32 cpu)
+{
+    struct task_struct *p;
+    __u32 tid = owner_tid(cpu);
+    bool dispatched = false;
+
+    bpf_for_each(scx_dsq, p, (u64)cpu, 0) {
+        if (!dispatched && tid != 0 && (__u32)p->pid == tid) {
+            if (claim_cpu(cpu, task_claim(p)) &&
+                scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
+                dispatched = true;
+            }
+            continue;
+        }
+        if ((__u32)p->pid != tid) {
+            u64 dsq = task_claim(p) == CLAIM_HOST ? PYLON_HOST_DSQ : PYLON_VCPU_DSQ;
+            scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, dsq, 0);
+        }
+    }
+    return dispatched;
+}
+
+/*
+ * Dispatches the first task on the vCPU queue that may run on @cpu next to
+ * its SMT siblings. A thread that owns another pCPU is left for that pCPU,
+ * which enqueue has kicked.
+ */
+static bool dispatch_vcpu(s32 cpu)
+{
+    struct task_struct *p;
+    int scanned = 0;
+
+    bpf_for_each(scx_dsq, p, PYLON_VCPU_DSQ, 0) {
+        if (++scanned > MAX_VCPU_SCAN) {
+            break;
+        }
+        if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+            continue;
+        }
+        struct pylon_task_ctx *tctx = task_ctx(p);
+        if (!tctx) {
+            continue;
+        }
+        if (tctx->owned_cpu != cpu && owns_cpu(p, tctx->owned_cpu)) {
+            continue;
+        }
+        if (claim_cpu(cpu, tctx->dom ? tctx->dom : CLAIM_HOST) &&
+            scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * scx_ops.dispatch(cpu, prev)
  *
- * Look up pylon_pcpu_owners[cpu]. If target_tid != 0, dispatch the matching
- * vCPU task directly to the local CPU queue; if prev is a donor vCPU whose
- * target_tid was replaced (e.g., deadline expired), preempt prev immediately.
+ * Run the pCPU's owner if it is queued. Otherwise run a vCPU thread or a
+ * host task, but only what the SMT siblings' claims allow; if nothing fits,
+ * the CPU idles.
  */
 SEC("struct_ops/pylon_dispatch")
 void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
 {
-    if (cpu < 0 || cpu >= MAX_PCPUS) {
+    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu)) {
         return;
     }
-
-    __u32 key = (__u32)cpu;
-    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
-    if (!entry || entry->target_tid == 0) {
+    if (dispatch_vcpu(cpu)) {
         return;
     }
-
-    __u32 target_tid = entry->target_tid;
-
-    /*
-     * If prev was running on this CPU and its TID no longer matches the
-     * current owner target_tid (e.g., donor vCPU deadline expired and pylond
-     * reassigned the pCPU to a recipient vCPU), preempt prev immediately.
-     */
-    if (prev && (__u32)prev->pid != target_tid) {
-        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+    if (claim_cpu(cpu, CLAIM_HOST) && scx_bpf_dsq_move_to_local(PYLON_HOST_DSQ)) {
+        return;
     }
+    /* Nothing to run: the CPU goes idle. */
+    set_claim(cpu, CLAIM_NONE);
+}
 
-    /* Acquire the target vCPU task by kernel TID (pid) and dispatch to SCX_DSQ_LOCAL */
-    struct task_struct *target = bpf_task_from_pid((s32)target_tid);
-    if (target) {
-        scx_bpf_dsq_insert(target, SCX_DSQ_LOCAL, SCX_SLICE_INF, 0);
-        bpf_task_release(target);
+/*
+ * scx_ops.running(p)
+ *
+ * Record what this CPU runs, including tasks that the kernel queued locally
+ * without asking the scheduler. The claim isn't cleared when a task stops:
+ * dispatch has already claimed for the next task by then, and the CPU going
+ * idle clears it.
+ */
+SEC("struct_ops/pylon_running")
+void BPF_PROG(pylon_running, struct task_struct *p)
+{
+    set_claim(scx_bpf_task_cpu(p), task_claim(p));
+}
+
+/*
+ * scx_ops.update_idle(cpu, idle)
+ *
+ * An idle CPU claims nothing.
+ */
+SEC("struct_ops/pylon_update_idle")
+void BPF_PROG(pylon_update_idle, s32 cpu, bool idle)
+{
+    if (idle) {
+        set_claim(cpu, CLAIM_NONE);
     }
 }
 
-SEC("struct_ops/pylon_init")
+SEC("struct_ops.s/pylon_init")
 s32 BPF_PROG(pylon_init)
 {
-    return 0;
+    u32 nr_cpus = scx_bpf_nr_cpu_ids();
+    s32 ret;
+
+    if (nr_cpus > MAX_PCPUS) {
+        nr_cpus = MAX_PCPUS;
+    }
+    for (u32 cpu = 0; cpu < nr_cpus && cpu < MAX_PCPUS; cpu++) {
+        ret = scx_bpf_create_dsq(cpu, -1);
+        if (ret) {
+            return ret;
+        }
+    }
+    ret = scx_bpf_create_dsq(PYLON_VCPU_DSQ, -1);
+    if (ret) {
+        return ret;
+    }
+    return scx_bpf_create_dsq(PYLON_HOST_DSQ, -1);
 }
 
 SEC("struct_ops/pylon_exit")
@@ -136,9 +492,22 @@ void BPF_PROG(pylon_exit, struct scx_exit_info *info)
 SEC(".struct_ops.link")
 struct sched_ext_ops pylon_ops = {
     .select_cpu = (void *)pylon_select_cpu,
+    .enqueue = (void *)pylon_enqueue,
     .dispatch = (void *)pylon_dispatch,
+    .running = (void *)pylon_running,
+    .update_idle = (void *)pylon_update_idle,
     .init = (void *)pylon_init,
     .exit = (void *)pylon_exit,
+    /*
+     * Without ENQ_LAST, a CPU with nothing else to run keeps its previous
+     * task even when a sibling's claim forbids it. ENQ_EXITING and
+     * ENQ_MIGRATION_DISABLED route those tasks through enqueue too, which
+     * kicks the CPU; kernels without upstream 7a9df7667963 otherwise leave
+     * them stranded on an idle CPU. KEEP_BUILTIN_IDLE keeps the kernel's
+     * idle tracking alongside update_idle.
+     */
+    .flags = SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_EXITING |
+             SCX_OPS_ENQ_MIGRATION_DISABLED,
     .name = "pylon",
 };
 

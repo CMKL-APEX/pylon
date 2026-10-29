@@ -18,6 +18,8 @@ fn main() {
     cmd.args([
         "-target",
         "bpf",
+        // v3 for the atomic exchange on the per-CPU SMT claims.
+        "-mcpu=v3",
         "-O2",
         "-g",
         "-Wall",
