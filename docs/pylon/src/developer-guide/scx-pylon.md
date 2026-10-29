@@ -51,14 +51,18 @@ process's tgid: its *domain*.
 queue:
 
 - The owner of its CPU goes on that CPU's owner queue (DSQ id = CPU)
-  with an infinite slice, and the CPU is kicked with
-  `SCX_KICK_PREEMPT`. This is what preempts a donor whose CPU was given
+  with a 20 ms slice, and the CPU is kicked with `SCX_KICK_PREEMPT`. This is what preempts a donor whose CPU was given
   to a recipient.
 - Another vCPU thread with a domain goes on the vCPU queue. If it owns
   a CPU elsewhere, that CPU is kicked.
+- A host task allowed on only one CPU, such as a per-CPU kworker, goes
+  on that CPU's local queue, and an idle CPU is kicked.
 - Everything else goes on the host queue.
 
-A task with migration disabled stays on its CPU's local queue. With
+A task with migration disabled stays on its CPU's local queue too. The
+kernel runs a CPU's local queue before it asks `dispatch` for work, so
+when the owner's slice ends, a pinned task waiting there runs first. The
+owner then gets the CPU back. With
 `SCX_ENQ_LAST`, the CPU has already decided to idle with `p` runnable,
 so `enqueue` kicks it to schedule again.
 
@@ -104,12 +108,12 @@ Not isolated:
 
 - tasks of higher sched classes (RT, deadline, stop);
 - interrupts and softirqs;
-- tasks with migration disabled, which are short and pinned.
+- tasks with migration disabled, which are short and pinned;
+- host tasks allowed on only one CPU, mostly per-CPU kernel threads.
+  They can't wait for the CPU or its siblings to free up: a busy vCPU
+  may never block, and the kernel's watchdog would eject the scheduler.
 
-Kernel core scheduling doesn't isolate interrupts either. A host task
-that can only run on a fenced CPU waits until the vCPU next to it
-stops. If that takes longer than the watchdog timeout, the kernel ejects
-the scheduler.
+Kernel core scheduling doesn't isolate interrupts either.
 
 ## Core scheduling guard
 
@@ -151,9 +155,11 @@ The flags are `SCX_OPS_ENQ_LAST`, `SCX_OPS_ENQ_EXITING`,
   every task on the host that isn't on its owned CPU, including tasks
   that own nothing. A reverse map (thread ID to CPU) would make it one
   lookup.
-- An infinite slice means an owner runs until it blocks. Other tasks
-  queued on that CPU, or pinned to its siblings, wait. The kernel's
-  stall watchdog can eject the scheduler if they wait too long.
+- An owner gives up its CPU only to tasks that can run nowhere else,
+  for at most one slice each (20 ms). A busy task pinned to an owned
+  CPU therefore halves the owner's time. A task that can run on two
+  CPUs, both owned or fenced, still waits until a vCPU blocks, and the
+  stall watchdog can eject the scheduler.
 - The program is attached for the whole host (`.name = "pylon"`, no
   partial-switch flag), so every `SCHED_NORMAL` task goes through it.
 - Two VMs on sibling threads (only possible without `pylond`'s

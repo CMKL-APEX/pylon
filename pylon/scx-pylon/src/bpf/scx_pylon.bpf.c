@@ -29,7 +29,12 @@
 #define SCX_DSQ_FLAG_BUILTIN (1ULL << 63)
 #define SCX_DSQ_LOCAL (SCX_DSQ_FLAG_BUILTIN | 2ULL)
 #define SCX_SLICE_DFL 20000000ULL /* 20 ms default slice */
-#define SCX_SLICE_INF (~0ULL)     /* Infinite slice for dedicated pCPU owner */
+/*
+ * The owner of a pCPU gets its CPU back after each slice unless a task that
+ * can only run there is waiting. A finite slice lets the kernel run such a
+ * task (a per-CPU kworker, say) before the watchdog ejects scx_pylon.
+ */
+#define PYLON_OWNER_SLICE SCX_SLICE_DFL
 
 /* sched_ext kick flags */
 #define SCX_KICK_IDLE (1ULL << 0)
@@ -380,8 +385,11 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
  *
  * The owner of a pCPU goes on that pCPU's queue and preempts whatever runs
  * there. Other managed vCPU threads go on the vCPU queue and wake their own
- * pCPU if they own one. A task that can't migrate stays on its CPU.
- * Everything else goes on the host queue.
+ * pCPU if they own one. A task that can't migrate stays on its CPU, as does
+ * a host task allowed on only one CPU: on the host queue, it would wait
+ * behind that CPU's owner, or behind a sibling's claim, until the watchdog
+ * fires. Both run whatever the siblings run. Everything else goes on the host
+ * queue.
  */
 SEC("struct_ops/pylon_enqueue")
 void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
@@ -394,7 +402,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
     } else if (owns_cpu(p, cpu)) {
         mark_owner(p, cpu);
-        scx_bpf_dsq_insert(p, (u64)cpu, SCX_SLICE_INF, enq_flags);
+        scx_bpf_dsq_insert(p, (u64)cpu, PYLON_OWNER_SLICE, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     } else if ((tctx = task_ctx(p)) && tctx->dom) {
         scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
@@ -403,6 +411,9 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         } else if (fenced(cpu, tctx->dom)) {
             kick_idle_cpu(p, tctx->dom);
         }
+    } else if (p->nr_cpus_allowed == 1) {
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+        scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
     } else {
         scx_bpf_dsq_insert(p, PYLON_HOST_DSQ, SCX_SLICE_DFL, enq_flags);
         if (fenced(cpu, CLAIM_HOST)) {

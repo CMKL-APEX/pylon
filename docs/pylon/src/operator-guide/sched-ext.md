@@ -12,7 +12,7 @@ ID of the vCPU that owns it. `pylond` writes the table through a
 memory-mapped BPF map, with no system calls. The scheduler reads it:
 
 - **When a vCPU thread wakes**, `scx_pylon` looks up the CPU that thread
-  owns and queues it there with an unlimited time slice. If the thread
+  owns and queues it there. If the thread
   was last on another CPU, it kicks the owned CPU so the switch happens
   at once.
 - **When a CPU needs its next task**, `scx_pylon` dispatches the
@@ -50,9 +50,10 @@ cat /sys/kernel/sched_ext/root/ops       # "pylon"
 
 Before attaching it on a shared host:
 
-- An owned CPU runs its vCPU thread with an unlimited slice. Other
-  tasks on that CPU wait until the vCPU blocks. Keep host work off the
-  managed CPUs.
+- An owned CPU runs its vCPU thread until it blocks. Tasks that can run
+  only on that CPU, such as per-CPU kernel threads, get it for up to
+  20 ms at a time; other tasks wait or run elsewhere. Keep host work off
+  the managed CPUs and their SMT siblings.
 - The kernel watches `sched_ext` schedulers. If a runnable task is
   starved for too long (30 s by default), the kernel ejects the
   scheduler and logs why in `dmesg`. The host then runs on its normal
