@@ -76,7 +76,10 @@ be claimed:
 
 - The engine's sweep time, by number of VMs.
 - Kick to `PARKED`, and revocation to recipient running, between real
-  VMs, with and without `scx_pylon` (step S6).
+  VMs, with and without `scx_pylon` (step S6). `pylond` now records
+  revocation-to-`PARKED` latency per VM
+  (`pylon_vm_park_latency_microseconds`), but no run has been recorded
+  yet.
 - Wake latency of a parked vCPU in a real VM.
 - `scx_pylon`'s cost for non-VM tasks on the host.
 - The same `pylon-bench` run on a CPU with `WAITPKG`.

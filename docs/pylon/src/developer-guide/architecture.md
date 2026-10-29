@@ -55,11 +55,13 @@ Policy changes are the one exception: Plane 1 writes them straight into
    writes the header, and creates a kick and a wake `eventfd` for each
    vCPU slot.
 2. **VMM → Plane 1.** If `socket` exists, `register_with_daemon` sends
-   one message: newline-terminated JSON (`vm_id`, `num_vcpus`,
+   one message: newline-terminated JSON (`vm_id`, `num_vcpus`, `kick_signal`,
    `min_cores`, `max_cores`, `priority_weight`), with the file
    descriptors in `SCM_RIGHTS` in this order: the page, the kick
    `eventfd`s, the wake `eventfd`s.
 3. **Plane 1.** Maps the page from the descriptor, checks the header,
+   records the VMM's PID from `SO_PEERCRED` (with a pidfd, for signalling
+   it later),
    builds a `VmHandle`, and publishes a new VM list without any old
    entry that has the same `vm_id`. It replies with
    `{"accepted":true,...}`. The VMM doesn't wait for the reply.
@@ -81,7 +83,7 @@ When a managed CPU is idle (the fast path):
 3. **Plane 2, matching phase.** Picks a parked vCPU of that VM (vCPUs
    with stranded work first), and an idle managed CPU. It writes the
    vCPU's thread ID to that CPU's owner entry, sets the slot's
-   `assigned_pcpu` and `state = WAKING`, and writes the vCPU's wake
+   `assigned_pcpu`, and writes the vCPU's wake
    `eventfd`.
 4. **VMM.** The parked thread's blocking read returns. It sets
    `state = RUNNING` and enters `KVM_RUN`.
@@ -94,24 +96,29 @@ When no managed CPU is idle, the engine takes one from a donor:
 1. **Plane 2, matching phase.** Picks a donor vCPU on another VM
    ([donor selection](arbitration.md#phase-3-matching)), sets its
    `revoke_deadline_tsc` to now + 8 µs and `revoke_requested = 1`,
-   writes its kick `eventfd`, and marks the CPU `Revoking`.
-2. **Donor.** Is meant to notice, park, and set `state = PARKED`.
-3. **Plane 2, revocation phase.** On each sweep, checks the donor: once
-   it's `PARKED`, or the deadline has passed, the engine moves the CPU
-   to the recipient as in the fast path, and counts a cooperative yield
-   or a forced preemption.
+   writes its kick `eventfd`, reserves the recipient vCPU, and marks the
+   CPU `Revoking`.
+2. **Donor.** Is meant to notice, agree by writing `PARKING`, and exit
+   to the VMM, which parks it and writes `PARKED`.
+3. **Plane 2, revocation phase.** Once the donor is `PARKED`, moves the
+   CPU to the recipient as in the fast path. If the deadline passes
+   first, it signals the donor's thread with the VMM's `kick_signal`
+   until the VMM force-parks it, and gives up waiting 50 µs after the
+   deadline ([phase 2](arbitration.md#phase-2-revocations-in-flight)).
 4. **Kernel.** With `scx_pylon`, `dispatch` on that CPU sees a new owner
-   and preempts the donor thread.
+   and preempts the donor thread if it's still there.
 
-> **Today, step 2 doesn't happen as designed.** Nothing turns the kick
-> into a guest interrupt, and the VMM parks only on its next exit to
-> userspace. See [Enhancements](enhancements.md#problems-in-the-current-revocation-path).
+> **Today, step 2 doesn't happen.** Nothing turns the kick into a guest
+> interrupt, and no guest component writes `PARKING`, so every
+> revocation ends with step 3's forced park. See
+> [Enhancements](enhancements.md#problems-in-the-current-revocation-path).
 
 ## Flow: giving a core back
 
 When a vCPU parks while no revocation is pending, the engine's first
-phase sees `state = PARKED` with `revoke_requested = 0` on an assigned
-CPU. It meters the time so far, clears the owner entry, sets the slot's
+phase sees, on an assigned CPU, `state = PARKED` with
+`revoke_requested = 0` and a higher `yield_count` than at assignment.
+It meters the time so far, clears the owner entry, sets the slot's
 `assigned_pcpu` to unassigned, and marks the CPU `Idle`.
 
 ## Threads in a Pylon VMM

@@ -78,17 +78,17 @@ Two limits follow from the types: at most 64 vCPUs per VM, and
 
 ## Who writes what, today
 
-The design gives each field one writer. The code doesn't follow that
-yet:
+The design gives each field one writer. Since spec 06 step S2, `pylond`
+no longer writes `state`; `pylon-guest-agent` still does until step S3:
 
 | Field | Writers today |
 |---|---|
-| `state` | VMM (parks, wakes), `pylond` (`WAKING` when it assigns a core; `PARKED` when a deadline passes), `pylon-guest-agent` (`PARKED` when it "yields" a vCPU) |
-| `revoke_requested` | `pylond` (sets and clears), VMM (clears when parking), `pylon-guest-agent` (clears) |
+| `state` | VMM (parks, wakes), `pylon-guest-agent` (`PARKED` when it "yields" a vCPU) |
+| `revoke_requested` | `pylond` (sets), VMM (clears when parking), `pylon-guest-agent` (clears) |
 | `yield_count` | VMM, `pylon-guest-agent` |
-| `last_yield_tsc` | `pylon-guest-agent` |
-| `forced_preempt_count` | `pylond` |
-| `assigned_pcpu`, `revoke_deadline_tsc` | `pylond` |
+| `last_yield_tsc` | VMM, `pylon-guest-agent` |
+| `forced_preempt_count` | VMM (forced parks) |
+| `assigned_pcpu`, `revoke_deadline_tsc` | `pylond` (the VMM initializes `assigned_pcpu` to `PCPU_UNASSIGNED`) |
 | `host_tid` | VMM |
 
 Spec 06 §3 replaces this with strict ownership: the guest writes only

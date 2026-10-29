@@ -69,7 +69,7 @@ Line counts include tests and were taken on 2026-10-29.
 | `cloud-hypervisor/src/main.rs` | The `--pylon` argument | `PylonConfig::SYNTAX` |
 | `vmm/src/config.rs` | `VmParams.pylon`; parsing during `VmConfig` construction | `parse_and_configure` |
 | `vmm/src/memory_manager.rs` | `MemoryManager::new`; `Error::Pylon` | `setup_memory_region` |
-| `vmm/src/cpu.rs` | vCPU thread start; after each `KVM_RUN` exit; `VmExit::Reset`; shutdown | `on_vcpu_thread_start`, `check_and_park_vcpu`, `shutdown_all` |
+| `vmm/src/cpu.rs` | vCPU thread start; after each `KVM_RUN` exit; shutdown | `on_vcpu_thread_start`, `check_and_park_vcpu`, `shutdown_all` |
 | `vmm/src/lib.rs` | `pub mod pylon;` | — |
 | `vmm/Cargo.toml` | `pylon-abi` dependency | — |
 

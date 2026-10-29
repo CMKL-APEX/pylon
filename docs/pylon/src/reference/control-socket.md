@@ -28,8 +28,14 @@ rejected with `{"accepted": false, "message": "invalid control request:
 Sent by the VMM at start. You don't send this by hand.
 
 ```json
-{"vm_id": 17, "num_vcpus": 8, "min_cores": 1, "max_cores": 8, "priority_weight": 100}
+{"vm_id": 17, "num_vcpus": 8, "min_cores": 1, "max_cores": 8, "priority_weight": 100, "kick_signal": 34}
 ```
+
+`kick_signal` (optional) is the signal that interrupts a vCPU's
+`KVM_RUN` in the VMM: its `SIGRTMIN`. `pylond` sends it to a donor vCPU's
+thread when a revocation's deadline passes. It must be a real-time
+signal. Without it, `pylond` never signals the VMM. `pylond` takes the
+VMM's PID from the socket's peer credentials, not from the message.
 
 Attached descriptors, in order: the shared page's file, then
 `num_vcpus` kick `eventfd`s, then `num_vcpus` wake `eventfd`s (1 + 2 ×
@@ -39,7 +45,7 @@ Attached descriptors, in order: the shared page's file, then
 |---|---|
 | `{"accepted": true, "message": "registered"}` | The page's header is valid. Any VM already registered with the same `vm_id` is replaced. |
 | `{"accepted": false, "message": "expected <n> FDs, got <m>"}` | Wrong number of descriptors. |
-| `{"accepted": false, "message": "<error>"}` | The page couldn't be mapped, or its header is invalid. |
+| `{"accepted": false, "message": "<error>"}` | The page couldn't be mapped, its header is invalid, `kick_signal` isn't a real-time signal, or a pidfd for the peer couldn't be opened. |
 
 ## Stats
 
@@ -66,7 +72,8 @@ Attached descriptors, in order: the shared page's file, then
       "allocated_core_microseconds": 81234567,
       "cooperative_yields": 12,
       "forced_preemptions": 4,
-      "runnable_threads": 5
+      "runnable_threads": 5,
+      "handoffs_without_park": 0
     }
   ]
 }
@@ -77,8 +84,9 @@ Attached descriptors, in order: the shared page's file, then
 | `current_cores` | `u32` | vCPUs with an assigned CPU whose state isn't `PARKED`. |
 | `allocated_core_microseconds` | `u64` | Core-microseconds metered to the VM since it registered. |
 | `cooperative_yields` | `u64` | Revocations completed by the donor parking. |
-| `forced_preemptions` | `u64` | Revocations completed by the deadline. |
+| `forced_preemptions` | `u64` | Revocations whose deadline passed before the donor parked. |
 | `runnable_threads` | `u32` | The guest's last report. |
+| `handoffs_without_park` | `u64` | Revocations where the core was handed over although the donor never parked. Should stay at 0. |
 
 ## Policy update
 
