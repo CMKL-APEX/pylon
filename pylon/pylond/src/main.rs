@@ -19,6 +19,7 @@ use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, calibrate_tsc_khz};
 use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
+use scx_pylon::coresched::{GuardMode, KernelCoreSched};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 
@@ -51,6 +52,12 @@ struct CliArgs {
     /// Never attach the sched_ext BPF dispatcher.
     #[arg(long)]
     no_scx: bool,
+
+    /// Refuse to attach scx-pylon while any task has a core scheduling cookie. `auto` does
+    /// this only on kernels without the sched_ext core-scheduling fixes; `on` also on kernels
+    /// that seem to have them.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_guard: GuardMode,
 
     /// Permission bits for the control socket, in octal (e.g. 660). Default: the process umask.
     #[arg(long, value_parser = parse_socket_mode)]
@@ -178,17 +185,27 @@ fn main() -> Result<()> {
         args.socket.display()
     );
 
-    let scx = match scx_attach(&args, Path::new(SCHED_EXT_SYSFS).exists()) {
+    let attach = scx_attach(&args, Path::new(SCHED_EXT_SYSFS).exists());
+    let guard = attach != ScxAttach::No && {
+        let kernel = KernelCoreSched::detect();
+        let guard = kernel.needs_guard(args.core_sched_guard);
+        info!(
+            "Core scheduling: {kernel}; scx_pylon guard {}",
+            if guard { "on" } else { "off" }
+        );
+        guard
+    };
+    let scx = match attach {
         ScxAttach::Required => {
             info!("Loading and attaching scx_pylon sched_ext BPF dispatcher to kernel...");
             Some(
-                scx_pylon::ScxPylonUserspace::load_and_attach()
+                scx_pylon::ScxPylonUserspace::load_and_attach(guard)
                     .context("failed to load and attach scx_pylon sched_ext dispatcher")?,
             )
         }
         ScxAttach::Try => {
             info!("Kernel has sched_ext; attaching scx_pylon BPF dispatcher...");
-            match scx_pylon::ScxPylonUserspace::load_and_attach() {
+            match scx_pylon::ScxPylonUserspace::load_and_attach(guard) {
                 Ok(scx) => Some(scx),
                 Err(e) => {
                     warn!("scx_pylon not attached, using the in-memory pCPU table: {e:#}");
@@ -312,6 +329,16 @@ mod tests {
         );
         assert_eq!(scx_attach(&args(&["--no-scx"]), true), ScxAttach::No);
         CliArgs::try_parse_from(["pylond", "--enable-scx", "--no-scx"]).unwrap_err();
+    }
+
+    #[test]
+    fn core_sched_guard_defaults_to_auto() {
+        assert_eq!(args(&[]).core_sched_guard, GuardMode::Auto);
+        assert_eq!(
+            args(&["--core-sched-guard", "off"]).core_sched_guard,
+            GuardMode::Off
+        );
+        CliArgs::try_parse_from(["pylond", "--core-sched-guard", "maybe"]).unwrap_err();
     }
 
     #[test]

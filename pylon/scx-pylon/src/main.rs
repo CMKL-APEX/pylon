@@ -12,6 +12,7 @@ use std::{fs, thread};
 
 use clap::Parser;
 use log::info;
+use scx_pylon::coresched::{GuardMode, KernelCoreSched};
 use scx_pylon::{MAX_PCPUS, PcpuOwnerFlags, PcpuOwnerMap, ScxPylonUserspace};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -38,6 +39,11 @@ struct Args {
     /// Direct path to a file-backed `pylon_pcpu_owners` shared memory file.
     #[arg(long)]
     shm: Option<PathBuf>,
+
+    /// Refuse to attach while any task has a core scheduling cookie. `auto` does this
+    /// only on kernels without the sched_ext core-scheduling fixes.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_guard: GuardMode,
 }
 
 fn print_sched_ext_sysfs() {
@@ -108,8 +114,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Standalone attach mode
+    let kernel = KernelCoreSched::detect();
+    let guard = kernel.needs_guard(args.core_sched_guard);
+    info!(
+        "Core scheduling: {kernel}; guard {}",
+        if guard { "on" } else { "off" }
+    );
     info!("Loading and attaching scx_pylon to kernel sched_ext...");
-    let scx = ScxPylonUserspace::load_and_attach()?;
+    let scx = ScxPylonUserspace::load_and_attach(guard)?;
     info!("scx_pylon attached successfully; kernel sched_ext is enabled.");
 
     print_sched_ext_sysfs();

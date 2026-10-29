@@ -16,6 +16,8 @@ use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapFlags, MapType, Object, ObjectBui
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
+pub mod coresched;
+
 /// Maximum number of physical CPUs tracked in the `pylon_pcpu_owners` BPF map.
 pub const MAX_PCPUS: usize = 256;
 
@@ -123,6 +125,14 @@ pub enum Error {
     /// Failed to memory-map or initialize backing storage for the owner map.
     #[error("Memory-map I/O operation failed")]
     Io(#[source] io::Error),
+
+    /// Failed to look for tasks with a core scheduling cookie.
+    #[error("Failed to look for core scheduling cookies")]
+    CoreSchedScan(#[source] io::Error),
+
+    /// A task has a core scheduling cookie, which turns core scheduling on.
+    #[error("Thread {tid} ({comm}) has a core scheduling cookie")]
+    CoreSchedInUse { tid: i32, comm: String },
 }
 
 /// Result alias for `scx-pylon`.
@@ -402,8 +412,11 @@ impl ScxPylonUserspace {
     /// Loads `scx_pylon.bpf.o` into the kernel, attaches the `sched_ext_ops`
     /// struct_ops dispatcher, and `mmap`s `pylon_pcpu_owners` into userspace.
     ///
+    /// With `guard`, refuses to attach while any task has a core scheduling
+    /// cookie (see [`coresched`]).
+    ///
     /// Requires `CAP_BPF` / `CAP_SYS_ADMIN` and a kernel with `CONFIG_SCHED_EXT=y`.
-    pub fn load_and_attach() -> Result<Self> {
+    pub fn load_and_attach(guard: bool) -> Result<Self> {
         let open_obj = Self::open_embedded()?;
         let mut obj = open_obj.load().map_err(Error::Bpf)?;
 
@@ -440,6 +453,15 @@ impl ScxPylonUserspace {
             .enumerate()
             .filter(|&(cpu, &next)| next as usize != cpu)
             .count();
+
+        if guard
+            && let Some(thread) = coresched::find_cookied_thread().map_err(Error::CoreSchedScan)?
+        {
+            return Err(Error::CoreSchedInUse {
+                tid: thread.tid,
+                comm: thread.comm,
+            });
+        }
 
         let mut ops_map = obj
             .maps_mut()
