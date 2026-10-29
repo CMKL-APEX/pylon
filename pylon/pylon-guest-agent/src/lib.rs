@@ -257,19 +257,21 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
             .guest_heartbeat
             .fetch_add(1, Ordering::Relaxed);
 
-        // 3. Update head wait timestamp if threads are waiting for cores
+        // 3. Record (in guest TSC) when threads started waiting for a vCPU, and keep that time
+        //    while they still wait, so `pylond` sees how long the backlog has lasted.
         let active = page.active_vcpu_count();
+        let head_wait = &page.telemetry.head_wait_tsc;
         if runnable > active {
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: _rdtsc is a standard unprivileged x86 instruction with no side effects.
-            let now_tsc = unsafe { _rdtsc() };
-            #[cfg(not(target_arch = "x86_64"))]
-            let now_tsc = 1;
-            page.telemetry
-                .head_wait_tsc
-                .store(now_tsc, Ordering::Release);
-        } else if runnable <= 1 {
-            page.telemetry.head_wait_tsc.store(0, Ordering::Release);
+            if head_wait.load(Ordering::Relaxed) == 0 {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: _rdtsc is a standard unprivileged x86 instruction with no side effects.
+                let now_tsc = unsafe { _rdtsc() };
+                #[cfg(not(target_arch = "x86_64"))]
+                let now_tsc = 1;
+                head_wait.store(now_tsc, Ordering::Release);
+            }
+        } else {
+            head_wait.store(0, Ordering::Release);
         }
 
         Ok(runnable)
@@ -454,6 +456,22 @@ mod tests {
         assert_eq!(shared.vcpus[1].revoke_requested.load(Ordering::Acquire), 1);
         assert_eq!(shared.vcpus[1].yield_count.load(Ordering::Relaxed), 0);
         assert_eq!(st2.guest_heartbeat, 2);
+
+        // 4. The backlog's start time holds while threads still wait for a vCPU...
+        let head_wait = shared.telemetry.head_wait_tsc.load(Ordering::Acquire);
+        assert_ne!(head_wait, 0);
+        agent.update_telemetry().unwrap();
+        assert_eq!(
+            shared.telemetry.head_wait_tsc.load(Ordering::Acquire),
+            head_wait
+        );
+
+        // ...and clears once there are as many running vCPUs as runnable threads.
+        for slot in &shared.vcpus[..3] {
+            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+        }
+        agent.update_telemetry().unwrap();
+        assert_eq!(shared.telemetry.head_wait_tsc.load(Ordering::Acquire), 0);
 
         // Clean up raw pointer
         // SAFETY: Reconstituting Box from raw pointer for safe deallocation.
