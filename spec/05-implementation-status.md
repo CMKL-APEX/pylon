@@ -15,6 +15,30 @@
 | **Track 2** | `pylon/track-2-scx-pylon` | `pylon/scx-pylon`: `sched_ext` BPF C program (`scx_pylon.bpf.c`) & `libbpf-rs` `BPF_F_MMAPABLE` wrapper | Subagent 2 | `DONE` | `cargo test -p scx-pylon` |
 | **Track 3** | `pylon/track-3-vmm-hooks` | `vmm/src/pylon.rs` & surgical hooks in `vmm/src/config.rs`, `vmm/src/memory_manager.rs`, `vmm/src/cpu.rs` | Subagent 3 | `DONE` | `cargo test -p vmm --features kvm` |
 | **Integration** | `feat/pylon` | Merge `pylon/track-1-abi-pylond`, `pylon/track-2-scx-pylon`, `pylon/track-3-vmm-hooks` & full test suite | Coordinator | `DONE` | `cargo test -p pylon-abi -p pylond -p scx-pylon && cargo test -p vmm --features kvm` |
+| **Track 1C** | `main` (`97379cccd`) | `pylond`: `VmPolicyUpdate` IPC (runtime `min_cores`/`max_cores`/`priority_weight`) | Coordinator | `DONE` | `cargo test -p pylond` |
+| **Track 1D** | `feat/pylon-observability-metering` (#8) | `pylond`: core-µs residency metering, `VmStatsRequest`, Prometheus exporter (`--metrics-port`) | Coordinator | `DONE` | `cargo test -p pylond` |
+| **Track 2B** | `feat/pylon-scx-kernel-dispatch` (#7) | `scx-pylon`: live `sched_ext` struct_ops attach, `scx_pylon` CLI, `pylond --enable-scx` | Coordinator | `DONE` | `cargo test -p scx-pylon` (live attach in `tests/live_attach.rs` needs a `sched_ext` host) |
+| **Track 2C** | `feat/pylond-scx-auto` (#9) | `pylond`: auto-attach `scx_pylon` when `/sys/kernel/sched_ext` exists, falling back to the in-memory owner table; `--no-scx` | Coordinator | `DONE` | `cargo test -p pylond` |
+| **Track G** | `main` (`f44b3fd87`) | `pylon/pylon-guest-agent`: userspace telemetry & cooperation daemon | Coordinator | `DONE` ⚠️ | `cargo test -p pylon-guest-agent`. Its revocation handling is unsafe (P4); spec 06 S3 makes it telemetry-only. |
+| **E2E** | `main` (`d2c1485b2`, `dff66af86`) | `pylond/tests/e2e_pylon.rs`, real-KVM VMM test, `pylon-bench` (Pylon vs. ACPI hotplug) | Coordinator | `DONE` | `cargo test -p pylond --test e2e_pylon`; `cargo run --release -p pylond --bin pylon-bench -- --quick` |
+| **CI** | `main` (`45b35ba6d`, `e03b59cb7`) → re-enable in progress | `.github/workflows/pylon-ci.yaml`; upstream `ci.yaml` targets & feature matrix | Coordinator | `IN_PROGRESS` | See [CI Coverage](#ci-coverage) |
+| **Track 4** | *TBD* | Spec 06 S1–S4, S6: VMM park decision table, `pylond` forced-park via `tgkill`, `pylon-kick` PCI device + MSI-X kick FDs, latency metrics | *Unassigned* | `NOT_STARTED` | Per step in `spec/06-guest-kick-path.md §8` |
+| **Track 5** | *TBD* | Spec 06 S5: `pylon/guest/linux` `pv-pylon` kernel module | *Unassigned* | `NOT_STARTED` | Guest integration test (spec 06 §8) |
+
+---
+
+## Known Issues (Revocation Path)
+
+These were found while drafting `spec/06-guest-kick-path.md`; full details are in §1 of that spec. Until Track 4 S1–S3 land, **do not treat the cooperative revocation path as functional**.
+
+| ID | Summary | Fixed by |
+| :- | :--- | :--- |
+| P1 | Kick `EventFd`s are sent to `pylond` but never wired to a guest interrupt. | Track 4 S4 |
+| P2 | The HLT fast-park hook sits on `VmExit::Reset`. It never fires under KVM's in-kernel LAPIC, and it can swallow a guest triple-fault reset. | Track 4 S1 |
+| P3 | The VMM parks on any userspace exit while `revoke_requested == 1`, ignoring `in_critical_section`. | Track 4 S1 |
+| P4 | The guest agent marks other vCPUs `PARKED` and clears `revoke_requested` while those vCPUs are still running. | Track 4 S3 |
+| P5 | On deadline expiry, `pylond` writes `PARKED`/clears `revoke_requested` for a still-runnable vCPU. | Track 4 S2 |
+| P6 | `PylonVcpuSlot::state` has three writers and no ownership rules. | Spec 06 §3 (S1–S3) |
 
 ---
 
@@ -62,3 +86,28 @@
 - **Notes / Logs:**
   - Implemented `PylonConfig` and `PylonVmmState` in `vmm/src/pylon.rs`, including 8,192B `/dev/shm/<vm-id>-pylon` creation/mmap, `PylonHeader` initialization, `GuestRegionMmap` GPA mapping (`0xFEDF_0000`, `MAP_SHARED`, `MemoryVisibility::Shared`), optional `pylond` Unix socket `SCM_RIGHTS` registration, `gettid()` export to `PylonVcpuSlot::host_tid`, initial vCPU parking (`vcpu_id >= initial_active_vcpus`), and `revoke_requested` fast-park/wake lifecycle.
   - Verified with `cargo test -p vmm --features kvm --lib pylon` (6/6 passed), `cargo test -p vmm --features kvm --lib config` (38/38 passed), `cargo test -p cloud-hypervisor --features kvm --bin cloud-hypervisor` (44/44 passed), and `cargo clippy -p vmm -p cloud-hypervisor --features kvm --tests` (0 warnings).
+
+---
+
+## CI Coverage
+
+`e03b59cb7` masked a large part of the upstream `ci.yaml` matrix. On 2026-10-29 it was re-enabled **except** for jobs that need self-hosted runners, because `CMKL-APEX/pylon` has none registered (`gh api repos/CMKL-APEX/pylon/actions/runners` → 0).
+
+**Pylon host crates on cross/musl targets:** `pylond` and `scx-pylon` are x86_64 glibc host daemons. `scx-pylon` builds a BPF object with `clang` and links vendored `libbpf` against `libelf`/`zlib`, and `pylond` depends on it. The cross and musl jobs therefore pass `--exclude scx-pylon --exclude pylond`, through a `pylon_exclude` matrix variable in `quality` and `build`. `scripts/run_unit_tests.sh` already does the same for musl. `pylon-abi`, `pylon-guest-agent`, and `vmm/src/pylon.rs` are still built on every target.
+
+| Job / step | Status | Verified locally (2026-10-29) |
+| :--- | :--- | :--- |
+| `quality` x86_64-gnu: clippy `mshv`, `mshv,kvm`, `pvmemcontrol`, `fw_cfg`, `ivshmem`, `kvm,sev_snp`, `mshv,sev_snp`, `mshv,igvm,sev_snp`, `kvm,igvm`, `mshv,igvm`, `kvm,igvm,sev_snp,fw_cfg`, `sev_snp,igvm,fw_cfg` | Re-enabled | ✅ All 12 pass `cargo clippy --locked --all --all-targets --tests --examples -- -D warnings` |
+| `quality` x86_64-musl | Re-enabled (Pylon host crates excluded) | ✅ `cargo check` of `pylon-abi`, `pylon-guest-agent`, `vmm`, `cloud-hypervisor` for the musl target |
+| `quality` aarch64-gnu / aarch64-musl | Re-enabled (Pylon host crates excluded) | ⚠️ Not verified: no aarch64 sysroot/`cross` on the dev host. `vmm/src/pylon.rs` has no arch-specific code outside a `cfg(target_arch = "x86_64")` test. |
+| `formatting` aarch64-musl | Re-enabled | n/a (`rustfmt` only) |
+| `build` x86_64-musl + `mshv`/`sev_snp`/`igvm` build steps | Re-enabled (Pylon host crates excluded from release `--all`) | ✅ x86_64-gnu feature builds covered by the clippy runs above |
+| `build-riscv64` | Re-enabled | ⚠️ Not verified (no riscv64 sysroot); builds only `cloud-hypervisor` |
+| `unit-tests-x86-64` musl | Re-enabled | ⚠️ Not verified (runs in the `dev_cli.sh` container) |
+| `virtio-villain` | Re-enabled (GitHub-hosted runner with KVM) | ⚠️ Not verified |
+| `integration-x86-64-pr` | **Still disabled** (`garm-noble-16` self-hosted runner) | — |
+| `integration-x86-64-mq`, `-graviton`, `-vfio`, `-windows`, `-mshv-x86-64`, `-sev-snp` | Unchanged (merge-queue/push only; self-hosted runners) | — |
+| `integration-metrics.yaml` | Gated on `github.repository == 'cloud-hypervisor/cloud-hypervisor'`; it used to queue forever on fork `main` pushes (`garm-jammy-16` runner absent) | — |
+
+**Follow-ups:**
+- Gate the remaining self-hosted jobs in `ci.yaml` on `github.repository == 'cloud-hypervisor/cloud-hypervisor'` instead of `if: false`, as `integration-metrics.yaml` now is, or register equivalent runners for the fork.
