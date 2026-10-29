@@ -52,8 +52,8 @@ the host on the hot path. Its layout is defined once, in
 | 0 | `runnable_threads` | `u32` | Runnable threads in the guest, running or queued. | `pylon-guest-agent` |
 | 4 | `rx_ring_cons_idx` | `u32` | Guest network receive ring's consumer index, compared with the host's doorbell to wake a zero-core VM. | Nothing |
 | 8 | `stranded_work_bitmap` | `u64` | Bit *n* set: parked vCPU *n* has queued work. `pylond` wakes those first. | Nothing |
-| 16 | `head_wait_tsc` | `u64` | TSC when the oldest runnable thread started waiting; `0` if none. | `pylon-guest-agent` |
-| 24 | `next_timer_tsc` | `u64` | TSC of the guest's next timer, to wake a zero-core VM. | Nothing |
+| 16 | `head_wait_tsc` | `u64` | Guest TSC since which runnable threads have waited for a vCPU; `0` if none. | `pylon-guest-agent` |
+| 24 | `next_timer_tsc` | `u64` | Guest TSC of the guest's next timer, to wake a zero-core VM. | Nothing (the VMM's `park_timer_deadline_tsc` covers armed timers) |
 | 32 | `guest_heartbeat` | `u64` | Incremented on every guest update. | `pylon-guest-agent` |
 | 40 | `_pad` | 16 bytes | | |
 
@@ -63,15 +63,15 @@ the host on the hot path. Its layout is defined once, in
 |---|---|---|---|
 | 0 | `state` | `u8` | `PARKED` = 0, `RUNNING` = 1, `PARKING` = 2, `WAKING` = 3 |
 | 1 | `in_critical_section` | `u8` | Non-zero while the vCPU holds a spinlock, handles an interrupt or has preemption disabled |
-| 8 | `last_yield_tsc` | `u64` | TSC of the vCPU's last yield |
+| 8 | `last_yield_tsc` | `u64` | Host TSC of the vCPU's last yield |
 | 16 | `yield_count` | `u64` | Number of yields |
-| 24 | `_reserved_guest` | 8 bytes | |
+| 24 | `park_timer_deadline_tsc` | `u64` | Host TSC at which the guest's TSC-deadline timer was due when the VMM parked the vCPU; `0` if none. Cleared when the vCPU runs. |
 | **32** | `revoke_requested` | `u8` | `1`: `pylond` wants this vCPU to give up its core |
 | 33 | `assigned_pcpu` | `u8` | Host CPU assigned by `pylond`; `255` (`PCPU_UNASSIGNED`) if none |
 | 36 | `host_tid` | `u32` | The vCPU thread's Linux thread ID, written by the VMM |
 | 40 | `revoke_deadline_tsc` | `u64` | TSC after which `pylond` stops waiting for a yield |
 | 48 | `forced_preempt_count` | `u64` | Revocations whose deadline passed |
-| 56 | `_reserved_host` | 8 bytes | |
+| 56 | `guest_tsc_offset` | `u64` | Guest TSC minus host TSC (wrapping), measured by the VMM before the vCPU first runs; `0` if unknown |
 
 Two limits follow from the types: at most 64 vCPUs per VM, and
 `assigned_pcpu` can only name host CPUs 0–254.
@@ -87,12 +87,27 @@ docs in `pylon-abi` say which:
 | `revoke_requested` | `pylond` sets it; the VMM clears it when it parks the vCPU. |
 | `yield_count`, `last_yield_tsc`, `forced_preempt_count` | The VMM, when it parks the vCPU. |
 | `assigned_pcpu`, `revoke_deadline_tsc` | `pylond`. The VMM initializes `assigned_pcpu` to `PCPU_UNASSIGNED`. |
-| `host_tid` | The VMM. |
+| `host_tid`, `guest_tsc_offset`, `park_timer_deadline_tsc` | The VMM. |
 | Telemetry | The guest (today `pylon-guest-agent`, which writes nothing else). |
 
 Version 2 has the same layout as version 1. The version changed because
 version-1 guest components broke these rules; a version-1 agent refuses
-a version-2 page, and the other way round.
+a version-2 page, and the other way round. `park_timer_deadline_tsc` and
+`guest_tsc_offset` were added later in version 2, in bytes that were
+reserved and zero, and readers treat `0` as "not provided", so they
+didn't need a new version.
+
+## Time bases
+
+The guest writes `head_wait_tsc` and `next_timer_tsc` with its own
+`rdtsc`. Under KVM that differs from the host's TSC by the vCPU's TSC
+offset (a new vCPU's TSC starts near 0). The VMM measures the offset
+when each vCPU thread starts, by reading the guest's `IA32_TSC` between
+two host `rdtsc`s, and stores it in `guest_tsc_offset`.
+`PylonSharedPage::guest_to_host_tsc` subtracts vCPU 0's offset, since KVM
+keeps a VM's vCPU TSCs in sync. The conversion assumes the guest TSC
+runs at the host's rate (no TSC scaling). Every other TSC field is host
+TSC.
 
 ## Memory ordering
 
@@ -109,10 +124,13 @@ for these pairs.
 ## The page in guest memory
 
 The VMM maps the page as a shared memory slot at `PYLON_DEFAULT_GPA`
-(`0xFEDF_0000`), or at `--pylon gpa=`. That address sits in the 32-bit
-reserved range below the local APIC on x86_64. The page is also added
-to the VMM's guest memory map, so it appears in the guest's E820 table
-as an 8 KiB RAM range ([Status](../status.md#what-doesnt-work-yet)).
+(`0xFEDF_0000`), or at `--pylon gpa=`. On x86_64 that address sits
+between the IOAPIC and the local APIC, outside the PCI windows. Like a
+device BAR, the page is not part of the VMM's guest RAM
+(`GuestMemoryMmap`), so the guest's E820 table, the PVH memory map and
+ACPI don't list it. `MemoryManager` keeps the mapping alive for the
+VM's lifetime. A guest maps it through `/dev/mem`, which
+`CONFIG_STRICT_DEVMEM` allows for addresses that aren't RAM.
 
 ## Changing the ABI
 

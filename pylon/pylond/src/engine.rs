@@ -274,9 +274,10 @@ impl MatrixEngine {
     }
 
     /// Selects a parked vCPU (`VCPU_STATE_PARKED`) for `vm`, checking `stranded_work_bitmap`
-    /// first via `trailing_zeros()` (`tzcnt`) before scanning remaining vCPU slots.
+    /// first via `trailing_zeros()` (`tzcnt`), then a vCPU whose timer is due at `now_tsc`
+    /// (`park_timer_deadline_tsc`), before scanning remaining vCPU slots.
     #[inline]
-    pub fn select_parked_vcpu(vm: &VmHandle) -> Option<u8> {
+    pub fn select_parked_vcpu(vm: &VmHandle, now_tsc: u64) -> Option<u8> {
         let page = vm.shared_page();
         let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
         let mut bitmap = page.telemetry.stranded_work_bitmap.load(Ordering::Acquire);
@@ -293,14 +294,37 @@ impl MatrixEngine {
             bitmap &= !bit;
         }
 
+        let mut first_parked = None;
         let mut idx = 0usize;
         while idx < num_vcpus {
-            if Self::is_unassigned_parked(&page.vcpus[idx]) {
-                return Some(idx as u8);
+            let slot = &page.vcpus[idx];
+            if Self::is_unassigned_parked(slot) {
+                if Self::park_timer_due(slot, now_tsc) {
+                    return Some(idx as u8);
+                }
+                first_parked = first_parked.or(Some(idx as u8));
             }
             idx += 1;
         }
-        None
+        first_parked
+    }
+
+    /// Whether the guest timer that was armed when `slot`'s vCPU parked is due. A parked
+    /// vCPU's timer interrupt can't fire until the vCPU gets a core again.
+    #[inline]
+    fn park_timer_due(slot: &PylonVcpuSlot, now_tsc: u64) -> bool {
+        let deadline = slot.park_timer_deadline_tsc.load(Ordering::Relaxed);
+        deadline != 0 && now_tsc >= deadline
+    }
+
+    /// Whether any of `vm`'s unassigned parked vCPUs has a timer due at `now_tsc`.
+    #[inline]
+    fn any_park_timer_due(vm: &VmHandle, now_tsc: u64) -> bool {
+        let page = vm.shared_page();
+        let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+        page.vcpus[..num_vcpus]
+            .iter()
+            .any(|slot| Self::is_unassigned_parked(slot) && Self::park_timer_due(slot, now_tsc))
     }
 
     /// A vCPU is free to receive a core when it is parked and no core is on its way to it.
@@ -463,7 +487,9 @@ impl MatrixEngine {
 
             let page = vm.shared_page();
             let runnable = page.telemetry.runnable_threads.load(Ordering::Acquire);
-            let raw_head_wait = page.telemetry.head_wait_tsc.load(Ordering::Relaxed);
+            // The guest writes these on its own TSC; see `PylonSharedPage::guest_to_host_tsc`.
+            let raw_head_wait =
+                page.guest_to_host_tsc(page.telemetry.head_wait_tsc.load(Ordering::Relaxed));
             let head_wait = if raw_head_wait > 0 {
                 now_tsc.saturating_sub(raw_head_wait)
             } else {
@@ -472,8 +498,10 @@ impl MatrixEngine {
 
             let mut zero_core_wakeup = false;
             if committed_cores == 0 {
-                let next_timer_tsc = page.telemetry.next_timer_tsc.load(Ordering::Relaxed);
-                let timer_expired = next_timer_tsc != 0 && now_tsc >= next_timer_tsc;
+                let next_timer_tsc =
+                    page.guest_to_host_tsc(page.telemetry.next_timer_tsc.load(Ordering::Relaxed));
+                let timer_expired = (next_timer_tsc != 0 && now_tsc >= next_timer_tsc)
+                    || Self::any_park_timer_due(vm, now_tsc);
                 let rx_cons = page.telemetry.rx_ring_cons_idx.load(Ordering::Relaxed);
                 let rx_pending = vm.host_rx_doorbell() > rx_cons;
                 if timer_expired || rx_pending {
@@ -633,7 +661,7 @@ impl MatrixEngine {
             while self.eval_buf[order_idx].needed_cores() > 0 {
                 let recipient_eval = self.eval_buf[order_idx];
                 let recipient_vm = &vms[recipient_eval.vm_idx];
-                let Some(recipient_vcpu) = Self::select_parked_vcpu(recipient_vm) else {
+                let Some(recipient_vcpu) = Self::select_parked_vcpu(recipient_vm, now_tsc) else {
                     break;
                 };
 

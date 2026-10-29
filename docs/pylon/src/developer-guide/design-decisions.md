@@ -125,8 +125,9 @@ and runs without it otherwise ([#9](https://github.com/CMKL-APEX/pylon/pull/9)).
 **Why.** It needs no device model, and a guest can find it with no
 discovery protocol. The reason isn't recorded beyond simplicity.
 
-**Cost.** The address isn't reserved in Cloud Hypervisor's layout, and
-the page shows up in the guest's E820 table as RAM. Spec 06 adds a PCI
+**Cost.** The address isn't reserved in Cloud Hypervisor's layout. The
+page has its own memory slot but isn't guest RAM, so it stays out of the
+guest's E820 table (it used to be listed as RAM). Spec 06 adds a PCI
 device that reports the address, and §9 plans to move the page into its
 BAR.
 

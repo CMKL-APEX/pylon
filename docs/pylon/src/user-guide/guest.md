@@ -27,9 +27,10 @@ default):
   `/proc/loadavg` (or `procs_running` in `/proc/stat`), to
   `runnable_threads`;
 - increments `guest_heartbeat`;
-- when there are more runnable threads than running vCPUs, writes the
-  current TSC to `head_wait_tsc`, and clears it when one thread or
-  fewer is runnable.
+- when there are more runnable threads than running vCPUs, records the
+  guest TSC at which that started in `head_wait_tsc`, keeps it while
+  threads still wait, and clears it once there are enough running
+  vCPUs.
 
 Build it on the host and copy it into the guest:
 

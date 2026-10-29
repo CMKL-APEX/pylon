@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fs, io, ptr, result};
 
-use hypervisor::{HypervisorVmError, MemoryVisibility, Vm};
+#[cfg(target_arch = "x86_64")]
+use hypervisor::arch::x86::{MsrEntry, msr_index};
+use hypervisor::{HypervisorVmError, MemoryVisibility, Vcpu, Vm};
 use log::{info, warn};
 use option_parser::{OptionParser, OptionParserError};
 use pylon_abi::{
@@ -26,12 +28,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::mmap::MmapRegionError;
-use vm_memory::{Address, GuestAddress, GuestMemoryRegion, GuestRegionCollectionError, MmapRegion};
+use vm_memory::{Address, GuestAddress, GuestMemoryRegion, MmapRegion};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::SIGRTMIN;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::{GuestMemoryMmap, GuestRegionMmap};
+use crate::GuestRegionMmap;
 
 /// TSC rate written into `PylonHeader`: unknown. The VMM writes the header before any vCPU
 /// exists, so it can't ask KVM; `pylond` measures the host TSC rate itself instead.
@@ -92,10 +94,6 @@ pub enum Error {
     /// Failed to construct the `GuestRegionMmap` at the requested GPA.
     #[error("Failed to create Pylon GuestRegionMmap at GPA {0:#x}")]
     GuestRegionNew(u64),
-
-    /// Failed to insert the Pylon `GuestRegionMmap` into `GuestMemoryMmap`.
-    #[error("Failed to insert Pylon region into guest memory")]
-    GuestMemoryInsert(#[source] GuestRegionCollectionError),
 
     /// Failed to register the Pylon shared memory region with the hypervisor.
     #[error("Failed to register Pylon user memory region with hypervisor")]
@@ -401,10 +399,14 @@ impl PylonVmmState {
 
     /// Maps the 8,192-byte `/dev/shm/<vm-id>-pylon` backing file into guest physical memory
     /// at `self.config.gpa` (`0xFEDF_0000` by default) with `MAP_SHARED`.
+    ///
+    /// The page gets its own hypervisor memory slot but stays out of `GuestMemoryMmap`, like a
+    /// device BAR: anything built from guest RAM (E820, PVH memmap, ACPI, hotplug layout)
+    /// would otherwise report it to the guest as RAM inside the 32-bit reserved hole. The
+    /// caller must keep the returned region alive as long as the VM.
     pub fn setup_gpa_mapping(
         &self,
         vm: &Arc<dyn Vm>,
-        guest_memory: &mut GuestMemoryMmap,
         next_memory_slot: &mut u32,
     ) -> result::Result<Arc<GuestRegionMmap>, Error> {
         let shm_clone = self.shm_file.try_clone().map_err(Error::ShmOpen)?;
@@ -423,15 +425,11 @@ impl PylonVmmState {
             GuestRegionMmap::new(mmap_region, gpa).ok_or(Error::GuestRegionNew(self.config.gpa))?,
         );
 
-        *guest_memory = guest_memory
-            .insert_region(Arc::clone(&region))
-            .map_err(Error::GuestMemoryInsert)?;
-
         let slot = *next_memory_slot;
         *next_memory_slot += 1;
 
-        // SAFETY: `region` is a valid `MAP_SHARED` mapping of `PYLON_SHARED_PAGE_SIZE` bytes
-        // whose backing `Arc<GuestRegionMmap>` is retained inside `guest_memory`.
+        // SAFETY: `region` is a valid `MAP_SHARED` mapping of `PYLON_SHARED_PAGE_SIZE` bytes,
+        // and the caller keeps the returned `Arc<GuestRegionMmap>` alive with the VM.
         unsafe {
             vm.create_user_memory_region(
                 slot,
@@ -506,9 +504,10 @@ impl PylonVmmState {
         }
     }
 
-    /// Called at the start of each vCPU thread (`vmm/src/cpu.rs`):
-    /// records `gettid()` in `host_tid` and parks vCPUs with `vcpu_id >= initial_active_vcpus`.
-    pub fn on_vcpu_thread_start(&self, vcpu_id: u32) {
+    /// Called at the start of each vCPU thread (`vmm/src/cpu.rs`): records `gettid()` in
+    /// `host_tid`, records the guest TSC offset measured with `read_guest_tsc` in
+    /// `guest_tsc_offset`, and parks vCPUs with `vcpu_id >= initial_active_vcpus`.
+    pub fn on_vcpu_thread_start(&self, vcpu_id: u32, read_guest_tsc: impl FnOnce() -> Option<u64>) {
         // SAFETY: `libc::gettid()` is always safe to call in a Linux thread context.
         let tid = unsafe { libc::gettid() as u32 };
         self.register_vcpu_tid(vcpu_id, tid);
@@ -516,6 +515,10 @@ impl PylonVmmState {
         let Some(slot) = self.vcpu_slot(vcpu_id) else {
             return;
         };
+
+        if let Some(offset) = measure_guest_tsc_offset(read_guest_tsc) {
+            slot.guest_tsc_offset.store(offset, Ordering::Release);
+        }
 
         if vcpu_id >= self.initial_active_vcpus {
             slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
@@ -538,7 +541,15 @@ impl PylonVmmState {
     /// `revoke_requested`, updates the yield counters, publishes `VCPU_STATE_PARKED`, blocks until
     /// woken by `pylond` (or VM shutdown), and restores `VCPU_STATE_RUNNING`. Returns `true` if
     /// the vCPU parked and woke up.
-    pub fn check_and_park_vcpu(&self, vcpu_id: u32) -> bool {
+    ///
+    /// Before parking, publishes the guest's armed TSC-deadline timer (`read_guest_timer`, in
+    /// guest TSC) as `park_timer_deadline_tsc` in host TSC, so `pylond` can give the vCPU a
+    /// core back when the timer is due: a parked vCPU's timer interrupt can't fire.
+    pub fn check_and_park_vcpu(
+        &self,
+        vcpu_id: u32,
+        read_guest_timer: impl FnOnce() -> Option<u64>,
+    ) -> bool {
         let Some(slot) = self.vcpu_slot(vcpu_id) else {
             return false;
         };
@@ -562,10 +573,16 @@ impl PylonVmmState {
         if decision == ParkDecision::Forced {
             slot.forced_preempt_count.fetch_add(1, Ordering::Relaxed);
         }
+        let timer = guest_timer_to_host(
+            read_guest_timer(),
+            slot.guest_tsc_offset.load(Ordering::Relaxed),
+        );
+        slot.park_timer_deadline_tsc.store(timer, Ordering::Relaxed);
         slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
 
         self.park_vcpu(vcpu_id);
 
+        slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
         if !self.shutting_down.load(Ordering::Acquire) {
             slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
         }
@@ -644,6 +661,70 @@ fn read_host_tsc() -> u64 {
     0
 }
 
+/// Measures guest TSC minus host TSC (wrapping) by reading the guest TSC between two host
+/// TSC reads. KVM computes a host-initiated `IA32_TSC` read from the host TSC at the time of
+/// the read, so the error is about half the ioctl's duration. Returns `None` if the guest TSC
+/// can't be read, or if the result is 0, which `guest_tsc_offset` reserves for "unknown".
+fn measure_guest_tsc_offset(read_guest_tsc: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    let before = read_host_tsc();
+    let guest = read_guest_tsc()?;
+    let after = read_host_tsc();
+    if before == 0 || after < before {
+        return None;
+    }
+    let offset = guest.wrapping_sub(before + (after - before) / 2);
+    (offset != 0).then_some(offset)
+}
+
+/// Converts a guest TSC-deadline timer value to host TSC for `park_timer_deadline_tsc`.
+/// Returns 0 if no timer is armed (the MSR reads 0) or the offset is unknown.
+fn guest_timer_to_host(guest_deadline: Option<u64>, guest_tsc_offset: u64) -> u64 {
+    match guest_deadline {
+        Some(deadline) if deadline != 0 && guest_tsc_offset != 0 => {
+            // A host TSC of 0 means "no timer", so a deadline that maps exactly there is
+            // moved by one cycle.
+            deadline.wrapping_sub(guest_tsc_offset).max(1)
+        }
+        _ => 0,
+    }
+}
+
+/// Reads one MSR of `vcpu`. Called from the vCPU's own thread, outside `KVM_RUN`.
+#[cfg(target_arch = "x86_64")]
+fn read_guest_msr(vcpu: &dyn Vcpu, index: u32) -> Option<u64> {
+    let mut msrs = vec![MsrEntry { index, data: 0 }];
+    match vcpu.get_msrs(&mut msrs) {
+        Ok(1) => Some(msrs[0].data),
+        _ => None,
+    }
+}
+
+/// Reads the guest's TSC (`IA32_TSC`), for `PylonVmmState::on_vcpu_thread_start`.
+#[cfg(target_arch = "x86_64")]
+pub fn read_guest_tsc(vcpu: &dyn Vcpu) -> Option<u64> {
+    read_guest_msr(vcpu, msr_index::MSR_IA32_TSC)
+}
+
+/// Reads the guest's armed TSC-deadline timer (`IA32_TSC_DEADLINE`, 0 if none), for
+/// `PylonVmmState::check_and_park_vcpu`. Needs the in-kernel local APIC; without it the
+/// read fails and no timer is published.
+#[cfg(target_arch = "x86_64")]
+pub fn read_guest_tsc_deadline(vcpu: &dyn Vcpu) -> Option<u64> {
+    read_guest_msr(vcpu, msr_index::MSR_IA32_TSC_DEADLINE)
+}
+
+/// `pylond` runs only on x86_64; elsewhere no guest TSC is published.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn read_guest_tsc(_vcpu: &dyn Vcpu) -> Option<u64> {
+    None
+}
+
+/// `pylond` runs only on x86_64; elsewhere no guest timer is published.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn read_guest_tsc_deadline(_vcpu: &dyn Vcpu) -> Option<u64> {
+    None
+}
+
 /// Initializes and installs the process-global `PylonVmmState`.
 pub fn configure_global(
     config: &PylonConfig,
@@ -687,33 +768,33 @@ pub fn clear_global_state() {
 }
 
 /// Hook for `MemoryManager::new` (`vmm/src/memory_manager.rs`): maps the Pylon shared page
-/// into guest physical memory if `--pylon` is active.
+/// into guest physical memory if `--pylon` is active. The returned region must live as long
+/// as the VM.
 pub fn setup_memory_region(
     vm: &Arc<dyn Vm>,
-    guest_memory: &mut GuestMemoryMmap,
     next_memory_slot: &mut u32,
 ) -> result::Result<Option<Arc<GuestRegionMmap>>, Error> {
     if let Some(state) = global_state() {
-        let region = state.setup_gpa_mapping(vm, guest_memory, next_memory_slot)?;
+        let region = state.setup_gpa_mapping(vm, next_memory_slot)?;
         Ok(Some(region))
     } else {
         Ok(None)
     }
 }
 
-/// Hook for `CpuManager::start_vcpu` (`vmm/src/cpu.rs`): registers `gettid()` and parks
-/// vCPUs with `vcpu_id >= initial_active_vcpus`.
-pub fn on_vcpu_thread_start(vcpu_id: u32) {
+/// Hook for `CpuManager::start_vcpu` (`vmm/src/cpu.rs`): registers `gettid()`, measures the
+/// guest TSC offset, and parks vCPUs with `vcpu_id >= initial_active_vcpus`.
+pub fn on_vcpu_thread_start(vcpu_id: u32, read_guest_tsc: impl FnOnce() -> Option<u64>) {
     if let Some(state) = global_state() {
-        state.on_vcpu_thread_start(vcpu_id);
+        state.on_vcpu_thread_start(vcpu_id, read_guest_tsc);
     }
 }
 
-/// Hook for the `vcpu.run()` exit loop (`vmm/src/cpu.rs`): parks the vCPU thread if
-/// `revoke_requested == 1`.
-pub fn check_and_park_vcpu(vcpu_id: u32) -> bool {
+/// Hook for the `vcpu.run()` exit loop (`vmm/src/cpu.rs`): parks the vCPU thread if the
+/// guest asked to or a revocation's deadline passed. `read_guest_timer` is only called then.
+pub fn check_and_park_vcpu(vcpu_id: u32, read_guest_timer: impl FnOnce() -> Option<u64>) -> bool {
     if let Some(state) = global_state() {
-        state.check_and_park_vcpu(vcpu_id)
+        state.check_and_park_vcpu(vcpu_id, read_guest_timer)
     } else {
         false
     }
@@ -840,7 +921,7 @@ mod tests {
         // vCPU 0 is < initial_active_vcpus (1), so it should register TID and enter RUNNING immediately.
         let state_vcpu0 = Arc::clone(&state);
         let handle0 = thread::spawn(move || {
-            state_vcpu0.on_vcpu_thread_start(0);
+            state_vcpu0.on_vcpu_thread_start(0, || None);
         });
         handle0.join().unwrap();
 
@@ -851,7 +932,7 @@ mod tests {
         // vCPU 1 is >= initial_active_vcpus (1), so it should park until woken.
         let state_vcpu1 = Arc::clone(&state);
         let handle1 = thread::spawn(move || {
-            state_vcpu1.on_vcpu_thread_start(1);
+            state_vcpu1.on_vcpu_thread_start(1, || None);
         });
 
         let slot1 = state.vcpu_slot(1).unwrap();
@@ -907,9 +988,20 @@ mod tests {
     /// Runs `check_and_park_vcpu(vcpu_id)` on a worker thread, waits until the vCPU is parked,
     /// wakes it, and returns whether it reported parking.
     fn park_on_worker_and_wake(state: &Arc<PylonVmmState>, vcpu_id: u32) -> bool {
+        park_with_timer_on_worker_and_wake(state, vcpu_id, None).0
+    }
+
+    /// Like `park_on_worker_and_wake`, with `guest_timer` as the guest's TSC-deadline timer.
+    /// Also returns the `park_timer_deadline_tsc` published while the vCPU was parked.
+    fn park_with_timer_on_worker_and_wake(
+        state: &Arc<PylonVmmState>,
+        vcpu_id: u32,
+        guest_timer: Option<u64>,
+    ) -> (bool, u64) {
         let slot = state.vcpu_slot(vcpu_id).unwrap();
         let state_worker = Arc::clone(state);
-        let worker = thread::spawn(move || state_worker.check_and_park_vcpu(vcpu_id));
+        let worker =
+            thread::spawn(move || state_worker.check_and_park_vcpu(vcpu_id, || guest_timer));
 
         for _ in 0..200 {
             if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
@@ -919,18 +1011,20 @@ mod tests {
         }
         assert_eq!(slot.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
         assert_eq!(slot.revoke_requested.load(Ordering::Acquire), 0);
+        let timer = slot.park_timer_deadline_tsc.load(Ordering::Acquire);
 
         state.wake_vcpu(vcpu_id).unwrap();
         let parked = worker.join().unwrap();
         assert_eq!(slot.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
-        parked
+        assert_eq!(slot.park_timer_deadline_tsc.load(Ordering::Acquire), 0);
+        (parked, timer)
     }
 
     fn running_vcpu0_state(dir: &TempDir) -> Arc<PylonVmmState> {
         let shm_path = dir.path().join("vm-park-pylon");
         let cfg = PylonConfig::parse(&format!("shm={}", shm_path.display())).unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
-        state.on_vcpu_thread_start(0);
+        state.on_vcpu_thread_start(0, || None);
         assert_eq!(
             state.vcpu_slot(0).unwrap().state.load(Ordering::Acquire),
             VCPU_STATE_RUNNING
@@ -945,13 +1039,13 @@ mod tests {
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // Without a revocation or a request from the guest, nothing happens.
-        assert!(!state.check_and_park_vcpu(0));
+        assert!(!state.check_and_park_vcpu(0, || None));
 
         // A revocation still inside its grace period leaves the vCPU running and the
         // request pending.
         slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
         slot0.revoke_requested.store(1, Ordering::Release);
-        assert!(!state.check_and_park_vcpu(0));
+        assert!(!state.check_and_park_vcpu(0, || None));
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
         assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 1);
         assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 0);
@@ -992,6 +1086,54 @@ mod tests {
         assert!(park_on_worker_and_wake(&state, 0));
         assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 1);
         assert_eq!(slot0.forced_preempt_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_park_publishes_guest_timer_in_host_tsc() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+
+        // Without a measured offset, a guest timer can't be placed on the host's clock.
+        slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
+        assert_eq!(
+            park_with_timer_on_worker_and_wake(&state, 0, Some(5_000)),
+            (true, 0)
+        );
+
+        // The guest TSC started when the host TSC was at 1,000,000.
+        slot0
+            .guest_tsc_offset
+            .store(0u64.wrapping_sub(1_000_000), Ordering::Release);
+        slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
+        assert_eq!(
+            park_with_timer_on_worker_and_wake(&state, 0, Some(5_000)),
+            (true, 1_005_000)
+        );
+
+        // No armed timer (the MSR reads 0), or the MSR couldn't be read.
+        for guest_timer in [Some(0), None] {
+            slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
+            assert_eq!(
+                park_with_timer_on_worker_and_wake(&state, 0, guest_timer),
+                (true, 0)
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_measure_guest_tsc_offset() {
+        assert_eq!(measure_guest_tsc_offset(|| None), None);
+
+        // A guest TSC 12,345 cycles ahead of the host's.
+        let offset = measure_guest_tsc_offset(|| Some(read_host_tsc() + 12_345)).unwrap();
+        let error = offset.wrapping_sub(12_345) as i64;
+        assert!(error.abs() < 10_000_000, "offset error {error} cycles");
+
+        // A guest TSC that started at 0 when the host TSC was well past it.
+        let offset = measure_guest_tsc_offset(|| Some(0)).unwrap();
+        assert!((offset as i64) < 0);
     }
 
     #[test]
@@ -1049,6 +1191,8 @@ mod tests {
         use vm_memory::{Bytes, GuestMemoryBackend};
         use vmm_sys_util::signal::register_signal_handler;
 
+        use crate::GuestMemoryMmap;
+
         extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
         let dir = TempDir::new().unwrap();
@@ -1069,7 +1213,7 @@ mod tests {
             .expect("failed to create KVM VM");
 
         let code_gpa = GuestAddress(0x1000);
-        let mut guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
         for (index, region) in guest_mem.iter().enumerate() {
             // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
             unsafe {
@@ -1086,8 +1230,8 @@ mod tests {
             }
         }
         let mut next_slot = 1u32;
-        state
-            .setup_gpa_mapping(&vm, &mut guest_mem, &mut next_slot)
+        let _pylon_region = state
+            .setup_gpa_mapping(&vm, &mut next_slot)
             .expect("failed to map Pylon shared page");
 
         // A guest that never agrees to park: `jmp $` at GPA 0x1000.
@@ -1111,7 +1255,19 @@ mod tests {
             regs.set_rflags(0x2);
             vcpu.set_regs(&regs).expect("set_regs");
 
-            state_vcpu.on_vcpu_thread_start(0);
+            state_vcpu.on_vcpu_thread_start(0, || read_guest_tsc(vcpu.as_ref()));
+
+            // The measured offset puts the guest's TSC on the host's clock. Unconverted, it
+            // would be off by the host's uptime: KVM starts a new vCPU's TSC at 0.
+            let guest_now = read_guest_tsc(vcpu.as_ref()).expect("read guest TSC");
+            let host_now = read_host_tsc();
+            let converted = state_vcpu.shared_page().guest_to_host_tsc(guest_now);
+            let error = host_now.wrapping_sub(converted) as i64;
+            assert!(
+                error.abs() < 100_000_000,
+                "converted guest TSC off by {error} cycles"
+            );
+
             loop {
                 // The kick signal makes KVM_RUN fail with EINTR, which the KVM backend
                 // reports as `VmExit::Ignore`.
@@ -1119,7 +1275,7 @@ mod tests {
                     VmExit::Ignore => {}
                     other => panic!("unexpected VM exit: {other:?}"),
                 }
-                if state_vcpu.check_and_park_vcpu(0) {
+                if state_vcpu.check_and_park_vcpu(0, || read_guest_tsc_deadline(vcpu.as_ref())) {
                     break;
                 }
             }
@@ -1174,6 +1330,8 @@ mod tests {
         use hypervisor::{HypervisorVmConfig, VmExit};
         use vm_memory::{Bytes, GuestMemoryBackend};
 
+        use crate::GuestMemoryMmap;
+
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-kvm-e2e-pylon");
         // Map Pylon shared page at GPA 0x8000 so 16-bit real-mode guest code can address it directly.
@@ -1193,7 +1351,7 @@ mod tests {
             .expect("failed to create KVM VM");
 
         let code_gpa = GuestAddress(0x1000);
-        let mut guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
         for (index, region) in guest_mem.iter().enumerate() {
             // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
             unsafe {
@@ -1211,10 +1369,12 @@ mod tests {
         }
 
         let mut next_slot = 1u32;
-        state
-            .setup_gpa_mapping(&vm, &mut guest_mem, &mut next_slot)
+        let _pylon_region = state
+            .setup_gpa_mapping(&vm, &mut next_slot)
             .expect("failed to map Pylon shared page into KVM guest GPA 0x8000");
         assert_eq!(next_slot, 2);
+        // The page has a memory slot of its own and stays out of guest RAM (K4).
+        assert!(guest_mem.find_region(GuestAddress(0x8000)).is_none());
 
         // 16-bit x86 guest code at GPA 0x1000 interacting with PylonSharedPage at GPA 0x8000:
         // - 0x8000: PylonHeader.magic (low 16 bits == 0x4D31, "1M")
@@ -1260,7 +1420,7 @@ mod tests {
             regs.set_rflags(0x2);
             vcpu.set_regs(&regs).expect("set_regs");
 
-            state_vcpu.on_vcpu_thread_start(0);
+            state_vcpu.on_vcpu_thread_start(0, || read_guest_tsc(vcpu.as_ref()));
 
             // First KVM_RUN: guest updates telemetry and spins until host sets revoke_requested = 1,
             // then agrees with VCPU_STATE_PARKING and executes HLT.
@@ -1270,7 +1430,7 @@ mod tests {
             }
 
             // Post-exit hook: sees VCPU_STATE_PARKING, parks in VCPU_STATE_PARKED until woken via wake_eventfd.
-            assert!(state_vcpu.check_and_park_vcpu(0));
+            assert!(state_vcpu.check_and_park_vcpu(0, || read_guest_tsc_deadline(vcpu.as_ref())));
 
             // Second KVM_RUN after host wakeup: guest writes runnable_threads = 7 and executes final HLT.
             match vcpu.run().expect("2nd vcpu.run failed") {
@@ -1312,6 +1472,9 @@ mod tests {
         assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 0);
         assert_eq!(slot0.yield_count.load(Ordering::Acquire), 1);
         assert_eq!(slot0.forced_preempt_count.load(Ordering::Acquire), 0);
+        assert_ne!(slot0.guest_tsc_offset.load(Ordering::Acquire), 0);
+        // No in-kernel local APIC here, so there's no TSC-deadline timer to publish.
+        assert_eq!(slot0.park_timer_deadline_tsc.load(Ordering::Acquire), 0);
 
         // 3. Wake the parked KVM vCPU thread via wake_eventfd and verify it resumes KVM execution.
         state.wake_vcpu(0).unwrap();
