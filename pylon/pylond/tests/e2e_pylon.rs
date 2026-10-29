@@ -809,6 +809,14 @@ fn test_e2e_observability_metering_and_socket_stats() {
     let next_tsc = start_tsc.saturating_add(50_000);
     engine.poll_once(next_tsc);
 
+    // `pylond` doesn't write `state`: a vCPU counts as allocated once its thread has woken
+    // and written RUNNING, which the simulated VMM does asynchronously.
+    wait_until(
+        Duration::from_secs(2),
+        || (0..2).all(|i| page.vcpus[i].state.load(Ordering::Acquire) == VCPU_STATE_RUNNING),
+        "both vCPUs running",
+    );
+
     // Query stats over Unix domain socket
     let stats_resp = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
     assert!(stats_resp.accepted);
@@ -910,6 +918,14 @@ fn test_e2e_prometheus_metrics_http_export() {
 
     let next_tsc = start_tsc.saturating_add(60_000);
     engine.poll_once(next_tsc);
+
+    // `pylond` doesn't write `state`: a vCPU counts as allocated once its thread has woken
+    // and written RUNNING, which the simulated VMM does asynchronously.
+    wait_until(
+        Duration::from_secs(2),
+        || (0..2).all(|i| page.vcpus[i].state.load(Ordering::Acquire) == VCPU_STATE_RUNNING),
+        "both vCPUs running",
+    );
 
     // Scrape Prometheus HTTP endpoint
     let mut client = TcpStream::connect(&metrics_addr).expect("connect to metrics endpoint");
