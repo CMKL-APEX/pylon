@@ -139,8 +139,8 @@ These are from spec 06 §10:
 
 | Item | Notes |
 |---|---|
-| Move the shared page into the `pylon-kick` BAR | Removes the fixed address and the E820 overlap (spec 06 §9). |
-| One time base | Decide whether the guest writes guest-TSC values and `pylond` converts them with the VM's TSC offset, or the ABI uses another clock. |
+| Move the shared page into the `pylon-kick` BAR | Removes the fixed address (spec 06 §9). |
+| Receive doorbell | A host-side producer for `host_rx_doorbell`, so packets wake a zero-core VM (K1). |
 | Reconnect | Let a VMM register again after `pylond` restarts (Q5). |
 | Lifecycle | Reject snapshot, restore and migration with `--pylon`, explicitly, until they're designed (spec 06 §7). |
 | aarch64 | A counter abstraction (`CNTVCT_EL0`) in place of the TSC in `pylond`, and a check of the shared page's address against the aarch64 layout. |
@@ -149,4 +149,6 @@ These are from spec 06 §10:
 Done since the first draft of this list: the real TSC rate (`pylond`
 measures the host's; K2), removing exited VMs and freeing their CPUs
 (K6), rejecting duplicate `vm_id`s, and `--socket-group`/`--socket-mode`
-(K5).
+(K5); one time base, with the VMM measuring each vCPU's guest TSC offset
+(K3); keeping the page out of the guest's RAM map (K4); and waking a
+parked vCPU when its guest timer is due (part of K1).

@@ -42,29 +42,29 @@ tracks 4 and 5).
 **Other gaps** (tracked as K1–K6 in the status tracker's
 [known issues](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md#known-issues-other)):
 
-- **Scale to zero.** The arbiter can wake a VM that holds no cores when
-  its next timer is due or packets arrive, but nothing writes either
-  signal yet: no guest component sets `next_timer_tsc`, and nothing on
-  the host feeds the receive doorbell. A VM whose vCPUs are all parked
-  can't run the guest agent either, so it isn't woken.
+- **Scale to zero.** A VM that holds no cores is woken when a timer it
+  armed before its vCPUs parked comes due: the VMM reads each vCPU's
+  TSC-deadline timer as it parks it. That needs the in-kernel local
+  APIC (the default with KVM) and a guest using TSC-deadline mode
+  (Linux's default when the CPU offers it). Arriving packets don't wake
+  such a VM yet: nothing on the host feeds the receive doorbell.
 - **Unwritten telemetry.** Nothing writes `in_critical_section` or
   `stranded_work_bitmap` yet, so donor selection can't avoid lock
   holders, and wakeups can't prefer vCPUs with stranded work.
-- **Time bases.** The guest agent writes `head_wait_tsc` from the
-  *guest's* TSC, while `pylond` compares it with the *host's*. Under KVM
-  the two differ by the VM's TSC offset, so the wait time `pylond`
-  computes is skewed by that offset.
+- **TSC scaling.** `pylond` converts the guest's TSC values with the
+  offset the VMM measures, assuming the guest TSC runs at the host's
+  rate. A VM restored with a different TSC rate would break that, but
+  restore doesn't support Pylon yet anyway.
 - **`min_cores` while idle.** A VM that reports no runnable threads
   wants zero cores, whatever its `min_cores`.
 - **Guest side.** There is no guest kernel driver yet. The userspace
   agent estimates demand from `/proc` and can't report critical
   sections.
-- **The shared page in the guest memory map.** The VMM adds the page to
-  guest memory, so on x86_64 the guest's E820 table lists it as an
-  8 KiB RAM range at `0xFEDF_0000`, overlapping the reserved range
-  around it. We haven't checked how each boot path (direct kernel boot,
-  firmware) and guest resolve that overlap. Moving the page into a PCI
-  BAR (see the roadmap) removes the question.
+- **The shared page's address.** The page is no longer reported to the
+  guest as RAM, but `0xFEDF_0000` is still a fixed address that Cloud
+  Hypervisor's layout doesn't reserve. Moving the page into a PCI BAR
+  (see the roadmap) removes it. We haven't yet booted a guest to check
+  its memory map since the change.
 - **Lifecycle.** Snapshot, restore and live migration don't account for
   Pylon state. vCPU hotplug and a `pylond` restart aren't handled: the
   VMM registers once, at boot, and doesn't reconnect.

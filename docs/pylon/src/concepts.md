@@ -70,8 +70,9 @@ grows with how long the guest's oldest runnable thread has waited,
 multiplied by the VM's priority weight. A VM below its `min_cores` gets
 a large boost, and a VM waking from zero cores gets the maximum.
 
-**Scale to zero.** A VM with no cores at all. `pylond` wakes it when
-the time in its `next_timer_tsc` arrives.
+**Scale to zero.** A VM with no cores at all. `pylond` wakes it when a
+guest timer comes due: one that was armed on a vCPU when the VMM parked
+it, or the guest's `next_timer_tsc`.
 
 **Core-microseconds.** The metering unit: one managed CPU assigned to a
 VM for one microsecond.
