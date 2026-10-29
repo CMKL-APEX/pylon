@@ -26,12 +26,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::mmap::MmapRegionError;
-use vm_memory::{Address, GuestAddress, GuestMemoryRegion, GuestRegionCollectionError, MmapRegion};
+use vm_memory::{Address, GuestAddress, GuestMemoryRegion, MmapRegion};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::SIGRTMIN;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::{GuestMemoryMmap, GuestRegionMmap};
+use crate::GuestRegionMmap;
 
 /// TSC rate written into `PylonHeader`: unknown. The VMM writes the header before any vCPU
 /// exists, so it can't ask KVM; `pylond` measures the host TSC rate itself instead.
@@ -92,10 +92,6 @@ pub enum Error {
     /// Failed to construct the `GuestRegionMmap` at the requested GPA.
     #[error("Failed to create Pylon GuestRegionMmap at GPA {0:#x}")]
     GuestRegionNew(u64),
-
-    /// Failed to insert the Pylon `GuestRegionMmap` into `GuestMemoryMmap`.
-    #[error("Failed to insert Pylon region into guest memory")]
-    GuestMemoryInsert(#[source] GuestRegionCollectionError),
 
     /// Failed to register the Pylon shared memory region with the hypervisor.
     #[error("Failed to register Pylon user memory region with hypervisor")]
@@ -401,10 +397,14 @@ impl PylonVmmState {
 
     /// Maps the 8,192-byte `/dev/shm/<vm-id>-pylon` backing file into guest physical memory
     /// at `self.config.gpa` (`0xFEDF_0000` by default) with `MAP_SHARED`.
+    ///
+    /// The page gets its own hypervisor memory slot but stays out of `GuestMemoryMmap`, like a
+    /// device BAR: anything built from guest RAM (E820, PVH memmap, ACPI, hotplug layout)
+    /// would otherwise report it to the guest as RAM inside the 32-bit reserved hole. The
+    /// caller must keep the returned region alive as long as the VM.
     pub fn setup_gpa_mapping(
         &self,
         vm: &Arc<dyn Vm>,
-        guest_memory: &mut GuestMemoryMmap,
         next_memory_slot: &mut u32,
     ) -> result::Result<Arc<GuestRegionMmap>, Error> {
         let shm_clone = self.shm_file.try_clone().map_err(Error::ShmOpen)?;
@@ -423,15 +423,11 @@ impl PylonVmmState {
             GuestRegionMmap::new(mmap_region, gpa).ok_or(Error::GuestRegionNew(self.config.gpa))?,
         );
 
-        *guest_memory = guest_memory
-            .insert_region(Arc::clone(&region))
-            .map_err(Error::GuestMemoryInsert)?;
-
         let slot = *next_memory_slot;
         *next_memory_slot += 1;
 
-        // SAFETY: `region` is a valid `MAP_SHARED` mapping of `PYLON_SHARED_PAGE_SIZE` bytes
-        // whose backing `Arc<GuestRegionMmap>` is retained inside `guest_memory`.
+        // SAFETY: `region` is a valid `MAP_SHARED` mapping of `PYLON_SHARED_PAGE_SIZE` bytes,
+        // and the caller keeps the returned `Arc<GuestRegionMmap>` alive with the VM.
         unsafe {
             vm.create_user_memory_region(
                 slot,
@@ -687,14 +683,14 @@ pub fn clear_global_state() {
 }
 
 /// Hook for `MemoryManager::new` (`vmm/src/memory_manager.rs`): maps the Pylon shared page
-/// into guest physical memory if `--pylon` is active.
+/// into guest physical memory if `--pylon` is active. The returned region must live as long
+/// as the VM.
 pub fn setup_memory_region(
     vm: &Arc<dyn Vm>,
-    guest_memory: &mut GuestMemoryMmap,
     next_memory_slot: &mut u32,
 ) -> result::Result<Option<Arc<GuestRegionMmap>>, Error> {
     if let Some(state) = global_state() {
-        let region = state.setup_gpa_mapping(vm, guest_memory, next_memory_slot)?;
+        let region = state.setup_gpa_mapping(vm, next_memory_slot)?;
         Ok(Some(region))
     } else {
         Ok(None)
@@ -1049,6 +1045,8 @@ mod tests {
         use vm_memory::{Bytes, GuestMemoryBackend};
         use vmm_sys_util::signal::register_signal_handler;
 
+        use crate::GuestMemoryMmap;
+
         extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
         let dir = TempDir::new().unwrap();
@@ -1069,7 +1067,7 @@ mod tests {
             .expect("failed to create KVM VM");
 
         let code_gpa = GuestAddress(0x1000);
-        let mut guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
         for (index, region) in guest_mem.iter().enumerate() {
             // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
             unsafe {
@@ -1086,8 +1084,8 @@ mod tests {
             }
         }
         let mut next_slot = 1u32;
-        state
-            .setup_gpa_mapping(&vm, &mut guest_mem, &mut next_slot)
+        let _pylon_region = state
+            .setup_gpa_mapping(&vm, &mut next_slot)
             .expect("failed to map Pylon shared page");
 
         // A guest that never agrees to park: `jmp $` at GPA 0x1000.
@@ -1174,6 +1172,8 @@ mod tests {
         use hypervisor::{HypervisorVmConfig, VmExit};
         use vm_memory::{Bytes, GuestMemoryBackend};
 
+        use crate::GuestMemoryMmap;
+
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-kvm-e2e-pylon");
         // Map Pylon shared page at GPA 0x8000 so 16-bit real-mode guest code can address it directly.
@@ -1193,7 +1193,7 @@ mod tests {
             .expect("failed to create KVM VM");
 
         let code_gpa = GuestAddress(0x1000);
-        let mut guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
         for (index, region) in guest_mem.iter().enumerate() {
             // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
             unsafe {
@@ -1211,10 +1211,12 @@ mod tests {
         }
 
         let mut next_slot = 1u32;
-        state
-            .setup_gpa_mapping(&vm, &mut guest_mem, &mut next_slot)
+        let _pylon_region = state
+            .setup_gpa_mapping(&vm, &mut next_slot)
             .expect("failed to map Pylon shared page into KVM guest GPA 0x8000");
         assert_eq!(next_slot, 2);
+        // The page has a memory slot of its own and stays out of guest RAM (K4).
+        assert!(guest_mem.find_region(GuestAddress(0x8000)).is_none());
 
         // 16-bit x86 guest code at GPA 0x1000 interacting with PylonSharedPage at GPA 0x8000:
         // - 0x8000: PylonHeader.magic (low 16 bits == 0x4D31, "1M")

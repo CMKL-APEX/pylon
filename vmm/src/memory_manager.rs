@@ -284,6 +284,8 @@ pub struct MemoryManager {
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handler: Option<UffdHandler>,
+    // The Pylon shared page's mapping, which has a hypervisor memory slot but isn't guest RAM.
+    _pylon_region: Option<Arc<GuestRegionMmap>>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -2075,6 +2077,7 @@ impl MemoryManager {
             next_memory_slot,
             selected_slot,
             next_hotplug_slot,
+            pylon_region,
         ) = if let Some(data) = restore_data {
             let (regions, memory_zones) = Self::restore_memory_regions_and_zones(
                 &data.guest_ram_mappings,
@@ -2097,6 +2100,7 @@ impl MemoryManager {
                 data.next_memory_slot,
                 data.selected_slot,
                 data.next_hotplug_slot,
+                None,
             )
         } else {
             // Init guest memory
@@ -2198,8 +2202,8 @@ impl MemoryManager {
             }
 
             let mut next_memory_slot = 0;
-            pylon::setup_memory_region(&vm, &mut guest_memory, &mut next_memory_slot)
-                .map_err(Error::Pylon)?;
+            let pylon_region =
+                pylon::setup_memory_region(&vm, &mut next_memory_slot).map_err(Error::Pylon)?;
 
             let mut hotplug_slots = Vec::with_capacity(HOTPLUG_COUNT);
             hotplug_slots.resize_with(HOTPLUG_COUNT, HotPlugState::default);
@@ -2216,6 +2220,7 @@ impl MemoryManager {
                 next_memory_slot,
                 0,
                 0,
+                pylon_region,
             )
         };
 
@@ -2296,6 +2301,7 @@ impl MemoryManager {
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
+            _pylon_region: pylon_region,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a CVM
             arch_mem_regions,
