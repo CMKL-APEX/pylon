@@ -36,6 +36,39 @@ pub enum GuardMode {
     Off,
 }
 
+/// What the guard's LSM hook answers a request for a core scheduling cookie.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum CookieDenial {
+    /// Fail with `EPERM`. Cloud Hypervisor then refuses to start a VM with
+    /// core scheduling on.
+    #[default]
+    Eperm,
+    /// Fail with `ENODEV`, as on a host without SMT. Cloud Hypervisor then
+    /// starts the VM without core scheduling, and without saying so.
+    Enodev,
+    /// Don't load the hook. A cookie made after attaching still disables
+    /// `scx_pylon`, but only after a short window.
+    Off,
+}
+
+impl CookieDenial {
+    /// The `PYLON_DENY_*` value for `pylon_guard.deny`.
+    pub const fn bpf_value(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Eperm => 1,
+            Self::Enodev => 2,
+        }
+    }
+}
+
+/// Whether the kernel runs BPF LSM programs. They can be loaded and attached
+/// without it, but are never called.
+pub fn bpf_lsm_active() -> bool {
+    fs::read_to_string("/sys/kernel/security/lsm")
+        .is_ok_and(|lsms| lsms.trim().split(',').any(|lsm| lsm == "bpf"))
+}
+
 /// What the running kernel can do with core scheduling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelCoreSched {
@@ -177,6 +210,14 @@ mod tests {
             assert_eq!(kernel.needs_guard(Auto), kernel == Affected);
             assert_eq!(kernel.needs_guard(On), kernel != Unsupported);
         }
+    }
+
+    #[test]
+    fn test_cookie_denial_bpf_values() {
+        // PYLON_DENY_* in scx_pylon.bpf.c.
+        assert_eq!(CookieDenial::Off.bpf_value(), 0);
+        assert_eq!(CookieDenial::Eperm.bpf_value(), 1);
+        assert_eq!(CookieDenial::Enodev.bpf_value(), 2);
     }
 
     #[test]

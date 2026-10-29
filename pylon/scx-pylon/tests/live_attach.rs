@@ -6,12 +6,14 @@
 use std::fs;
 
 use scx_pylon::ScxPylonUserspace;
-use scx_pylon::coresched::{GuardMode, KernelCoreSched};
+use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 
 #[test]
 #[ignore = "requires CAP_BPF / root"]
 fn test_live_attach_and_detach() {
-    let guard = KernelCoreSched::detect().needs_guard(GuardMode::Auto);
+    let guard = KernelCoreSched::detect()
+        .needs_guard(GuardMode::Auto)
+        .then_some(CookieDenial::Eperm);
     let scx =
         ScxPylonUserspace::load_and_attach(guard).expect("Failed to load and attach scx_pylon");
     let state = fs::read_to_string("/sys/kernel/sched_ext/state").expect("read sched_ext state");

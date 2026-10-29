@@ -56,6 +56,18 @@
 /* scx_bpf_exit code when core scheduling turns on (pylon#15) */
 #define PYLON_EXIT_CORE_SCHED 1
 
+/* prctl(2) core scheduling commands, from include/uapi/linux/prctl.h */
+#define PR_SCHED_CORE 62
+#define PR_SCHED_CORE_GET 0
+
+#define EPERM 1
+#define ENODEV 19
+
+/* Values of pylon_guard.deny: what a request for a cookie gets */
+#define PYLON_DENY_OFF 0
+#define PYLON_DENY_EPERM 1
+#define PYLON_DENY_ENODEV 2
+
 /* Flags in struct pcpu_owner_entry */
 #define PCPU_OWNER_FLAG_ACTIVE (1U << 0)
 #define PCPU_OWNER_FLAG_PREEMPT (1U << 1)
@@ -108,6 +120,8 @@ struct pylon_guard {
     __u32 cookie_tgid;
     /* Set once scx_pylon has asked the kernel to disable it */
     __u32 exiting;
+    /* PYLON_DENY_*, written by userspace before attaching */
+    __u32 deny;
 };
 
 struct {
@@ -557,6 +571,35 @@ int BPF_PROG(pylon_sched_core_get)
         __sync_val_compare_and_swap(&g->cookie_tgid, 0, (__u32)(bpf_get_current_pid_tgid() >> 32));
     }
     return 0;
+}
+
+/*
+ * Loaded only with the guard and a denial. Refuses every PR_SCHED_CORE
+ * command except GET, so no task gets a cookie while scx_pylon is attached.
+ * task_prctl programs run as modify-return: 0 lets the prctl go on.
+ */
+SEC("lsm/task_prctl")
+int BPF_PROG(pylon_task_prctl, int option, unsigned long arg2, unsigned long arg3,
+             unsigned long arg4, unsigned long arg5, int ret)
+{
+    if (ret) {
+        return ret;
+    }
+    if (option != PR_SCHED_CORE || arg2 == PR_SCHED_CORE_GET) {
+        return 0;
+    }
+    struct pylon_guard *g = guard();
+    if (!g) {
+        return 0;
+    }
+    switch (g->deny) {
+    case PYLON_DENY_EPERM:
+        return -EPERM;
+    case PYLON_DENY_ENODEV:
+        return -ENODEV;
+    default:
+        return 0;
+    }
 }
 
 SEC(".struct_ops.link")

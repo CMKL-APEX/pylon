@@ -16,6 +16,8 @@ use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapFlags, MapType, Object, ObjectBui
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
+use crate::coresched::CookieDenial;
+
 pub mod coresched;
 
 /// Maximum number of physical CPUs tracked in the `pylon_pcpu_owners` BPF map.
@@ -32,6 +34,9 @@ pub const GUARD_MAP_NAME: &str = "pylon_guard";
 
 /// Name of the program that watches for new core scheduling cookies.
 pub const SCHED_CORE_WATCH_PROG_NAME: &str = "pylon_sched_core_get";
+
+/// Name of the LSM program that refuses new core scheduling cookies.
+pub const COOKIE_DENY_PROG_NAME: &str = "pylon_task_prctl";
 
 /// Name of the `sched_ext_ops` struct_ops map inside `scx_pylon.bpf.o`.
 pub const SCX_OPS_MAP_NAME: &str = "pylon_ops";
@@ -143,6 +148,10 @@ pub enum Error {
     /// A process asked for a core scheduling cookie while attaching.
     #[error("Process {tgid} asked for a core scheduling cookie")]
     CoreSchedTurnedOn { tgid: u32 },
+
+    /// The guard needs BPF LSM to refuse cookies, and the kernel doesn't run it.
+    #[error("BPF LSM is not active")]
+    BpfLsmInactive,
 
     /// Required BPF program was not found in the embedded object.
     #[error("Missing required BPF program '{prog_name}'")]
@@ -427,22 +436,30 @@ impl ScxPylonUserspace {
     /// Loads `scx_pylon.bpf.o` into the kernel, attaches the `sched_ext_ops`
     /// struct_ops dispatcher, and `mmap`s `pylon_pcpu_owners` into userspace.
     ///
-    /// With `guard`, refuses to attach while any task has a core scheduling
-    /// cookie, and disables itself when a task asks for one later (see
-    /// [`coresched`]).
+    /// With a `guard`, refuses to attach while any task has a core scheduling
+    /// cookie, answers requests for new cookies as the [`CookieDenial`] says,
+    /// and disables itself if a task gets one anyway (see [`coresched`]).
     ///
     /// Requires `CAP_BPF` / `CAP_SYS_ADMIN` and a kernel with `CONFIG_SCHED_EXT=y`.
-    pub fn load_and_attach(guard: bool) -> Result<Self> {
+    pub fn load_and_attach(guard: Option<CookieDenial>) -> Result<Self> {
+        let deny = guard.filter(|&d| d != CookieDenial::Off);
+        if deny.is_some() && !coresched::bpf_lsm_active() {
+            return Err(Error::BpfLsmInactive);
+        }
+
         let mut open_obj = Self::open_embedded()?;
         // The watcher needs sched_core_get(), which kernels without
         // CONFIG_SCHED_CORE lack.
-        open_obj
-            .progs_mut()
-            .find(|p| p.name() == SCHED_CORE_WATCH_PROG_NAME)
-            .ok_or(Error::MissingProg {
-                prog_name: SCHED_CORE_WATCH_PROG_NAME,
-            })?
-            .set_autoload(guard);
+        for (prog_name, autoload) in [
+            (SCHED_CORE_WATCH_PROG_NAME, guard.is_some()),
+            (COOKIE_DENY_PROG_NAME, deny.is_some()),
+        ] {
+            open_obj
+                .progs_mut()
+                .find(|p| p.name() == prog_name)
+                .ok_or(Error::MissingProg { prog_name })?
+                .set_autoload(autoload);
+        }
         let mut obj = open_obj.load().map_err(Error::Bpf)?;
 
         let owner_map = {
@@ -480,9 +497,19 @@ impl ScxPylonUserspace {
             .count();
 
         let mut guard_links = Vec::new();
-        if guard {
-            // Watch before looking, so a cookie made in between is seen by
-            // one or the other.
+        if let Some(deny) = guard {
+            Self::set_guard_deny(&obj, deny)?;
+            // Refuse and watch before looking, so a cookie made in between
+            // is refused, or seen by one or the other.
+            if deny != CookieDenial::Off {
+                let prog = obj
+                    .progs_mut()
+                    .find(|p| p.name() == COOKIE_DENY_PROG_NAME)
+                    .ok_or(Error::MissingProg {
+                        prog_name: COOKIE_DENY_PROG_NAME,
+                    })?;
+                guard_links.push(prog.attach_lsm().map_err(Error::Bpf)?);
+            }
             let watch = obj
                 .progs_mut()
                 .find(|p| p.name() == SCHED_CORE_WATCH_PROG_NAME)
@@ -524,15 +551,27 @@ impl ScxPylonUserspace {
         })
     }
 
-    /// Reads the tgid that the watcher recorded asking for a cookie, or 0.
-    fn cookie_tgid(obj: &Object) -> Result<u32> {
-        let map = obj
-            .maps()
+    fn guard_map(obj: &Object) -> Result<libbpf_rs::Map<'_>> {
+        obj.maps()
             .find(|m| m.name() == GUARD_MAP_NAME)
             .ok_or(Error::MissingMap {
                 map_name: GUARD_MAP_NAME,
-            })?;
-        let value = map
+            })
+    }
+
+    /// Writes `deny` to the guard map, whose other fields start at 0.
+    fn set_guard_deny(obj: &Object, deny: CookieDenial) -> Result<()> {
+        // struct pylon_guard { cookie_tgid, exiting, deny }, all u32.
+        let mut value = [0u8; 3 * size_of::<u32>()];
+        value[2 * size_of::<u32>()..].copy_from_slice(&deny.bpf_value().to_ne_bytes());
+        Self::guard_map(obj)?
+            .update(&0u32.to_ne_bytes(), &value, MapFlags::ANY)
+            .map_err(Error::Bpf)
+    }
+
+    /// Reads the tgid that the watcher recorded asking for a cookie, or 0.
+    fn cookie_tgid(obj: &Object) -> Result<u32> {
+        let value = Self::guard_map(obj)?
             .lookup(&0u32.to_ne_bytes(), MapFlags::ANY)
             .map_err(Error::Bpf)?
             .unwrap_or_default();
@@ -592,6 +631,7 @@ mod tests {
         );
         for prog in [
             SCHED_CORE_WATCH_PROG_NAME,
+            COOKIE_DENY_PROG_NAME,
             "pylon_dispatch",
             "pylon_enqueue",
             "pylon_running",

@@ -19,7 +19,7 @@ use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, calibrate_tsc_khz};
 use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
-use scx_pylon::coresched::{GuardMode, KernelCoreSched};
+use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 
@@ -58,6 +58,13 @@ struct CliArgs {
     /// that seem to have them.
     #[arg(long, value_enum, default_value_t)]
     core_sched_guard: GuardMode,
+
+    /// With the guard, what a task asking for a core scheduling cookie gets while scx-pylon
+    /// is attached: `eperm` fails Cloud Hypervisor VMs that have core scheduling on, `enodev`
+    /// starts them without it, and `off` lets the request through, which then disables
+    /// scx-pylon. `eperm` and `enodev` need BPF LSM.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_deny: CookieDenial,
 
     /// Permission bits for the control socket, in octal (e.g. 660). Default: the process umask.
     #[arg(long, value_parser = parse_socket_mode)]
@@ -186,13 +193,17 @@ fn main() -> Result<()> {
     );
 
     let attach = scx_attach(&args, Path::new(SCHED_EXT_SYSFS).exists());
-    let guard = attach != ScxAttach::No && {
+    let guard = if attach == ScxAttach::No {
+        None
+    } else {
         let kernel = KernelCoreSched::detect();
-        let guard = kernel.needs_guard(args.core_sched_guard);
-        info!(
-            "Core scheduling: {kernel}; scx_pylon guard {}",
-            if guard { "on" } else { "off" }
-        );
+        let guard = kernel
+            .needs_guard(args.core_sched_guard)
+            .then_some(args.core_sched_deny);
+        match guard {
+            Some(deny) => info!("Core scheduling: {kernel}; scx_pylon guard on, deny {deny:?}"),
+            None => info!("Core scheduling: {kernel}; scx_pylon guard off"),
+        }
         guard
     };
     let scx = match attach {
@@ -339,6 +350,11 @@ mod tests {
             GuardMode::Off
         );
         CliArgs::try_parse_from(["pylond", "--core-sched-guard", "maybe"]).unwrap_err();
+        assert_eq!(args(&[]).core_sched_deny, CookieDenial::Eperm);
+        assert_eq!(
+            args(&["--core-sched-deny", "enodev"]).core_sched_deny,
+            CookieDenial::Enodev
+        );
     }
 
     #[test]
