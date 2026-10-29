@@ -68,6 +68,8 @@ component that doesn't recognise it must stay telemetry-only.
 | `forced_preempt_count` | VMM (increments it when it force-parks, §4.4) | Moves from `pylond` to the VMM, because the VMM is the only party that knows a forced park actually happened. |
 | `host_tid` | VMM | Unchanged. |
 | `last_yield_tsc`, `yield_count` | VMM | Written when the VMM parks the vCPU (cooperative or forced). |
+| `park_timer_deadline_tsc` | VMM | The guest's armed TSC-deadline timer, in host TSC, written before `PARKED` and cleared on wake (K1). Uses the former `_reserved_guest`. |
+| `guest_tsc_offset` | VMM | Guest TSC minus host TSC, measured before the vCPU first runs (K3). Uses the former `_reserved_host`. |
 
 `VCPU_STATE_WAKING` is no longer written by `pylond`. The VMM may write it
 between returning from the wake `EventFd` read and re-entering `KVM_RUN`, if
@@ -361,10 +363,10 @@ forced park, which is honest about the current state, and the metrics show it.
 ## 9. Follow-ups (Not in This Spec)
 
 - Move the shared page into a `pylon-kick` BAR and drop the fixed GPA
-  `0xFEDF_0000`. That address is in the 32-bit reserved range between the IOAPIC
-  (`0xFEC0_0000`) and the LAPIC (`0xFEE0_0000`), but `arch/src/x86_64/layout.rs`
-  doesn't declare it. A future upstream device could land on it, and we haven't
-  checked how guests see it in the e820/ACPI tables.
+  `0xFEDF_0000`. That address lies between the IOAPIC (`0xFEC0_0000`) and the
+  LAPIC (`0xFEE0_0000`), but `arch/src/x86_64/layout.rs` doesn't declare it, so
+  a future upstream device could land on it. Since K4 the page is no longer
+  guest RAM: it is absent from the E820 map, like the IOAPIC and LAPIC.
 - aarch64 `pylond` (counter abstraction).
 
 ---

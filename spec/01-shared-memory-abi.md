@@ -53,9 +53,9 @@ pub struct PylonTelemetry {
     pub rx_ring_cons_idx: AtomicU32,
     /// Bitmask of parked vCPU indices (0..63) that have stranded local runqueue tasks or RCU work.
     pub stranded_work_bitmap: AtomicU64,
-    /// Guest TSC timestamp (rdtsc) of the oldest thread waiting in the runqueue.
+    /// Guest TSC since which runnable threads have waited for a vCPU; 0 if none wait.
     pub head_wait_tsc: AtomicU64,
-    /// Next guest timer deadline TSC (used by pylond to wake a 0-core idle VM).
+    /// Next guest timer deadline in guest TSC (used by pylond to wake a 0-core idle VM).
     pub next_timer_tsc: AtomicU64,
     /// Monotonically increasing guest heartbeat counter.
     pub guest_heartbeat: AtomicU64,
@@ -76,7 +76,9 @@ pub struct PylonVcpuSlot {
     pub last_yield_tsc: AtomicU64,
     /// Number of cooperative yields performed by this vCPU.
     pub yield_count: AtomicU64,
-    pub _reserved_guest: [u8; 8],
+    /// Host TSC at which the guest's TSC-deadline timer was due when the VMM parked this
+    /// vCPU; 0 if none. Written by the VMM; cleared when the vCPU runs again.
+    pub park_timer_deadline_tsc: AtomicU64,
 
     // --- Upper 32B: Written by Host (pylond & VMM init) ---
     /// Set to 1 by pylond when requesting this vCPU to yield its physical core.
@@ -90,7 +92,9 @@ pub struct PylonVcpuSlot {
     pub revoke_deadline_tsc: AtomicU64,
     /// Number of forced preemptions (deadline violations) on this vCPU.
     pub forced_preempt_count: AtomicU64,
-    pub _reserved_host: [u8; 8],
+    /// Guest TSC minus host TSC (wrapping); 0 if not measured. Written by the VMM before the
+    /// vCPU first runs. `pylond` converts guest-written TSC values with vCPU 0's offset.
+    pub guest_tsc_offset: AtomicU64,
 }
 
 /// Full 2-page (8192-byte) shared memory region mapped at /dev/shm/<vm-id>-pylon.
@@ -112,3 +116,11 @@ pub struct PylonSharedPage {
 - `size_of::<PylonVcpuSlot>() == 64`
 - `size_of::<PylonSharedPage>() == 8192`
 - `offset_of!(PylonVcpuSlot, revoke_requested) == 32`
+- `offset_of!(PylonVcpuSlot, park_timer_deadline_tsc) == 24`
+- `offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56`
+
+### Time bases
+The guest writes `head_wait_tsc` and `next_timer_tsc` with its own TSC. `pylond` converts them
+to host TSC with `PylonSharedPage::guest_to_host_tsc` (subtracting vCPU 0's `guest_tsc_offset`).
+Every other TSC field is host TSC. The conversion assumes the guest TSC runs at the host rate
+(no TSC scaling); an offset of 0 leaves values unconverted.

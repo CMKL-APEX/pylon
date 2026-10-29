@@ -23,12 +23,12 @@ Every polling tick (~1 us), the Matrix Engine executes four phases:
 ### Phase 1: Demand & Zero-Core Wakeup Evaluation
 For each registered `VmHandle`:
 1. Load `runnable = telemetry.runnable_threads.load(Acquire)`.
-2. Load `head_wait = now_tsc.saturating_sub(telemetry.head_wait_tsc.load(Relaxed))`.
+2. Load `head_wait = now_tsc.saturating_sub(guest_to_host_tsc(telemetry.head_wait_tsc.load(Relaxed)))` (the guest writes guest TSC; spec 01 *Time bases*).
 3. **Zero-Core Check:** If `vm.active_cores == 0`:
-   - Check if `now_tsc >= telemetry.next_timer_tsc.load(Relaxed)`.
+   - Check if `now_tsc >= guest_to_host_tsc(telemetry.next_timer_tsc.load(Relaxed))`, or if any free parked vCPU's `park_timer_deadline_tsc` (host TSC, written by the VMM) is non-zero and has passed.
    - Check if the host-side vDPA/virtio RX doorbell counter has advanced past `telemetry.rx_ring_cons_idx.load(Relaxed)`.
    - If either is true, immediately mark the VM as requiring at least 1 physical core with maximum urgency.
-4. **Stranded Work Preference:** When selecting which parked `vCPU_i` to wake for a VM, always check `telemetry.stranded_work_bitmap.load(Acquire)` first (`tzcnt` on the bitmap) so vCPUs holding local runqueue work or RCU callbacks are woken before fresh vCPUs.
+4. **Stranded Work Preference:** When selecting which parked `vCPU_i` to wake for a VM, always check `telemetry.stranded_work_bitmap.load(Acquire)` first (`tzcnt` on the bitmap) so vCPUs holding local runqueue work or RCU callbacks are woken before fresh vCPUs. Next, prefer a vCPU whose `park_timer_deadline_tsc` has passed, since its timer interrupt can't fire while it is parked.
 
 ### Phase 2: Progress In-Flight Revocations
 For each managed tenant physical core (`pCPU`) in `CoreState::Revoking { donor_vm, donor_vcpu, recipient_vm, recipient_vcpu, deadline_tsc }`:
