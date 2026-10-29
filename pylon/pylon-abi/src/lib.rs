@@ -14,6 +14,8 @@ pub const PYLON_MAGIC: u64 = 0x5059_4C4F_4E56_4D31; // "PYLONVM1"
 ///
 /// Version 2 keeps version 1's layout and changes who may write which field
 /// (`spec/06-guest-kick-path.md` §3): see the field docs of [`PylonVcpuSlot`].
+/// `PylonVcpuSlot::park_timer_deadline_tsc` and `PylonVcpuSlot::guest_tsc_offset` use space
+/// that was reserved (zero) before; a reader treats 0 in either as "not provided".
 pub const PYLON_ABI_VERSION: u32 = 2;
 
 /// vCPU execution states in `PylonVcpuSlot::state`.
@@ -85,9 +87,11 @@ pub struct PylonTelemetry {
     pub rx_ring_cons_idx: AtomicU32,
     /// Bitmask of parked vCPU indices (0..63) that have stranded local runqueue tasks or RCU work.
     pub stranded_work_bitmap: AtomicU64,
-    /// Guest TSC timestamp (rdtsc) of the oldest thread waiting in the runqueue.
+    /// Guest TSC (`rdtsc` in the guest) since which runnable threads have been waiting for a
+    /// vCPU, or 0 if none wait. `pylond` converts it with `guest_tsc_offset`.
     pub head_wait_tsc: AtomicU64,
-    /// Next guest timer deadline TSC (used by pylond to wake a 0-core idle VM).
+    /// Next guest timer deadline in guest TSC, or 0 (used by pylond to wake a 0-core idle VM).
+    /// `pylond` converts it with `guest_tsc_offset`.
     pub next_timer_tsc: AtomicU64,
     /// Monotonically increasing guest heartbeat counter.
     pub guest_heartbeat: AtomicU64,
@@ -145,7 +149,10 @@ pub struct PylonVcpuSlot {
     /// Number of times the VMM parked this vCPU, cooperatively or forced. Written by the VMM,
     /// before it publishes `VCPU_STATE_PARKED`.
     pub yield_count: AtomicU64,
-    pub _reserved_guest: [u8; 8],
+    /// Host TSC at which the guest's TSC-deadline timer on this vCPU was due when the VMM
+    /// parked it, or 0 if no timer was armed or the VMM couldn't read it. Written by the VMM
+    /// before it publishes `VCPU_STATE_PARKED`, and cleared when the vCPU runs again.
+    pub park_timer_deadline_tsc: AtomicU64,
 
     // --- Upper 32B: Written by Host (pylond & VMM init) ---
     /// Set to 1 by `pylond` when requesting this vCPU to yield its physical core; cleared by
@@ -162,7 +169,9 @@ pub struct PylonVcpuSlot {
     pub revoke_deadline_tsc: AtomicU64,
     /// Number of times the VMM force-parked this vCPU. Written by the VMM.
     pub forced_preempt_count: AtomicU64,
-    pub _reserved_host: [u8; 8],
+    /// Guest TSC minus host TSC (wrapping) on this vCPU, or 0 if the VMM didn't measure it.
+    /// Written by the VMM before the vCPU first runs. See [`PylonSharedPage::guest_to_host_tsc`].
+    pub guest_tsc_offset: AtomicU64,
 }
 
 impl PylonVcpuSlot {
@@ -175,14 +184,14 @@ impl PylonVcpuSlot {
             _pad_guest: [0u8; 6],
             last_yield_tsc: AtomicU64::new(0),
             yield_count: AtomicU64::new(0),
-            _reserved_guest: [0u8; 8],
+            park_timer_deadline_tsc: AtomicU64::new(0),
             revoke_requested: AtomicU8::new(0),
             assigned_pcpu: AtomicU8::new(PCPU_UNASSIGNED),
             _pad_host: [0u8; 2],
             host_tid: AtomicU32::new(0),
             revoke_deadline_tsc: AtomicU64::new(0),
             forced_preempt_count: AtomicU64::new(0),
-            _reserved_host: [0u8; 8],
+            guest_tsc_offset: AtomicU64::new(0),
         }
     }
 
@@ -193,11 +202,13 @@ impl PylonVcpuSlot {
         self.in_critical_section.store(0, Ordering::Release);
         self.last_yield_tsc.store(0, Ordering::Release);
         self.yield_count.store(0, Ordering::Release);
+        self.park_timer_deadline_tsc.store(0, Ordering::Release);
         self.revoke_requested.store(0, Ordering::Release);
         self.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
         self.host_tid.store(0, Ordering::Release);
         self.revoke_deadline_tsc.store(0, Ordering::Release);
         self.forced_preempt_count.store(0, Ordering::Release);
+        self.guest_tsc_offset.store(0, Ordering::Release);
     }
 }
 
@@ -245,6 +256,18 @@ impl PylonSharedPage {
         }
         count
     }
+
+    /// Converts a guest TSC value written by the guest (`head_wait_tsc`, `next_timer_tsc`) to
+    /// host TSC, using vCPU 0's `guest_tsc_offset`. KVM keeps a VM's vCPU TSCs in sync, so
+    /// one offset serves the whole VM. Returns 0 for 0 ("not set"), and `guest_tsc` unchanged
+    /// if the offset is unknown. Assumes the guest TSC runs at the host rate (no TSC scaling).
+    #[inline]
+    pub fn guest_to_host_tsc(&self, guest_tsc: u64) -> u64 {
+        if guest_tsc == 0 {
+            return 0;
+        }
+        guest_tsc.wrapping_sub(self.vcpus[0].guest_tsc_offset.load(Ordering::Acquire))
+    }
 }
 
 // Compile-time layout assertions required by Specification 01.
@@ -258,6 +281,8 @@ const _: () = {
     assert!(size_of::<PylonSharedPage>() == 8192);
     assert!(align_of::<PylonSharedPage>() == 4096);
     assert!(offset_of!(PylonVcpuSlot, revoke_requested) == 32);
+    assert!(offset_of!(PylonVcpuSlot, park_timer_deadline_tsc) == 24);
+    assert!(offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56);
     assert!(offset_of!(PylonSharedPage, header) == 0);
     assert!(offset_of!(PylonSharedPage, telemetry) == 64);
     assert!(offset_of!(PylonSharedPage, vcpus) == 128);
@@ -302,5 +327,23 @@ mod tests {
             page.vcpus[0].assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
         );
+    }
+
+    #[test]
+    fn test_guest_to_host_tsc() {
+        // SAFETY: All fields in PylonSharedPage are valid when zero-initialized.
+        let mut page: PylonSharedPage = unsafe { zeroed() };
+        page.init(1, 2, 0);
+        // Unknown offset: guest TSC is taken as host TSC.
+        assert_eq!(page.guest_to_host_tsc(5_000), 5_000);
+        assert_eq!(page.guest_to_host_tsc(0), 0);
+
+        // KVM starts a guest's TSC near 0, so the offset is usually "negative".
+        let host_at_start: u64 = 1_000_000_000;
+        page.vcpus[0]
+            .guest_tsc_offset
+            .store(0u64.wrapping_sub(host_at_start), Ordering::Release);
+        assert_eq!(page.guest_to_host_tsc(5_000), host_at_start + 5_000);
+        assert_eq!(page.guest_to_host_tsc(0), 0);
     }
 }
