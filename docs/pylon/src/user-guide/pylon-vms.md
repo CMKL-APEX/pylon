@@ -44,8 +44,9 @@ the one with twice the weight wins. It's relative: only the ratio
 between VMs matters.
 
 **`vm_id`** names the VM to `pylond`. **Set it, and keep it unique on
-the host.** It defaults to `1`, and when a second VM registers with an
-id already in use, `pylond` replaces the first one's registration.
+the host.** It defaults to `1`. While a VM's VMM runs, `pylond`
+rejects any other VM that registers with the same id, and logs it. The
+rejected VM boots, but `pylond` never manages it.
 
 **`shm`** is the file backing the VM's shared page. Use a path under
 `/dev/shm`, one per VM. The VMM creates the file if it doesn't exist
@@ -80,14 +81,9 @@ it can exit. The shared-page file is **not** removed. Delete it
 yourself, or reuse the path for the same VM next time: the VMM zeroes
 it at start.
 
-`pylond` doesn't learn that the VM is gone. Its registration stays
-until another VM registers with the same `vm_id` or `pylond` restarts.
-Managed CPUs that `pylond` had given to the VM's running vCPUs aren't
-reclaimed either, because those vCPUs' slots still read `RUNNING`.
-<!-- TODO(verify): derived from the code (no deregistration path in
-pylond/src/control.rs; reclaim needs state == PARKED); not yet observed
-on a host. -->
-Restart `pylond` to recover them.
+`pylond` holds a pidfd for each VM's VMM. Within about a second of the
+VMM exiting, it removes the VM's registration and frees the managed
+CPUs the VM held. The VM's `vm_id` is then free for its next start.
 
 ## Things to avoid
 

@@ -59,7 +59,15 @@ usec = (now_tsc - last_tsc) * 1000 / tsc_khz
 
 It carries the remainder forward (it advances `last_tsc` by exactly the
 cycles it counted), so rounding doesn't lose time across sweeps.
-`tsc_khz` comes from the VM's header, with 3,000,000 as the default.
+`tsc_khz` comes from the VM's header when it is non-zero. The VMM
+writes `0`, so in practice it is the host TSC rate that `pylond`
+measures at start (`calibrate_tsc_khz`, 50 ms against the system
+clock), or 3,000,000 if that fails.
+
+**Removed VMs.** A CPU still `Assigned` to a VM that is no longer
+registered (Plane 1 removes VMs whose VMM exited) is freed: the engine
+clears its owner entry and marks it `Idle`. This runs even when no VMs
+are left.
 
 ## Phase 1: demand
 

@@ -28,8 +28,6 @@ running works, but never cooperatively yet:
   connected to a guest interrupt, so the guest isn't told about a
   revocation.
 - No guest component writes `PARKING` to agree to park.
-- `pylon-guest-agent` can mark a vCPU as parked while it is still
-  running.
 
 The host side is in place. The VMM parks a vCPU only when the guest
 asks to (by writing `PARKING`) or when the revocation's deadline has
@@ -52,13 +50,10 @@ tracks 4 and 5).
 - **Unwritten telemetry.** Nothing writes `in_critical_section` or
   `stranded_work_bitmap` yet, so donor selection can't avoid lock
   holders, and wakeups can't prefer vCPUs with stranded work.
-- **Time bases.** The VMM writes a fixed `tsc_khz` of 3,000,000 (3 GHz)
-  into the header, whatever the host's real TSC rate, so `pylond`'s
-  grace period and metering are only right on a 3 GHz TSC. The guest
-  agent writes `head_wait_tsc` from the *guest's* TSC, while `pylond`
-  compares it with the *host's*. Under KVM the two differ by the VM's
-  TSC offset, so the wait time `pylond` computes is skewed by that
-  offset.
+- **Time bases.** The guest agent writes `head_wait_tsc` from the
+  *guest's* TSC, while `pylond` compares it with the *host's*. Under KVM
+  the two differ by the VM's TSC offset, so the wait time `pylond`
+  computes is skewed by that offset.
 - **`min_cores` while idle.** A VM that reports no runnable threads
   wants zero cores, whatever its `min_cores`.
 - **Guest side.** There is no guest kernel driver yet. The userspace
@@ -72,12 +67,7 @@ tracks 4 and 5).
   BAR (see the roadmap) removes the question.
 - **Lifecycle.** Snapshot, restore and live migration don't account for
   Pylon state. vCPU hotplug and a `pylond` restart aren't handled: the
-  VMM registers once, at boot, and doesn't reconnect. `pylond` isn't
-  told when a VM exits, so it keeps the registration, and possibly the
-  managed CPUs it gave that VM, until it restarts.
-- **Architectures and backends.** `pylond` and `scx_pylon` are
-  x86_64-only (they use the TSC and `TPAUSE`). Pylon has only been run
-  on KVM.
+  VMM registers once, at boot, and doesn't reconnect.
 
 ## Roadmap
 

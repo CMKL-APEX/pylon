@@ -59,9 +59,8 @@ Before=multi-user.target
 Type=simple
 RuntimeDirectory=pylon
 Environment=RUST_LOG=info
-ExecStart=/usr/local/bin/pylond --socket /run/pylon/pylond.sock --cores 2-7
-# pylond doesn't set the socket's mode; open it to the VMMs' group.
-ExecStartPost=/bin/sh -c 'for i in $(seq 50); do [ -S /run/pylon/pylond.sock ] && break; sleep 0.1; done; chgrp kvm /run/pylon/pylond.sock && chmod 0660 /run/pylon/pylond.sock'
+# Let the group the VMMs run as (here: kvm) use the socket.
+ExecStart=/usr/local/bin/pylond --socket /run/pylon/pylond.sock --cores 2-7 --socket-group kvm --socket-mode 660
 Restart=on-failure
 
 [Install]

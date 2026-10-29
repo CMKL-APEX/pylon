@@ -13,7 +13,7 @@ explains what the guest sees and how it reports demand.
   work waits until `pylond` wakes the vCPU.
 - **The shared page**, 8 KiB at guest-physical address `0xFEDF_0000`
   (or the `gpa` you set). It starts with the header: magic
-  `0x5059_4C4F_4E56_4D31` (`"PYLONVM1"`), ABI version `1`, the number of
+  `0x5059_4C4F_4E56_4D31` (`"PYLONVM1"`), ABI version `2`, the number of
   vCPU slots and the VM's id. See [Shared-memory
   ABI](../developer-guide/shared-memory-abi.md) for the layout.
 
@@ -45,11 +45,11 @@ It needs root, and a guest kernel that allows `/dev/mem` mappings of the
 page's address. All its options are in [Other
 tools](../reference/tools.md#pylon-guest-agent).
 
-> **Warning.** The agent also tries to "yield" vCPUs that `pylond` asks
-> to give up a core, by marking them parked in the page. It can't
-> actually stop those vCPUs, so it misreports their state to `pylond`.
-> This is a known problem ([Status](../status.md#what-doesnt-work-yet)).
-> The fix makes the agent telemetry-only.
+The agent only writes telemetry. It leaves vCPU states and revocation
+requests alone: a userspace process can't stop a vCPU, so it can't
+agree to park one. Older versions of the agent marked revoked vCPUs as
+parked while they kept running; this version doesn't, and a mismatched
+agent refuses to start against a version-2 page.
 
 ## Limits of a userspace agent
 
