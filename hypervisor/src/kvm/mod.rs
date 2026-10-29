@@ -323,6 +323,7 @@ impl From<MpState> for kvm_mp_state {
             MpState::Kvm(s) => s,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("CpuState is not valid"),
         }
     }
@@ -358,6 +359,7 @@ impl From<CpuState> for VcpuKvmState {
             CpuState::Kvm(s) => s,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("CpuState is not valid"),
         }
     }
@@ -377,6 +379,7 @@ impl From<ClockData> for kvm_clock_data {
             ClockData::Kvm(s) => s,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("CpuState is not valid"),
         }
     }
@@ -394,6 +397,7 @@ impl From<crate::Register> for kvm_bindings::kvm_one_reg {
             crate::Register::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("Register is not valid"),
         }
     }
@@ -413,6 +417,7 @@ impl From<crate::VcpuInit> for kvm_bindings::kvm_vcpu_init {
             crate::VcpuInit::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("VcpuInit is not valid"),
         }
     }
@@ -432,6 +437,7 @@ impl From<crate::RegList> for kvm_bindings::RegList {
             crate::RegList::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("RegList is not valid"),
         }
     }
@@ -451,6 +457,7 @@ impl From<crate::StandardRegisters> for kvm_bindings::kvm_regs {
             crate::StandardRegisters::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("StandardRegisters are not valid"),
         }
     }
@@ -470,6 +477,7 @@ impl From<crate::StandardRegisters> for kvm_bindings::kvm_riscv_core {
             crate::StandardRegisters::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("StandardRegisters are not valid"),
         }
     }
@@ -487,6 +495,7 @@ impl From<IrqRoutingEntry> for kvm_irq_routing_entry {
             IrqRoutingEntry::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("IrqRoutingEntry is not valid"),
         }
     }
@@ -969,6 +978,7 @@ impl vm::Vm for KvmVm {
             .map(|entry| match entry {
                 IrqRoutingEntry::Kvm(e) => *e,
                 #[allow(unreachable_patterns)]
+                #[expect(clippy::panic, reason = "mixed hypervisor backends")]
                 _ => panic!("IrqRoutingEntry type is wrong"),
             })
             .collect();
@@ -1684,7 +1694,8 @@ pub struct KvmVcpu {
 #[cfg(feature = "sev_snp")]
 impl KvmVcpu {
     fn validate_gpa_range(&self, gpa: u64, num_pages: u64) -> cpu::Result<u64> {
-        if let Some(size) = num_pages.checked_mul(PAGE_SIZE_4K)
+        if gpa.is_multiple_of(PAGE_SIZE_4K)
+            && let Some(size) = num_pages.checked_mul(PAGE_SIZE_4K)
             && size != 0
             && let Some(end) = gpa.checked_add(size)
             && let Some(slots) = &self.memory_slots
@@ -3742,6 +3753,8 @@ mod tests {
         assert_eq!(vcpu.validate_gpa_range(0x5000, 1).unwrap(), 0x1000);
         for (gpa, pages) in [
             (0, 1),
+            (0x1001, 1),
+            (0x1fff, 1),
             (0x6000, 1),
             (0x3000, 2),
             (0x3000, 3),
