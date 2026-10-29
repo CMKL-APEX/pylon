@@ -275,37 +275,6 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
         Ok(runnable)
     }
 
-    /// Inspect vCPU slots and cooperatively park vCPUs where the host has requested revocation.
-    pub fn handle_revocations(&self) -> Vec<u32> {
-        let page = self.shared_page();
-        let num_vcpus = (page.header.num_vcpus as usize).min(MAX_VCPUS);
-        let mut yielded = Vec::new();
-
-        // vCPU 0 is the primary / bootstrap core and generally does not yield unless scale-to-zero.
-        for (vcpu_id, slot) in page.vcpus.iter().enumerate().take(num_vcpus).skip(1) {
-            if slot.revoke_requested.load(Ordering::Acquire) == 1 {
-                let cur_state = slot.state.load(Ordering::Acquire);
-                if cur_state == VCPU_STATE_RUNNING || cur_state == VCPU_STATE_WAKING {
-                    // Check if vCPU is in a critical section
-                    if slot.in_critical_section.load(Ordering::Acquire) == 0 {
-                        slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
-                        slot.revoke_requested.store(0, Ordering::Release);
-                        slot.yield_count.fetch_add(1, Ordering::Relaxed);
-                        #[cfg(target_arch = "x86_64")]
-                        // SAFETY: _rdtsc is a standard unprivileged x86 instruction with no side effects.
-                        let now_tsc = unsafe { _rdtsc() };
-                        #[cfg(not(target_arch = "x86_64"))]
-                        let now_tsc = 1;
-                        slot.last_yield_tsc.store(now_tsc, Ordering::Release);
-                        yielded.push(vcpu_id as u32);
-                    }
-                }
-            }
-        }
-
-        yielded
-    }
-
     /// Take a full status snapshot.
     pub fn status(&self) -> GuestAgentStatus {
         let page = self.shared_page();
@@ -349,10 +318,13 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
         }
     }
 
-    /// Main loop step: update telemetry, handle revocations, and return status.
+    /// Main loop step: update telemetry and return status.
+    ///
+    /// The agent only writes telemetry. It never writes a vCPU's `state` or clears
+    /// `revoke_requested`: a userspace process can't stop a vCPU, so parking belongs to the
+    /// guest kernel and the VMM (`spec/06-guest-kick-path.md` §3).
     pub fn step(&self) -> Result<GuestAgentStatus, PylonGuestError> {
         self.update_telemetry()?;
-        self.handle_revocations();
         Ok(self.status())
     }
 
@@ -465,8 +437,7 @@ mod tests {
         assert_eq!(st1.runnable_threads, 3);
         assert_eq!(st1.guest_heartbeat, 1);
 
-        // 3. Test revocation handling
-        // Simulate host assigning vCPU 1 to pCPU 4, then requesting revocation
+        // 3. A pending revocation is left to the VMM: a step only writes telemetry.
         let shared = agent.shared_page();
         shared.vcpus[1]
             .state
@@ -474,14 +445,15 @@ mod tests {
         shared.vcpus[1].assigned_pcpu.store(4, Ordering::Release);
         shared.vcpus[1].revoke_requested.store(1, Ordering::Release);
 
-        let yielded = agent.handle_revocations();
-        assert_eq!(yielded, vec![1]);
+        let st2 = agent.step().unwrap();
+        assert!(st2.vcpus[1].revoke_requested);
         assert_eq!(
             shared.vcpus[1].state.load(Ordering::Acquire),
-            VCPU_STATE_PARKED
+            VCPU_STATE_RUNNING
         );
-        assert_eq!(shared.vcpus[1].revoke_requested.load(Ordering::Acquire), 0);
-        assert_eq!(shared.vcpus[1].yield_count.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.vcpus[1].revoke_requested.load(Ordering::Acquire), 1);
+        assert_eq!(shared.vcpus[1].yield_count.load(Ordering::Relaxed), 0);
+        assert_eq!(st2.guest_heartbeat, 2);
 
         // Clean up raw pointer
         // SAFETY: Reconstituting Box from raw pointer for safe deallocation.
