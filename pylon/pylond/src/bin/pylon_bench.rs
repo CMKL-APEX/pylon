@@ -6,6 +6,11 @@
 //! Benchmark comparing Pylon microsecond core elasticity against Cloud Hypervisor ACPI CPU hotplug
 //! across a multi-wave bursty parallel compute workload.
 
+#![expect(
+    clippy::cast_ptr_alignment,
+    reason = "every cast is of a page-aligned mmap(2) to the shared page"
+)]
+
 use core::hint::spin_loop;
 use std::env::temp_dir;
 use std::fs::{self, OpenOptions};

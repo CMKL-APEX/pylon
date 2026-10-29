@@ -102,6 +102,7 @@ impl PcpuOwnerFlags {
 
     /// Returns the bitwise OR of `self` and `other`.
     #[inline]
+    #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -245,7 +246,13 @@ impl PcpuOwnerMap {
         // SAFETY: `self.mmap` is page-aligned by `mmap(2)` and guaranteed to be
         // at least `PCPU_OWNER_MAP_BYTES` (`256 * 8 = 2048` bytes) long.
         // `AtomicPcpuOwnerSlot` has size 8 and alignment 4 with no invalid bit patterns.
-        unsafe { &*(self.mmap.as_ptr() as *const [AtomicPcpuOwnerSlot; MAX_PCPUS]) }
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "mmap(2) returns page-aligned memory"
+        )]
+        unsafe {
+            &*(self.mmap.as_ptr() as *const [AtomicPcpuOwnerSlot; MAX_PCPUS])
+        }
     }
 
     /// Atomically assigns `pcpu` ownership to `target_tid` with `flags` using

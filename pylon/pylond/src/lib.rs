@@ -124,7 +124,13 @@ impl PcpuOwnerStorage {
         match self {
             Self::Mmap(mmap) => {
                 // SAFETY: `mmap` was verified to be at least `MAX_PCPUS * 8` bytes and page-aligned.
-                unsafe { &*mmap.as_ptr().cast::<PcpuOwnerEntry>().add(pcpu_id) }
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "mmap(2) returns page-aligned memory"
+                )]
+                unsafe {
+                    &*mmap.as_ptr().cast::<PcpuOwnerEntry>().add(pcpu_id)
+                }
             }
             Self::Heap(entries) => &entries[pcpu_id],
         }
@@ -606,7 +612,13 @@ impl VmHandle {
     pub fn shared_page(&self) -> &PylonSharedPage {
         // SAFETY: `shm_mmap` length was verified to be >= `PYLON_SHARED_PAGE_SIZE` (8192)
         // and `mmap` guarantees page alignment (4096 bytes), matching `PylonSharedPage`.
-        unsafe { &*(self.inner.shm_mmap.as_ptr().cast::<PylonSharedPage>()) }
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "mmap(2) returns page-aligned memory"
+        )]
+        unsafe {
+            &*(self.inner.shm_mmap.as_ptr().cast::<PylonSharedPage>())
+        }
     }
 
     /// Reads the host-side vDPA/virtio RX doorbell index for 0-core wakeups.
@@ -839,6 +851,10 @@ mod tests {
         // SAFETY: `file` is truncated to `PYLON_SHARED_PAGE_SIZE` (8192 bytes).
         let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         // SAFETY: `mmap` is page-aligned and 8192 bytes, matching `PylonSharedPage`.
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "mmap(2) returns page-aligned memory"
+        )]
         let page = unsafe { &mut *(mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
         page.init(vm_id, num_vcpus, tsc_khz);
         for (vcpu_idx, slot) in page.vcpus.iter().enumerate().take(num_vcpus as usize) {

@@ -5,6 +5,11 @@
 
 //! End-to-End Integration Tests for the Pylon Subsystem (`pylon-abi`, `pylond`, `scx-pylon`, and VMM vCPU fast-park lifecycle).
 
+#![expect(
+    clippy::cast_ptr_alignment,
+    reason = "every cast is of a page-aligned mmap(2) to the shared page"
+)]
+
 use std::env::temp_dir;
 use std::fs::{self, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
