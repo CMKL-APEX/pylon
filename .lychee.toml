@@ -32,6 +32,10 @@ exclude = [
   # Metrics publish endpoint only answers authenticated PUTs; a plain GET
   # returns 404.
   '^https://ch-metrics\.azurewebsites\.net/api/publishmetrics',
+  # The Pylon docs site exists only once pylon-docs.yaml has published
+  # gh-pages from main and GitHub Pages serves that branch; links to it
+  # in a pull request that adds pages would otherwise fail.
+  '^https://cmkl-apex\.github\.io/pylon/',
 ]
 
 # Exclude loopback addresses

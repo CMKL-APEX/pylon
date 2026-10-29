@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **Pylon Project Scope (`CMKL-APEX/pylon`):**
 > **Pylon** is the microsecond-scale elastic Virtual Machine Monitor (VMM) and host CPU core arbitration subsystem for the **Glidex Cloud** suite, built as a surgical fork of Cloud Hypervisor.
-> - User and developer documentation is available in [`docs/pylon.md`](docs/pylon.md), architectural specifications live in [`spec/`](spec/00-architecture.md), and standalone Pylon crates live in [`pylon/`](pylon/).
+> - User, operator and developer documentation is the Pylon book in [`docs/pylon/`](docs/pylon/README.md), published at <https://cmkl-apex.github.io/pylon/>. Architectural specifications live in [`spec/`](spec/00-architecture.md), and standalone Pylon crates live in [`pylon/`](pylon/).
 > - **All changes, pushes, pull requests, and issues must remain in [`CMKL-APEX/pylon`](https://github.com/CMKL-APEX/pylon)** and must **NOT** be pushed, submitted as PRs, or filed as issues to upstream `cloud-hypervisor/cloud-hypervisor` unless the project owner explicitly states otherwise.
 
 ---
