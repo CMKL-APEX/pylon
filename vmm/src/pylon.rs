@@ -33,8 +33,9 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::{GuestMemoryMmap, GuestRegionMmap};
 
-/// Default guest TSC frequency in kHz written into `PylonHeader` when not queried from host.
-pub const DEFAULT_TSC_KHZ: u64 = 3_000_000;
+/// TSC rate written into `PylonHeader`: unknown. The VMM writes the header before any vCPU
+/// exists, so it can't ask KVM; `pylond` measures the host TSC rate itself instead.
+pub const UNKNOWN_TSC_KHZ: u64 = 0;
 
 /// Default VM priority weight for Pylon core arbitration.
 pub const DEFAULT_PRIORITY_WEIGHT: u32 = 100;
@@ -311,7 +312,7 @@ impl PylonVmmState {
                     version: PYLON_ABI_VERSION,
                     num_vcpus,
                     vm_id: config.vm_id,
-                    tsc_khz: DEFAULT_TSC_KHZ,
+                    tsc_khz: UNKNOWN_TSC_KHZ,
                     _reserved: [0u8; 32],
                 },
             );
@@ -811,7 +812,7 @@ mod tests {
         assert_eq!(page.header.version, PYLON_ABI_VERSION);
         assert_eq!(page.header.num_vcpus, 4);
         assert_eq!(page.header.vm_id, 77);
-        assert_eq!(page.header.tsc_khz, DEFAULT_TSC_KHZ);
+        assert_eq!(page.header.tsc_khz, UNKNOWN_TSC_KHZ);
         assert_eq!(page.telemetry.runnable_threads.load(Ordering::Relaxed), 0);
 
         for i in 0..4 {
