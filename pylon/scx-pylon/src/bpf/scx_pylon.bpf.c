@@ -53,6 +53,9 @@
 
 #define BPF_FOR_EACH_ITER (&___it)
 
+/* scx_bpf_exit code when core scheduling turns on (pylon#15) */
+#define PYLON_EXIT_CORE_SCHED 1
+
 /* Flags in struct pcpu_owner_entry */
 #define PCPU_OWNER_FLAG_ACTIVE (1U << 0)
 #define PCPU_OWNER_FLAG_PREEMPT (1U << 1)
@@ -94,6 +97,28 @@ struct {
     __type(key, int);
     __type(value, struct pylon_task_ctx);
 } pylon_task_ctx SEC(".maps");
+
+/*
+ * Core scheduling guard (pylon#15). On kernels without the sched_ext
+ * core-scheduling fixes, scx_pylon must not run once any task has a core
+ * scheduling cookie.
+ */
+struct pylon_guard {
+    /* tgid of the first task seen asking for a cookie, or 0 */
+    __u32 cookie_tgid;
+    /* Set once scx_pylon has asked the kernel to disable it */
+    __u32 exiting;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct pylon_guard);
+} pylon_guard SEC(".maps");
+
+static char core_sched_fmt[] =
+    "core scheduling turned on by pid %llu; this kernel lacks the sched_ext fixes";
 
 __u32 cpu_claim[MAX_PCPUS];
 
@@ -137,6 +162,27 @@ static __always_inline s32 smt_next(s32 cpu)
         return cpu;
     }
     return (s32)*next;
+}
+
+static __always_inline struct pylon_guard *guard(void)
+{
+    __u32 key = 0;
+    return bpf_map_lookup_elem(&pylon_guard, &key);
+}
+
+/*
+ * Asks the kernel to disable scx_pylon once a task has asked for a core
+ * scheduling cookie. Dispatch goes on as usual until the kernel does.
+ */
+static void exit_on_core_sched(void)
+{
+    struct pylon_guard *g = guard();
+
+    if (!g || !g->cookie_tgid || __atomic_exchange_n(&g->exiting, 1, __ATOMIC_SEQ_CST)) {
+        return;
+    }
+    unsigned long long data[1] = {g->cookie_tgid};
+    scx_bpf_exit_bstr(PYLON_EXIT_CORE_SCHED, core_sched_fmt, data, sizeof(data));
 }
 
 static __always_inline struct pylon_task_ctx *task_ctx(struct task_struct *p)
@@ -428,6 +474,7 @@ static bool dispatch_vcpu(s32 cpu)
 SEC("struct_ops/pylon_dispatch")
 void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
 {
+    exit_on_core_sched();
     if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu)) {
         return;
     }
@@ -493,6 +540,23 @@ s32 BPF_PROG(pylon_init)
 SEC("struct_ops/pylon_exit")
 void BPF_PROG(pylon_exit, struct scx_exit_info *info)
 {
+}
+
+/*
+ * Loaded only with the guard. sched_core_get() runs whenever a task gets a
+ * new cookie, before the first one turns core scheduling on. Disabling
+ * scx_pylon then takes until the next dispatch and the kernel's disable
+ * work, so this narrows the window but doesn't close it.
+ */
+SEC("fentry/sched_core_get")
+int BPF_PROG(pylon_sched_core_get)
+{
+    struct pylon_guard *g = guard();
+
+    if (g) {
+        __sync_val_compare_and_swap(&g->cookie_tgid, 0, (__u32)(bpf_get_current_pid_tgid() >> 32));
+    }
+    return 0;
 }
 
 SEC(".struct_ops.link")

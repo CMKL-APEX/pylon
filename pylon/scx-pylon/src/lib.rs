@@ -27,6 +27,12 @@ pub const PCPU_OWNERS_MAP_NAME: &str = "pylon_pcpu_owners";
 /// Name of the SMT sibling ring array map inside `scx_pylon.bpf.o`.
 pub const SMT_NEXT_MAP_NAME: &str = "pylon_smt_next";
 
+/// Name of the core scheduling guard array map inside `scx_pylon.bpf.o`.
+pub const GUARD_MAP_NAME: &str = "pylon_guard";
+
+/// Name of the program that watches for new core scheduling cookies.
+pub const SCHED_CORE_WATCH_PROG_NAME: &str = "pylon_sched_core_get";
+
 /// Name of the `sched_ext_ops` struct_ops map inside `scx_pylon.bpf.o`.
 pub const SCX_OPS_MAP_NAME: &str = "pylon_ops";
 
@@ -133,6 +139,14 @@ pub enum Error {
     /// A task has a core scheduling cookie, which turns core scheduling on.
     #[error("Thread {tid} ({comm}) has a core scheduling cookie")]
     CoreSchedInUse { tid: i32, comm: String },
+
+    /// A process asked for a core scheduling cookie while attaching.
+    #[error("Process {tgid} asked for a core scheduling cookie")]
+    CoreSchedTurnedOn { tgid: u32 },
+
+    /// Required BPF program was not found in the embedded object.
+    #[error("Missing required BPF program '{prog_name}'")]
+    MissingProg { prog_name: &'static str },
 }
 
 /// Result alias for `scx-pylon`.
@@ -327,6 +341,7 @@ pub fn host_smt_ring() -> [u32; MAX_PCPUS] {
 pub struct ScxPylonUserspace {
     _obj: Object,
     _link: Link,
+    _guard_links: Vec<Link>,
     owner_map: PcpuOwnerMap,
 }
 
@@ -413,11 +428,21 @@ impl ScxPylonUserspace {
     /// struct_ops dispatcher, and `mmap`s `pylon_pcpu_owners` into userspace.
     ///
     /// With `guard`, refuses to attach while any task has a core scheduling
-    /// cookie (see [`coresched`]).
+    /// cookie, and disables itself when a task asks for one later (see
+    /// [`coresched`]).
     ///
     /// Requires `CAP_BPF` / `CAP_SYS_ADMIN` and a kernel with `CONFIG_SCHED_EXT=y`.
     pub fn load_and_attach(guard: bool) -> Result<Self> {
-        let open_obj = Self::open_embedded()?;
+        let mut open_obj = Self::open_embedded()?;
+        // The watcher needs sched_core_get(), which kernels without
+        // CONFIG_SCHED_CORE lack.
+        open_obj
+            .progs_mut()
+            .find(|p| p.name() == SCHED_CORE_WATCH_PROG_NAME)
+            .ok_or(Error::MissingProg {
+                prog_name: SCHED_CORE_WATCH_PROG_NAME,
+            })?
+            .set_autoload(guard);
         let mut obj = open_obj.load().map_err(Error::Bpf)?;
 
         let owner_map = {
@@ -454,13 +479,28 @@ impl ScxPylonUserspace {
             .filter(|&(cpu, &next)| next as usize != cpu)
             .count();
 
-        if guard
-            && let Some(thread) = coresched::find_cookied_thread().map_err(Error::CoreSchedScan)?
-        {
-            return Err(Error::CoreSchedInUse {
-                tid: thread.tid,
-                comm: thread.comm,
-            });
+        let mut guard_links = Vec::new();
+        if guard {
+            // Watch before looking, so a cookie made in between is seen by
+            // one or the other.
+            let watch = obj
+                .progs_mut()
+                .find(|p| p.name() == SCHED_CORE_WATCH_PROG_NAME)
+                .ok_or(Error::MissingProg {
+                    prog_name: SCHED_CORE_WATCH_PROG_NAME,
+                })?;
+            guard_links.push(watch.attach_trace().map_err(Error::Bpf)?);
+
+            if let Some(thread) = coresched::find_cookied_thread().map_err(Error::CoreSchedScan)? {
+                return Err(Error::CoreSchedInUse {
+                    tid: thread.tid,
+                    comm: thread.comm,
+                });
+            }
+            let tgid = Self::cookie_tgid(&obj)?;
+            if tgid != 0 {
+                return Err(Error::CoreSchedTurnedOn { tgid });
+            }
         }
 
         let mut ops_map = obj
@@ -479,8 +519,25 @@ impl ScxPylonUserspace {
         Ok(Self {
             _obj: obj,
             _link: link,
+            _guard_links: guard_links,
             owner_map,
         })
+    }
+
+    /// Reads the tgid that the watcher recorded asking for a cookie, or 0.
+    fn cookie_tgid(obj: &Object) -> Result<u32> {
+        let map = obj
+            .maps()
+            .find(|m| m.name() == GUARD_MAP_NAME)
+            .ok_or(Error::MissingMap {
+                map_name: GUARD_MAP_NAME,
+            })?;
+        let value = map
+            .lookup(&0u32.to_ne_bytes(), MapFlags::ANY)
+            .map_err(Error::Bpf)?
+            .unwrap_or_default();
+        // `cookie_tgid` is the first member of `struct pylon_guard`.
+        Ok(value.first_chunk().map_or(0, |b| u32::from_ne_bytes(*b)))
     }
 
     /// Returns a reference to the zero-syscall memory-mapped `pylon_pcpu_owners` map.
@@ -489,9 +546,10 @@ impl ScxPylonUserspace {
         &self.owner_map
     }
 
-    /// Consumes the loader handle and returns the `PcpuOwnerMap`, BPF `Link`, and `Object`.
-    pub fn into_parts(self) -> (PcpuOwnerMap, Link, Object) {
-        (self.owner_map, self._link, self._obj)
+    /// Consumes the loader handle and returns the `PcpuOwnerMap`, the struct_ops
+    /// `Link`, the guard's `Link`s, and the `Object`.
+    pub fn into_parts(self) -> (PcpuOwnerMap, Link, Vec<Link>, Object) {
+        (self.owner_map, self._link, self._guard_links, self._obj)
     }
 }
 
@@ -533,6 +591,7 @@ mod tests {
             "Expected pylon_select_cpu program in {prog_names:?}"
         );
         for prog in [
+            SCHED_CORE_WATCH_PROG_NAME,
             "pylon_dispatch",
             "pylon_enqueue",
             "pylon_running",
@@ -543,10 +602,12 @@ mod tests {
                 "Expected {prog} program in {prog_names:?}"
             );
         }
-        assert!(
-            open_obj.maps().any(|m| m.name() == SMT_NEXT_MAP_NAME),
-            "Expected {SMT_NEXT_MAP_NAME} map"
-        );
+        for map in [SMT_NEXT_MAP_NAME, GUARD_MAP_NAME] {
+            assert!(
+                open_obj.maps().any(|m| m.name() == map),
+                "Expected {map} map"
+            );
+        }
     }
 
     #[test]

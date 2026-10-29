@@ -221,11 +221,11 @@ fn main() -> Result<()> {
     let smt_ring = scx.as_ref().map(|_| scx_pylon::host_smt_ring());
 
     let (pcpu_owners, _scx_handle) = if let Some(scx) = scx {
-        let (owner_map, link, obj) = scx.into_parts();
+        let (owner_map, link, guard_links, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
         let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
             .context("failed to create PcpuOwnerTable from scx_pylon mmap")?;
-        (Arc::new(table), Some((link, obj)))
+        (Arc::new(table), Some((link, guard_links, obj)))
     } else if let Some(ref path) = args.pcpu_map_file {
         let file = OpenOptions::new()
             .read(true)
