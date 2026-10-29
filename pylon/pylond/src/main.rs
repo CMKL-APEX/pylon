@@ -199,6 +199,10 @@ fn main() -> Result<()> {
         ScxAttach::No => None,
     };
 
+    // scx_pylon keeps SMT siblings of a running vCPU free of other VMs, so the engine must not
+    // give two VMs sibling threads of one core.
+    let smt_ring = scx.as_ref().map(|_| scx_pylon::host_smt_ring());
+
     let (pcpu_owners, _scx_handle) = if let Some(scx) = scx {
         let (owner_map, link, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
@@ -232,6 +236,9 @@ fn main() -> Result<()> {
             let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);
+            }
+            if let Some(ring) = smt_ring {
+                engine.set_smt_ring(&ring);
             }
             engine.run(&engine_stop)
         })
