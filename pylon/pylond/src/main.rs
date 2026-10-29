@@ -4,7 +4,7 @@
 //
 
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -12,7 +12,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::MatrixEngine;
@@ -40,9 +40,15 @@ struct CliArgs {
     #[arg(long)]
     pcpu_map_file: Option<PathBuf>,
 
-    /// Attach the live kernel sched_ext BPF dispatcher (scx-pylon).
-    #[arg(long)]
+    /// Attach the live kernel sched_ext BPF dispatcher (scx-pylon), and fail if it can't be.
+    /// Without this or `--no-scx`, it is attached when the kernel has sched_ext and no
+    /// `--pcpu-map-file` is given, falling back to the in-memory table if attaching fails.
+    #[arg(long, conflicts_with = "no_scx")]
     enable_scx: bool,
+
+    /// Never attach the sched_ext BPF dispatcher.
+    #[arg(long)]
+    no_scx: bool,
 
     /// Optional TCP port to expose Prometheus metrics over HTTP (e.g. 9100).
     #[arg(long)]
@@ -78,6 +84,29 @@ fn parse_core_list(spec: &str) -> Result<Vec<usize>> {
     Ok(cores)
 }
 
+/// Present when the running kernel was built with `CONFIG_SCHED_CLASS_EXT`.
+const SCHED_EXT_SYSFS: &str = "/sys/kernel/sched_ext";
+
+/// Whether to attach scx-pylon at startup.
+#[derive(Debug, PartialEq, Eq)]
+enum ScxAttach {
+    /// `--enable-scx`: attach, or exit.
+    Required,
+    /// The kernel has sched_ext: attach, or fall back to the in-memory table.
+    Try,
+    No,
+}
+
+fn scx_attach(args: &CliArgs, kernel_has_sched_ext: bool) -> ScxAttach {
+    if args.enable_scx {
+        ScxAttach::Required
+    } else if args.no_scx || args.pcpu_map_file.is_some() || !kernel_has_sched_ext {
+        ScxAttach::No
+    } else {
+        ScxAttach::Try
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let args = CliArgs::parse();
@@ -87,10 +116,28 @@ fn main() -> Result<()> {
         args.socket.display()
     );
 
-    let (pcpu_owners, _scx_handle) = if args.enable_scx {
-        info!("Loading and attaching scx_pylon sched_ext BPF dispatcher to kernel...");
-        let scx = scx_pylon::ScxPylonUserspace::load_and_attach()
-            .context("failed to load and attach scx_pylon sched_ext dispatcher")?;
+    let scx = match scx_attach(&args, Path::new(SCHED_EXT_SYSFS).exists()) {
+        ScxAttach::Required => {
+            info!("Loading and attaching scx_pylon sched_ext BPF dispatcher to kernel...");
+            Some(
+                scx_pylon::ScxPylonUserspace::load_and_attach()
+                    .context("failed to load and attach scx_pylon sched_ext dispatcher")?,
+            )
+        }
+        ScxAttach::Try => {
+            info!("Kernel has sched_ext; attaching scx_pylon BPF dispatcher...");
+            match scx_pylon::ScxPylonUserspace::load_and_attach() {
+                Ok(scx) => Some(scx),
+                Err(e) => {
+                    warn!("scx_pylon not attached, using the in-memory pCPU table: {e:#}");
+                    None
+                }
+            }
+        }
+        ScxAttach::No => None,
+    };
+
+    let (pcpu_owners, _scx_handle) = if let Some(scx) = scx {
         let (owner_map, link, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
         let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
@@ -148,4 +195,39 @@ fn main() -> Result<()> {
 
     control_res?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::iter;
+
+    use super::*;
+
+    fn args(flags: &[&str]) -> CliArgs {
+        CliArgs::try_parse_from(iter::once("pylond").chain(flags.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn scx_attaches_when_the_kernel_has_sched_ext() {
+        assert_eq!(scx_attach(&args(&[]), true), ScxAttach::Try);
+        assert_eq!(scx_attach(&args(&[]), false), ScxAttach::No);
+    }
+
+    #[test]
+    fn scx_flags_override_detection() {
+        assert_eq!(
+            scx_attach(&args(&["--enable-scx"]), false),
+            ScxAttach::Required
+        );
+        assert_eq!(scx_attach(&args(&["--no-scx"]), true), ScxAttach::No);
+        CliArgs::try_parse_from(["pylond", "--enable-scx", "--no-scx"]).unwrap_err();
+    }
+
+    #[test]
+    fn a_pcpu_map_file_keeps_scx_off_unless_required() {
+        let map = ["--pcpu-map-file", "/run/pylon/owners"];
+        assert_eq!(scx_attach(&args(&map), true), ScxAttach::No);
+        let required = [map[0], map[1], "--enable-scx"];
+        assert_eq!(scx_attach(&args(&required), true), ScxAttach::Required);
+    }
 }
