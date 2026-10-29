@@ -12,6 +12,7 @@ use std::{fs, thread};
 
 use clap::Parser;
 use log::info;
+use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 use scx_pylon::{MAX_PCPUS, PcpuOwnerFlags, PcpuOwnerMap, ScxPylonUserspace};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -38,6 +39,18 @@ struct Args {
     /// Direct path to a file-backed `pylon_pcpu_owners` shared memory file.
     #[arg(long)]
     shm: Option<PathBuf>,
+
+    /// Refuse to attach while any task has a core scheduling cookie. `auto` does this
+    /// only on kernels without the sched_ext core-scheduling fixes.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_guard: GuardMode,
+
+    /// With the guard, what a task asking for a core scheduling cookie gets while scx_pylon
+    /// is attached: `eperm` fails Cloud Hypervisor VMs that have core scheduling on, `enodev`
+    /// starts them without it, and `off` lets the request through, which then disables
+    /// scx_pylon. `eperm` and `enodev` need BPF LSM.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_deny: CookieDenial,
 }
 
 fn print_sched_ext_sysfs() {
@@ -108,8 +121,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Standalone attach mode
+    let kernel = KernelCoreSched::detect();
+    let guard = kernel
+        .needs_guard(args.core_sched_guard)
+        .then_some(args.core_sched_deny);
+    match guard {
+        Some(deny) => info!("Core scheduling: {kernel}; guard on, deny {deny:?}"),
+        None => info!("Core scheduling: {kernel}; guard off"),
+    }
     info!("Loading and attaching scx_pylon to kernel sched_ext...");
-    let scx = ScxPylonUserspace::load_and_attach()?;
+    let scx = ScxPylonUserspace::load_and_attach(guard)?;
     info!("scx_pylon attached successfully; kernel sched_ext is enabled.");
 
     print_sched_ext_sysfs();

@@ -60,6 +60,45 @@ Before attaching it on a shared host:
 - Only one `sched_ext` scheduler can be attached at a time. If another
   is attached, attaching `scx_pylon` fails.
 
+## Core scheduling
+
+On kernels that lack upstream fixes to `sched_ext`, it can't be used
+together with kernel core scheduling (`PR_SCHED_CORE`): the host hangs
+or crashes (issue #15). Ubuntu's 7.0.0-42 is one such kernel. Core
+scheduling turns on for the whole host as soon as *any* process asks
+for it, and Cloud Hypervisor does by default (`core_scheduling=vm`),
+so one VM started by anyone is enough.
+
+So, on such a kernel, `pylond` guards `scx_pylon`:
+
+- It doesn't attach while any thread has a core scheduling cookie.
+  The log names the thread.
+- While attached, it refuses requests for new cookies. Cloud
+  Hypervisor then fails to start a VM with `Error enabling core
+  scheduling`. Start such VMs with `--cpus ...,core_scheduling=off`.
+  `scx_pylon` keeps SMT siblings apart for VMs that `pylond` manages;
+  VMs it doesn't manage get no SMT isolation from each other.
+
+`pylond` logs its decision at startup, for example `Core scheduling:
+kernel lacks the sched_ext core-scheduling fixes (pylon#15); scx_pylon
+guard on, deny Eperm`.
+
+| Option | Meaning |
+|---|---|
+| `--core-sched-guard auto` (default) | Guard only on kernels that can core-schedule and lack the fix. |
+| `--core-sched-guard on` | Also guard kernels that seem fixed, for distributions that backported only part of the fix. |
+| `--core-sched-guard off` | Never guard. Only for kernels you have checked yourself. |
+| `--core-sched-deny eperm` (default) | Refuse new cookies with `EPERM`: VMs asking for core scheduling don't start. |
+| `--core-sched-deny enodev` | Refuse with `ENODEV`: Cloud Hypervisor starts such VMs without core scheduling, and doesn't say so. |
+| `--core-sched-deny off` | Don't refuse. A new cookie makes the kernel disable `scx_pylon`, but the bug can still hit first. |
+
+Refusing cookies needs the kernel's BPF LSM: `/sys/kernel/security/lsm`
+must list `bpf`. Otherwise attaching fails unless you pass
+`--core-sched-deny off`. Checking other processes' cookies needs root.
+
+To see which processes have a cookie: `sudo coresched get -s <pid>`
+(util-linux 2.40 or later).
+
 Use `--no-scx` when the host runs other latency-sensitive work you
 don't want under a VM-oriented scheduler, or until you have tested
 `scx_pylon` with your workload.

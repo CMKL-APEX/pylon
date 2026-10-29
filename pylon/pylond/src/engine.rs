@@ -7,6 +7,7 @@
 use core::arch::asm;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{__cpuid_count, _mm_pause, _rdtsc};
+use std::array::from_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -39,6 +40,9 @@ pub const REVOKE_RESIGNAL_US: u64 = 10;
 
 /// Default `_tpause` delay in TSC cycles (~300-400 ns on a 3 GHz core).
 pub const DEFAULT_TPAUSE_CYCLES: u64 = 1000;
+
+/// Longest SMT sibling ring followed when placing vCPUs.
+const MAX_SMT: usize = 8;
 
 /// Measures the host TSC rate in kHz against `CLOCK_MONOTONIC` over `window`. Returns `None`
 /// where there is no TSC.
@@ -194,6 +198,8 @@ pub struct MatrixEngine {
     /// Host TSC rate, used for VMs whose header gives none.
     host_tsc_khz: u64,
     has_waitpkg: bool,
+    /// SMT sibling ring: the next CPU on the same core, or the CPU itself.
+    smt_next: [u16; MAX_PCPUS],
 }
 
 impl MatrixEngine {
@@ -223,6 +229,7 @@ impl MatrixEngine {
             revoke_signalled_tsc: [0; MAX_PCPUS],
             host_tsc_khz: DEFAULT_TSC_KHZ,
             has_waitpkg,
+            smt_next: from_fn(|pcpu| pcpu as u16),
         }
     }
 
@@ -231,6 +238,18 @@ impl MatrixEngine {
     pub fn set_host_tsc_khz(&mut self, tsc_khz: u64) {
         if tsc_khz > 0 {
             self.host_tsc_khz = tsc_khz;
+        }
+    }
+
+    /// Sets the SMT sibling ring (`scx_pylon::host_smt_ring`), so that VMs aren't given sibling
+    /// threads of one core. Entries out of range are treated as CPUs without siblings.
+    pub fn set_smt_ring(&mut self, ring: &[u32; MAX_PCPUS]) {
+        for (pcpu, &next) in ring.iter().enumerate() {
+            self.smt_next[pcpu] = if (next as usize) < MAX_PCPUS {
+                next as u16
+            } else {
+                pcpu as u16
+            };
         }
     }
 
@@ -666,7 +685,7 @@ impl MatrixEngine {
                 };
 
                 // 1. Fast Path: Check for an Idle physical core.
-                if let Some(idle_pcpu) = self.find_idle_pcpu() {
+                if let Some(idle_pcpu) = self.find_idle_pcpu(recipient_eval.vm_id) {
                     self.assign_pcpu(idle_pcpu, recipient_vm, recipient_vcpu, now_tsc);
                     self.eval_buf[order_idx].assigned_cores += 1;
                     continue;
@@ -746,16 +765,60 @@ impl MatrixEngine {
         (assigned, incoming)
     }
 
+    /// Returns how `vm_id` relates to the SMT siblings of `pcpu`: `None` if a sibling is
+    /// assigned to, or being handed to or from, another VM (`scx_pylon` won't run the two side
+    /// by side), else `Some(true)` if a sibling is already `vm_id`'s.
     #[inline]
-    fn find_idle_pcpu(&self) -> Option<usize> {
+    fn sibling_fit(&self, pcpu: usize, vm_id: u64) -> Option<bool> {
+        let mut shares_core = false;
+        let mut sib = pcpu;
+        let mut i = 0usize;
+        while i < MAX_SMT {
+            sib = self.smt_next[sib] as usize;
+            if sib == pcpu {
+                break;
+            }
+            match self.core_states[sib] {
+                CoreState::Idle => {}
+                CoreState::Assigned { vm_id: owner, .. } => {
+                    if owner != vm_id {
+                        return None;
+                    }
+                    shares_core = true;
+                }
+                CoreState::Revoking {
+                    donor_vm_id,
+                    recipient_vm_id,
+                    ..
+                } => {
+                    if donor_vm_id != vm_id || recipient_vm_id != vm_id {
+                        return None;
+                    }
+                    shares_core = true;
+                }
+            }
+            i += 1;
+        }
+        Some(shares_core)
+    }
+
+    /// Finds an idle managed core that `vm_id` may use, preferring one whose SMT sibling the VM
+    /// already holds so that whole cores stay free for other VMs.
+    #[inline]
+    fn find_idle_pcpu(&self, vm_id: u64) -> Option<usize> {
+        let mut found = None;
         let mut pcpu = 0usize;
         while pcpu < MAX_PCPUS {
             if self.managed_pcpus[pcpu] && self.core_states[pcpu] == CoreState::Idle {
-                return Some(pcpu);
+                match self.sibling_fit(pcpu, vm_id) {
+                    Some(true) => return Some(pcpu),
+                    Some(false) if found.is_none() => found = Some(pcpu),
+                    _ => {}
+                }
             }
             pcpu += 1;
         }
-        None
+        found
     }
 
     /// Selects the best donor `(pcpu, donor_eval_idx, donor_vcpu)` to preempt for `recipient`,
@@ -779,6 +842,7 @@ impl MatrixEngine {
                 vcpu: donor_vcpu,
             } = self.core_states[pcpu]
                 && donor_vm_id != recipient.vm_id
+                && self.sibling_fit(pcpu, recipient.vm_id).is_some()
                 && let Some(donor_eval_idx) = self.find_eval_idx(vm_count, donor_vm_id)
             {
                 let donor_eval = self.eval_buf[donor_eval_idx];
@@ -852,5 +916,65 @@ impl MatrixEngine {
             i += 1;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arc_swap::ArcSwap;
+
+    use super::*;
+
+    fn engine_with_cores(pcpus: &[usize]) -> MatrixEngine {
+        MatrixEngine::new(
+            Arc::new(ArcSwap::from_pointee(Vec::new())),
+            Arc::new(PcpuOwnerTable::new_in_memory()),
+            pcpus,
+        )
+    }
+
+    fn assigned(vm_id: u64) -> CoreState {
+        CoreState::Assigned { vm_id, vcpu: 0 }
+    }
+
+    #[test]
+    fn idle_cores_skip_siblings_of_other_vms() {
+        let mut engine = engine_with_cores(&[0, 1, 2, 3]);
+        // Two cores: CPUs 0 and 2, and CPUs 1 and 3.
+        let mut ring: [u32; MAX_PCPUS] = from_fn(|pcpu| pcpu as u32);
+        ring[..4].copy_from_slice(&[2, 3, 0, 1]);
+        engine.set_smt_ring(&ring);
+
+        engine.set_core_state(0, assigned(1));
+        // VM 1 gets the other thread of its core; VM 2 gets a core of its own.
+        assert_eq!(engine.find_idle_pcpu(1), Some(2));
+        assert_eq!(engine.find_idle_pcpu(2), Some(1));
+
+        engine.set_core_state(1, assigned(2));
+        // CPU 2 sits next to VM 1 and CPU 3 next to VM 2.
+        assert_eq!(engine.find_idle_pcpu(3), None);
+        assert_eq!(engine.find_idle_pcpu(2), Some(3));
+
+        // A core being handed between VMs counts as both.
+        engine.set_core_state(
+            1,
+            CoreState::Revoking {
+                donor_vm_id: 2,
+                donor_vcpu: 0,
+                recipient_vm_id: 3,
+                recipient_vcpu: 0,
+                deadline_tsc: 0,
+            },
+        );
+        assert_eq!(engine.find_idle_pcpu(2), None);
+        assert_eq!(engine.find_idle_pcpu(3), None);
+        assert_eq!(engine.find_idle_pcpu(1), Some(2));
+    }
+
+    #[test]
+    fn without_a_ring_every_core_stands_alone() {
+        let mut engine = engine_with_cores(&[0, 1]);
+        engine.set_core_state(0, assigned(1));
+        assert_eq!(engine.find_idle_pcpu(2), Some(1));
     }
 }

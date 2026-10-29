@@ -19,6 +19,7 @@ use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, calibrate_tsc_khz};
 use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
+use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 
@@ -51,6 +52,19 @@ struct CliArgs {
     /// Never attach the sched_ext BPF dispatcher.
     #[arg(long)]
     no_scx: bool,
+
+    /// Refuse to attach scx-pylon while any task has a core scheduling cookie. `auto` does
+    /// this only on kernels without the sched_ext core-scheduling fixes; `on` also on kernels
+    /// that seem to have them.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_guard: GuardMode,
+
+    /// With the guard, what a task asking for a core scheduling cookie gets while scx-pylon
+    /// is attached: `eperm` fails Cloud Hypervisor VMs that have core scheduling on, `enodev`
+    /// starts them without it, and `off` lets the request through, which then disables
+    /// scx-pylon. `eperm` and `enodev` need BPF LSM.
+    #[arg(long, value_enum, default_value_t)]
+    core_sched_deny: CookieDenial,
 
     /// Permission bits for the control socket, in octal (e.g. 660). Default: the process umask.
     #[arg(long, value_parser = parse_socket_mode)]
@@ -178,17 +192,31 @@ fn main() -> Result<()> {
         args.socket.display()
     );
 
-    let scx = match scx_attach(&args, Path::new(SCHED_EXT_SYSFS).exists()) {
+    let attach = scx_attach(&args, Path::new(SCHED_EXT_SYSFS).exists());
+    let guard = if attach == ScxAttach::No {
+        None
+    } else {
+        let kernel = KernelCoreSched::detect();
+        let guard = kernel
+            .needs_guard(args.core_sched_guard)
+            .then_some(args.core_sched_deny);
+        match guard {
+            Some(deny) => info!("Core scheduling: {kernel}; scx_pylon guard on, deny {deny:?}"),
+            None => info!("Core scheduling: {kernel}; scx_pylon guard off"),
+        }
+        guard
+    };
+    let scx = match attach {
         ScxAttach::Required => {
             info!("Loading and attaching scx_pylon sched_ext BPF dispatcher to kernel...");
             Some(
-                scx_pylon::ScxPylonUserspace::load_and_attach()
+                scx_pylon::ScxPylonUserspace::load_and_attach(guard)
                     .context("failed to load and attach scx_pylon sched_ext dispatcher")?,
             )
         }
         ScxAttach::Try => {
             info!("Kernel has sched_ext; attaching scx_pylon BPF dispatcher...");
-            match scx_pylon::ScxPylonUserspace::load_and_attach() {
+            match scx_pylon::ScxPylonUserspace::load_and_attach(guard) {
                 Ok(scx) => Some(scx),
                 Err(e) => {
                     warn!("scx_pylon not attached, using the in-memory pCPU table: {e:#}");
@@ -199,12 +227,16 @@ fn main() -> Result<()> {
         ScxAttach::No => None,
     };
 
+    // scx_pylon keeps SMT siblings of a running vCPU free of other VMs, so the engine must not
+    // give two VMs sibling threads of one core.
+    let smt_ring = scx.as_ref().map(|_| scx_pylon::host_smt_ring());
+
     let (pcpu_owners, _scx_handle) = if let Some(scx) = scx {
-        let (owner_map, link, obj) = scx.into_parts();
+        let (owner_map, link, guard_links, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
         let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
             .context("failed to create PcpuOwnerTable from scx_pylon mmap")?;
-        (Arc::new(table), Some((link, obj)))
+        (Arc::new(table), Some((link, guard_links, obj)))
     } else if let Some(ref path) = args.pcpu_map_file {
         let file = OpenOptions::new()
             .read(true)
@@ -232,6 +264,9 @@ fn main() -> Result<()> {
             let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);
+            }
+            if let Some(ring) = smt_ring {
+                engine.set_smt_ring(&ring);
             }
             engine.run(&engine_stop)
         })
@@ -305,6 +340,21 @@ mod tests {
         );
         assert_eq!(scx_attach(&args(&["--no-scx"]), true), ScxAttach::No);
         CliArgs::try_parse_from(["pylond", "--enable-scx", "--no-scx"]).unwrap_err();
+    }
+
+    #[test]
+    fn core_sched_guard_defaults_to_auto() {
+        assert_eq!(args(&[]).core_sched_guard, GuardMode::Auto);
+        assert_eq!(
+            args(&["--core-sched-guard", "off"]).core_sched_guard,
+            GuardMode::Off
+        );
+        CliArgs::try_parse_from(["pylond", "--core-sched-guard", "maybe"]).unwrap_err();
+        assert_eq!(args(&[]).core_sched_deny, CookieDenial::Eperm);
+        assert_eq!(
+            args(&["--core-sched-deny", "enodev"]).core_sched_deny,
+            CookieDenial::Enodev
+        );
     }
 
     #[test]

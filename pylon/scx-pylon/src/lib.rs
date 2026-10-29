@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::fs::OpenOptions;
+use std::array::from_fn;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -11,15 +12,31 @@ use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapType, Object, ObjectBuilder, OpenObject};
+use libbpf_rs::{AsRawLibbpf, Link, MapCore, MapFlags, MapType, Object, ObjectBuilder, OpenObject};
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
+
+use crate::coresched::CookieDenial;
+
+pub mod coresched;
 
 /// Maximum number of physical CPUs tracked in the `pylon_pcpu_owners` BPF map.
 pub const MAX_PCPUS: usize = 256;
 
 /// Name of the `BPF_F_MMAPABLE` array map inside `scx_pylon.bpf.o`.
 pub const PCPU_OWNERS_MAP_NAME: &str = "pylon_pcpu_owners";
+
+/// Name of the SMT sibling ring array map inside `scx_pylon.bpf.o`.
+pub const SMT_NEXT_MAP_NAME: &str = "pylon_smt_next";
+
+/// Name of the core scheduling guard array map inside `scx_pylon.bpf.o`.
+pub const GUARD_MAP_NAME: &str = "pylon_guard";
+
+/// Name of the program that watches for new core scheduling cookies.
+pub const SCHED_CORE_WATCH_PROG_NAME: &str = "pylon_sched_core_get";
+
+/// Name of the LSM program that refuses new core scheduling cookies.
+pub const COOKIE_DENY_PROG_NAME: &str = "pylon_task_prctl";
 
 /// Name of the `sched_ext_ops` struct_ops map inside `scx_pylon.bpf.o`.
 pub const SCX_OPS_MAP_NAME: &str = "pylon_ops";
@@ -119,6 +136,26 @@ pub enum Error {
     /// Failed to memory-map or initialize backing storage for the owner map.
     #[error("Memory-map I/O operation failed")]
     Io(#[source] io::Error),
+
+    /// Failed to look for tasks with a core scheduling cookie.
+    #[error("Failed to look for core scheduling cookies")]
+    CoreSchedScan(#[source] io::Error),
+
+    /// A task has a core scheduling cookie, which turns core scheduling on.
+    #[error("Thread {tid} ({comm}) has a core scheduling cookie")]
+    CoreSchedInUse { tid: i32, comm: String },
+
+    /// A process asked for a core scheduling cookie while attaching.
+    #[error("Process {tgid} asked for a core scheduling cookie")]
+    CoreSchedTurnedOn { tgid: u32 },
+
+    /// The guard needs BPF LSM to refuse cookies, and the kernel doesn't run it.
+    #[error("BPF LSM is not active")]
+    BpfLsmInactive,
+
+    /// Required BPF program was not found in the embedded object.
+    #[error("Missing required BPF program '{prog_name}'")]
+    MissingProg { prog_name: &'static str },
 }
 
 /// Result alias for `scx-pylon`.
@@ -259,10 +296,61 @@ impl PcpuOwnerMap {
     }
 }
 
+/// Parses a kernel CPU list such as `"0,16"` or `"0-3,8"`. Returns `None` if
+/// it is malformed.
+pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for range in list.trim().split(',').filter(|r| !r.is_empty()) {
+        match range.split_once('-') {
+            Some((first, last)) => {
+                let first: usize = first.parse().ok()?;
+                let last: usize = last.parse().ok()?;
+                if first > last {
+                    return None;
+                }
+                cpus.extend(first..=last);
+            }
+            None => cpus.push(range.parse().ok()?),
+        }
+    }
+    Some(cpus)
+}
+
+/// Builds the SMT sibling ring for `pylon_smt_next`: each CPU maps to the
+/// next CPU on the same core, wrapping around, or to itself if it has no
+/// siblings. `siblings(cpu)` returns the CPU's `thread_siblings_list`.
+pub fn smt_ring(siblings: impl Fn(usize) -> Option<String>) -> [u32; MAX_PCPUS] {
+    let mut ring: [u32; MAX_PCPUS] = from_fn(|cpu| cpu as u32);
+    for (cpu, next) in ring.iter_mut().enumerate() {
+        let Some(mut core) = siblings(cpu).as_deref().and_then(parse_cpu_list) else {
+            continue;
+        };
+        core.retain(|&c| c < MAX_PCPUS);
+        core.sort_unstable();
+        core.dedup();
+        if let Some(pos) = core.iter().position(|&c| c == cpu) {
+            *next = core[(pos + 1) % core.len()] as u32;
+        }
+    }
+    ring
+}
+
+/// Reads the host's SMT sibling ring from
+/// `/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list`.
+pub fn host_smt_ring() -> [u32; MAX_PCPUS] {
+    smt_ring(|cpu| {
+        fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ))
+        .ok()
+    })
+}
+
 /// Userspace loader and handle for the `scx_pylon` `sched_ext` BPF dispatcher.
 pub struct ScxPylonUserspace {
     _obj: Object,
     _link: Link,
+    _guard_links: Vec<Link>,
     owner_map: PcpuOwnerMap,
 }
 
@@ -348,9 +436,30 @@ impl ScxPylonUserspace {
     /// Loads `scx_pylon.bpf.o` into the kernel, attaches the `sched_ext_ops`
     /// struct_ops dispatcher, and `mmap`s `pylon_pcpu_owners` into userspace.
     ///
+    /// With a `guard`, refuses to attach while any task has a core scheduling
+    /// cookie, answers requests for new cookies as the [`CookieDenial`] says,
+    /// and disables itself if a task gets one anyway (see [`coresched`]).
+    ///
     /// Requires `CAP_BPF` / `CAP_SYS_ADMIN` and a kernel with `CONFIG_SCHED_EXT=y`.
-    pub fn load_and_attach() -> Result<Self> {
-        let open_obj = Self::open_embedded()?;
+    pub fn load_and_attach(guard: Option<CookieDenial>) -> Result<Self> {
+        let deny = guard.filter(|&d| d != CookieDenial::Off);
+        if deny.is_some() && !coresched::bpf_lsm_active() {
+            return Err(Error::BpfLsmInactive);
+        }
+
+        let mut open_obj = Self::open_embedded()?;
+        // The watcher needs sched_core_get(), which kernels without
+        // CONFIG_SCHED_CORE lack.
+        for (prog_name, autoload) in [
+            (SCHED_CORE_WATCH_PROG_NAME, guard.is_some()),
+            (COOKIE_DENY_PROG_NAME, deny.is_some()),
+        ] {
+            open_obj
+                .progs_mut()
+                .find(|p| p.name() == prog_name)
+                .ok_or(Error::MissingProg { prog_name })?
+                .set_autoload(autoload);
+        }
         let mut obj = open_obj.load().map_err(Error::Bpf)?;
 
         let owner_map = {
@@ -363,6 +472,64 @@ impl ScxPylonUserspace {
             PcpuOwnerMap::from_map_fd(bpf_map.as_fd())?
         };
 
+        // The ring must be in place before attaching: without it every CPU
+        // looks like a core of its own and siblings aren't kept apart.
+        let smt_map =
+            obj.maps()
+                .find(|m| m.name() == SMT_NEXT_MAP_NAME)
+                .ok_or(Error::MissingMap {
+                    map_name: SMT_NEXT_MAP_NAME,
+                })?;
+        let ring = host_smt_ring();
+        for (cpu, next) in ring.iter().enumerate() {
+            smt_map
+                .update(
+                    &(cpu as u32).to_ne_bytes(),
+                    &next.to_ne_bytes(),
+                    MapFlags::ANY,
+                )
+                .map_err(Error::Bpf)?;
+        }
+        let smt_cpus = ring
+            .iter()
+            .enumerate()
+            .filter(|&(cpu, &next)| next as usize != cpu)
+            .count();
+
+        let mut guard_links = Vec::new();
+        if let Some(deny) = guard {
+            Self::set_guard_deny(&obj, deny)?;
+            // Refuse and watch before looking, so a cookie made in between
+            // is refused, or seen by one or the other.
+            if deny != CookieDenial::Off {
+                let prog = obj
+                    .progs_mut()
+                    .find(|p| p.name() == COOKIE_DENY_PROG_NAME)
+                    .ok_or(Error::MissingProg {
+                        prog_name: COOKIE_DENY_PROG_NAME,
+                    })?;
+                guard_links.push(prog.attach_lsm().map_err(Error::Bpf)?);
+            }
+            let watch = obj
+                .progs_mut()
+                .find(|p| p.name() == SCHED_CORE_WATCH_PROG_NAME)
+                .ok_or(Error::MissingProg {
+                    prog_name: SCHED_CORE_WATCH_PROG_NAME,
+                })?;
+            guard_links.push(watch.attach_trace().map_err(Error::Bpf)?);
+
+            if let Some(thread) = coresched::find_cookied_thread().map_err(Error::CoreSchedScan)? {
+                return Err(Error::CoreSchedInUse {
+                    tid: thread.tid,
+                    comm: thread.comm,
+                });
+            }
+            let tgid = Self::cookie_tgid(&obj)?;
+            if tgid != 0 {
+                return Err(Error::CoreSchedTurnedOn { tgid });
+            }
+        }
+
         let mut ops_map = obj
             .maps_mut()
             .find(|m| m.name() == SCX_OPS_MAP_NAME)
@@ -371,13 +538,45 @@ impl ScxPylonUserspace {
             })?;
         let link = ops_map.attach_struct_ops().map_err(Error::Bpf)?;
 
-        log::info!("scx_pylon loaded and attached; mapped {MAX_PCPUS} pCPU owner slots");
+        log::info!(
+            "scx_pylon loaded and attached; mapped {MAX_PCPUS} pCPU owner slots, \
+             {smt_cpus} CPUs with SMT siblings"
+        );
 
         Ok(Self {
             _obj: obj,
             _link: link,
+            _guard_links: guard_links,
             owner_map,
         })
+    }
+
+    fn guard_map(obj: &Object) -> Result<libbpf_rs::Map<'_>> {
+        obj.maps()
+            .find(|m| m.name() == GUARD_MAP_NAME)
+            .ok_or(Error::MissingMap {
+                map_name: GUARD_MAP_NAME,
+            })
+    }
+
+    /// Writes `deny` to the guard map, whose other fields start at 0.
+    fn set_guard_deny(obj: &Object, deny: CookieDenial) -> Result<()> {
+        // struct pylon_guard { cookie_tgid, exiting, deny }, all u32.
+        let mut value = [0u8; 3 * size_of::<u32>()];
+        value[2 * size_of::<u32>()..].copy_from_slice(&deny.bpf_value().to_ne_bytes());
+        Self::guard_map(obj)?
+            .update(&0u32.to_ne_bytes(), &value, MapFlags::ANY)
+            .map_err(Error::Bpf)
+    }
+
+    /// Reads the tgid that the watcher recorded asking for a cookie, or 0.
+    fn cookie_tgid(obj: &Object) -> Result<u32> {
+        let value = Self::guard_map(obj)?
+            .lookup(&0u32.to_ne_bytes(), MapFlags::ANY)
+            .map_err(Error::Bpf)?
+            .unwrap_or_default();
+        // `cookie_tgid` is the first member of `struct pylon_guard`.
+        Ok(value.first_chunk().map_or(0, |b| u32::from_ne_bytes(*b)))
     }
 
     /// Returns a reference to the zero-syscall memory-mapped `pylon_pcpu_owners` map.
@@ -386,9 +585,10 @@ impl ScxPylonUserspace {
         &self.owner_map
     }
 
-    /// Consumes the loader handle and returns the `PcpuOwnerMap`, BPF `Link`, and `Object`.
-    pub fn into_parts(self) -> (PcpuOwnerMap, Link, Object) {
-        (self.owner_map, self._link, self._obj)
+    /// Consumes the loader handle and returns the `PcpuOwnerMap`, the struct_ops
+    /// `Link`, the guard's `Link`s, and the `Object`.
+    pub fn into_parts(self) -> (PcpuOwnerMap, Link, Vec<Link>, Object) {
+        (self.owner_map, self._link, self._guard_links, self._obj)
     }
 }
 
@@ -429,9 +629,59 @@ mod tests {
             prog_names.iter().any(|n| n == "pylon_select_cpu"),
             "Expected pylon_select_cpu program in {prog_names:?}"
         );
+        for prog in [
+            SCHED_CORE_WATCH_PROG_NAME,
+            COOKIE_DENY_PROG_NAME,
+            "pylon_dispatch",
+            "pylon_enqueue",
+            "pylon_running",
+            "pylon_update_idle",
+        ] {
+            assert!(
+                prog_names.iter().any(|n| n == prog),
+                "Expected {prog} program in {prog_names:?}"
+            );
+        }
+        for map in [SMT_NEXT_MAP_NAME, GUARD_MAP_NAME] {
+            assert!(
+                open_obj.maps().any(|m| m.name() == map),
+                "Expected {map} map"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_cpu_list() {
+        assert_eq!(parse_cpu_list("0,16\n"), Some(vec![0, 16]));
+        assert_eq!(parse_cpu_list("4-7,12"), Some(vec![4, 5, 6, 7, 12]));
+        assert_eq!(parse_cpu_list("3"), Some(vec![3]));
+        assert_eq!(parse_cpu_list("2-1"), None);
+        assert_eq!(parse_cpu_list("a"), None);
+    }
+
+    #[test]
+    fn test_smt_ring() {
+        // Two threads per core, siblings 16 apart, as on an EPYC 9124.
+        let ring = smt_ring(|cpu| (cpu < 32).then(|| format!("{},{}", cpu % 16, cpu % 16 + 16)));
+        assert_eq!(ring[0], 16);
+        assert_eq!(ring[16], 0);
+        assert_eq!(ring[15], 31);
+        assert_eq!(ring[31], 15);
+        // CPUs without topology are their own core.
+        assert_eq!(ring[32], 32);
+        assert_eq!(ring[255], 255);
+
+        // Four threads per core form a ring.
+        let ring =
+            smt_ring(|cpu| (cpu < 8).then(|| format!("{}-{}", cpu / 4 * 4, cpu / 4 * 4 + 3)));
+        assert_eq!(&ring[..8], &[1, 2, 3, 0, 5, 6, 7, 4]);
+
+        // SMT off: every CPU lists only itself.
+        let ring = smt_ring(|cpu| Some(cpu.to_string()));
         assert!(
-            prog_names.iter().any(|n| n == "pylon_dispatch"),
-            "Expected pylon_dispatch program in {prog_names:?}"
+            ring.iter()
+                .enumerate()
+                .all(|(cpu, &next)| next as usize == cpu)
         );
     }
 
