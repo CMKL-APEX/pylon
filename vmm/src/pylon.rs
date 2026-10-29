@@ -18,9 +18,9 @@ use hypervisor::{HypervisorVmError, MemoryVisibility, Vm};
 use log::{info, warn};
 use option_parser::{OptionParser, OptionParserError};
 use pylon_abi::{
-    MAX_VCPUS, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_MAGIC, PYLON_SHARED_PAGE_SIZE,
-    PylonHeader, PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED, VCPU_STATE_PARKING,
-    VCPU_STATE_RUNNING,
+    MAX_VCPUS, PCPU_UNASSIGNED, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_MAGIC,
+    PYLON_SHARED_PAGE_SIZE, PylonHeader, PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED,
+    VCPU_STATE_PARKING, VCPU_STATE_RUNNING,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -28,6 +28,7 @@ use vm_memory::guest_memory::FileOffset;
 use vm_memory::mmap::MmapRegionError;
 use vm_memory::{Address, GuestAddress, GuestMemoryRegion, GuestRegionCollectionError, MmapRegion};
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::signal::SIGRTMIN;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::{GuestMemoryMmap, GuestRegionMmap};
@@ -214,6 +215,10 @@ struct DaemonRegistrationPayload {
     min_cores: u32,
     max_cores: u32,
     priority_weight: u32,
+    /// The signal that interrupts a vCPU's `KVM_RUN` here (`SIGRTMIN`, as installed in
+    /// `vmm/src/cpu.rs`). `pylond` sends it to a donor vCPU whose revocation deadline has
+    /// passed, so the post-exit hook force-parks it (`spec/06-guest-kick-path.md` §4.4).
+    kick_signal: i32,
 }
 
 /// VMM-side Pylon runtime state managing the 8,192-byte `PylonSharedPage` and per-vCPU park/wake primitives.
@@ -311,6 +316,14 @@ impl PylonVmmState {
                 },
             );
         }
+        // `pylond` treats a parked vCPU as free for a core only while its `assigned_pcpu` is
+        // unassigned, which zeroing doesn't produce.
+        // SAFETY: `shared_page` points to the 8,192-byte mapping initialized above, and its vCPU
+        // slots are only accessed through atomics.
+        let page = unsafe { shared_page.as_ref() };
+        for slot in &page.vcpus {
+            slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+        }
 
         let mut kick_eventfds = Vec::with_capacity(num_vcpus as usize);
         let mut wake_eventfds = Vec::with_capacity(num_vcpus as usize);
@@ -364,6 +377,7 @@ impl PylonVmmState {
             min_cores: self.config.min_cores,
             max_cores: self.config.max_cores.unwrap_or(self.max_vcpus),
             priority_weight: self.config.priority_weight,
+            kick_signal: SIGRTMIN(),
         };
         let mut json_bytes =
             serde_json::to_vec(&payload).map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
@@ -805,6 +819,7 @@ mod tests {
             assert_eq!(slot.state.load(Ordering::Relaxed), VCPU_STATE_PARKED);
             assert_eq!(slot.revoke_requested.load(Ordering::Relaxed), 0);
             assert_eq!(slot.host_tid.load(Ordering::Relaxed), 0);
+            assert_eq!(slot.assigned_pcpu.load(Ordering::Relaxed), PCPU_UNASSIGNED);
         }
         assert!(state.vcpu_slot(4).is_none());
     }
@@ -1021,8 +1036,135 @@ mod tests {
         assert_eq!(msg.min_cores, 1);
         assert_eq!(msg.max_cores, 2);
         assert_eq!(msg.priority_weight, 150);
+        assert_eq!(msg.kick_signal, SIGRTMIN());
         // 1 shm_fd + 2 kick_eventfds + 2 wake_eventfds = 5 FDs
         assert_eq!(fds_read, 5);
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+    #[test]
+    fn test_e2e_real_kvm_vm_forced_park_on_kick_signal() {
+        use hypervisor::{HypervisorVmConfig, VmExit};
+        use vm_memory::{Bytes, GuestMemoryBackend};
+        use vmm_sys_util::signal::register_signal_handler;
+
+        extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-kvm-forced-pylon");
+        let cfg = PylonConfig::parse(&format!(
+            "shm={},gpa=0x8000,vm_id=43,initial_active_vcpus=1",
+            shm_path.display()
+        ))
+        .unwrap();
+        let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+
+        let Ok(hv) = hypervisor::new() else {
+            eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
+            return;
+        };
+        let vm = hv
+            .create_vm(HypervisorVmConfig::default())
+            .expect("failed to create KVM VM");
+
+        let code_gpa = GuestAddress(0x1000);
+        let mut guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
+        for (index, region) in guest_mem.iter().enumerate() {
+            // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
+            unsafe {
+                vm.create_user_memory_region(
+                    index as u32,
+                    region.start_addr().raw_value(),
+                    region.len().try_into().unwrap(),
+                    region.as_ptr(),
+                    false,
+                    false,
+                    MemoryVisibility::Shared,
+                )
+                .expect("failed to register guest code memory region");
+            }
+        }
+        let mut next_slot = 1u32;
+        state
+            .setup_gpa_mapping(&vm, &mut guest_mem, &mut next_slot)
+            .expect("failed to map Pylon shared page");
+
+        // A guest that never agrees to park: `jmp $` at GPA 0x1000.
+        guest_mem
+            .write_slice(&[0xEB, 0xFE], code_gpa)
+            .expect("failed to write guest code");
+
+        let state_vcpu = Arc::clone(&state);
+        let vcpu_thread = thread::spawn(move || {
+            // As in `vmm/src/cpu.rs`: a no-op handler, so the signal only interrupts KVM_RUN.
+            register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
+            let mut vcpu = vm
+                .create_vcpu(0, None, Default::default())
+                .expect("failed to create KVM vCPU 0");
+            let mut sregs = vcpu.get_sregs().expect("get_sregs");
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            vcpu.set_sregs(&sregs).expect("set_sregs");
+            let mut regs = vcpu.get_regs().expect("get_regs");
+            regs.set_rip(0x1000);
+            regs.set_rflags(0x2);
+            vcpu.set_regs(&regs).expect("set_regs");
+
+            state_vcpu.on_vcpu_thread_start(0);
+            loop {
+                // The kick signal makes KVM_RUN fail with EINTR, which the KVM backend
+                // reports as `VmExit::Ignore`.
+                match vcpu.run().expect("vcpu.run failed") {
+                    VmExit::Ignore => {}
+                    other => panic!("unexpected VM exit: {other:?}"),
+                }
+                if state_vcpu.check_and_park_vcpu(0) {
+                    break;
+                }
+            }
+        });
+
+        let slot0 = state.vcpu_slot(0).unwrap();
+        for _ in 0..500 {
+            if slot0.host_tid.load(Ordering::Acquire) != 0
+                && slot0.state.load(Ordering::Acquire) == VCPU_STATE_RUNNING
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let tid = slot0.host_tid.load(Ordering::Acquire);
+        assert_ne!(tid, 0);
+
+        // Do what pylond does once a revocation's deadline has passed: the request is pending,
+        // its deadline (0) is over, and the vCPU thread gets the kick signal. Resend it, as
+        // pylond does, in case one lands while the thread is outside KVM_RUN.
+        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+        for _ in 0..500 {
+            if slot0.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
+                break;
+            }
+            // SAFETY: `tgkill` signals thread `tid` of this process; the vCPU thread has a
+            // handler installed for `SIGRTMIN`.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    tid as libc::pid_t,
+                    SIGRTMIN(),
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 0);
+        assert_eq!(slot0.forced_preempt_count.load(Ordering::Acquire), 1);
+        assert_eq!(slot0.yield_count.load(Ordering::Acquire), 1);
+
+        state.wake_vcpu(0).unwrap();
+        vcpu_thread.join().expect("KVM vCPU thread panicked");
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
