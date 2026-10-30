@@ -297,8 +297,8 @@ parallel.
 | ID | Task | Depends on | Owner | Branch / PR | Status | Verification | Result |
 | :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` (#22) | `DONE` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Merged in #22. |
-| A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` | `IN_PROGRESS` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
-| A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
+| A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` (#23) | `DONE` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
+| A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t2-pylond-counter` | `IN_PROGRESS` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
 | A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
@@ -361,6 +361,21 @@ Interface for A-T2, A-T3 and A-T4:
 - No layout change and no `PYLON_ABI_VERSION` bump; only doc comments and spec 01 *Time bases*.
 
 Verification (aarch64 host): `cargo test -p pylon-abi` passes (5; with `--no-default-features` the 3 layout tests), clippy `-D warnings` is clean for both feature sets. x86_64 was only **compiled** (`cargo clippy --target x86_64-unknown-linux-gnu`, after `rustup target add x86_64-unknown-linux-gnu`), not run, because this host can't execute x86_64. CI must run the x86_64 tests.
+
+#### A-T2
+What changed in `pylond`:
+- `read_tsc` is now `pylon_abi::clock::read_counter`. `calibrate_tsc_khz` returns `CNTFRQ_EL0` on aarch64 and still measures on x86_64. The name stays to keep the change small.
+- `default_counter_khz()` replaces the bare `DEFAULT_TSC_KHZ` as the engine's initial rate, and in the e2e tests and `pylon-bench`: on aarch64 it is the architectural rate, so the 8 µs grace window is 8 µs there too. `DEFAULT_TSC_KHZ` stays as the x86 fallback.
+- `DEFAULT_TPAUSE_CYCLES` (1000 ticks) is replaced by `SWEEP_INTERVAL_NS` (333), converted with the host rate when `run` starts. On a 3 GHz TSC this is 999 ticks.
+- `detect_waitpkg`/`has_waitpkg` are now `detect_timed_wait`/`has_timed_wait`: `WAITPKG` on x86_64, `HWCAP2_WFXT` on aarch64. `pause_cycles` uses `WFET` there, else `spin_loop()`.
+- `WFET` is written as `.inst 0xd5031009` (`wfet x9`). The encoding `0xd5031000 | Rt` was checked by assembling `wfet x0`, `wfet x17` and `wfit x3` with `clang -march=armv8.7-a` and disassembling (`d5031000`, `d5031011`, `d5031023`).
+- `--engine-cpu` (default 1, `DEFAULT_ENGINE_CPU`) and `MatrixEngine::set_engine_cpu`. `pylond` warns if it is also in `--cores`. Which CPU class is the right default stays Q-A3.
+
+Verification (aarch64 host): `cargo test -p pylond` passes: 19 lib, 1 bench, 7 main, 6 e2e. Before this change `test_calibrated_tsc_rate_is_plausible` and 3 e2e tests failed (A-T0), so the stuck clock (A1) was the cause. `cargo clippy --locked --all --all-targets --tests --features kvm -- -D warnings` and `cargo +nightly fmt --all --check` are clean, which includes the `absolute_paths` error A-T0 found. New tests: `test_pause_cycles_waits_about_the_interval`, `engine_cpu_defaults_to_the_engine_default`. The rate-plausibility test's range is now 10 MHz to 10 GHz.
+
+x86_64 was not built as `pylond`: cross-building its vendored `libbpf` fails here. The functions that changed were checked as a standalone crate for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with clippy `-D warnings` (that is how an x86-only unused `spin_loop` import was found and fixed). CI must build and test `pylond` on x86_64.
+
+`WFET` on the reference host (Cortex-X925 core 2, Cortex-A725 core 12; 20,000 waits each; throwaway program, not committed). Overshoot past the deadline in ns, p50 / p99: 67 / 115 at a 333 ns interval, 72 / 120 at 1 µs, 72 / 136 at 5 µs, the same on both core types. The worst case was 30 µs. 0.5% to 18% of waits returned early (more at short intervals), which the polling loop absorbs, so the pause is a hint, not a timer. For comparison, an `isb` spin iteration costs 12 ns. This bears on Q-A5 and on the A-T8 latency numbers.
 
 ---
 
