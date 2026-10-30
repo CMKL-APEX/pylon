@@ -1427,6 +1427,270 @@ mod tests {
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
     }
 
+    /// A real KVM VM with one vCPU whose guest spins (`b .`) and never agrees to park, so the
+    /// vCPU thread parks only when `check_and_park_vcpu` says so. The thread runs until `stop`.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    struct SpinGuest {
+        state: Arc<PylonVmmState>,
+        stop: Arc<AtomicBool>,
+        thread: thread::JoinHandle<()>,
+        tid: libc::pid_t,
+        _pylon_region: Arc<GuestRegionMmap>,
+        _dir: TempDir,
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    impl SpinGuest {
+        /// `None` if `/dev/kvm` isn't usable.
+        fn start(vm_id: u64) -> Option<Self> {
+            use hypervisor::{HypervisorVmConfig, VmExit};
+            use vm_memory::{Bytes, GuestMemoryBackend};
+            use vmm_sys_util::signal::register_signal_handler;
+
+            use crate::GuestMemoryMmap;
+
+            extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+
+            let hv = hypervisor::new().ok()?;
+            let dir = TempDir::new().unwrap();
+            let shm_path = dir.path().join(format!("vm-kvm-spin-{vm_id}-pylon"));
+            let cfg = PylonConfig::parse(&format!(
+                "shm={},gpa=0x8000,vm_id={vm_id},initial_active_vcpus=1",
+                shm_path.display()
+            ))
+            .unwrap();
+            let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+            let vm = hv
+                .create_vm(HypervisorVmConfig::default())
+                .expect("failed to create KVM VM");
+
+            // `b .`, the branch to itself, at the start of one page of guest memory.
+            let code_gpa = GuestAddress(0x4000_0000);
+            let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
+            for (index, region) in guest_mem.iter().enumerate() {
+                // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory, which
+                // the vCPU thread keeps alive by owning `guest_mem`.
+                unsafe {
+                    vm.create_user_memory_region(
+                        index as u32,
+                        region.start_addr().raw_value(),
+                        region.len().try_into().unwrap(),
+                        region.as_ptr(),
+                        false,
+                        false,
+                        MemoryVisibility::Shared,
+                    )
+                    .expect("failed to register guest code memory region");
+                }
+            }
+            let mut next_slot = 1u32;
+            let pylon_region = state
+                .setup_gpa_mapping(&vm, &mut next_slot)
+                .expect("failed to map Pylon shared page");
+            guest_mem
+                .write_slice(&0x1400_0000u32.to_le_bytes(), code_gpa)
+                .expect("failed to write guest code");
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let (state_vcpu, stop_vcpu) = (Arc::clone(&state), Arc::clone(&stop));
+            let thread = thread::spawn(move || {
+                // As in `vmm/src/cpu.rs`: a no-op handler, so the signal only interrupts KVM_RUN.
+                register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
+                let _guest_mem = guest_mem;
+                let mut vcpu = vm
+                    .create_vcpu(0, None)
+                    .expect("failed to create KVM vCPU 0");
+                let mut kvi = vcpu.create_vcpu_init();
+                vm.get_preferred_target(&mut kvi).expect("preferred target");
+                vcpu.vcpu_init(&kvi).expect("vcpu init");
+                vcpu.setup_regs(0, code_gpa.raw_value(), 0, false)
+                    .expect("setup_regs");
+
+                state_vcpu.on_vcpu_thread_start(0, || read_guest_tsc(vcpu.as_ref()));
+                while !stop_vcpu.load(Ordering::Acquire) {
+                    // The kick signal makes KVM_RUN fail with EINTR, which the KVM backend
+                    // reports as `VmExit::Ignore`.
+                    match vcpu.run().expect("vcpu.run failed") {
+                        VmExit::Ignore => {}
+                        other => panic!("unexpected VM exit: {other:?}"),
+                    }
+                    state_vcpu.check_and_park_vcpu(0, || read_guest_tsc_deadline(vcpu.as_ref()));
+                }
+            });
+
+            let slot0 = state.vcpu_slot(0).unwrap();
+            for _ in 0..500 {
+                if slot0.host_tid.load(Ordering::Acquire) != 0
+                    && slot0.state.load(Ordering::Acquire) == VCPU_STATE_RUNNING
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            let tid = slot0.host_tid.load(Ordering::Acquire) as libc::pid_t;
+            assert_ne!(tid, 0);
+            Some(Self {
+                state,
+                stop,
+                thread,
+                tid,
+                _pylon_region: pylon_region,
+                _dir: dir,
+            })
+        }
+
+        /// Sends the kick signal, as `pylond` does for a revocation.
+        fn kick(&self) {
+            // SAFETY: `tgkill` signals thread `tid` of this process; the vCPU thread has a
+            // handler installed for `SIGRTMIN`.
+            unsafe {
+                libc::syscall(libc::SYS_tgkill, libc::getpid(), self.tid, SIGRTMIN());
+            }
+        }
+
+        /// Requests a revocation whose grace period is over, as `pylond` does.
+        fn request_forced_revocation(&self) {
+            let slot0 = self.state.vcpu_slot(0).unwrap();
+            slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+            slot0.revoke_requested.store(1, Ordering::Release);
+        }
+
+        /// Stops the vCPU thread and waits for it.
+        fn stop(self) {
+            self.stop.store(true, Ordering::Release);
+            // Kick it out of KVM_RUN, or wake it if it is parked.
+            for _ in 0..500 {
+                if self.thread.is_finished() {
+                    break;
+                }
+                self.kick();
+                let _ = self.state.wake_vcpu(0);
+                thread::sleep(Duration::from_millis(2));
+            }
+            self.thread.join().expect("KVM vCPU thread panicked");
+        }
+    }
+
+    /// An aarch64 guest that never agrees to park is parked by the kick signal once the grace
+    /// period is over: the same path as the x86_64 test below, on a real aarch64 KVM vCPU.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[test]
+    fn test_e2e_real_kvm_vcpu_aarch64_forced_park_on_kick_signal() {
+        let Some(guest) = SpinGuest::start(45) else {
+            eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
+            return;
+        };
+        let slot0 = guest.state.vcpu_slot(0).unwrap();
+
+        // Resend the signal, as pylond does, in case one lands while the thread is outside
+        // KVM_RUN.
+        guest.request_forced_revocation();
+        for _ in 0..500 {
+            if slot0.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
+                break;
+            }
+            guest.kick();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 0);
+        assert_eq!(slot0.forced_preempt_count.load(Ordering::Acquire), 1);
+        assert_eq!(slot0.yield_count.load(Ordering::Acquire), 1);
+
+        guest.state.wake_vcpu(0).unwrap();
+        for _ in 0..500 {
+            if slot0.state.load(Ordering::Acquire) == VCPU_STATE_RUNNING {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        guest.stop();
+    }
+
+    /// Latency of the forced-park path on a real aarch64 KVM vCPU: from the revocation request
+    /// (and first kick signal) until `PARKED`, and from the wake to `RUNNING` again. Run with
+    /// `cargo test -p vmm --features kvm --lib bench_forced_park -- --ignored --nocapture`.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[test]
+    #[ignore = "a benchmark: prints latencies"]
+    fn bench_forced_park_latency_real_kvm_aarch64() {
+        use core::hint::spin_loop;
+
+        use pylon_abi::clock::architectural_counter_khz;
+
+        const ITERATIONS: usize = 3000;
+        // As pylond: re-send the kick this often (`REVOKE_RESIGNAL_US`).
+        const RESIGNAL_US: u64 = 10;
+
+        let Some(guest) = SpinGuest::start(46) else {
+            eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
+            return;
+        };
+        let khz = architectural_counter_khz().expect("CNTFRQ_EL0 is set");
+        let to_ns = |ticks: u64| ticks.saturating_mul(1_000_000) / khz;
+        let resignal = RESIGNAL_US * khz / 1000;
+        let slot0 = guest.state.vcpu_slot(0).unwrap();
+
+        let (mut park_ns, mut wake_ns, mut resignals) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..ITERATIONS {
+            let start = read_host_tsc();
+            guest.request_forced_revocation();
+            guest.kick();
+            let (mut last_signal, mut signals) = (start, 1u32);
+            while slot0.state.load(Ordering::Acquire) != VCPU_STATE_PARKED {
+                let now = read_host_tsc();
+                assert!(now - start < khz * 1000, "no park within 1 s");
+                if now - last_signal >= resignal {
+                    guest.kick();
+                    last_signal = now;
+                    signals += 1;
+                }
+                spin_loop();
+            }
+            park_ns.push(to_ns(read_host_tsc() - start));
+            resignals.push(signals);
+
+            // Let it settle in the park before waking, as a core handoff would.
+            thread::sleep(Duration::from_micros(200));
+            let wake_start = read_host_tsc();
+            guest.state.wake_vcpu(0).unwrap();
+            while slot0.state.load(Ordering::Acquire) != VCPU_STATE_RUNNING {
+                assert!(
+                    read_host_tsc() - wake_start < khz * 1000,
+                    "no wake within 1 s"
+                );
+                spin_loop();
+            }
+            wake_ns.push(to_ns(read_host_tsc() - wake_start));
+            // Let the vCPU get back into KVM_RUN.
+            thread::sleep(Duration::from_micros(200));
+        }
+        guest.stop();
+
+        let report = |name: &str, mut v: Vec<u64>| {
+            v.sort_unstable();
+            let mean = v.iter().sum::<u64>() as f64 / v.len() as f64 / 1000.0;
+            let at = |q: usize| v[(v.len() * q / 100).min(v.len() - 1)] as f64 / 1000.0;
+            eprintln!(
+                "{name}: n={} mean={mean:.1} us p50={:.1} p90={:.1} p99={:.1} max={:.1}",
+                v.len(),
+                at(50),
+                at(90),
+                at(99),
+                *v.last().unwrap() as f64 / 1000.0
+            );
+        };
+        report("forced park (request -> PARKED)", park_ns);
+        report("wake (wake_vcpu -> RUNNING)     ", wake_ns);
+        let quick = resignals.iter().filter(|&&n| n == 1).count();
+        eprintln!(
+            "parked within {RESIGNAL_US} us, before any re-signal: {quick}/{ITERATIONS}; \
+             most signals sent for one park: {}",
+            resignals.iter().max().unwrap()
+        );
+    }
+
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
     #[test]
     fn test_e2e_real_kvm_vm_pylon_shared_gpa_and_cooperative_park() {
