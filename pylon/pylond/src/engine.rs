@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use core::arch::asm;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{__cpuid_count, _mm_pause, _rdtsc};
+use core::arch::x86_64::{__cpuid_count, _mm_pause};
+#[cfg(not(target_arch = "x86_64"))]
+use core::hint::spin_loop;
 use std::array::from_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
+use pylon_abi::clock::{architectural_counter_khz, read_counter};
 use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonVcpuSlot, VCPU_STATE_PARKED};
 
 use crate::{
@@ -23,9 +26,15 @@ use crate::{
 /// Maximum number of concurrent VMs evaluated per stack-allocated sweep in Plane 2.
 pub const MAX_TRACKED_VMS: usize = 64;
 
-/// TSC rate (3.0 GHz = 3,000,000 kHz) assumed when neither a VM's header nor a host measurement
-/// gives one.
+/// x86_64 TSC rate (3.0 GHz = 3,000,000 kHz) assumed when neither a VM's header nor a host
+/// measurement gives one. Use [`default_counter_khz`], which prefers the architectural rate.
 pub const DEFAULT_TSC_KHZ: u64 = 3_000_000;
+
+/// Counter rate in kHz assumed when neither a VM's header nor a host measurement gives one: the
+/// architectural rate where there is one (`CNTFRQ_EL0` on aarch64), else [`DEFAULT_TSC_KHZ`].
+pub fn default_counter_khz() -> u64 {
+    architectural_counter_khz().unwrap_or(DEFAULT_TSC_KHZ)
+}
 
 /// Default revocation grace period in microseconds (`spec/00-architecture.md` & `spec/02-pylond-arbiter.md`).
 pub const REVOKE_GRACE_PERIOD_US: u64 = 8;
@@ -38,20 +47,32 @@ pub const FORCE_HANDOFF_US: u64 = 50;
 /// that lands while the vCPU thread is outside `KVM_RUN` doesn't stop its next guest entry.
 pub const REVOKE_RESIGNAL_US: u64 = 10;
 
-/// Default `_tpause` delay in TSC cycles (~300-400 ns on a 3 GHz core).
-pub const DEFAULT_TPAUSE_CYCLES: u64 = 1000;
+/// Delay between polling sweeps in nanoseconds (~1000 cycles on a 3 GHz core). The engine turns it
+/// into counter ticks with the host rate, so it doesn't depend on the counter's frequency.
+pub const SWEEP_INTERVAL_NS: u64 = 333;
+
+/// Default CPU the polling engine pins itself to.
+pub const DEFAULT_ENGINE_CPU: usize = 1;
+
+/// `AT_HWCAP2` bit for `WFET`/`WFIT` (`FEAT_WFxT`), from the kernel's `asm/hwcap.h`.
+#[cfg(target_arch = "aarch64")]
+const HWCAP2_WFXT: libc::c_ulong = 1 << 31;
 
 /// Longest SMT sibling ring followed when placing vCPUs.
 const MAX_SMT: usize = 8;
 
-/// Measures the host TSC rate in kHz against `CLOCK_MONOTONIC` over `window`. Returns `None`
-/// where there is no TSC.
+/// Finds the host counter rate in kHz: the architectural rate where there is one (`CNTFRQ_EL0` on
+/// aarch64), else measured against `CLOCK_MONOTONIC` over `window` (the TSC on x86_64). Returns
+/// `None` where there is no counter.
 pub fn calibrate_tsc_khz(window: Duration) -> Option<u64> {
-    if !cfg!(target_arch = "x86_64") {
-        return None;
+    if let Some(khz) = architectural_counter_khz() {
+        return Some(khz);
     }
     let start = Instant::now();
     let start_tsc = read_tsc();
+    if start_tsc == 0 {
+        return None;
+    }
     thread::sleep(window);
     let cycles = read_tsc().saturating_sub(start_tsc);
     let nanos = u64::try_from(start.elapsed().as_nanos()).ok()?;
@@ -62,10 +83,17 @@ pub fn calibrate_tsc_khz(window: Duration) -> Option<u64> {
     u64::try_from(u128::from(cycles) * 1_000_000 / u128::from(nanos)).ok()
 }
 
-/// Detects whether the current x86_64 CPU supports the `WAITPKG` (`tpause`) instruction set
-/// (CPUID.07H:0H.ECX[bit 5]).
+/// Converts nanoseconds to counter ticks at `counter_khz`, at least 1.
+fn ns_to_cycles(nanos: u64, counter_khz: u64) -> u64 {
+    u64::try_from(u128::from(nanos) * u128::from(counter_khz) / 1_000_000)
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+/// Detects whether this CPU can wait until a counter value: `WAITPKG` (`tpause`, CPUID.07H:0H.ECX
+/// bit 5) on x86_64, `FEAT_WFxT` (`WFET`, `HWCAP2_WFXT`) on aarch64.
 #[inline]
-pub fn detect_waitpkg() -> bool {
+pub fn detect_timed_wait() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: `cpuid` leaf 0 and leaf 7 are always safe to query on x86_64 processors.
@@ -76,24 +104,21 @@ pub fn detect_waitpkg() -> bool {
         }
         (leaf7.ecx & (1 << 5)) != 0
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `getauxval` only reads the process's auxiliary vector.
+        (unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_WFXT) != 0
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
 }
 
-/// Reads the current x86_64 Time-Stamp Counter (`rdtsc`).
+/// Reads the host counter: the TSC on x86_64, `CNTVCT_EL0` on aarch64 (`pylon_abi::clock`).
 #[inline]
 pub fn read_tsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: `_rdtsc` is always safe to execute on x86_64 processors.
-        unsafe { _rdtsc() }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        0
-    }
+    read_counter()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -114,15 +139,36 @@ unsafe fn tpause_waitpkg(control: u32, deadline_tsc: u64) {
     }
 }
 
-/// Pauses the polling core for `cycles` TSC ticks using `_tpause(0, now_tsc + cycles)` when the
-/// CPU supports `WAITPKG`, falling back to `_mm_pause()` on older x86_64 processors.
+/// Waits until `CNTVCT_EL0` reaches `deadline` (or an event wakes the core earlier).
+///
+/// # Safety
+///
+/// The CPU must support `FEAT_WFxT`.
+#[cfg(target_arch = "aarch64")]
 #[inline]
-pub fn pause_cycles(now_tsc: u64, cycles: u64, has_waitpkg: bool) {
+unsafe fn wfet(deadline: u64) {
+    // SAFETY: The caller verified `FEAT_WFxT`. `wfet x9` (`0xd5031009`, which is `0xd5031000 | Rt`;
+    // `.inst` because the assembler needs the `wfxt` feature for the mnemonic) is a hint that waits
+    // in a low-power state and touches no memory, so it can return at any time. `x9` is named so
+    // the encoding's register is known.
+    unsafe {
+        asm!(
+            ".inst 0xd5031009",
+            in("x9") deadline,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Pauses the polling core for `cycles` counter ticks: until `now_tsc + cycles` with `tpause` or
+/// `WFET` when `has_timed_wait`, else with a spin-loop hint. It may return early.
+#[inline]
+pub fn pause_cycles(now_tsc: u64, cycles: u64, has_timed_wait: bool) {
     #[cfg(target_arch = "x86_64")]
     {
-        if has_waitpkg {
+        if has_timed_wait {
             let target = now_tsc.wrapping_add(cycles);
-            // SAFETY: `has_waitpkg` is only true when CPUID verified `WAITPKG` support.
+            // SAFETY: `has_timed_wait` is only true when CPUID verified `WAITPKG` support.
             unsafe {
                 tpause_waitpkg(0, target);
             }
@@ -134,10 +180,21 @@ pub fn pause_cycles(now_tsc: u64, cycles: u64, has_waitpkg: bool) {
             }
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        let _ = (now_tsc, cycles, has_waitpkg);
-        core::hint::spin_loop();
+        if has_timed_wait {
+            // SAFETY: `has_timed_wait` is only true when `HWCAP2_WFXT` reported `FEAT_WFxT`.
+            unsafe {
+                wfet(now_tsc.wrapping_add(cycles));
+            }
+        } else {
+            spin_loop();
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (now_tsc, cycles, has_timed_wait);
+        spin_loop();
     }
 }
 
@@ -177,7 +234,7 @@ impl VmDemandEval {
     }
 }
 
-/// Plane 2: Real-Time Matrix Engine (Pinned to Host Core 1).
+/// Plane 2: Real-Time Matrix Engine (pinned to one host CPU, `DEFAULT_ENGINE_CPU` unless set).
 ///
 /// Executes the 3-phase microsecond arbitration loop with zero heap allocations, zero mutexes,
 /// and zero blocking syscalls in steady state.
@@ -197,7 +254,8 @@ pub struct MatrixEngine {
     revoke_signalled_tsc: [u64; MAX_PCPUS],
     /// Host TSC rate, used for VMs whose header gives none.
     host_tsc_khz: u64,
-    has_waitpkg: bool,
+    has_timed_wait: bool,
+    engine_cpu: usize,
     /// SMT sibling ring: the next CPU on the same core, or the CPU itself.
     smt_next: [u16; MAX_PCPUS],
 }
@@ -215,7 +273,7 @@ impl MatrixEngine {
                 managed_pcpus[pcpu] = true;
             }
         }
-        let has_waitpkg = detect_waitpkg();
+        let has_timed_wait = detect_timed_wait();
 
         Self {
             vm_snapshot,
@@ -227,8 +285,9 @@ impl MatrixEngine {
             assigned_yield_count: [0; MAX_PCPUS],
             revoke_requested_tsc: [0; MAX_PCPUS],
             revoke_signalled_tsc: [0; MAX_PCPUS],
-            host_tsc_khz: DEFAULT_TSC_KHZ,
-            has_waitpkg,
+            host_tsc_khz: default_counter_khz(),
+            has_timed_wait,
+            engine_cpu: DEFAULT_ENGINE_CPU,
             smt_next: from_fn(|pcpu| pcpu as u16),
         }
     }
@@ -274,20 +333,27 @@ impl MatrixEngine {
         &self.pcpu_owners
     }
 
-    /// Pins the calling thread to Host Core 1 and runs the real-time polling loop until `stop` is set.
+    /// Sets the host CPU the polling loop pins itself to in [`Self::run`].
+    pub fn set_engine_cpu(&mut self, cpu: usize) {
+        self.engine_cpu = cpu;
+    }
+
+    /// Pins the calling thread to the engine CPU and runs the real-time polling loop until `stop`
+    /// is set.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), Error> {
-        if let Err(err) = pin_current_thread_to_core(1) {
-            warn!("Plane 2 could not pin to Core 1: {err}");
+        if let Err(err) = pin_current_thread_to_core(self.engine_cpu) {
+            warn!("Plane 2 could not pin to CPU {}: {err}", self.engine_cpu);
         }
+        let sweep_cycles = ns_to_cycles(SWEEP_INTERVAL_NS, self.host_tsc_khz);
         info!(
-            "Plane 2 (Matrix Engine) started (waitpkg={})",
-            self.has_waitpkg
+            "Plane 2 (Matrix Engine) started (cpu={}, timed_wait={}, sweep={sweep_cycles} ticks)",
+            self.engine_cpu, self.has_timed_wait
         );
 
         while !stop.load(Ordering::Relaxed) {
             let now_tsc = read_tsc();
             self.poll_once(now_tsc);
-            pause_cycles(now_tsc, DEFAULT_TPAUSE_CYCLES, self.has_waitpkg);
+            pause_cycles(now_tsc, sweep_cycles, self.has_timed_wait);
         }
         Ok(())
     }

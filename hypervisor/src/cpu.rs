@@ -331,6 +331,10 @@ pub trait Vcpu: Send + Sync {
     /// Sets the guest virtual counter (`CNTVCT_EL0`).
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     fn set_cntvct(&self, val: u64) -> Result<()>;
+    /// Gets the guest's EL1 virtual timer as `(CNTV_CTL_EL0, CNTV_CVAL_EL0)` via
+    /// `KVM_REG_ARM_TIMER_CTL` and `KVM_REG_ARM_TIMER_CVAL`.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn get_vtimer(&self) -> Result<(u64, u64)>;
     /// Get the timebase frequency (timer frequency in Hz) on RISC-V 64-bit.
     /// This is the frequency at which the RISC-V `time` CSR increments.
     #[cfg(target_arch = "riscv64")]

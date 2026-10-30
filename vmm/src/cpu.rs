@@ -138,6 +138,9 @@ pub enum Error {
     #[error("Error running vCPU")]
     VcpuRun(#[source] anyhow::Error),
 
+    #[error("Error checking --pylon")]
+    Pylon(#[source] pylon::Error),
+
     #[error("Error spawning vCPU thread")]
     VcpuSpawn(#[source] io::Error),
 
@@ -947,6 +950,8 @@ impl CpuManager {
                 hypervisor.get_max_vcpus(),
             ));
         }
+
+        pylon::check_hypervisor(hypervisor.hypervisor_type()).map_err(Error::Pylon)?;
 
         let max_vcpus = usize::try_from(config.max_vcpus).unwrap();
         let mut vcpu_states = Vec::with_capacity(max_vcpus);

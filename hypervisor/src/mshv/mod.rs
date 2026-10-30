@@ -1345,6 +1345,11 @@ impl cpu::Vcpu for MshvVcpu {
         unimplemented!()
     }
 
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn get_vtimer(&self) -> cpu::Result<(u64, u64)> {
+        unimplemented!()
+    }
+
     #[cfg(target_arch = "aarch64")]
     fn get_reg_list(&self, _reg_list: &mut crate::RegList) -> cpu::Result<()> {
         unimplemented!()
