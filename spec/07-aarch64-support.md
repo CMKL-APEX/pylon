@@ -196,15 +196,16 @@ stage 2:
 
 ### 4.5 `scx-pylon`
 1. `build.rs`: take the multiarch include directory and `-D__TARGET_ARCH_{x86,arm64}`
-   from `CARGO_CFG_TARGET_ARCH`.
-2. `vmlinux.h`: add `src/bpf/arm64/vmlinux.h` next to the x86 one (moved to
-   `src/bpf/x86/vmlinux.h`), generated with
-   `bpftool btf dump file /sys/kernel/btf/vmlinux format c`, and trimmed the
-   same way the x86 one was. `build.rs` picks the directory. The program only
-   uses `struct_ops`, maps and `fentry` (no `pt_regs` access), so CO-RE
-   relocations absorb any layout differences; the check is that the object
-   loads and attaches.
-3. Run `tests/live_attach.rs` on the reference host.
+   from `CARGO_CFG_TARGET_ARCH` (done, A-T6).
+2. `vmlinux.h`: **one header serves both architectures; no arm64 copy.** The
+   program reads kernel types only through CO-RE (the header carries
+   `preserve_access_index`), and sched_ext's types and flags are the same on
+   both. A-T6 checked this against the aarch64 kernel's BTF (see the A-T6
+   notes): the CO-RE relocations resolve, `struct sched_ext_ops` has the same
+   42 members, and the five sched_ext enums the program uses are identical.
+   If a future kernel changes a type the program uses, regenerate the one
+   header with `bpftool btf dump file /sys/kernel/btf/vmlinux format c`.
+3. Run `tests/live_attach.rs` on the reference host (needs root; done, A-T6).
 
 ### 4.6 Guest side
 - Guest agent: `head_wait_tsc` from `pylon_abi::clock::read_counter()`
@@ -305,8 +306,8 @@ parallel.
 | A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t2-pylond-counter` (#24) | `DONE` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
 | A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t3-vmm-counter` (#25) | `DONE` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t4-guest-agent` (#26) | `DONE` | `cargo test -p pylon-guest-agent` | — |
-| A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `IN_REVIEW` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
-| A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
+| A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
+| A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `IN_REVIEW` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | *Unassigned* | — | `NOT_STARTED` | Green aarch64 `quality` + unit-test jobs | — |
 | A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
@@ -423,6 +424,22 @@ Layout (A7):
 `FEAT_S2FWB` (A8, Q-A4): not detectable, so a documented requirement (§4.4). Evidence on the reference host (Cortex-X925, kernel `7.0.0-1019-nvidia`): `mrs ID_AA64MMFR2_EL1` from EL0 gives `0x0000000100000000`, with `FWB[43:40]` = 0 while `AT[35:32]` = 1 is visible; `ECV` in `ID_AA64MMFR0_EL1` reads 2 and `WFxT` is advertised, so the core is at least Armv8.7 and must implement `FEAT_S2FWB`. No runtime check or `--pylon` rejection was added, because a check that reads 0 on a core that has the feature would reject valid hosts. With A-T4 the agent no longer does atomic read-modify-writes on the page, so a host without `FEAT_S2FWB` loses coherency guarantees and not correctness of the agent's code. Still to do (A-T8): a note in the book and a check in a real guest.
 
 Verification (aarch64 host): `cargo test -p arch --features kvm` passes (17); `cargo test -p vmm --features kvm --lib pylon` passes (10); `cargo clippy --locked -p arch -p vmm --all-targets --features vmm/kvm,arch/kvm -- -D warnings`, the same for `arch` on `x86_64-unknown-linux-gnu`, and `cargo +nightly fmt --all --check` are clean. `vmm` for x86_64 can't be cross-built here (`zstd-sys`), so CI covers the x86_64 side of the VMM's assert.
+
+#### A-T6
+Built on `main` after A-T0 (#22); independent of A-T1 to A-T5.
+
+What changed: `scx-pylon/build.rs` takes `-D__TARGET_ARCH_{x86,arm64}` and the multiarch include directory from `CARGO_CFG_TARGET_ARCH` instead of the hard-coded `/usr/include/x86_64-linux-gnu`. An architecture it doesn't know gets neither, as before. x86_64 gets the same include directory and the new define, which `bpf_tracing.h` only uses for its `PT_REGS` macros.
+
+**No arm64 `vmlinux.h`** (A6; §4.5 item 2 was planned the other way). Checked offline, against the reference host's kernel BTF (`7.0.0-1019-nvidia`, aarch64), for the object built on aarch64 from the existing header:
+- `bpftool gen min_core_btf /sys/kernel/btf/vmlinux out.btf scx_pylon.bpf.o` succeeds, and the output holds `task_struct` with the 5 fields the program reads (`pid`, `tgid`, `migration_disabled`, `nr_cpus_allowed`, `cpus_ptr`). So every CO-RE relocation resolves.
+- `struct sched_ext_ops` has 42 members in the object and in the kernel, and none of the object's is missing in the kernel (struct_ops members are matched by name at load).
+- The enums `scx_ops_flags`, `scx_enq_flags`, `scx_kick_flags`, `scx_dsq_id_flags` and `scx_public_consts` are identical in the checked-in header (from an x86_64 7.0.0-42 kernel) and the aarch64 kernel's dump, so the flag values compiled in are right.
+
+Guard (§4.1 item 4): on the reference host `PR_SCHED_CORE_GET` fails with `ENODEV` and `/sys/devices/system/cpu/smt/active` is 0, so `KernelCoreSched::detect()` is `NoSmt` and `needs_guard(Auto)` is false: `pylond` doesn't ask for the `lsm/task_prctl` hook, so the missing BPF LSM doesn't matter. This is by reading the code and the two probes, not by running `pylond` (needs root). With `--core-sched-guard on` the guard is asked for on a no-SMT host, and without BPF LSM the load then fails.
+
+Verification (aarch64 host): `cargo build`, `cargo test -p scx-pylon` (10 passed, `live_attach` ignored) and `cargo clippy --locked -p scx-pylon --all-targets -- -D warnings` are clean, and so is rustfmt.
+
+**Live attach, run as root** (the test binary built as a normal user, then `sudo`; kernel `7.0.0-1019-nvidia`, aarch64): `tests/live_attach.rs` passes. It loads the object built from the existing `vmlinux.h`, attaches it, sees `/sys/kernel/sched_ext/state` go `enabled`, sets and reads back a pCPU owner entry, detaches, and sees `disabled`; the whole test took 1.03 s and the host was back to `disabled` afterwards. So the object loads and attaches on aarch64, which settles A6, and it confirms the offline checks above. It does not exercise scheduling under load or `pylond`'s path (`--enable-scx`); that is for A-T8. x86_64: `scx-pylon` can't be cross-built here (vendored `libbpf`), so CI covers it.
 
 ---
 
