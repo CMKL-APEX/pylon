@@ -25,7 +25,7 @@
 | **Docs** | `docs/pylon-book` (#11) | Pylon book in `docs/pylon/` (mdBook) and `pylon-docs.yaml`, publishing to `gh-pages` | Coordinator | `DONE` | `mdbook build docs/pylon` |
 | **Track 4** | S1–S2: `pylon/s1-park-decision` (#12); S3: `pylon/s3-and-fixes` | Spec 06 S1–S4, S6: VMM park decision table, `pylond` forced-park via `tgkill`, guest agent telemetry-only and ABI v2, `pylon-kick` PCI device + MSI-X kick FDs, latency metrics | Coordinator | `IN_PROGRESS` (S1–S3 done; S4 blocked on spec 06 Q1; S6 not started) | `cargo test -p vmm --features kvm --lib pylon`, `cargo test -p pylond`, `cargo test -p pylon-guest-agent`; later steps per `spec/06-guest-kick-path.md §8` |
 | **Track 5** | *TBD* | Spec 06 S5: `pylon/guest/linux` `pv-pylon` kernel module | *Unassigned* | `NOT_STARTED` | Guest integration test (spec 06 §8) |
-| **Track 6** | `pylon/a64-<task>-<slug>` | Spec 07: aarch64 host & guest support (counter abstraction, `WFET`, guest virtual timer, arm64 `scx-pylon`, CI). Per-task board: `spec/07-aarch64-support.md §9` | Coordinator | `NOT_STARTED` | Spec 07 §7 |
+| **Track 6** | `pylon/a64-<task>-<slug>` | Spec 07: aarch64 host & guest support (counter abstraction, `WFET`, guest virtual timer, arm64 `scx-pylon`, CI). Per-task board: `spec/07-aarch64-support.md §9` | Coordinator | `IN_PROGRESS` (A-T0) | Spec 07 §7 |
 
 ---
 
