@@ -120,6 +120,13 @@ pub enum RegionType {
     Reserved,
 }
 
+/// Whether the guest-physical ranges `[a, a + a_size)` and `[b, b + b_size)` share an address.
+/// For the compile-time layout checks in each architecture's `layout` module.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) const fn ranges_overlap(a: u64, a_size: u64, b: u64, b_size: u64) -> bool {
+    a < b + b_size && b < a + a_size
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod smbios;
 

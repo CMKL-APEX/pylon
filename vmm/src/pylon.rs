@@ -34,6 +34,14 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::GuestRegionMmap;
 
+// The shared page's address is declared in the architecture's layout and in the ABI crate, which
+// can't see each other, so check here that they agree.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const _: () = {
+    assert!(arch::layout::PYLON_SHARED_START.0 == PYLON_DEFAULT_GPA);
+    assert!(arch::layout::PYLON_SHARED_SIZE == PYLON_SHARED_PAGE_SIZE as u64);
+};
+
 /// TSC rate written into `PylonHeader`: unknown. The VMM writes the header before any vCPU
 /// exists, so it can't ask KVM; `pylond` measures the host TSC rate itself instead.
 pub const UNKNOWN_TSC_KHZ: u64 = 0;

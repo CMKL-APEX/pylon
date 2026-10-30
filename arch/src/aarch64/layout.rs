@@ -122,6 +122,30 @@ pub const TPM_SIZE: u64 = 0x1000;
 /// Start of 64-bit RAM.
 pub const RAM_64BIT_START: GuestAddress = GuestAddress(0x1_0000_0000);
 
+/// Pylon shared page (`pylon_abi::PYLON_SHARED_PAGE_SIZE` bytes), mapped by the VMM when
+/// `--pylon` is on. It sits in the 32-bit reserved hole, outside guest RAM and the FDT's memory
+/// node. 64 KiB aligned, so a guest with 64 KiB pages can map it. `vmm::pylon` checks it against
+/// `pylon_abi::PYLON_DEFAULT_GPA`.
+pub const PYLON_SHARED_START: GuestAddress = GuestAddress(0xfedf_0000);
+pub const PYLON_SHARED_SIZE: u64 = 0x2000;
+
+const _: () = {
+    use crate::ranges_overlap;
+
+    assert!(PYLON_SHARED_START.0.is_multiple_of(0x1_0000));
+    assert!(PYLON_SHARED_START.0 >= MEM_32BIT_RESERVED_START.0);
+    assert!(
+        PYLON_SHARED_START.0 + PYLON_SHARED_SIZE
+            <= MEM_32BIT_RESERVED_START.0 + MEM_32BIT_RESERVED_SIZE
+    );
+    assert!(!ranges_overlap(
+        PYLON_SHARED_START.0,
+        PYLON_SHARED_SIZE,
+        TPM_START.0,
+        TPM_SIZE
+    ));
+};
+
 /// Kernel command line maximum size.
 /// As per `arch/arm64/include/uapi/asm/setup.h`.
 pub const CMDLINE_MAX_SIZE: usize = 2048;
