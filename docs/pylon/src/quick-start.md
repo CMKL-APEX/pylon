@@ -24,7 +24,9 @@ This produces `target/release/cloud-hypervisor` and
 
 `pylond` arbitrates the host CPUs you give it with `--cores`, and uses
 host cores 0 and 1 for itself. Keep those three sets apart: don't list
-0 or 1 in `--cores`.
+0 or 1 in `--cores`. Core 1 is where the polling engine runs; move it
+with `--engine-cpu` (on a host with big and little cores, pick a big
+one) and keep it out of `--cores` too.
 
 ```bash
 sudo ./target/release/pylond --socket /run/pylon/pylond.sock --cores 2-7 \
