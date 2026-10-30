@@ -309,7 +309,7 @@ parallel.
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` (#29) | `DONE` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
-| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
+| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `IN_PROGRESS` (bench and forced-park e2e done; book page done in #31; booting a guest and `pylond` end to end open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 
 ### 9.2 Handoffs & Questions
@@ -380,7 +380,7 @@ Verification (aarch64 host): `cargo test -p pylond` passes: 19 lib, 1 bench, 7 m
 
 x86_64 was not built as `pylond`: cross-building its vendored `libbpf` fails here. The functions that changed were checked as a standalone crate for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with clippy `-D warnings` (that is how an x86-only unused `spin_loop` import was found and fixed). CI must build and test `pylond` on x86_64.
 
-`WFET` on the reference host (Cortex-X925 core 2, Cortex-A725 core 12; 20,000 waits each; throwaway program, not committed). Overshoot past the deadline in ns, p50 / p99: 67 / 115 at a 333 ns interval, 72 / 120 at 1 µs, 72 / 136 at 5 µs, the same on both core types. The worst case was 30 µs. 0.5% to 18% of waits returned early (more at short intervals), which the polling loop absorbs, so the pause is a hint, not a timer. For comparison, an `isb` spin iteration costs 12 ns. This bears on Q-A5 and on the A-T8 latency numbers.
+`WFET` on the reference host (20,000 waits each; throwaway program, not committed). **Correction (A-T8):** this note first said cores 2 and 12 were a Cortex-X925 and an A725; both are Cortex-A725 (see A-T8 for the topology). Overshoot past the deadline in ns, p50 / p99: 67 / 115 at a 333 ns interval, 72 / 120 at 1 µs, 72 / 136 at 5 µs on A725 cores 2 and 12; re-measured on Cortex-X925 cores 5, 9 and 15 it is 51 to 67 / 131 at 333 ns, 56 to 72 / 136 at 1 µs and 5 µs, so the two core types behave alike. The worst case was 30 µs. 0.5% to 18% of waits returned early (more at short intervals), which the polling loop absorbs, so the pause is a hint, not a timer. For comparison, an `isb` spin iteration costs 12 ns. This bears on Q-A5 and on the A-T8 latency numbers.
 
 #### A-T3
 Built on `main` after A-T1 (#23); independent of A-T2.
@@ -457,6 +457,26 @@ Left out on purpose: `hypervisor` tests (hosted arm64 runners have no `/dev/kvm`
 Verification: I ran every command of the job on the aarch64 dev host in a clean target directory with `RUSTFLAGS=-D warnings`: all pass (clippy clean; `pylon-abi`+`pylon-guest-agent` 5+5, `pylond` 19+1+7+6, `scx-pylon` 10, `arch` 17, `vmm` pylon 13 and config 38). With `/dev/kvm` hidden (bind-mounted over with `/dev/null` in a user namespace) the `vmm` real-KVM test prints "Skipping" and passes, as it would on a runner without KVM. The workflow file parses as YAML. **Not verified: the job on a GitHub runner**: its first run is this PR's check. Package or toolchain differences on the hosted image (Ubuntu 24.04 arm) could show up there.
 
 Housekeeping in the same PR: A-T6 is `DONE` (its row was left `IN_REVIEW` when #28 merged).
+
+#### A-T8
+First results, on the reference host (kernel `7.0.0-1019-nvidia`). Still open: booting a guest (no guest image or `pv-pylon` exists here, so the VM-level numbers below come from a spin-loop guest) and `pylond --enable-scx` end to end. The book page is done (#31).
+
+**CPU topology** (decoded from `midr_el1`; an earlier note was wrong): CPUs 0-4 and 10-14 are Cortex-A725 (part `0xd87`, 2.8 GHz max); CPUs 5-9 and 15-19 are Cortex-X925 (part `0xd85`, 3.9 GHz max); no SMT. `pylond`'s default engine CPU (1) is an A725, and its default tenant cores `2-7` are a mix. Q-A3 stays open: nothing here measures whether the engine's core class changes handoff latency.
+
+**`pylon-bench`** (threads standing in for vCPUs, release build, default 20 waves, 1 to 8 vCPUs, 5 runs): Pylon scale-out latency mean 13.8 to 17.6 µs, p50 11.3 to 16.1 µs, p99 31.9 to 63.1 µs; scale-in (revoke) mean 0.73 to 2.18 µs, p99 usually about 1 µs with occasional outliers (18 to 28 µs in 2 of 5 runs). The quick preset: 15.2 µs mean scale-out. The "ACPI hotplug" column in this tool is a model (`--acpi-bringup-us` and `--acpi-eject-us` sleeps), not a measurement, so its improvement ratios say nothing about a real hotplug. For scale: the spec 05 note from an x86_64 EPYC host had a 138 µs mean scale-out for the same tool; the cause there was never found, and this run's 14 to 18 µs is in the range spec 00 aims at (3 to 6 µs) only within a factor of 3.
+
+**Forced park on a real aarch64 KVM vCPU** (new, `vmm` tests): `test_e2e_real_kvm_vcpu_aarch64_forced_park_on_kick_signal` (the aarch64 counterpart of the x86_64 test, which A-T3 listed as missing) runs a guest that spins (`b .`) and never agrees to park; a revocation whose grace period is over plus the kick signal parks it, `forced_preempt_count` and `yield_count` become 1, and the wake brings it back to `RUNNING`. `bench_forced_park_latency_real_kvm_aarch64` (`#[ignore]`d; `cargo test --release -p vmm --features kvm --lib bench_forced_park -- --ignored --nocapture`) repeats it 3000 times and re-signals every 10 µs like `pylond`:
+
+| | request to `PARKED` (µs) mean / p50 / p90 / p99 / max | `wake_vcpu` to `RUNNING` (µs) mean / p50 / p90 / p99 / max |
+| :--- | :--- | :--- |
+| unpinned, run 1 | 9.7 / 6.8 / 19.5 / 29.7 / 89 | 18.9 / 4.7 / 92.5 / 103.6 / 132 |
+| unpinned, run 2 | 9.6 / 6.6 / 18.9 / 29.6 / 217 | 18.9 / 4.4 / 94.0 / 105.0 / 173 |
+
+About 72% of the parks complete within 10 µs, before a re-signal is needed. Pinning the whole test process to two cores (X925 5-6 or A725 2-3) only adds noise: the test runner's other threads share those cores (p99 wake 7 ms), so those runs are not reported as results.
+
+**Finding: the wake has two modes.** The median wake is 3 to 5 µs, but about 10% take 90 to 105 µs. The reference host's cpuidle states match: `LPI-1` has a 42 µs exit latency and `LPI-3` 433 µs (driver `acpi_idle`, governor `menu`), and a parked vCPU thread's core idles. A core handoff wakes a thread on a possibly idle core, so these exits would sit in `pylond`'s revoke-to-running path. Not yet tested: whether holding the cores out of deep idle (a PM QoS latency request on `/dev/cpu_dma_latency`, root only) removes the 90 µs mode. This may also bear on the 138 µs on x86_64.
+
+What this does not measure: the guest never cooperates and no `pylond` decides anything, so it isolates the VMM's kick, KVM exit, park and wake mechanics. The 8 µs grace window and the cooperative path need `pv-pylon` (spec 06 S5).
 
 ---
 
