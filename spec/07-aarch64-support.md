@@ -272,7 +272,7 @@ parallel.
 | **A-T4** | Guest agent counter (§4.6) and no-RMW test (§4.4). | A5 | A-T1 |
 | **A-T5** | Layout constant and overlap asserts on both arches (§4.3); `FEAT_S2FWB` check (§4.4). | A7, A8 (short term) | A-T0 |
 | **A-T6** | `scx-pylon` arm64 build and `vmlinux.h`; live attach (§4.5); guard check (§4.1 item 4). | A6 | A-T0 |
-| **A-T7** | CI: drop the aarch64 `pylon_exclude` for gnu, add aarch64 unit tests; update spec 05 *CI Coverage*. | A9 | A-T2, A-T3, A-T6 |
+| **A-T7** | CI: build, lint and test the Pylon crates on a native aarch64 runner (`pylon-aarch64` in `pylon-ci.yaml`); update spec 05 *CI Coverage*. | A9 | A-T2, A-T3, A-T6 |
 | **A-T8** | E2E and perf on aarch64 (§7); Pylon book (`docs/pylon/`) platform page. | — | A-T2…A-T6 |
 | **A-T9** | Kick path on the GICv3 ITS (§4.7). | — | spec 06 S4 |
 
@@ -307,8 +307,8 @@ parallel.
 | A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t3-vmm-counter` (#25) | `DONE` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t4-guest-agent` (#26) | `DONE` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
-| A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `IN_REVIEW` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
-| A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | *Unassigned* | — | `NOT_STARTED` | Green aarch64 `quality` + unit-test jobs | — |
+| A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
+| A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` | `IN_REVIEW` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
 | A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 
@@ -440,6 +440,23 @@ Guard (§4.1 item 4): on the reference host `PR_SCHED_CORE_GET` fails with `ENOD
 Verification (aarch64 host): `cargo build`, `cargo test -p scx-pylon` (10 passed, `live_attach` ignored) and `cargo clippy --locked -p scx-pylon --all-targets -- -D warnings` are clean, and so is rustfmt.
 
 **Live attach, run as root** (the test binary built as a normal user, then `sudo`; kernel `7.0.0-1019-nvidia`, aarch64): `tests/live_attach.rs` passes. It loads the object built from the existing `vmlinux.h`, attaches it, sees `/sys/kernel/sched_ext/state` go `enabled`, sets and reads back a pCPU owner entry, detaches, and sees `disabled`; the whole test took 1.03 s and the host was back to `disabled` afterwards. So the object loads and attaches on aarch64, which settles A6, and it confirms the offline checks above. It does not exercise scheduling under load or `pylond`'s path (`--enable-scx`); that is for A-T8. x86_64: `scx-pylon` can't be cross-built here (vendored `libbpf`), so CI covers it.
+
+#### A-T7
+Built on `main` after A-T6 (#28).
+
+**Deviation from §8:** the plan said to drop the aarch64 `pylon_exclude` in the `quality` job. That job cross-compiles with `houseabsolute/actions-rust-cross` on an x86_64 runner, and the vendored `libbpf` needs the target's `libelf`, which the cross image lacks; so the exclusion stays (only its comment changed, in `quality` and `build`). The Pylon crates get aarch64 coverage from a new native job instead.
+
+What changed: `.github/workflows/pylon-ci.yaml` gets `pylon-aarch64` ("Pylon aarch64 (clippy & unit tests)") on `ubuntu-24.04-arm`, free for this public repo. It installs the same BPF/VMM build dependencies as the x86_64 jobs and runs, with `RUSTFLAGS=-D warnings`:
+- clippy `-D warnings` on `pylon-abi`, `pylon-guest-agent`, `pylond`, `scx-pylon`, `arch`, `hypervisor`, `vmm` and `cloud-hypervisor` with `--features kvm --tests`;
+- tests: `pylon-abi` and `pylon-guest-agent`; `pylond` (including `e2e_pylon`); `scx-pylon`; `arch --features kvm`; `vmm --features kvm --lib pylon` and `--lib config`.
+
+It is a new job, not a matrix on the existing ones, so the existing check names don't change. It adds `pylon-guest-agent` and `arch`, which the x86_64 Pylon jobs don't run (the x86_64 unit-test job in `ci.yaml` runs the workspace).
+
+Left out on purpose: `hypervisor` tests (hosted arm64 runners have no `/dev/kvm`, and two tests create a VM with `unwrap`), the `pylon-bench` benchmark (shared runners say nothing about latency), and the live `sched_ext` attach (needs root and a `sched_ext` kernel); A-T8 covers the last two on real hardware.
+
+Verification: I ran every command of the job on the aarch64 dev host in a clean target directory with `RUSTFLAGS=-D warnings`: all pass (clippy clean; `pylon-abi`+`pylon-guest-agent` 5+5, `pylond` 19+1+7+6, `scx-pylon` 10, `arch` 17, `vmm` pylon 13 and config 38). With `/dev/kvm` hidden (bind-mounted over with `/dev/null` in a user namespace) the `vmm` real-KVM test prints "Skipping" and passes, as it would on a runner without KVM. The workflow file parses as YAML. **Not verified: the job on a GitHub runner**: its first run is this PR's check. Package or toolchain differences on the hosted image (Ubuntu 24.04 arm) could show up there.
+
+Housekeeping in the same PR: A-T6 is `DONE` (its row was left `IN_REVIEW` when #28 merged).
 
 ---
 

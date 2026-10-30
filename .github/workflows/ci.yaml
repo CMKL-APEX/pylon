@@ -371,8 +371,9 @@ jobs:
             experimental: true
           - rust: stable
             experimental: false
-          # pylond and scx-pylon are x86_64 glibc host daemons (TSC, libbpf);
-          # the cross/musl toolchains don't provide their BPF build deps.
+          # pylond and scx-pylon are glibc host daemons built against libbpf; the
+          # cross/musl toolchains don't provide the target's libelf. pylon-ci.yaml
+          # builds and tests them natively on x86_64 and aarch64 (pylon-aarch64).
           - target: aarch64-unknown-linux-gnu
             pylon_exclude: --exclude scx-pylon --exclude pylond
           - target: aarch64-unknown-linux-musl
@@ -550,8 +551,9 @@ jobs:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
         include:
-          # pylond and scx-pylon are x86_64 glibc host daemons (TSC, libbpf);
-          # the cross/musl toolchains don't provide their BPF build deps.
+          # pylond and scx-pylon are glibc host daemons built against libbpf; the
+          # cross/musl toolchains don't provide the target's libelf. pylon-ci.yaml
+          # builds and tests them natively on x86_64 and aarch64 (pylon-aarch64).
           - target: x86_64-unknown-linux-musl
             pylon_exclude: --exclude scx-pylon --exclude pylond
     steps:
