@@ -123,6 +123,34 @@ pub const IOAPIC_SIZE: u64 = 0x20;
 // APIC
 pub const APIC_START: GuestAddress = GuestAddress(0xfee0_0000);
 
+/// Pylon shared page (`pylon_abi::PYLON_SHARED_PAGE_SIZE` bytes), mapped by the VMM when
+/// `--pylon` is on. It sits between the IOAPIC/TPM and the APIC, outside guest RAM. 64 KiB
+/// aligned, so a guest with 64 KiB pages can map it. `vmm::pylon` checks it against
+/// `pylon_abi::PYLON_DEFAULT_GPA`.
+pub const PYLON_SHARED_START: GuestAddress = GuestAddress(0xfedf_0000);
+pub const PYLON_SHARED_SIZE: u64 = 0x2000;
+
+const _: () = {
+    use crate::ranges_overlap;
+
+    assert!(PYLON_SHARED_START.0.is_multiple_of(0x1_0000));
+    assert!(PYLON_SHARED_START.0 + PYLON_SHARED_SIZE <= APIC_START.0);
+    assert!(PYLON_SHARED_START.0 + PYLON_SHARED_SIZE <= RAM_64BIT_START.0);
+    assert!(PYLON_SHARED_START.0 >= KVM_IDENTITY_MAP_START.0 + KVM_IDENTITY_MAP_SIZE);
+    assert!(!ranges_overlap(
+        PYLON_SHARED_START.0,
+        PYLON_SHARED_SIZE,
+        IOAPIC_START.0,
+        IOAPIC_SIZE
+    ));
+    assert!(!ranges_overlap(
+        PYLON_SHARED_START.0,
+        PYLON_SHARED_SIZE,
+        TPM_START.0,
+        TPM_SIZE
+    ));
+};
+
 // == End of "32-bit reserved" range. ==
 
 // ** 64-bit RAM start (start: 4GiB, length: varies) **

@@ -178,15 +178,19 @@ stage 2:
   `pylond`'s cached view.
 
 **Decision:**
-- Short term (this spec): support only hosts with `FEAT_S2FWB`. The VMM
-  checks for it at start-up and rejects `--pylon` on aarch64 without it.
-  KVM doesn't report FWB to userspace, and the kernel doesn't expose
-  `ID_AA64MMFR2_EL1.FWB` through `HWCAP`s or sysfs. Finding a reliable check
-  is part of task A-T5 (Q-A4). If there is none, it becomes a documented host
-  requirement instead of a runtime check.
-- The guest agent keeps `/dev/mem` but, on aarch64, uses only plain loads and
-  stores. It does no read-modify-write on the page (today it does none; a
-  test pins that down).
+- Short term (this spec): `--pylon` on aarch64 needs a host with `FEAT_S2FWB`
+  for the guest's `/dev/mem` mapping to be coherent. This is a **documented
+  host requirement, not a runtime check**: A-T5 found no reliable way to test
+  for it from userspace (Q-A4). `ID_AA64MMFR2_EL1.FWB` reads 0 through the
+  kernel's `MRS` emulation even on a core that must implement it, because the
+  kernel hides that field, and neither `HWCAP`s, `/proc/cpuinfo` nor sysfs
+  report it. Every Armv8.4-A or later core has it, which covers current
+  server Arm parts.
+- The guest agent keeps `/dev/mem` but uses only plain loads and stores on the
+  page, on every architecture. It used to bump `guest_heartbeat` with
+  `fetch_add`, which is an atomic read-modify-write (`ldadd` with LSE); it is
+  now a load and a store, since the agent is the field's only writer. A test
+  keeps read-modify-write methods out of the agent's code (A-T4).
 - Long term: spec 06 §9 (page in a `pylon-kick` prefetchable BAR, mapped by
   `pv-pylon` with `memremap(MEMREMAP_WB)`) removes the problem.
 
@@ -298,12 +302,12 @@ parallel.
 | ID | Task | Depends on | Owner | Branch / PR | Status | Verification | Result |
 | :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` (#22) | `DONE` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Merged in #22. |
-| A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` | `IN_PROGRESS` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
-| A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
-| A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
-| A-T4 | Guest agent counter + no-RMW test | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-guest-agent` | — |
-| A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
-| A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` | `IN_REVIEW` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
+| A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` (#23) | `DONE` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
+| A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t2-pylond-counter` (#24) | `DONE` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
+| A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t3-vmm-counter` (#25) | `DONE` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
+| A-T4 | Guest agent counter + no-RMW test | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t4-guest-agent` (#26) | `DONE` | `cargo test -p pylon-guest-agent` | — |
+| A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
+| A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `IN_REVIEW` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | *Unassigned* | — | `NOT_STARTED` | Green aarch64 `quality` + unit-test jobs | — |
 | A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
@@ -363,6 +367,64 @@ Interface for A-T2, A-T3 and A-T4:
 
 Verification (aarch64 host): `cargo test -p pylon-abi` passes (5; with `--no-default-features` the 3 layout tests), clippy `-D warnings` is clean for both feature sets. x86_64 was only **compiled** (`cargo clippy --target x86_64-unknown-linux-gnu`, after `rustup target add x86_64-unknown-linux-gnu`), not run, because this host can't execute x86_64. CI must run the x86_64 tests.
 
+#### A-T2
+What changed in `pylond`:
+- `read_tsc` is now `pylon_abi::clock::read_counter`. `calibrate_tsc_khz` returns `CNTFRQ_EL0` on aarch64 and still measures on x86_64. The name stays to keep the change small.
+- `default_counter_khz()` replaces the bare `DEFAULT_TSC_KHZ` as the engine's initial rate, and in the e2e tests and `pylon-bench`: on aarch64 it is the architectural rate, so the 8 µs grace window is 8 µs there too. `DEFAULT_TSC_KHZ` stays as the x86 fallback.
+- `DEFAULT_TPAUSE_CYCLES` (1000 ticks) is replaced by `SWEEP_INTERVAL_NS` (333), converted with the host rate when `run` starts. On a 3 GHz TSC this is 999 ticks.
+- `detect_waitpkg`/`has_waitpkg` are now `detect_timed_wait`/`has_timed_wait`: `WAITPKG` on x86_64, `HWCAP2_WFXT` on aarch64. `pause_cycles` uses `WFET` there, else `spin_loop()`.
+- `WFET` is written as `.inst 0xd5031009` (`wfet x9`). The encoding `0xd5031000 | Rt` was checked by assembling `wfet x0`, `wfet x17` and `wfit x3` with `clang -march=armv8.7-a` and disassembling (`d5031000`, `d5031011`, `d5031023`).
+- `--engine-cpu` (default 1, `DEFAULT_ENGINE_CPU`) and `MatrixEngine::set_engine_cpu`. `pylond` warns if it is also in `--cores`. Which CPU class is the right default stays Q-A3.
+
+Verification (aarch64 host): `cargo test -p pylond` passes: 19 lib, 1 bench, 7 main, 6 e2e. Before this change `test_calibrated_tsc_rate_is_plausible` and 3 e2e tests failed (A-T0), so the stuck clock (A1) was the cause. `cargo clippy --locked --all --all-targets --tests --features kvm -- -D warnings` and `cargo +nightly fmt --all --check` are clean, which includes the `absolute_paths` error A-T0 found. New tests: `test_pause_cycles_waits_about_the_interval`, `engine_cpu_defaults_to_the_engine_default`. The rate-plausibility test's range is now 10 MHz to 10 GHz.
+
+x86_64 was not built as `pylond`: cross-building its vendored `libbpf` fails here. The functions that changed were checked as a standalone crate for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with clippy `-D warnings` (that is how an x86-only unused `spin_loop` import was found and fixed). CI must build and test `pylond` on x86_64.
+
+`WFET` on the reference host (Cortex-X925 core 2, Cortex-A725 core 12; 20,000 waits each; throwaway program, not committed). Overshoot past the deadline in ns, p50 / p99: 67 / 115 at a 333 ns interval, 72 / 120 at 1 µs, 72 / 136 at 5 µs, the same on both core types. The worst case was 30 µs. 0.5% to 18% of waits returned early (more at short intervals), which the polling loop absorbs, so the pause is a hint, not a timer. For comparison, an `isb` spin iteration costs 12 ns. This bears on Q-A5 and on the A-T8 latency numbers.
+
+#### A-T3
+Built on `main` after A-T1 (#23); independent of A-T2.
+
+What changed:
+- `hypervisor`: `Vcpu::get_vtimer() -> (CNTV_CTL_EL0, CNTV_CVAL_EL0)` (aarch64 + `kvm`; MSHV is `unimplemented!()` like `get_cntvct`), via `KVM_REG_ARM_TIMER_CTL` (`0x6030_0000_0013_df19`) and `KVM_REG_ARM_TIMER_CVAL` (`0x6030_0000_0013_df02`). A unit test pins these ids, and `CNT` (`..._df1a`), to the kernel's `kvm.h` values.
+- `vmm/src/pylon.rs`: `read_host_tsc` is `pylon_abi::clock::read_counter` on every arch (A3). `read_guest_tsc` is `get_cntvct`, and `read_guest_tsc_deadline` is `CVAL` when `CTL.ENABLE == 1 && CTL.IMASK == 0`, else 0 (A4). Without `kvm` on aarch64 both still return `None`.
+- `pylon::check_hypervisor`, called from `CpuManager::new`: `--pylon` on MSHV on aarch64 fails with "--pylon is not supported on MSHV on aarch64". MSHV on x86_64 is unchanged (spec 06 Q4 still open).
+- `test_measure_guest_tsc_offset` now runs on both arches. New: `test_vtimer_deadline_needs_enable_and_no_mask`, `test_real_kvm_vcpu_counter_offset_and_idle_timer` (real vCPU: offset, conversion, idle timer reads 0) and, in `hypervisor`, `test_timer_register_ids` and `test_vtimer_and_counter_read`.
+
+Findings:
+- KVM starts a new vCPU's counter near 0, like the x86 TSC: on the reference host `guest_tsc_offset` was about -5.0e12 ticks (the host's uptime) in three runs, so it is never the reserved 0 and the "offset unknown" handling doesn't hide timers on aarch64.
+- Converting a fresh guest counter to the host counter is off by 660 to 850 ticks (0.7 to 0.85 µs at 1 GHz): half the duration of the register read between the two host reads. It applies to `head_wait_tsc` and published timer deadlines, against the 8 µs grace window.
+- The guest's armed timer is read from the vCPU's saved state outside `KVM_RUN`, as `check_and_park_vcpu` does. Only the EL1 virtual timer is read; a guest using the physical timer (`CNTP_*`) would publish no deadline (Q-A6).
+
+Verification (aarch64 host): `cargo test -p vmm --features kvm --lib` passes (148, 13 `pylon`), `cargo test -p hypervisor --features kvm` passes (8 lib, 4 more). `cargo clippy --locked -p vmm -p hypervisor -p cloud-hypervisor --all-targets -- -D warnings` is clean with `kvm`, `mshv` and `mshv,kvm`, and `cargo +nightly fmt --all --check` is clean.
+
+Not verified: x86_64. `vmm` cross-builds fail here (`zstd-sys` needs an x86_64 C toolchain), so CI must build and test it. The x86 code is unchanged except `read_host_tsc`, the removed `_rdtsc` import and the widened `cfg`s of the non-x86 stubs. The forced-park-by-signal end-to-end test with a running guest exists only for x86_64; an aarch64 equivalent needs a bootable guest and is left to A-T8.
+
+#### A-T4
+Built on `main` after A-T1 (#23); independent of A-T2 and A-T3.
+
+What changed in `pylon-guest-agent`:
+- `head_wait_tsc` is `pylon_abi::clock::read_counter()` (the guest's `CNTVCT_EL0` on aarch64) instead of the constant `1` (A5). A counter that reads 0 is stored as 1, because 0 means "no backlog".
+- **Correction to §4.4:** the agent did do a read-modify-write on the page: `guest_heartbeat.fetch_add(1)`. On aarch64 that is an atomic (`ldadd`) on a `/dev/mem` mapping, which is device memory unless stage 2 forces write-back (`FEAT_S2FWB`). It is now a load and a store; the agent is the only writer of the field. The spec's earlier "today it does none" was wrong, and §4.4 now says so.
+- Tests: `test_head_wait_is_a_counter_reading` (the stored value lies between two counter reads) and `test_agent_does_no_read_modify_write_on_the_page`. The second scans the agent's own source (everything before `#[cfg(test)]`) for `fetch_*`, `swap` and `compare_exchange*`. It's a source scan, not an instruction-level check: it keeps the obvious regressions out and can't see an RMW inside a dependency. I confirmed it fails when a `fetch_add` is put back.
+
+Verification (aarch64 host): `cargo test -p pylon-guest-agent` passes (5), clippy `-D warnings` and `cargo +nightly fmt --all --check` are clean. x86_64 was compiled and linted (`cargo clippy --target x86_64-unknown-linux-gnu`) but not run, since this host can't execute x86_64.
+
+Not covered: the agent running in an aarch64 guest on `/dev/mem`. Whether that mapping works at all depends on A-T5 (`FEAT_S2FWB`) and on the guest kernel allowing `/dev/mem` for that range (`CONFIG_STRICT_DEVMEM`), which is for A-T8.
+
+#### A-T5
+Built on `main` after A-T0 (#22); independent of A-T1 to A-T4.
+
+Layout (A7):
+- `arch::layout::PYLON_SHARED_START` (`0xFEDF_0000`) and `PYLON_SHARED_SIZE` (`0x2000`) on both x86_64 and aarch64, with compile-time asserts. Both: 64 KiB aligned (a guest with 64 KiB pages can map it), and no overlap with the TPM. x86_64: also clear of the IOAPIC, below the APIC and 4 GiB, and above the KVM identity map. aarch64: inside the 32-bit reserved hole. I checked that each assert fires by moving the address onto the IOAPIC (x86_64) and the TPM (aarch64).
+- `vmm/src/pylon.rs` asserts at compile time that these equal `pylon_abi::PYLON_DEFAULT_GPA` and `PYLON_SHARED_PAGE_SIZE`; `arch` and `pylon-abi` can't see each other, so the VMM, which sees both, checks. Gated to x86_64 and aarch64 so the riscv64 build isn't affected.
+- On x86_64 the page lies outside the range `MEM_32BIT_RESERVED_*` declares (that ends at `0xF800_0000`), as the TPM, IOAPIC and APIC do, so those asserts are the only protection against a future device landing on it. The page is still not in the FDT `memory` node or any RAM listing (K4).
+- No behaviour change: nothing moved, and `gpa=` still overrides the default.
+
+`FEAT_S2FWB` (A8, Q-A4): not detectable, so a documented requirement (§4.4). Evidence on the reference host (Cortex-X925, kernel `7.0.0-1019-nvidia`): `mrs ID_AA64MMFR2_EL1` from EL0 gives `0x0000000100000000`, with `FWB[43:40]` = 0 while `AT[35:32]` = 1 is visible; `ECV` in `ID_AA64MMFR0_EL1` reads 2 and `WFxT` is advertised, so the core is at least Armv8.7 and must implement `FEAT_S2FWB`. No runtime check or `--pylon` rejection was added, because a check that reads 0 on a core that has the feature would reject valid hosts. With A-T4 the agent no longer does atomic read-modify-writes on the page, so a host without `FEAT_S2FWB` loses coherency guarantees and not correctness of the agent's code. Still to do (A-T8): a note in the book and a check in a real guest.
+
+Verification (aarch64 host): `cargo test -p arch --features kvm` passes (17); `cargo test -p vmm --features kvm --lib pylon` passes (10); `cargo clippy --locked -p arch -p vmm --all-targets --features vmm/kvm,arch/kvm -- -D warnings`, the same for `arch` on `x86_64-unknown-linux-gnu`, and `cargo +nightly fmt --all --check` are clean. `vmm` for x86_64 can't be cross-built here (`zstd-sys`), so CI covers the x86_64 side of the VMM's assert.
+
 #### A-T6
 Built on `main` after A-T0 (#22); independent of A-T1 to A-T5.
 
@@ -391,7 +453,8 @@ Verification (aarch64 host): `cargo build`, `cargo test -p scx-pylon` (10 passed
   `pylon-clock` crate?
 - **Q-A3:** On heterogeneous hosts, which core class should run `pylond`'s
   engine, and should metering weight big and little cores differently?
-- **Q-A4:** Can `FEAT_S2FWB` be detected reliably from userspace on the host,
-  or does it have to be a documented host requirement?
+- **Q-A4:** *Resolved by A-T5:* it can't be detected reliably from userspace, so
+  it is a documented host requirement (§4.4).
 - **Q-A5:** Should hosts without `WFXT` (before Armv8.7) be supported at all,
   given that the fallback is a hot spin?
+- **Q-A6:** Should the VMM also read the physical timer (`CNTP_CTL_EL0`/`CNTP_CVAL_EL0`) when it publishes a parked vCPU's timer? Linux guests use the virtual timer by default, and `get_vtimer` reads only that.
