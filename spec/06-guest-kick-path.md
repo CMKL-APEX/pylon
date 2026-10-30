@@ -367,7 +367,8 @@ forced park, which is honest about the current state, and the metrics show it.
   LAPIC (`0xFEE0_0000`), but `arch/src/x86_64/layout.rs` doesn't declare it, so
   a future upstream device could land on it. Since K4 the page is no longer
   guest RAM: it is absent from the E820 map, like the IOAPIC and LAPIC.
-- aarch64 `pylond` (counter abstraction).
+- aarch64 `pylond` (counter abstraction). Now specified in
+  `spec/07-aarch64-support.md`.
 
 ---
 
