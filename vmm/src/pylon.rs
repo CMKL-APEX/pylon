@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::_rdtsc;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -16,9 +14,10 @@ use std::{fs, io, ptr, result};
 
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{MsrEntry, msr_index};
-use hypervisor::{HypervisorVmError, MemoryVisibility, Vcpu, Vm};
+use hypervisor::{HypervisorType, HypervisorVmError, MemoryVisibility, Vcpu, Vm};
 use log::{info, warn};
 use option_parser::{OptionParser, OptionParserError};
+use pylon_abi::clock::read_counter;
 use pylon_abi::{
     MAX_VCPUS, PCPU_UNASSIGNED, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_MAGIC,
     PYLON_SHARED_PAGE_SIZE, PylonHeader, PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED,
@@ -54,6 +53,10 @@ pub enum Error {
     /// Missing required `shm` parameter in `--pylon`.
     #[error("Error parsing --pylon: shm path missing")]
     MissingShmPath,
+
+    /// `--pylon` on a hypervisor backend that can't read the guest's counter and timer.
+    #[error("--pylon is not supported on MSHV on aarch64")]
+    UnsupportedHypervisor,
 
     /// Invalid `gpa` parameter in `--pylon`.
     #[error("Error parsing --pylon: invalid GPA {0}")]
@@ -647,23 +650,16 @@ fn park_decision(state: u8, revoke_requested: u8, deadline_tsc: u64, now_tsc: u6
     }
 }
 
-/// Reads the host TSC, the clock `pylond` writes `revoke_deadline_tsc` in.
-#[cfg(target_arch = "x86_64")]
+/// Reads the host counter, the clock `pylond` writes `revoke_deadline_tsc` in: the TSC on x86_64,
+/// `CNTVCT_EL0` on aarch64.
 fn read_host_tsc() -> u64 {
-    // SAFETY: `rdtsc` has no preconditions and no side effects on x86_64.
-    unsafe { _rdtsc() }
+    read_counter()
 }
 
-/// `pylond` runs only on x86_64, so no deadline is ever set elsewhere; a TSC of 0 keeps any
-/// non-zero deadline from passing.
-#[cfg(not(target_arch = "x86_64"))]
-fn read_host_tsc() -> u64 {
-    0
-}
-
-/// Measures guest TSC minus host TSC (wrapping) by reading the guest TSC between two host
-/// TSC reads. KVM computes a host-initiated `IA32_TSC` read from the host TSC at the time of
-/// the read, so the error is about half the ioctl's duration. Returns `None` if the guest TSC
+/// Measures guest counter minus host counter (wrapping) by reading the guest counter between two
+/// host counter reads. KVM computes a host-initiated read (`IA32_TSC` on x86_64,
+/// `KVM_REG_ARM_TIMER_CNT` on aarch64) from the host counter at the time of the read, so the
+/// error is about half the ioctl's duration. Returns `None` if the guest TSC
 /// can't be read, or if the result is 0, which `guest_tsc_offset` reserves for "unknown".
 fn measure_guest_tsc_offset(read_guest_tsc: impl FnOnce() -> Option<u64>) -> Option<u64> {
     let before = read_host_tsc();
@@ -676,8 +672,8 @@ fn measure_guest_tsc_offset(read_guest_tsc: impl FnOnce() -> Option<u64>) -> Opt
     (offset != 0).then_some(offset)
 }
 
-/// Converts a guest TSC-deadline timer value to host TSC for `park_timer_deadline_tsc`.
-/// Returns 0 if no timer is armed (the MSR reads 0) or the offset is unknown.
+/// Converts a guest timer deadline (in the guest counter) to the host counter for
+/// `park_timer_deadline_tsc`. Returns 0 if no timer is armed (0) or the offset is unknown.
 fn guest_timer_to_host(guest_deadline: Option<u64>, guest_tsc_offset: u64) -> u64 {
     match guest_deadline {
         Some(deadline) if deadline != 0 && guest_tsc_offset != 0 => {
@@ -713,16 +709,58 @@ pub fn read_guest_tsc_deadline(vcpu: &dyn Vcpu) -> Option<u64> {
     read_guest_msr(vcpu, msr_index::MSR_IA32_TSC_DEADLINE)
 }
 
-/// `pylond` runs only on x86_64; elsewhere no guest TSC is published.
-#[cfg(not(target_arch = "x86_64"))]
+/// Reads the guest's virtual counter (`CNTVCT_EL0`), for `PylonVmmState::on_vcpu_thread_start`.
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+pub fn read_guest_tsc(vcpu: &dyn Vcpu) -> Option<u64> {
+    vcpu.get_cntvct().ok()
+}
+
+/// The guest's armed EL1 virtual timer as a deadline in the guest counter, or 0 if none is armed,
+/// from `CNTV_CTL_EL0` and `CNTV_CVAL_EL0`. The timer fires when `ENABLE` (bit 0) is set,
+/// `IMASK` (bit 1) is clear and the counter reaches the compare value.
+#[cfg(any(all(target_arch = "aarch64", feature = "kvm"), test))]
+fn vtimer_deadline(ctl: u64, cval: u64) -> u64 {
+    const ENABLE: u64 = 1 << 0;
+    const IMASK: u64 = 1 << 1;
+    if ctl & ENABLE != 0 && ctl & IMASK == 0 {
+        cval
+    } else {
+        0
+    }
+}
+
+/// Reads the guest's armed virtual timer (0 if none), for `PylonVmmState::check_and_park_vcpu`.
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+pub fn read_guest_tsc_deadline(vcpu: &dyn Vcpu) -> Option<u64> {
+    let (ctl, cval) = vcpu.get_vtimer().ok()?;
+    Some(vtimer_deadline(ctl, cval))
+}
+
+/// No guest counter is published where the hypervisor backend can't read it.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "kvm"))))]
 pub fn read_guest_tsc(_vcpu: &dyn Vcpu) -> Option<u64> {
     None
 }
 
-/// `pylond` runs only on x86_64; elsewhere no guest timer is published.
-#[cfg(not(target_arch = "x86_64"))]
+/// No guest timer is published where the hypervisor backend can't read it.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "kvm"))))]
 pub fn read_guest_tsc_deadline(_vcpu: &dyn Vcpu) -> Option<u64> {
     None
+}
+
+/// Hook for `CpuManager::new` (`vmm/src/cpu.rs`): rejects `--pylon` on a hypervisor backend that
+/// can't support it, so it fails at start-up instead of silently never forcing a park. MSHV on
+/// aarch64 can't read the guest's counter or timer (`spec/07-aarch64-support.md` §4.2).
+pub fn check_hypervisor(hypervisor_type: HypervisorType) -> result::Result<(), Error> {
+    #[cfg(feature = "mshv")]
+    if cfg!(target_arch = "aarch64")
+        && hypervisor_type == HypervisorType::Mshv
+        && global_state().is_some()
+    {
+        return Err(Error::UnsupportedHypervisor);
+    }
+    let _ = hypervisor_type;
+    Ok(())
 }
 
 /// Initializes and installs the process-global `PylonVmmState`.
@@ -1121,7 +1159,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_measure_guest_tsc_offset() {
         assert_eq!(measure_guest_tsc_offset(|| None), None);
@@ -1134,6 +1171,19 @@ mod tests {
         // A guest TSC that started at 0 when the host TSC was well past it.
         let offset = measure_guest_tsc_offset(|| Some(0)).unwrap();
         assert!((offset as i64) < 0);
+    }
+
+    #[test]
+    fn test_vtimer_deadline_needs_enable_and_no_mask() {
+        // ENABLE set, IMASK clear: the timer will fire at CVAL. ISTATUS (bit 2) doesn't matter.
+        assert_eq!(vtimer_deadline(0b001, 777), 777);
+        assert_eq!(vtimer_deadline(0b101, 777), 777);
+        // Disabled, or masked: no interrupt will come, so nothing to publish.
+        assert_eq!(vtimer_deadline(0b000, 777), 0);
+        assert_eq!(vtimer_deadline(0b011, 777), 0);
+        assert_eq!(vtimer_deadline(0b010, 777), 0);
+        // The guest's compare value is 0 when the timer is armed for the epoch.
+        assert_eq!(vtimer_deadline(0b001, 0), 0);
     }
 
     #[test]
@@ -1182,6 +1232,51 @@ mod tests {
         assert_eq!(msg.kick_signal, SIGRTMIN());
         // 1 shm_fd + 2 kick_eventfds + 2 wake_eventfds = 5 FDs
         assert_eq!(fds_read, 5);
+    }
+
+    /// The guest counter read from a real vCPU converts to the host counter within a small
+    /// error, and an unarmed virtual timer publishes no deadline.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[test]
+    fn test_real_kvm_vcpu_counter_offset_and_idle_timer() {
+        use hypervisor::HypervisorVmConfig;
+
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-kvm-counter-pylon");
+        let cfg = PylonConfig::parse(&format!(
+            "shm={},gpa=0x8000,vm_id=44,initial_active_vcpus=1",
+            shm_path.display()
+        ))
+        .unwrap();
+        let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+
+        let Ok(hv) = hypervisor::new() else {
+            eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
+            return;
+        };
+        let vm = hv
+            .create_vm(HypervisorVmConfig::default())
+            .expect("failed to create KVM VM");
+        let vcpu = vm
+            .create_vcpu(0, None)
+            .expect("failed to create KVM vCPU 0");
+        let mut kvi = vcpu.create_vcpu_init();
+        vm.get_preferred_target(&mut kvi).expect("preferred target");
+        vcpu.vcpu_init(&kvi).expect("vcpu init");
+
+        state.on_vcpu_thread_start(0, || read_guest_tsc(vcpu.as_ref()));
+
+        let guest_now = read_guest_tsc(vcpu.as_ref()).expect("read guest counter");
+        let host_now = read_host_tsc();
+        let converted = state.shared_page().guest_to_host_tsc(guest_now);
+        let error = host_now.wrapping_sub(converted) as i64;
+        // Counter ticks (1 GHz on this class of hardware): a few ioctls' worth of error is fine,
+        // a missing offset would be off by the VM's counter offset.
+        assert!(
+            error.abs() < 100_000_000,
+            "converted guest counter off by {error} ticks"
+        );
+        assert_eq!(read_guest_tsc_deadline(vcpu.as_ref()), Some(0));
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
