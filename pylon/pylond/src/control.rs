@@ -391,13 +391,26 @@ async fn handle_client_connection(
                 }
             }
         } else {
+            let message = format!("expected {expected_fds} FDs, got {}", fds.len());
+            warn!("Rejected registration of VM {}: {message}", req.vm_id);
             VmRegistrationResponse {
                 accepted: false,
-                message: format!("expected {expected_fds} FDs, got {}", fds.len()),
+                message,
             }
         };
 
-        send_json_response_async(&stream, &response).await
+        match send_json_response_async(&stream, &response).await {
+            // The VMM closes the socket without reading the reply.
+            Err(Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(())
+            }
+            res => res,
+        }
     }
 }
 
@@ -759,6 +772,29 @@ mod tests {
             self.entries.lock().unwrap().remove(&tid);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn registration_ignores_a_vmm_that_closed_the_socket() {
+        let (vmm, daemon) = StdUnixStream::pair().unwrap();
+        let req = VmRegistrationRequest {
+            vm_id: 1,
+            num_vcpus: 1,
+            min_cores: 0,
+            max_cores: 1,
+            priority_weight: 1,
+            kick_signal: None,
+        };
+        // One FD instead of three: rejected, but the reply is still sent.
+        let payload = serde_json::to_vec(&req).unwrap();
+        let null = fs::File::open("/dev/null").unwrap();
+        send_msg_with_fds(vmm.as_raw_fd(), &payload, &[null.as_raw_fd()]).unwrap();
+        drop(vmm);
+
+        daemon.set_nonblocking(true).unwrap();
+        let daemon = UnixStream::from_std(daemon).unwrap();
+        let snapshot = Arc::new(VmSnapshot::from_pointee(Vec::new()));
+        handle_client_connection(daemon, snapshot).await.unwrap();
     }
 
     #[test]
