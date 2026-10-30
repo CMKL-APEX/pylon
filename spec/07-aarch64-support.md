@@ -296,7 +296,7 @@ parallel.
 
 | ID | Task | Depends on | Owner | Branch / PR | Status | Verification | Result |
 | :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` | `IN_PROGRESS` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | — |
+| A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` | `IN_REVIEW` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Not yet merged. |
 | A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
 | A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
 | A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
@@ -327,7 +327,30 @@ Each owner keeps a subsection here: interface notes for dependent tasks,
 deviations from the design (and why), and test logs.
 
 #### A-T0
-*(empty)*
+Run on `origin/main` at `7bf5f80be`, native aarch64 (20 CPUs, one socket, kernel `7.0.0-1019-nvidia`). Needs `libelf-dev` installed (`libbpf-sys` vendored build).
+
+| Step | Result |
+| :--- | :--- |
+| `cargo build --all --features kvm` | pass |
+| `cargo test -p pylon-abi` | pass (3) |
+| `cargo test -p pylon-guest-agent` | pass (3) |
+| `cargo test -p scx-pylon` | pass (10; `live_attach` is `#[ignore]`, needs root, **not run**) |
+| `cargo test -p vmm --features kvm --lib pylon` | pass (10) |
+| `cargo test -p hypervisor --features kvm` | pass (10) |
+| `cargo test -p pylond --no-fail-fast` | **4 fail**, rest pass |
+| `cargo clippy --locked --all --all-targets --tests --features kvm -- -D warnings` | **1 error** |
+
+Failures, all expected from gaps A1/A2 and fixed by A-T1/A-T2:
+- `tests::test_calibrated_tsc_rate_is_plausible` (`pylond/src/lib.rs:1651`): `calibrate_tsc_khz` returns `None` off x86_64 (A1).
+- `e2e_pylon`, 3 of 6 fail: `test_e2e_full_stack_multi_vm_scale_out_and_cooperative_revocation` times out waiting for a core handoff; `test_e2e_zero_core_hibernation_timer_and_rx_doorbell_wakeup` gets `255` (unassigned) where it expects pCPU `2`; `test_e2e_observability_metering_and_socket_stats` sees `allocated_core_microseconds == 0`. These match a clock stuck at 0 (A1). Not yet confirmed by changing the clock.
+- clippy `absolute_paths` at `pylond/src/engine.rs:140`: `core::hint::spin_loop()` in the non-x86_64 stub of `pause_cycles`. The lint only fires on aarch64; A-T2 replaces that code. With `--keep-going` this was the only error reported, but crates that depend on `pylond` were not linted past it, so re-run clippy after A-T2.
+
+Host facts (for A-T1/A-T2/A-T5/A-T6):
+- `CNTFRQ_EL0` = 1,000,000,000 Hz; 100 ms measured as 100.07 M ticks.
+- CPUs: Cortex-X925 + Cortex-A725, no SMT. `/proc/cpuinfo` lists `wfxt`, `ecv`, `atomics`; `HWCAP2` bit 31 (`WFXT`) is set.
+- `/sys/kernel/sched_ext` and `/sys/kernel/btf/vmlinux` exist. The BPF LSM is **not** in `/sys/kernel/security/lsm` (`lockdown,capability,landlock,yama,apparmor,ima,evm`).
+- The build did not fail on the x86 `vmlinux.h` or the `x86_64-linux-gnu` include path (A6), but nothing loaded the BPF object, so A6 stays open until A-T6's live attach.
+- An earlier run on kernel `6.17.0-1021-nvidia` failed only because `libelf-dev` was missing; the dev host's kernel has since changed to 7.0.0-1019.
 
 ---
 
