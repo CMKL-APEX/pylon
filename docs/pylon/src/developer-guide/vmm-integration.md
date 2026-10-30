@@ -64,9 +64,15 @@ surface as `memory_manager::Error::Pylon`.
 
 Called at the top of each vCPU thread in `vmm/src/cpu.rs`, after the
 thread barrier and before the first `KVM_RUN`. It stores `gettid()` in
-the slot's `host_tid`. For `vcpu_id >= initial_active_vcpus`, it sets
-`PARKED` and blocks on the wake `eventfd`. For the others, it sets
-`RUNNING`.
+the slot's `host_tid`, sets `RUNNING`, and for
+`vcpu_id >= initial_active_vcpus` also sets the slot's `park_on_boot`
+tag. It doesn't park those vCPUs: a guest brings its secondary CPUs
+online at boot (`PSCI CPU_ON` on aarch64, INIT/SIPI on x86_64), and a
+vCPU whose thread never enters `KVM_RUN` doesn't answer, so the guest
+waits for it, gives up, and boots without it. Once the guest has
+booted (a non-zero `guest_heartbeat`), `pylond` sets `revoke_requested`
+on each tagged vCPU and signals its thread, and `check_and_park_vcpu`
+parks it (below).
 
 ### After each exit: `check_and_park_vcpu`
 
@@ -76,6 +82,7 @@ exit to userspace. It applies the decision table from spec 06 §4.4
 
 | `state` | `revoke_requested` | Deadline | Action |
 |---|---|---|---|
+| any, `park_on_boot` set | 1 | any | Boot park: park at once, without a yield or forced-park count, and clear the tag |
 | `PARKING` | any | any | Cooperative park |
 | other | 1 | `now >= revoke_deadline_tsc` | Forced park |
 | other | 1 | not passed | Keep running: the guest hasn't agreed and may hold a lock |
@@ -85,7 +92,8 @@ exit to userspace. It applies the decision table from spec 06 §4.4
 it clears `revoke_requested`, increments `yield_count` (and
 `forced_preempt_count` for a forced park), records `last_yield_tsc`,
 publishes `PARKED` with `Release`, blocks on the wake `eventfd`, and
-sets `RUNNING` again on wakeup (unless shutting down).
+sets `RUNNING` again on wakeup (unless shutting down). A boot park
+skips the counters and clears `park_on_boot` instead.
 
 Under KVM with an in-kernel LAPIC, a running vCPU exits to userspace
 only for MMIO, PIO, signals and similar, so on its own this check runs

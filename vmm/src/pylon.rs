@@ -517,7 +517,14 @@ impl PylonVmmState {
 
     /// Called at the start of each vCPU thread (`vmm/src/cpu.rs`): records `gettid()` in
     /// `host_tid`, records the guest TSC offset measured with `read_guest_tsc` in
-    /// `guest_tsc_offset`, and parks vCPUs with `vcpu_id >= initial_active_vcpus`.
+    /// `guest_tsc_offset`, and tags vCPUs with `vcpu_id >= initial_active_vcpus` as
+    /// `park_on_boot`.
+    ///
+    /// Those vCPUs are not parked yet. A guest brings its secondary CPUs online at boot, and
+    /// a vCPU whose thread never runs doesn't answer (aarch64's `PSCI CPU_ON`, x86_64's
+    /// INIT/SIPI): the guest waits for each CPU, gives up, and boots without it. So they run
+    /// until the guest reports it is up, and `pylond` then asks the VMM to park them
+    /// (`check_and_park_vcpu`).
     pub fn on_vcpu_thread_start(&self, vcpu_id: u32, read_guest_tsc: impl FnOnce() -> Option<u64>) {
         // SAFETY: `libc::gettid()` is always safe to call in a Linux thread context.
         let tid = unsafe { libc::gettid() as u32 };
@@ -532,14 +539,9 @@ impl PylonVmmState {
         }
 
         if vcpu_id >= self.initial_active_vcpus {
-            slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
-            self.park_vcpu(vcpu_id);
-            if !self.shutting_down.load(Ordering::Acquire) {
-                slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
-            }
-        } else {
-            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            slot.park_on_boot.store(1, Ordering::Release);
         }
+        slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
     }
 
     /// Post-exit park handler called inside the vCPU run loop (`vmm/src/cpu.rs`) after every
@@ -547,7 +549,10 @@ impl PylonVmmState {
     ///
     /// Parks the vCPU when the guest asked to (`state == VCPU_STATE_PARKING`), or when `pylond`
     /// requested a revocation whose `revoke_deadline_tsc` has passed
-    /// (`spec/06-guest-kick-path.md` §4.4). A pending revocation still inside its grace period
+    /// (`spec/06-guest-kick-path.md` §4.4). A vCPU tagged `park_on_boot` parks as soon as
+    /// `pylond` requests it, whatever the deadline: the guest has just brought it online and it
+    /// holds no lock. That park isn't a yield: it updates neither `yield_count` nor
+    /// `forced_preempt_count`, and clears the tag. A pending revocation still inside its grace period
     /// doesn't park the vCPU: the guest hasn't agreed and may hold a lock. On parking, clears
     /// `revoke_requested`, updates the yield counters, publishes `VCPU_STATE_PARKED`, blocks until
     /// woken by `pylond` (or VM shutdown), and restores `VCPU_STATE_RUNNING`. Returns `true` if
@@ -565,24 +570,33 @@ impl PylonVmmState {
             return false;
         };
 
-        let decision = park_decision(
-            slot.state.load(Ordering::Acquire),
-            slot.revoke_requested.load(Ordering::Acquire),
-            // Ordered by the `revoke_requested` Acquire load: `pylond` stores the deadline
-            // before setting `revoke_requested` with Release.
-            slot.revoke_deadline_tsc.load(Ordering::Relaxed),
-            read_host_tsc(),
-        );
+        let revoke_requested = slot.revoke_requested.load(Ordering::Acquire);
+        let decision = if slot.park_on_boot.load(Ordering::Acquire) != 0 && revoke_requested == 1 {
+            ParkDecision::Boot
+        } else {
+            park_decision(
+                slot.state.load(Ordering::Acquire),
+                revoke_requested,
+                // Ordered by the `revoke_requested` Acquire load: `pylond` stores the deadline
+                // before setting `revoke_requested` with Release.
+                slot.revoke_deadline_tsc.load(Ordering::Relaxed),
+                read_host_tsc(),
+            )
+        };
         if decision == ParkDecision::Continue {
             return false;
         }
 
         slot.revoke_requested.store(0, Ordering::Release);
-        slot.yield_count.fetch_add(1, Ordering::Relaxed);
-        slot.last_yield_tsc
-            .store(read_host_tsc(), Ordering::Relaxed);
-        if decision == ParkDecision::Forced {
-            slot.forced_preempt_count.fetch_add(1, Ordering::Relaxed);
+        if decision == ParkDecision::Boot {
+            slot.park_on_boot.store(0, Ordering::Release);
+        } else {
+            slot.yield_count.fetch_add(1, Ordering::Relaxed);
+            slot.last_yield_tsc
+                .store(read_host_tsc(), Ordering::Relaxed);
+            if decision == ParkDecision::Forced {
+                slot.forced_preempt_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let timer = guest_timer_to_host(
             read_guest_timer(),
@@ -644,6 +658,8 @@ enum ParkDecision {
     Cooperative,
     /// A revocation's grace period ran out without the guest's consent.
     Forced,
+    /// `pylond` asked for the initial park of a vCPU tagged `park_on_boot`.
+    Boot,
 }
 
 /// Decides whether a vCPU that just exited to userspace parks, from its slot's `state`,
@@ -953,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vcpu_thread_start_tid_and_initial_parking() {
+    fn test_vcpu_thread_start_tid_and_boot_tag() {
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-tid-pylon");
         let cfg = PylonConfig::parse(&format!(
@@ -975,26 +991,57 @@ mod tests {
         assert_ne!(slot0.host_tid.load(Ordering::Acquire), 0);
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
 
-        // vCPU 1 is >= initial_active_vcpus (1), so it should park until woken.
+        // vCPU 1 is >= initial_active_vcpus (1): it registers its thread and is tagged
+        // `park_on_boot`, but keeps running, so a guest can bring it online.
         let state_vcpu1 = Arc::clone(&state);
-        let handle1 = thread::spawn(move || {
-            state_vcpu1.on_vcpu_thread_start(1, || None);
-        });
-
+        thread::spawn(move || state_vcpu1.on_vcpu_thread_start(1, || None))
+            .join()
+            .unwrap();
         let slot1 = state.vcpu_slot(1).unwrap();
-        for _ in 0..100 {
-            if slot1.host_tid.load(Ordering::Acquire) != 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
         assert_ne!(slot1.host_tid.load(Ordering::Acquire), 0);
-        assert_eq!(slot1.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
-
-        // Wake vCPU 1 and verify it transitions to VCPU_STATE_RUNNING.
-        state.wake_vcpu(1).unwrap();
-        handle1.join().unwrap();
         assert_eq!(slot1.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        assert_eq!(slot1.park_on_boot.load(Ordering::Acquire), 1);
+        assert_eq!(slot0.park_on_boot.load(Ordering::Acquire), 0);
+    }
+
+    /// The initial park of a vCPU tagged `park_on_boot` happens when `pylond` asks for it, at
+    /// once and whatever the revocation deadline says, and counts as neither a yield nor a
+    /// forced park. Until then the vCPU is left alone.
+    #[test]
+    fn test_boot_park_waits_for_the_request_and_isn_t_a_yield() {
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-boot-park-pylon");
+        let cfg = PylonConfig::parse(&format!(
+            "shm={},initial_active_vcpus=1",
+            shm_path.display()
+        ))
+        .unwrap();
+        let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.on_vcpu_thread_start(1, || None);
+        let slot1 = state.vcpu_slot(1).unwrap();
+
+        // Nothing asked: an exit to userspace leaves it running.
+        assert!(!state.check_and_park_vcpu(1, || None));
+        assert_eq!(slot1.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        assert_eq!(slot1.park_on_boot.load(Ordering::Acquire), 1);
+
+        // Asked, with a deadline far in the future (a normal revocation would wait).
+        slot1.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
+        slot1.revoke_requested.store(1, Ordering::Release);
+        assert_eq!(
+            park_with_timer_on_worker_and_wake(&state, 1, None),
+            (true, 0)
+        );
+        assert_eq!(slot1.park_on_boot.load(Ordering::Acquire), 0);
+        assert_eq!(slot1.yield_count.load(Ordering::Acquire), 0);
+        assert_eq!(slot1.forced_preempt_count.load(Ordering::Acquire), 0);
+
+        // The tag is gone: a later request is an ordinary revocation again, which waits for its
+        // deadline.
+        slot1.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
+        slot1.revoke_requested.store(1, Ordering::Release);
+        assert!(!state.check_and_park_vcpu(1, || None));
+        assert_eq!(slot1.revoke_requested.load(Ordering::Acquire), 1);
     }
 
     #[test]

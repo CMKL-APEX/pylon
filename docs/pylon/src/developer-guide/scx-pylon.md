@@ -51,8 +51,9 @@ its first `enqueue`, when `pylond` has listed it in `pylon_vcpu_dom`.
 with the registered VMs' shared pages every second. `enqueue` checks the
 tgid too, so a thread ID reused by another process isn't tagged. A vCPU
 is therefore isolated whether or not it ever owns a CPU, which matters
-because `pylond` only gives CPUs to vCPUs that start parked
-(`initial_active_vcpus`).
+because `pylond` only gives CPUs to vCPUs that are parked
+(`initial_active_vcpus`: the vCPUs beyond it are parked once the guest
+has booted).
 
 **`enqueue(p, enq_flags)`** puts each task on one of three kinds of
 queue:

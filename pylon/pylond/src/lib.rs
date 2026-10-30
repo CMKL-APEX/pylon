@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{io, ptr};
 
 use arc_swap::ArcSwap;
+use log::warn;
 use memmap2::MmapMut;
-use pylon_abi::{MAX_VCPUS, PYLON_SHARED_PAGE_SIZE, PylonSharedPage};
+use pylon_abi::{MAX_VCPUS, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -571,6 +572,40 @@ impl VmHandle {
             });
         }
         Ok(true)
+    }
+
+    /// Asks the VMM to park the vCPUs it tagged `park_on_boot`, once the guest has booted: its
+    /// `guest_heartbeat` is non-zero. The VMM left those vCPUs running so the guest could bring
+    /// them online. For each one still running, sets `revoke_requested` and signals its thread,
+    /// and the VMM parks it at once. Call it again until it returns 0: a signal that lands
+    /// outside `KVM_RUN` doesn't stop the next guest entry, so a vCPU still tagged is asked
+    /// again. Returns the number of vCPUs asked.
+    pub fn park_booted_vcpus(&self) -> usize {
+        let page = self.shared_page();
+        if page.telemetry.guest_heartbeat.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let num_vcpus = (self.inner.num_vcpus as usize).min(MAX_VCPUS);
+        let mut asked = 0;
+        for (vcpu_idx, slot) in page.vcpus[..num_vcpus].iter().enumerate() {
+            if slot.park_on_boot.load(Ordering::Acquire) == 0
+                || slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
+            {
+                continue;
+            }
+            // The deadline doesn't matter to a boot park, and 0 keeps it from ever looking like
+            // a revocation that is still inside its grace period.
+            slot.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+            slot.revoke_requested.store(1, Ordering::Release);
+            match self.signal_vcpu(vcpu_idx) {
+                Ok(_) => asked += 1,
+                Err(err) => warn!(
+                    "VM {}: couldn't ask vCPU {vcpu_idx} to park: {err}",
+                    self.inner.vm_id
+                ),
+            }
+        }
+        asked
     }
 
     /// Dynamically updates the elastic core bounds and scheduling weight for this VM.
@@ -1433,6 +1468,107 @@ mod tests {
         while KICK_SIGNALS_SEEN.load(Ordering::SeqCst) < at_least {
             assert!(Instant::now() < deadline, "vCPU thread wasn't signalled");
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    static BOOT_KICK_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn count_boot_kick_signal(_: libc::c_int) {
+        BOOT_KICK_SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Once the guest is up (a heartbeat), `pylond` asks the VMM to park exactly the vCPUs it
+    /// tagged `park_on_boot` that are still running, and signals their threads; it asks again
+    /// until the VMM has parked them, and never touches the others.
+    #[test]
+    fn test_park_booted_vcpus_asks_tagged_running_vcpus_after_the_heartbeat() {
+        let kick_signal = libc::SIGRTMIN() + 4;
+        // SAFETY: installs a handler that only increments an atomic, which is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = zeroed();
+            action.sa_sigaction = count_boot_kick_signal as *const () as usize;
+            assert_eq!(libc::sigaction(kick_signal, &action, ptr::null_mut()), 0);
+        }
+
+        let mut rig = build_test_vm(50, 3, 0, 3, 1);
+        rig.req.kick_signal = Some(kick_signal);
+        let handle = VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            rig.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            rig.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_vmm_pid(process_id() as i32)
+        .unwrap();
+
+        // vCPU threads: threads of this process that just sleep.
+        let stop = Arc::new(AtomicBool::new(false));
+        let tids = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+        let threads: Vec<_> = (0..3)
+            .map(|i| {
+                let (stop, tids) = (Arc::clone(&stop), Arc::clone(&tids));
+                thread::spawn(move || {
+                    // SAFETY: `gettid` has no preconditions.
+                    tids[i].store(unsafe { libc::gettid() } as u64, Ordering::SeqCst);
+                    while !stop.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+        while tids.iter().any(|t| t.load(Ordering::SeqCst) == 0) {
+            thread::yield_now();
+        }
+        let page = handle.shared_page();
+        for (i, slot) in page.vcpus[..3].iter().enumerate() {
+            slot.host_tid
+                .store(tids[i].load(Ordering::SeqCst) as u32, Ordering::Release);
+            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+        }
+        // vCPU 0 is an initial vCPU (no tag); 1 is tagged and running; 2 is tagged, already parked.
+        page.vcpus[1].park_on_boot.store(1, Ordering::Release);
+        page.vcpus[2].park_on_boot.store(1, Ordering::Release);
+        page.vcpus[2]
+            .state
+            .store(VCPU_STATE_PARKED, Ordering::Release);
+
+        // The guest hasn't reported yet: leave everything alone.
+        assert_eq!(handle.park_booted_vcpus(), 0);
+        assert_eq!(page.vcpus[1].revoke_requested.load(Ordering::Acquire), 0);
+
+        page.telemetry.guest_heartbeat.store(1, Ordering::Release);
+        assert_eq!(handle.park_booted_vcpus(), 1);
+        for (i, expected) in [(0, 0), (1, 1), (2, 0)] {
+            assert_eq!(
+                page.vcpus[i].revoke_requested.load(Ordering::Acquire),
+                expected,
+                "vCPU {i}"
+            );
+        }
+        assert_eq!(page.vcpus[1].revoke_deadline_tsc.load(Ordering::Acquire), 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while BOOT_KICK_SIGNALS_SEEN.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "vCPU thread wasn't signalled");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // A signal can be lost: while the VMM hasn't parked it, the next call asks again.
+        assert_eq!(handle.park_booted_vcpus(), 1);
+        // The VMM parked it and cleared the tag: nothing left to ask.
+        page.vcpus[1].park_on_boot.store(0, Ordering::Release);
+        page.vcpus[1].revoke_requested.store(0, Ordering::Release);
+        assert_eq!(handle.park_booted_vcpus(), 0);
+
+        stop.store(true, Ordering::SeqCst);
+        for t in threads {
+            t.join().unwrap();
         }
     }
 

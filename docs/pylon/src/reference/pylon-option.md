@@ -12,7 +12,7 @@ device options. An unknown key is an error.
 | `shm` | path | **required** | File backing the 8 KiB shared page, for example `/dev/shm/vm17-pylon`. Created if missing (with its parent directories), resized to 8,192 bytes and zeroed at start. Not removed at exit. One file per VM. |
 | `socket` | path | none | `pylond`'s control socket, such as `/run/pylon/pylond.sock`. Without it, the VM never registers, and parked vCPUs are never woken. |
 | `gpa` | integer, `0x` hex or decimal | `0xfedf0000` | Guest-physical address of the page. Must be a multiple of 4,096. |
-| `initial_active_vcpus` | integer | `--cpus boot` | vCPUs `0 … n-1` run from the start; the others start parked. Capped at the number of slots. |
+| `initial_active_vcpus` | integer | `--cpus boot` | vCPUs `0 … n-1` always run; the others run during boot and are parked once the guest reports it is up (first `guest_heartbeat`). Capped at the number of slots. |
 | `min_cores` | integer | `1` | Cores `pylond` tries to give the VM before any VM above its minimum, whenever it reports demand. |
 | `max_cores` | integer | number of slots | Most cores `pylond` gives the VM. |
 | `priority_weight` | integer | `100` | Multiplies the VM's urgency. Only ratios between VMs matter. |

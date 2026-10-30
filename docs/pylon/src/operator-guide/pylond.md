@@ -23,6 +23,10 @@ option is in the [pylond reference](../reference/pylond.md).
   between sweeps, which uses less power than spinning; on others, it
   uses `PAUSE` or a spin hint. The engine logs `timed_wait=true` or
   `false` at start, with the CPU it pinned to.
+- Once a guest reports it is up (a non-zero `guest_heartbeat`), Plane 1
+  asks the VMM to park the vCPUs beyond `initial_active_vcpus`, signalling
+  each thread; it checks once a second and logs `asked n booted vCPU(s)
+  to park`.
 - The engine is pinned to CPU 1 unless you pass `--engine-cpu`. On a host
   with big and little cores, pick a big one; `pylond` warns if it is also
   in `--cores`.

@@ -4,6 +4,8 @@
 //
 
 use std::error::Error;
+use std::io::{self, ErrorKind};
+use std::mem::{size_of, zeroed};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 use pylon_guest_agent::{GuestAgentStatus, LinuxProcfsReader, PylonGuestAgent, PylonMemoryBackend};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -35,6 +37,12 @@ struct Args {
     #[arg(long, default_value_t = 50_000)]
     interval_us: u64,
 
+    /// Guest CPU the agent runs on. It must be a vCPU that is never parked: if the agent sits
+    /// on a parked vCPU it can't report demand, and nothing wakes that vCPU. Any of the VM's
+    /// `initial_active_vcpus` will do; vCPU 0 always runs.
+    #[arg(long, default_value_t = 0)]
+    cpu: usize,
+
     /// Show current Pylon status and exit
     #[arg(long)]
     status: bool,
@@ -49,6 +57,27 @@ fn parse_hex_or_dec(s: &str) -> Result<u64, String> {
         u64::from_str_radix(stripped, 16).map_err(|e| format!("invalid hex GPA: {e}"))
     } else {
         s.parse::<u64>().map_err(|e| format!("invalid GPA: {e}"))
+    }
+}
+
+/// Restricts the calling thread to `cpu`.
+fn pin_to_cpu(cpu: usize) -> io::Result<()> {
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return Err(io::Error::from(ErrorKind::InvalidInput));
+    }
+    // SAFETY: `cpu_set_t` is plain old data that zero-initializes, `CPU_SET` stays within it
+    // (`cpu` is below `CPU_SETSIZE`), and `sched_setaffinity(0, ..)` acts on the calling thread
+    // with a valid mask pointer and size.
+    let ret = unsafe {
+        let mut set: libc::cpu_set_t = zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set)
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -109,6 +138,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.interval_us
     );
 
+    if let Err(err) = pin_to_cpu(args.cpu) {
+        warn!(
+            "Couldn't pin the agent to CPU {}: {err}; it may stall if its CPU is parked",
+            args.cpu
+        );
+    }
+
     // Register clean shutdown on SIGINT or SIGTERM
     let term = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&term))?;
@@ -123,4 +159,47 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Pylon guest agent received exit signal, shutting down cleanly.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CPUs the calling thread may run on.
+    fn allowed_cpus() -> Vec<usize> {
+        // SAFETY: `cpu_set_t` is plain old data that zero-initializes, and `sched_getaffinity(0,
+        // ..)` fills it for the calling thread given a valid pointer and size.
+        let set = unsafe {
+            let mut set: libc::cpu_set_t = zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set),
+                0
+            );
+            set
+        };
+        // SAFETY: `CPU_ISSET` only reads within the set, for indexes below `CPU_SETSIZE`.
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect()
+    }
+
+    #[test]
+    fn pin_to_cpu_restricts_the_calling_thread_to_that_cpu() {
+        // On its own thread, so the test runner's threads keep their CPUs.
+        thread::spawn(|| {
+            let cpu = allowed_cpus()[0];
+            pin_to_cpu(cpu).unwrap();
+            assert_eq!(allowed_cpus(), [cpu]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn pin_to_cpu_rejects_a_cpu_beyond_the_set() {
+        assert_eq!(
+            pin_to_cpu(libc::CPU_SETSIZE as usize).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
 }

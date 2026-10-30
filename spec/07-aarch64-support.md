@@ -325,7 +325,7 @@ Issues discovered during this work that are outside its scope. Give each one
 an ID (`A-F1`, `A-F2`, …) and a pointer to evidence.
 
 - **A-F1** (A-T3, found by A-T8; fixed in the same PR as this note): the vCPU-thread seccomp filter allowed `KVM_GET_MSRS` for Pylon on x86_64 but not `KVM_GET_ONE_REG` on aarch64, so an aarch64 VM with `--pylon` died with SIGSYS (`si_syscall=29`, `ioctl`) at vCPU start. The unit tests and the real-KVM tests don't apply seccomp, which is why A-T3 missed it. Cloud Hypervisor's own filter is enforced by default.
-- **A-F2** (open): on aarch64, vCPUs that start parked (`initial_active_vcpus` below the vCPU count) never answer their `PSCI CPU_ON`. The guest kernel waits 5 s for each secondary, prints "CPUn: failed to come online" and boots with 1 CPU (15 s for 3 secondaries); the CPUs can be onlined later with `echo 1 > /sys/devices/system/cpu/cpuN/online`, but only while `pylond` has a reason to wake the parked vCPU. So the quick start's "boots with eight vCPUs, two of them running" doesn't hold on aarch64 today. On x86_64 the same wait applies to the INIT/SIPI start-up (spec 06 Q2 notes the effect for parked vCPUs); I haven't run it there. A fix has to let the vCPU thread run far enough to answer the power-on request before it parks, or have the guest not wait.
+- **A-F2** (fixed by the boot-park change; see the A-F2 notes in §9.4): on aarch64, vCPUs that start parked (`initial_active_vcpus` below the vCPU count) never answer their `PSCI CPU_ON`. The guest kernel waits 5 s for each secondary, prints "CPUn: failed to come online" and boots with 1 CPU (15 s for 3 secondaries); the CPUs can be onlined later with `echo 1 > /sys/devices/system/cpu/cpuN/online`, but only while `pylond` has a reason to wake the parked vCPU. So the quick start's "boots with eight vCPUs, two of them running" doesn't hold on aarch64 today. On x86_64 the same wait applies to the INIT/SIPI start-up (spec 06 Q2 notes the effect for parked vCPUs); I haven't run it there. A fix has to let the vCPU thread run far enough to answer the power-on request before it parks, or have the guest not wait.
 
 ### 9.4 Task Notes
 
@@ -488,6 +488,18 @@ What this does not measure: the guest never cooperates and no `pylond` decides a
 - Small numbers: 9 parks across two VMs, with the revocations concentrated in the hotplug phase. A longer run with a steady contended load would give a distribution.
 
 Not done: `pylond --enable-scx` with a VM (root), the cooperative path (needs `pv-pylon`), and the idle-state test.
+
+#### A-F2: boot park
+**Fix.** A vCPU beyond `initial_active_vcpus` is no longer parked before its first `KVM_RUN`. The VMM sets it `RUNNING` and tags its slot `park_on_boot` (a new byte in the slot's host half, offset 34, reserved before: no version bump). `pylond`'s control plane, which already holds each VM's registered kick signal and vCPU thread IDs, asks for the park once the guest reports it is up, that is a non-zero `guest_heartbeat` (the agent's first heartbeat): once a second it sets `revoke_requested` on each tagged vCPU that is still running and signals its thread. The VMM parks a tagged vCPU at once on that request, whatever the deadline, without counting a yield or a forced park, and clears the tag. A VM without a guest agent never gets its extra vCPUs parked: it behaves as an ordinary VM, not as one with dead CPUs. The guest agent also pins itself to vCPU 0 (`--cpu`, default 0), because an agent stranded on a parked vCPU can't report the demand that would wake it.
+
+**Verified on the aarch64 reference host** with the harness from A-T8 (guest with 4 vCPUs, `initial_active_vcpus=1`, no `maxcpus=1`, no guest-side hotplug step):
+- before: "CPU1..3: failed to come online" after 5 s each, 1 CPU;
+- after: `smp: Brought up 1 node, 4 CPUs` at 8 ms; `pylond` logs `asked 3 booted vCPU(s) to park` about a second after registering; 30 waves ran at 25.45 ms mean, 0.45 ms over the unmanaged 25.0 ms. That gap is about the guest agent's 1 ms polling interval (half of it on average), not `pylond`.
+- A run that didn't pin the guest's init (and so its children) to CPU 0 hung at the first child init forked: a `sleep` landed on a vCPU that had just been parked, and nothing woke it, because one runnable thread on an otherwise idle VM isn't demand. This is the stranded-work problem of spec 06 Q2 and K1, which this change doesn't solve; it only shows now that the CPUs come online. The troubleshooting page says so. The agent's own pin was checked by a unit test, not in that run (the run pinned init, and the agent with it, from the init script).
+
+Unit tests: `vmm` (`test_boot_park_waits_for_the_request_and_isn_t_a_yield`, and the tag in `test_vcpu_thread_start_tid_and_boot_tag`), `pylond` (`test_park_booted_vcpus_asks_tagged_running_vcpus_after_the_heartbeat`), `pylon-guest-agent` (the CPU pin), and the layout asserts in `pylon-abi`.
+
+**Not verified: x86_64.** The same bring-up wait should apply there in principle (INIT/SIPI to a vCPU whose thread never runs), so the change is architecture-neutral and applies to both; but I haven't booted an x86_64 guest with parked initial vCPUs, before or after. CI covers the x86_64 build and unit tests only.
 
 ---
 
