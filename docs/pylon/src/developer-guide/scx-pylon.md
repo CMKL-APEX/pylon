@@ -98,6 +98,11 @@ task allowed on only that CPU), or a domain (tgid).
   siblings claiming at once each see the other's claim.
 - `running` records the task actually running, and `update_idle` clears
   the claim.
+- `running` also checks the siblings again. A sibling can claim after
+  `dispatch` checked, and its kick can land before the new task is
+  current, preempting nothing. The task would then run a whole slice
+  next to the sibling, so the CPU kicks itself instead. Tasks with
+  migration disabled skip this: they go back on the same CPU.
 - The order is: a domain beats host, and between two domains the
   lower-numbered CPU wins. The winner kicks the loser with
   `SCX_KICK_PREEMPT`, and the loser's next `dispatch` backs off.
