@@ -298,7 +298,7 @@ parallel.
 | :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` (#22) | `DONE` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Merged in #22. |
 | A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` (#23) | `DONE` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
-| A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t2-pylond-counter` | `IN_PROGRESS` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
+| A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t2-pylond-counter` | `IN_REVIEW` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
 | A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
