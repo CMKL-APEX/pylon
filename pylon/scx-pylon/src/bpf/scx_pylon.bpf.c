@@ -571,7 +571,9 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
  *
  * Record what this CPU runs, including tasks that the kernel queued locally
  * without asking the scheduler. A pinned host task runs without checking
- * its siblings, so it kicks the vCPUs that yield to it. The claim isn't cleared when a task stops:
+ * its siblings, so it kicks the vCPUs that yield to it. Any other task
+ * checks its siblings again, and backs off if one claimed in the meantime.
+ * The claim isn't cleared when a task stops:
  * dispatch has already claimed for the next task by then, and the CPU going
  * idle clears it.
  */
@@ -588,6 +590,14 @@ void BPF_PROG(pylon_running, struct task_struct *p)
     set_claim(cpu, claim);
     if (claim == CLAIM_PINNED) {
         kick_siblings(cpu, claim);
+    } else if (claim != CLAIM_NONE && !is_migration_disabled(p) &&
+               fenced(cpu, claim, owns_cpu(p, cpu))) {
+        /*
+         * A sibling claimed after dispatch checked, and its kick landed
+         * before @p was current, so it preempted nothing. Without this, @p
+         * would run its whole slice next to the sibling.
+         */
+        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     }
 }
 

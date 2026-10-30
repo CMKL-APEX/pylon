@@ -123,6 +123,8 @@ mod kvm {
     pub(super) const KVM_GET_SUPPORTED_CPUID: u64 = 0xc008_ae05;
     pub(super) const KVM_CREATE_DEVICE: u64 = 0xc00c_aee0;
     pub(super) const KVM_GET_REG_LIST: u64 = 0xc008_aeb0;
+    #[cfg(target_arch = "x86_64")]
+    pub(super) const KVM_GET_MSRS: u64 = 0xc008_ae88;
     pub(super) const KVM_MEMORY_ENCRYPT_OP: u64 = 0xc008_aeba;
     pub(super) const KVM_NMI: u64 = 0xae9a;
     pub(super) const KVM_GET_NESTED_STATE: u64 = 3229658814;
@@ -483,7 +485,6 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
     const KVM_GET_LAPIC: u64 = 0x8400_ae8e;
     const KVM_GET_MSR_INDEX_LIST: u64 = 0xc004_ae02;
     const KVM_GET_MSR_FEATURE_INDEX_LIST: u64 = 0xc004_ae0a;
-    const KVM_GET_MSRS: u64 = 0xc008_ae88;
     const KVM_GET_SREGS: u64 = 0x8138_ae83;
     const KVM_GET_TSC_KHZ: u64 = 0xaea3;
     const KVM_GET_XCRS: u64 = 0x8188_aea6;
@@ -898,6 +899,9 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_NMI)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_NESTED_STATE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_NESTED_STATE)?],
+        // Pylon reads the guest TSC and TSC deadline from the vCPU thread.
+        #[cfg(target_arch = "x86_64")]
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSRS)?],
     ])
 }
 
