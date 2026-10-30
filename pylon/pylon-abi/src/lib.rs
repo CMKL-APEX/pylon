@@ -171,7 +171,13 @@ pub struct PylonVcpuSlot {
     /// Physical CPU core ID (pCPU) assigned to this vCPU, or reserved for it during a
     /// revocation, by `pylond`; `PCPU_UNASSIGNED` if none. The VMM initializes it.
     pub assigned_pcpu: AtomicU8,
-    pub _pad_host: [u8; 2],
+    /// Non-zero while the VMM wants this vCPU parked once the guest has booted. The VMM sets it
+    /// when the vCPU's thread starts, for vCPUs beyond `initial_active_vcpus`, and leaves the
+    /// vCPU running so the guest can bring it online. When the guest reports it is up (a
+    /// non-zero `guest_heartbeat`), `pylond` sets `revoke_requested` and signals the thread; the
+    /// VMM then parks the vCPU at once and clears this byte. 0 before ABI v2 used these bytes.
+    pub park_on_boot: AtomicU8,
+    pub _pad_host: [u8; 1],
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
     pub host_tid: AtomicU32,
     /// Host counter deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
@@ -197,7 +203,8 @@ impl PylonVcpuSlot {
             park_timer_deadline_tsc: AtomicU64::new(0),
             revoke_requested: AtomicU8::new(0),
             assigned_pcpu: AtomicU8::new(PCPU_UNASSIGNED),
-            _pad_host: [0u8; 2],
+            park_on_boot: AtomicU8::new(0),
+            _pad_host: [0u8; 1],
             host_tid: AtomicU32::new(0),
             revoke_deadline_tsc: AtomicU64::new(0),
             forced_preempt_count: AtomicU64::new(0),
@@ -215,6 +222,7 @@ impl PylonVcpuSlot {
         self.park_timer_deadline_tsc.store(0, Ordering::Release);
         self.revoke_requested.store(0, Ordering::Release);
         self.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+        self.park_on_boot.store(0, Ordering::Release);
         self.host_tid.store(0, Ordering::Release);
         self.revoke_deadline_tsc.store(0, Ordering::Release);
         self.forced_preempt_count.store(0, Ordering::Release);
@@ -292,6 +300,8 @@ const _: () = {
     assert!(size_of::<PylonSharedPage>() == 8192);
     assert!(align_of::<PylonSharedPage>() == 4096);
     assert!(offset_of!(PylonVcpuSlot, revoke_requested) == 32);
+    assert!(offset_of!(PylonVcpuSlot, park_on_boot) == 34);
+    assert!(offset_of!(PylonVcpuSlot, host_tid) == 36);
     assert!(offset_of!(PylonVcpuSlot, park_timer_deadline_tsc) == 24);
     assert!(offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56);
     assert!(offset_of!(PylonSharedPage, header) == 0);
@@ -317,6 +327,8 @@ mod tests {
         assert_eq!(size_of::<PylonSharedPage>(), 8192);
         assert_eq!(align_of::<PylonSharedPage>(), 4096);
         assert_eq!(offset_of!(PylonVcpuSlot, revoke_requested), 32);
+        assert_eq!(offset_of!(PylonVcpuSlot, park_on_boot), 34);
+        assert_eq!(offset_of!(PylonVcpuSlot, host_tid), 36);
         assert_eq!(offset_of!(PylonSharedPage, header), 0);
         assert_eq!(offset_of!(PylonSharedPage, telemetry), 64);
         assert_eq!(offset_of!(PylonSharedPage, vcpus), 128);

@@ -178,6 +178,12 @@ impl ControlPlane {
                 }
                 _ = prune.tick() => {
                     Self::remove_exited_vms(&self.vm_snapshot);
+                    for vm in self.vm_snapshot.load().iter() {
+                        let asked = vm.park_booted_vcpus();
+                        if asked > 0 {
+                            info!("VM {}: asked {asked} booted vCPU(s) to park", vm.vm_id());
+                        }
+                    }
                     if let Some(table) = &self.vcpu_domains {
                         let current = self
                             .vm_snapshot
