@@ -74,9 +74,11 @@ So, on such a kernel, `pylond` guards `scx_pylon`:
 
 - It doesn't attach while any thread has a core scheduling cookie.
   The log names the thread.
-- While attached, it refuses requests for new cookies. Cloud
+- While attached, it refuses requests for new cookies. Pylon's Cloud
   Hypervisor then fails to start a VM with `Error enabling core
-  scheduling`. Start such VMs with `--cpus ...,core_scheduling=off`.
+  scheduling`. Upstream Cloud Hypervisor hangs instead, without
+  answering its API, until it is killed with `SIGKILL`. Start such VMs
+  with `--cpus ...,core_scheduling=off`.
   `scx_pylon` keeps SMT siblings apart for VMs that `pylond` manages,
   from about a second after each vCPU thread starts, whether or not the
   vCPU has a CPU of its own. VMs it doesn't manage get no SMT isolation

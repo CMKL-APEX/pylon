@@ -81,7 +81,9 @@ with `--core-sched-deny off`), and `scx_pylon` disabled itself.
 
 `scx_pylon` is attached with the core scheduling guard, which refuses
 core scheduling. Start the VM with `--cpus ...,core_scheduling=off`
-([Core scheduling](sched-ext.md#core-scheduling)).
+([Core scheduling](sched-ext.md#core-scheduling)). Upstream Cloud
+Hypervisor doesn't fail in this case: it hangs before booting the
+guest and stops answering its API.
 
 If the kernel ejected the scheduler later, `dmesg` says why (for
 example a runnable task stall). `pylond` keeps running without it.
