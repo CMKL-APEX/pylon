@@ -5,5 +5,11 @@ name = "pylon-abi"
 rust-version.workspace = true
 version = "0.1.0"
 
+[features]
+default = ["clock"]
+# The `clock` module: counter reads that need inline assembly. Turn it off to use only the
+# shared-page layout.
+clock = []
+
 [lints]
 workspace = true
