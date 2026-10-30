@@ -3,7 +3,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+//! Layout of the Pylon shared page.
+//!
+//! Every `*_tsc` field and `tsc_khz` count *host counter ticks*, in the unit of
+//! [`clock::read_counter`]: the TSC on x86_64 and `CNTVCT_EL0` on aarch64
+//! (`spec/07-aarch64-support.md` §3). The names keep "tsc" so the layout and its users stay
+//! unchanged.
+
 #![no_std]
+
+#[cfg(feature = "clock")]
+pub mod clock;
 
 use core::mem::{align_of, offset_of, size_of};
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -47,8 +57,8 @@ pub struct PylonHeader {
     pub version: u32,
     pub num_vcpus: u32,
     pub vm_id: u64,
-    /// TSC rate in kHz, or 0 if the writer doesn't know it. `pylond` then uses the host TSC
-    /// rate it measures itself.
+    /// Counter rate in kHz, or 0 if the writer doesn't know it. `pylond` then uses the host
+    /// counter rate it finds itself (measured on x86_64, `CNTFRQ_EL0` on aarch64).
     pub tsc_khz: u64,
     pub _reserved: [u8; 32],
 }
@@ -87,10 +97,10 @@ pub struct PylonTelemetry {
     pub rx_ring_cons_idx: AtomicU32,
     /// Bitmask of parked vCPU indices (0..63) that have stranded local runqueue tasks or RCU work.
     pub stranded_work_bitmap: AtomicU64,
-    /// Guest TSC (`rdtsc` in the guest) since which runnable threads have been waiting for a
+    /// Guest counter (`rdtsc` or `CNTVCT_EL0` in the guest) since which runnable threads have been waiting for a
     /// vCPU, or 0 if none wait. `pylond` converts it with `guest_tsc_offset`.
     pub head_wait_tsc: AtomicU64,
-    /// Next guest timer deadline in guest TSC, or 0 (used by pylond to wake a 0-core idle VM).
+    /// Next guest timer deadline in the guest counter, or 0 (used by pylond to wake a 0-core idle VM).
     /// `pylond` converts it with `guest_tsc_offset`.
     pub next_timer_tsc: AtomicU64,
     /// Monotonically increasing guest heartbeat counter.
@@ -144,13 +154,13 @@ pub struct PylonVcpuSlot {
     /// Non-zero when the guest vCPU holds a spinlock, is in an IRQ handler, or has preemption disabled.
     pub in_critical_section: AtomicU8,
     pub _pad_guest: [u8; 6],
-    /// Host TSC when the VMM last parked this vCPU. Written by the VMM.
+    /// Host counter when the VMM last parked this vCPU. Written by the VMM.
     pub last_yield_tsc: AtomicU64,
     /// Number of times the VMM parked this vCPU, cooperatively or forced. Written by the VMM,
     /// before it publishes `VCPU_STATE_PARKED`.
     pub yield_count: AtomicU64,
-    /// Host TSC at which the guest's TSC-deadline timer on this vCPU was due when the VMM
-    /// parked it, or 0 if no timer was armed or the VMM couldn't read it. Written by the VMM
+    /// Host counter value at which the guest's timer on this vCPU (the TSC deadline on x86_64,
+    /// the virtual timer's compare value on aarch64) was due when the VMM parked it, or 0 if no timer was armed or the VMM couldn't read it. Written by the VMM
     /// before it publishes `VCPU_STATE_PARKED`, and cleared when the vCPU runs again.
     pub park_timer_deadline_tsc: AtomicU64,
 
@@ -164,12 +174,12 @@ pub struct PylonVcpuSlot {
     pub _pad_host: [u8; 2],
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
     pub host_tid: AtomicU32,
-    /// Host TSC deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
+    /// Host counter deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
     /// Written by `pylond` before it sets `revoke_requested`.
     pub revoke_deadline_tsc: AtomicU64,
     /// Number of times the VMM force-parked this vCPU. Written by the VMM.
     pub forced_preempt_count: AtomicU64,
-    /// Guest TSC minus host TSC (wrapping) on this vCPU, or 0 if the VMM didn't measure it.
+    /// Guest counter minus host counter (wrapping) on this vCPU, or 0 if the VMM didn't measure it.
     /// Written by the VMM before the vCPU first runs. See [`PylonSharedPage::guest_to_host_tsc`].
     pub guest_tsc_offset: AtomicU64,
 }
@@ -257,10 +267,11 @@ impl PylonSharedPage {
         count
     }
 
-    /// Converts a guest TSC value written by the guest (`head_wait_tsc`, `next_timer_tsc`) to
-    /// host TSC, using vCPU 0's `guest_tsc_offset`. KVM keeps a VM's vCPU TSCs in sync, so
-    /// one offset serves the whole VM. Returns 0 for 0 ("not set"), and `guest_tsc` unchanged
-    /// if the offset is unknown. Assumes the guest TSC runs at the host rate (no TSC scaling).
+    /// Converts a guest counter value written by the guest (`head_wait_tsc`, `next_timer_tsc`)
+    /// to the host counter, using vCPU 0's `guest_tsc_offset`. KVM keeps a VM's vCPU counters
+    /// in sync, so one offset serves the whole VM. Returns 0 for 0 ("not set"), and `guest_tsc`
+    /// unchanged if the offset is unknown. Assumes the guest counter runs at the host rate (no
+    /// TSC scaling on x86_64, and no differing counter frequency on aarch64).
     #[inline]
     pub fn guest_to_host_tsc(&self, guest_tsc: u64) -> u64 {
         if guest_tsc == 0 {
