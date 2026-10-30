@@ -11,17 +11,21 @@ where the code differs, this page follows the code.
 
 ```rust
 // MatrixEngine::run, simplified
-pin_current_thread_to_core(1);
+pin_current_thread_to_core(self.engine_cpu); // --engine-cpu, default 1
+let sweep_cycles = ns_to_cycles(SWEEP_INTERVAL_NS, self.host_tsc_khz); // 333 ns
 while !stop {
     let now_tsc = read_tsc();
     self.poll_once(now_tsc);
-    pause_cycles(now_tsc, DEFAULT_TPAUSE_CYCLES, self.has_waitpkg); // 1,000 cycles
+    pause_cycles(now_tsc, sweep_cycles, self.has_timed_wait);
 }
 ```
 
-`pause_cycles` uses `TPAUSE` until `now_tsc + 1000` on CPUs with
-`WAITPKG`, and `PAUSE` otherwise. A thousand cycles is about 330 ns on a
-3 GHz TSC, so with the sweep itself, a pass takes on the order of a
+`read_tsc` reads the host counter: the TSC on x86_64, `CNTVCT_EL0` on
+aarch64 (`pylon_abi::clock`). `pause_cycles` waits until
+`now_tsc + sweep_cycles` with `TPAUSE` on x86_64 CPUs with `WAITPKG` and
+with `WFET` on aarch64 CPUs with `FEAT_WFxT`, and with `PAUSE` or a spin
+hint otherwise; the wait is a hint and may end early. The interval is
+333 ns, so with the sweep itself a pass takes on the order of a
 microsecond. That figure hasn't been measured; see
 [Benchmarks](benchmarks.md#gaps).
 
@@ -60,9 +64,10 @@ usec = (now_tsc - last_tsc) * 1000 / tsc_khz
 It carries the remainder forward (it advances `last_tsc` by exactly the
 cycles it counted), so rounding doesn't lose time across sweeps.
 `tsc_khz` comes from the VM's header when it is non-zero. The VMM
-writes `0`, so in practice it is the host TSC rate that `pylond`
-measures at start (`calibrate_tsc_khz`, 50 ms against the system
-clock), or 3,000,000 if that fails.
+writes `0`, so in practice it is the host counter rate that `pylond`
+finds at start (`calibrate_tsc_khz`): `CNTFRQ_EL0` on aarch64, a 50 ms
+measurement against the system clock on x86_64. If that fails, it
+assumes the architectural rate or, on x86_64, 3,000,000.
 
 **Removed VMs.** A CPU still `Assigned` to a VM that is no longer
 registered (Plane 1 removes VMs whose VMM exited) is freed: the engine
@@ -80,8 +85,10 @@ telemetry.
 `park_timer_deadline_tsc` has passed, or if the host's receive doorbell
 is ahead of the guest's `rx_ring_cons_idx`.
 
-**Time bases.** The guest writes `head_wait_tsc` and `next_timer_tsc`
-on its own TSC. `pylond` converts them to host TSC with
+**Time bases.** Every `*_tsc` field counts host counter ticks (the TSC,
+or `CNTVCT_EL0` on aarch64). The guest writes `head_wait_tsc` and
+`next_timer_tsc` on its own counter. `pylond` converts them to the host
+counter with
 `PylonSharedPage::guest_to_host_tsc`, which subtracts the offset the
 VMM measured for vCPU 0. Everything else is already host TSC.
 

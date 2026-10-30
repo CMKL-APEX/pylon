@@ -3,8 +3,9 @@
 This page builds Pylon from source, starts the `pylond` arbiter and
 boots a VM with eight vCPUs, two of them running.
 
-You need an x86_64 Linux host with KVM, and a user that can read and
-write `/dev/kvm`. `pylond` and `scx_pylon` are x86_64-only today.
+You need an x86_64 or aarch64 Linux host with KVM, and a user that can
+read and write `/dev/kvm`. On aarch64, read the
+[aarch64 requirements](operator-guide/installation.md#aarch64) first.
 
 ## 1. Build
 

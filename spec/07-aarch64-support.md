@@ -308,7 +308,7 @@ parallel.
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t4-guest-agent` (#26) | `DONE` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
-| A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` | `IN_REVIEW` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
+| A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` (#29) | `DONE` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
 | A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 

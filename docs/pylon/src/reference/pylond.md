@@ -2,7 +2,7 @@
 
 ```text
 pylond [--socket <path>] [--socket-group <group>] [--socket-mode <mode>]
-       [--cores <list>] [--enable-scx | --no-scx]
+       [--cores <list>] [--engine-cpu <cpu>] [--enable-scx | --no-scx]
        [--core-sched-guard <auto|on|off>] [--core-sched-deny <eperm|enodev|off>]
        [--pcpu-map-file <path>] [--metrics-port <port>] [--metrics-addr <addr>]
 ```
@@ -13,6 +13,7 @@ pylond [--socket <path>] [--socket-group <group>] [--socket-mode <mode>]
 | `--socket-group <group>` | `pylond`'s group | Group that owns the socket: a name or a numeric GID. |
 | `--socket-mode <mode>` | `pylond`'s umask | The socket's permission bits, in octal, such as `660` or `0o660`. VMMs need write permission to register. |
 | `--cores <list>` | `2-7` | Managed host CPUs: a comma-separated list of CPUs and ranges, such as `2-7` or `4-15,20-31`. Must not include 0 or 1, which `pylond` uses itself. |
+| `--engine-cpu <cpu>` | `1` | Host CPU the Plane 2 polling engine pins itself to. It busy-polls, so it should not be in `--cores`; `pylond` warns if it is. |
 | `--enable-scx` | off | Attach `scx_pylon`, or exit with an error if it can't be attached. Conflicts with `--no-scx`. |
 | `--no-scx` | off | Never attach `scx_pylon`. |
 | `--core-sched-guard <mode>` | `auto` | Keep `scx_pylon` away from kernel core scheduling: `auto` on kernels that lack the fix for issue #15, `on` on every kernel that can core-schedule, `off` never ([Core scheduling](../operator-guide/sched-ext.md#core-scheduling)). |
@@ -28,11 +29,12 @@ fails, it logs a warning and continues.
 
 ## Startup
 
-At start, `pylond` measures the host's TSC rate against the system clock
-for 50 ms and logs `Host TSC rate: <n> kHz`. It uses that rate to turn
-TSC cycles into time for every VM whose shared-page header gives none,
-which the VMM's doesn't. If it can't measure it, it assumes 3 GHz and
-says so.
+At start, `pylond` finds the host's counter rate and logs
+`Host counter rate: <n> kHz`: on aarch64 it reads `CNTFRQ_EL0`, on
+x86_64 it measures the TSC against the system clock for 50 ms. It uses
+that rate to turn counter ticks into time for every VM whose shared-page
+header gives none, which the VMM's doesn't. If it can't find it, it
+assumes the architectural rate or, on x86_64, 3 GHz, and says so.
 
 ## Environment
 

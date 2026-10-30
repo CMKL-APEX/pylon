@@ -66,7 +66,7 @@ as a measured speed-up.
 | Figure | Kind | Source |
 |---|---|---|
 | Grace period: 8 µs | Default | `REVOKE_GRACE_PERIOD_US`, `pylond/src/engine.rs` |
-| Pause between sweeps: 1,000 TSC cycles (~330 ns at 3 GHz) | Default | `DEFAULT_TPAUSE_CYCLES` |
+| Pause between sweeps: 333 ns, converted to counter ticks with the host rate (about 1,000 ticks on a 3 GHz TSC) | Default | `SWEEP_INTERVAL_NS` |
 | Handoff target: "~3–6 µs" | Design goal | `spec/00-architecture.md` §1 |
 
 ## Gaps

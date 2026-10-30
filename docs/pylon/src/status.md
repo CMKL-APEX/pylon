@@ -44,16 +44,18 @@ tracks 4 and 5).
 
 - **Scale to zero.** A VM that holds no cores is woken when a timer it
   armed before its vCPUs parked comes due: the VMM reads each vCPU's
-  TSC-deadline timer as it parks it. That needs the in-kernel local
-  APIC (the default with KVM) and a guest using TSC-deadline mode
-  (Linux's default when the CPU offers it). Arriving packets don't wake
+  timer as it parks it. On x86_64 that is the TSC-deadline timer, which
+  needs the in-kernel local APIC (the default with KVM) and a guest
+  using TSC-deadline mode (Linux's default when the CPU offers it). On
+  aarch64 it is the guest's EL1 virtual timer; a guest using the
+  physical timer publishes none. Arriving packets don't wake
   such a VM yet: nothing on the host feeds the receive doorbell.
 - **Unwritten telemetry.** Nothing writes `in_critical_section` or
   `stranded_work_bitmap` yet, so donor selection can't avoid lock
   holders, and wakeups can't prefer vCPUs with stranded work.
-- **TSC scaling.** `pylond` converts the guest's TSC values with the
-  offset the VMM measures, assuming the guest TSC runs at the host's
-  rate. A VM restored with a different TSC rate would break that, but
+- **Counter scaling.** `pylond` converts the guest's counter values
+  with the offset the VMM measures, assuming the guest counter runs at
+  the host's rate. The offset is measured to about a microsecond. A VM restored with a different TSC rate would break that, but
   restore doesn't support Pylon yet anyway.
 - **`min_cores` while idle.** A VM that reports no runnable threads
   wants zero cores, whatever its `min_cores`.
@@ -76,7 +78,7 @@ tracks 4 and 5).
 | 4 | Fix the VMM's park decision, make `pylond` force a clean park on deadline, add the `pylon-kick` device that delivers revocations as interrupts, measure handoff latency. | Designed ([spec 06](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md)); not started |
 | 5 | `pv-pylon` Linux guest kernel module: report critical sections, park at safe points. | Designed (spec 06 §4.6); not started |
 | — | Move the shared page from the fixed address into a PCI BAR. | Follow-up in spec 06 §9 |
-| — | aarch64 `pylond` (a counter abstraction instead of the TSC). | Not designed |
+| — | Run an aarch64 guest with Pylon end to end (the host side is done: [spec 07](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md)). | In progress |
 | — | Snapshot, restore and migration support. | Not designed; to be rejected explicitly until then |
 
 [Enhancements](developer-guide/enhancements.md) explains the track 4

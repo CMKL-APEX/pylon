@@ -143,7 +143,7 @@ These are from spec 06 §10:
 | Receive doorbell | A host-side producer for `host_rx_doorbell`, so packets wake a zero-core VM (K1). |
 | Reconnect | Let a VMM register again after `pylond` restarts (Q5). |
 | Lifecycle | Reject snapshot, restore and migration with `--pylon`, explicitly, until they're designed (spec 06 §7). |
-| aarch64 | A counter abstraction (`CNTVCT_EL0`) in place of the TSC in `pylond`, and a check of the shared page's address against the aarch64 layout. |
+| aarch64 | Done for the host side (spec 07): a counter abstraction, `WFET`, the guest timer, the shared page's address in the aarch64 layout, an arm64 `scx_pylon` and CI. Open: a booted aarch64 guest run end to end and the kick device on the GICv3 ITS (A-T8, A-T9). |
 | `scx_pylon` lookup | A thread-ID-to-CPU map, so `select_cpu` doesn't scan all 256 entries. |
 
 Done since the first draft of this list: the real TSC rate (`pylond`
