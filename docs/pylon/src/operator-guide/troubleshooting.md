@@ -38,6 +38,12 @@ wait until `pylond` wakes the vCPU. Until the guest kernel module
 exists, keep `initial_active_vcpus` high enough for the guest's normal
 load. This is a known open question in the design (spec 06, Q2).
 
+One case to avoid in particular: a process that has to keep running,
+such as the guest agent, sitting on a parked vCPU. If it is the only
+runnable thread, `pylond` sees no demand and never wakes that vCPU. The
+guest agent pins itself to vCPU 0 (`--cpu`), which never parks; give any
+other must-run process a CPU among the initial vCPUs too.
+
 ## Forced preemptions are high
 
 That's expected for now: the guest isn't told about revocations, so

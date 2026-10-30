@@ -59,9 +59,11 @@ Add `--pylon` to an ordinary Cloud Hypervisor command line:
     --pylon shm=/dev/shm/vm1-pylon,socket=/run/pylon/pylond.sock,vm_id=1,initial_active_vcpus=2,min_cores=1,max_cores=8
 ```
 
-The VM boots with eight vCPUs. vCPUs 0 and 1 run; vCPUs 2–7 start
-parked. The VM registers with `pylond`, which can then wake parked vCPUs
-when there's demand.
+The VM boots with eight vCPUs, and the guest brings all eight online.
+vCPUs 0 and 1 keep running. Once the guest reports that it is up (the
+guest agent's first heartbeat), `pylond` asks the VMM to park vCPUs 2–7,
+and wakes them again when there's demand. Without a guest agent the
+other vCPUs are never parked: the VM then behaves like an ordinary one.
 
 **Give every VM its own `vm_id`.** It defaults to `1`, and `pylond`
 rejects a VM whose id is already registered by a running VMM.

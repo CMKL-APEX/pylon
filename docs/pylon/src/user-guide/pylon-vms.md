@@ -27,7 +27,10 @@ Give the VM as many vCPUs as it could ever use; the parked ones cost a
 thread each and no CPU time.
 
 **`initial_active_vcpus`** is how many vCPUs run from the start: vCPUs
-`0` to `n-1`. The rest start parked. It defaults to the `boot` count,
+`0` to `n-1`. The rest run during boot, so the guest can bring them
+online, and are parked once the guest reports that it is up (its first
+heartbeat); until then, or if no guest agent ever reports, they run. It
+defaults to the `boot` count,
 so without it every vCPU starts running. Keep at least `1`, because the
 guest boots on vCPU 0.
 

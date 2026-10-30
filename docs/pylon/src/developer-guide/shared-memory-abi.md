@@ -68,6 +68,7 @@ the host on the hot path. Its layout is defined once, in
 | 24 | `park_timer_deadline_tsc` | `u64` | Host TSC at which the guest's TSC-deadline timer was due when the VMM parked the vCPU; `0` if none. Cleared when the vCPU runs. |
 | **32** | `revoke_requested` | `u8` | `1`: `pylond` wants this vCPU to give up its core |
 | 33 | `assigned_pcpu` | `u8` | Host CPU assigned by `pylond`; `255` (`PCPU_UNASSIGNED`) if none |
+| 34 | `park_on_boot` | `u8` | `1` while the VMM wants the vCPU parked once the guest has booted: set when the vCPU thread starts, for vCPUs beyond `initial_active_vcpus`; cleared by the VMM when it parks the vCPU. Reserved (`0`) before; no version bump. |
 | 36 | `host_tid` | `u32` | The vCPU thread's Linux thread ID, written by the VMM |
 | 40 | `revoke_deadline_tsc` | `u64` | TSC after which `pylond` stops waiting for a yield |
 | 48 | `forced_preempt_count` | `u64` | Revocations whose deadline passed |
@@ -87,6 +88,7 @@ docs in `pylon-abi` say which:
 | `revoke_requested` | `pylond` sets it; the VMM clears it when it parks the vCPU. |
 | `yield_count`, `last_yield_tsc`, `forced_preempt_count` | The VMM, when it parks the vCPU. |
 | `assigned_pcpu`, `revoke_deadline_tsc` | `pylond`. The VMM initializes `assigned_pcpu` to `PCPU_UNASSIGNED`. |
+| `park_on_boot` | The VMM sets and clears it. `pylond` reads it: it asks the VMM to park a tagged vCPU (it sets `revoke_requested`) once `guest_heartbeat` is non-zero. |
 | `host_tid`, `guest_tsc_offset`, `park_timer_deadline_tsc` | The VMM. |
 | Telemetry | The guest (today `pylon-guest-agent`, which writes nothing else). |
 

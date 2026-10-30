@@ -26,7 +26,8 @@ default):
 - writes the number of runnable threads, from the fourth field of
   `/proc/loadavg` (or `procs_running` in `/proc/stat`), to
   `runnable_threads`;
-- increments `guest_heartbeat`;
+- increments `guest_heartbeat`, which also tells `pylond` that the guest
+  has booted, so it parks the vCPUs beyond `initial_active_vcpus`;
 - when there are more runnable threads than running vCPUs, records the
   guest counter (the TSC, or `CNTVCT_EL0` on aarch64) at which that
   started in `head_wait_tsc`, keeps it while
