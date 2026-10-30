@@ -129,3 +129,60 @@ jobs:
         run: |
           cargo build --release -p pylon-abi -p pylond -p scx-pylon -p cloud-hypervisor --features cloud-hypervisor/kvm
           cargo run --release -p pylond --bin pylon-bench -- --quick
+
+  # The same crates on a native aarch64 runner (spec 07). The cross-compiling `quality` jobs in
+  # ci.yaml can't build `pylond` and `scx-pylon` (libbpf needs the target's libelf), so this is
+  # where aarch64 Pylon code is built and tested. Hosted arm64 runners have no /dev/kvm: tests
+  # that need it skip themselves (`vmm`) or are left out (`hypervisor`). The benchmark isn't run
+  # either: shared runners say nothing about handoff latency.
+  pylon-aarch64:
+    name: Pylon aarch64 (clippy & unit tests)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install BPF & VMM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq \
+            build-essential \
+            clang \
+            llvm \
+            libelf-dev \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Run Clippy on Pylon crates, arch layout and VMM hooks
+        run: |
+          cargo clippy \
+            -p pylon-abi \
+            -p pylon-guest-agent \
+            -p pylond \
+            -p scx-pylon \
+            -p arch \
+            -p hypervisor \
+            -p vmm \
+            -p cloud-hypervisor \
+            --features kvm \
+            --tests \
+            -- -D warnings
+      - name: Test pylon-abi and pylon-guest-agent
+        run: cargo test -p pylon-abi -p pylon-guest-agent
+      - name: Test pylond (Control Plane, Matrix Engine, and End-to-End Integration)
+        run: cargo test -p pylond
+      - name: Test scx-pylon (BPF compilation & BPF_F_MMAPABLE wrapper)
+        run: cargo test -p scx-pylon
+      - name: Test arch layout
+        run: cargo test -p arch --features kvm
+      - name: Test VMM Pylon module & CLI configuration
+        run: |
+          cargo test -p vmm --features kvm --lib pylon
+          cargo test -p vmm --features kvm --lib config
