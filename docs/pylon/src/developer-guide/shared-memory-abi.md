@@ -38,7 +38,7 @@ the host on the hot path. Its layout is defined once, in
 | 8 | `version` | `u32` | `PYLON_ABI_VERSION` = 2 (same layout as 1; stricter writer rules) |
 | 12 | `num_vcpus` | `u32` | Number of slots in use: `max(boot, max)` vCPUs |
 | 16 | `vm_id` | `u64` | From `--pylon vm_id=` |
-| 24 | `tsc_khz` | `u64` | TSC rate used to convert cycles to time, or `0` if unknown. The VMM writes `0`; `pylond` then uses the host TSC rate it measures at start. |
+| 24 | `tsc_khz` | `u64` | Counter rate used to convert ticks to time, or `0` if unknown. The VMM writes `0`; `pylond` then uses the host counter rate it finds at start. |
 | 32 | `_reserved` | 32 bytes | Zero |
 
 `pylond` rejects a registration whose header fails
@@ -99,11 +99,16 @@ didn't need a new version.
 
 ## Time bases
 
+Every `*_tsc` field and `tsc_khz` count host counter ticks: the TSC on
+x86_64 and the virtual counter `CNTVCT_EL0` on aarch64. The names and
+the layout don't depend on the architecture.
+
 The guest writes `head_wait_tsc` and `next_timer_tsc` with its own
-`rdtsc`. Under KVM that differs from the host's TSC by the vCPU's TSC
-offset (a new vCPU's TSC starts near 0). The VMM measures the offset
-when each vCPU thread starts, by reading the guest's `IA32_TSC` between
-two host `rdtsc`s, and stores it in `guest_tsc_offset`.
+counter. Under KVM that differs from the host's by the vCPU's offset (a
+new vCPU's counter starts near 0). The VMM measures the offset when each
+vCPU thread starts, by reading the guest's counter (`IA32_TSC` on
+x86_64, `KVM_REG_ARM_TIMER_CNT` on aarch64) between two host counter
+reads, and stores it in `guest_tsc_offset`.
 `PylonSharedPage::guest_to_host_tsc` subtracts vCPU 0's offset, since KVM
 keeps a VM's vCPU TSCs in sync. The conversion assumes the guest TSC
 runs at the host's rate (no TSC scaling). Every other TSC field is host

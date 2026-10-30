@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Architecture | x86_64. `pylond` and `scx_pylon` read the TSC and use `TPAUSE` (with a `PAUSE` fallback on CPUs without `WAITPKG`). The VMM side builds on every architecture Cloud Hypervisor supports. |
+| Architecture | x86_64 or aarch64. `pylond` and the VMM count time in host counter ticks: the TSC on x86_64, the virtual counter `CNTVCT_EL0` on aarch64. Between sweeps `pylond` waits with `TPAUSE` (a `PAUSE` fallback on CPUs without `WAITPKG`) on x86_64, and with `WFET` on aarch64 CPUs that have `FEAT_WFxT` (a spin hint otherwise). See [aarch64](#aarch64). The VMM side builds on every architecture Cloud Hypervisor supports. |
 | Hypervisor | KVM. Pylon hasn't been run on MSHV. |
 | Rust | The workspace's MSRV, 1.89.0, or newer. |
 | Build packages | Cloud Hypervisor's usual ones, plus `clang` (with the BPF target), `llvm`, `libelf-dev`, `zlib1g-dev` and `pkg-config`, for `scx_pylon`. |
@@ -15,6 +15,37 @@ On Debian or Ubuntu:
 ```bash
 sudo apt-get install -y build-essential clang llvm libelf-dev zlib1g-dev pkg-config
 ```
+
+## aarch64
+
+Pylon runs on aarch64 KVM hosts with aarch64 Linux guests. What it needs
+beyond the table above:
+
+- **KVM only.** `--pylon` is rejected at start-up on MSHV on aarch64,
+  which can read neither the guest's counter nor its timer.
+- **`FEAT_S2FWB`, which every Armv8.4 or later core implements.**
+  The guest agent maps the shared page through `/dev/mem`, which on arm64
+  is device memory; stage 2 must force write-back for it to be coherent
+  with `pylond`. This is a host requirement, not a runtime check: the
+  kernel hides the ID register field, so Pylon can't test for it.
+- **`FEAT_WFxT` (Armv8.7) is optional.** Without it `pylond` spins with a
+  hint between sweeps instead of waiting, so the engine CPU stays fully
+  busy at lower power savings; check `timed_wait=true` in its start-up
+  log line.
+- **The shared page is at guest address `0xFEDF_0000`**, 64 KiB aligned,
+  in the 32-bit reserved hole, outside the FDT's memory node.
+- **Heterogeneous CPUs.** On a host with big and little cores, put the
+  polling engine on a big core with `pylond --engine-cpu <cpu>` (the
+  default is CPU 1) and keep it out of `--cores`. Which choice is best
+  hasn't been measured.
+- **Idle states.** A parked vCPU's core may idle deeply. The first
+  aarch64 measurements showed a 90 to 105 µs tail on vCPU wake-ups that
+  is consistent with the reference host's `LPI-1` exit latency (42 µs),
+  but the cause hasn't been confirmed: keeping cores out of deep idle
+  hasn't been tried.
+
+The aarch64 numbers so far are in [Benchmarks](../developer-guide/benchmarks.md).
+A booted aarch64 guest hasn't been run with Pylon yet.
 
 ## Build
 

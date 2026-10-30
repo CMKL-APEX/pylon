@@ -308,8 +308,8 @@ parallel.
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t4-guest-agent` (#26) | `DONE` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
-| A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` | `IN_REVIEW` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
-| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` | `IN_PROGRESS` (bench and forced-park e2e done; guest boot, `pylond` end to end and book page open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
+| A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` (#29) | `DONE` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
+| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `IN_PROGRESS` (bench and forced-park e2e done; book page done in #31; booting a guest and `pylond` end to end open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 
 ### 9.2 Handoffs & Questions
@@ -459,7 +459,7 @@ Verification: I ran every command of the job on the aarch64 dev host in a clean 
 Housekeeping in the same PR: A-T6 is `DONE` (its row was left `IN_REVIEW` when #28 merged).
 
 #### A-T8
-First results, on the reference host (kernel `7.0.0-1019-nvidia`). Still open: booting a guest (no guest image or `pv-pylon` exists here, so the VM-level numbers below come from a spin-loop guest), `pylond --enable-scx` end to end, and the book page.
+First results, on the reference host (kernel `7.0.0-1019-nvidia`). Still open: booting a guest (no guest image or `pv-pylon` exists here, so the VM-level numbers below come from a spin-loop guest) and `pylond --enable-scx` end to end. The book page is done (#31).
 
 **CPU topology** (decoded from `midr_el1`; an earlier note was wrong): CPUs 0-4 and 10-14 are Cortex-A725 (part `0xd87`, 2.8 GHz max); CPUs 5-9 and 15-19 are Cortex-X925 (part `0xd85`, 3.9 GHz max); no SMT. `pylond`'s default engine CPU (1) is an A725, and its default tenant cores `2-7` are a mix. Q-A3 stays open: nothing here measures whether the engine's core class changes handoff latency.
 

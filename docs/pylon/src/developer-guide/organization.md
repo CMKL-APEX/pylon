@@ -39,7 +39,7 @@ Line counts include tests and were taken on 2026-10-29.
 |---|---|
 | `src/lib.rs` | Shared types: `VmHandle` (one registered VM: its mapped page, `eventfd`s, policy and counters), `VmSnapshot` (`ArcSwap<Vec<VmHandle>>`), the pCPU owner table, `CoreState`, the JSON request and response types, and CPU pinning. |
 | `src/control.rs` | Plane 1: `ControlPlane`, the Unix socket server, `SCM_RIGHTS` file descriptor passing, registration, policy and stats handling, the Prometheus HTTP server, and client helpers (`send_registration` and the like). |
-| `src/engine.rs` | Plane 2: `MatrixEngine`, the polling loop, TSC and `TPAUSE` helpers. |
+| `src/engine.rs` | Plane 2: `MatrixEngine`, the polling loop, the counter, rate and timed-wait helpers (TSC and `TPAUSE` on x86_64, `CNTVCT_EL0` and `WFET` on aarch64). |
 | `src/main.rs` | The `pylond` binary: options, `scx_pylon` attach policy, thread start-up. |
 | `src/bin/pylon_bench.rs` | The Pylon vs. ACPI hotplug model benchmark. |
 | `tests/e2e_pylon.rs` | End-to-end tests: a real control plane and engine, with VMs simulated by threads. |

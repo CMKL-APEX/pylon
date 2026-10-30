@@ -62,9 +62,10 @@ The rules weren't strict enough at first (spec 06 P6).
 
 ## A polling arbiter on a dedicated core
 
-**Decision.** `pylond`'s engine spins on host core 1, sweeping every
-VM's page about every microsecond, and waits between sweeps with
-`TPAUSE` (spec 02 §1).
+**Decision.** `pylond`'s engine spins on one host CPU (core 1 by
+default), sweeping every VM's page about every microsecond, and waits
+between sweeps with `TPAUSE` on x86_64 or `WFET` on aarch64 (spec 02 §1,
+spec 07).
 
 **Why.** Interrupt- or event-driven designs put a wakeup, which costs
 microseconds, on the path of every decision. Polling sees a change
