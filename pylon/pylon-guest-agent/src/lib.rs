@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::_rdtsc;
 use core::sync::atomic::Ordering;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -13,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::{io, thread};
 
+use pylon_abi::clock::read_counter;
 use pylon_abi::{
     MAX_VCPUS, PCPU_UNASSIGNED, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_MAGIC,
     PYLON_SHARED_PAGE_SIZE, PylonHeader, PylonSharedPage, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
@@ -256,23 +255,23 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
             .runnable_threads
             .store(runnable, Ordering::Release);
 
-        // 2. Increment heartbeat
-        page.telemetry
-            .guest_heartbeat
-            .fetch_add(1, Ordering::Relaxed);
+        // 2. Increment heartbeat. The agent is its only writer, so a load and a store do the
+        //    job of `fetch_add`. The page is mapped through `/dev/mem`, which on arm64 is
+        //    device memory, where atomic read-modify-writes aren't supported.
+        let heartbeat = &page.telemetry.guest_heartbeat;
+        heartbeat.store(
+            heartbeat.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
 
-        // 3. Record (in guest TSC) when threads started waiting for a vCPU, and keep that time
+        // 3. Record (in the guest counter) when threads started waiting for a vCPU, and keep that time
         //    while they still wait, so `pylond` sees how long the backlog has lasted.
         let active = page.active_vcpu_count();
         let head_wait = &page.telemetry.head_wait_tsc;
         if runnable > active {
             if head_wait.load(Ordering::Relaxed) == 0 {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: _rdtsc is a standard unprivileged x86 instruction with no side effects.
-                let now_tsc = unsafe { _rdtsc() };
-                #[cfg(not(target_arch = "x86_64"))]
-                let now_tsc = 1;
-                head_wait.store(now_tsc, Ordering::Release);
+                // 0 means "none wait", so a counter that reads 0 is stored as 1.
+                head_wait.store(read_counter().max(1), Ordering::Release);
             }
         } else {
             head_wait.store(0, Ordering::Release);
@@ -480,5 +479,62 @@ mod tests {
         // Clean up raw pointer
         // SAFETY: Reconstituting Box from raw pointer for safe deallocation.
         unsafe { drop(Box::from_raw(page_ptr)) };
+    }
+
+    /// `head_wait_tsc` is the guest counter at the moment a backlog started, not a placeholder:
+    /// `pylond` turns it into a wait time.
+    #[test]
+    fn test_head_wait_is_a_counter_reading() {
+        // SAFETY: Zeroing PylonSharedPage produces a valid initial state with zeroes in atomics.
+        let mut page = Box::new(unsafe { mem::zeroed::<PylonSharedPage>() });
+        page.init(102, 4, 0);
+        let page_ptr = Box::into_raw(page);
+        let agent =
+            PylonGuestAgent::new(PylonMemoryBackend::from_raw(page_ptr), MockReader::new(3))
+                .unwrap();
+
+        let before = read_counter();
+        agent.update_telemetry().unwrap();
+        let after = read_counter();
+        let head_wait = agent
+            .shared_page()
+            .telemetry
+            .head_wait_tsc
+            .load(Ordering::Acquire);
+        assert!(
+            (before.max(1)..=after.max(1)).contains(&head_wait),
+            "{head_wait} not in {before}..={after}"
+        );
+
+        // SAFETY: Reconstituting Box from raw pointer for safe deallocation.
+        unsafe { drop(Box::from_raw(page_ptr)) };
+    }
+
+    /// The agent maps the page through `/dev/mem`, which on arm64 is device memory, where atomic
+    /// read-modify-writes (`ldadd`, `swp`, exclusives) aren't supported (`spec/07-aarch64-support.md`
+    /// §4.4). It may only load and store. Read-modify-write methods compile to those instructions,
+    /// so keep them out of the agent's own code.
+    #[test]
+    fn test_agent_does_no_read_modify_write_on_the_page() {
+        let source = include_str!("lib.rs");
+        let agent_code = source.split("#[cfg(test)]").next().unwrap();
+        for method in [
+            ".fetch_add(",
+            ".fetch_sub(",
+            ".fetch_and(",
+            ".fetch_or(",
+            ".fetch_xor(",
+            ".fetch_max(",
+            ".fetch_min(",
+            ".fetch_update(",
+            ".swap(",
+            ".compare_exchange(",
+            ".compare_exchange_weak(",
+        ] {
+            assert!(
+                !agent_code.contains(method),
+                "the agent must not call `{method}` on the shared page"
+            );
+        }
     }
 }

@@ -184,9 +184,11 @@ stage 2:
   `ID_AA64MMFR2_EL1.FWB` through `HWCAP`s or sysfs. Finding a reliable check
   is part of task A-T5 (Q-A4). If there is none, it becomes a documented host
   requirement instead of a runtime check.
-- The guest agent keeps `/dev/mem` but, on aarch64, uses only plain loads and
-  stores. It does no read-modify-write on the page (today it does none; a
-  test pins that down).
+- The guest agent keeps `/dev/mem` but uses only plain loads and stores on the
+  page, on every architecture. It used to bump `guest_heartbeat` with
+  `fetch_add`, which is an atomic read-modify-write (`ldadd` with LSE); it is
+  now a load and a store, since the agent is the field's only writer. A test
+  keeps read-modify-write methods out of the agent's code (A-T4).
 - Long term: spec 06 §9 (page in a `pylon-kick` prefetchable BAR, mapped by
   `pv-pylon` with `memremap(MEMREMAP_WB)`) removes the problem.
 
@@ -299,8 +301,8 @@ parallel.
 | A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` (#22) | `DONE` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Merged in #22. |
 | A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` (#23) | `DONE` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
 | A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t2-pylond-counter` (#24) | `DONE` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
-| A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t3-vmm-counter` (#25) | `IN_REVIEW` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
-| A-T4 | Guest agent counter + no-RMW test | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-guest-agent` | — |
+| A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t3-vmm-counter` (#25) | `DONE` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
+| A-T4 | Guest agent counter + no-RMW test | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t4-guest-agent` (#26) | `IN_REVIEW` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | *Unassigned* | — | `NOT_STARTED` | Green aarch64 `quality` + unit-test jobs | — |
@@ -394,6 +396,18 @@ Findings:
 Verification (aarch64 host): `cargo test -p vmm --features kvm --lib` passes (148, 13 `pylon`), `cargo test -p hypervisor --features kvm` passes (8 lib, 4 more). `cargo clippy --locked -p vmm -p hypervisor -p cloud-hypervisor --all-targets -- -D warnings` is clean with `kvm`, `mshv` and `mshv,kvm`, and `cargo +nightly fmt --all --check` is clean.
 
 Not verified: x86_64. `vmm` cross-builds fail here (`zstd-sys` needs an x86_64 C toolchain), so CI must build and test it. The x86 code is unchanged except `read_host_tsc`, the removed `_rdtsc` import and the widened `cfg`s of the non-x86 stubs. The forced-park-by-signal end-to-end test with a running guest exists only for x86_64; an aarch64 equivalent needs a bootable guest and is left to A-T8.
+
+#### A-T4
+Built on `main` after A-T1 (#23); independent of A-T2 and A-T3.
+
+What changed in `pylon-guest-agent`:
+- `head_wait_tsc` is `pylon_abi::clock::read_counter()` (the guest's `CNTVCT_EL0` on aarch64) instead of the constant `1` (A5). A counter that reads 0 is stored as 1, because 0 means "no backlog".
+- **Correction to §4.4:** the agent did do a read-modify-write on the page: `guest_heartbeat.fetch_add(1)`. On aarch64 that is an atomic (`ldadd`) on a `/dev/mem` mapping, which is device memory unless stage 2 forces write-back (`FEAT_S2FWB`). It is now a load and a store; the agent is the only writer of the field. The spec's earlier "today it does none" was wrong, and §4.4 now says so.
+- Tests: `test_head_wait_is_a_counter_reading` (the stored value lies between two counter reads) and `test_agent_does_no_read_modify_write_on_the_page`. The second scans the agent's own source (everything before `#[cfg(test)]`) for `fetch_*`, `swap` and `compare_exchange*`. It's a source scan, not an instruction-level check: it keeps the obvious regressions out and can't see an RMW inside a dependency. I confirmed it fails when a `fetch_add` is put back.
+
+Verification (aarch64 host): `cargo test -p pylon-guest-agent` passes (5), clippy `-D warnings` and `cargo +nightly fmt --all --check` are clean. x86_64 was compiled and linted (`cargo clippy --target x86_64-unknown-linux-gnu`) but not run, since this host can't execute x86_64.
+
+Not covered: the agent running in an aarch64 guest on `/dev/mem`. Whether that mapping works at all depends on A-T5 (`FEAT_S2FWB`) and on the guest kernel allowing `/dev/mem` for that range (`CONFIG_STRICT_DEVMEM`), which is for A-T8.
 
 ---
 
