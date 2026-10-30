@@ -18,10 +18,14 @@ option is in the [pylond reference](../reference/pylond.md).
 
 - **Don't put 0 or 1 in `--cores`.** `pylond` doesn't check, and its own
   threads would then compete with VMs on those CPUs.
-- The engine thread spins at all times. On CPUs with `WAITPKG`, it waits
-  with `TPAUSE` between sweeps, which uses less power than spinning; on
-  others, it uses `PAUSE`. The engine logs `waitpkg=true` or `false` at
-  start.
+- The engine thread spins at all times. On x86_64 CPUs with `WAITPKG`
+  and aarch64 CPUs with `FEAT_WFxT`, it waits with `TPAUSE` or `WFET`
+  between sweeps, which uses less power than spinning; on others, it
+  uses `PAUSE` or a spin hint. The engine logs `timed_wait=true` or
+  `false` at start, with the CPU it pinned to.
+- The engine is pinned to CPU 1 unless you pass `--engine-cpu`. On a host
+  with big and little cores, pick a big one; `pylond` warns if it is also
+  in `--cores`.
 - Keep other work off CPU 1, for example with the kernel's
   `isolcpus=` or `nohz_full=` boot options, or a cgroup `cpuset` that
   excludes it. Any interruption of the engine delays every handoff on

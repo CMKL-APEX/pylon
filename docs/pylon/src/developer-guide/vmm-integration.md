@@ -81,7 +81,7 @@ exit to userspace. It applies the decision table from spec 06 §4.4
 | other | 1 | not passed | Keep running: the guest hasn't agreed and may hold a lock |
 | other | 0 | — | Keep running |
 
-`now` is the host TSC, the clock `pylond` writes deadlines in. To park,
+`now` is the host counter (the TSC, or `CNTVCT_EL0` on aarch64), the clock `pylond` writes deadlines in. To park,
 it clears `revoke_requested`, increments `yield_count` (and
 `forced_preempt_count` for a forced park), records `last_yield_tsc`,
 publishes `PARKED` with `Release`, blocks on the wake `eventfd`, and
