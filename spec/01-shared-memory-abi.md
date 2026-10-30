@@ -120,7 +120,12 @@ pub struct PylonSharedPage {
 - `offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56`
 
 ### Time bases
-The guest writes `head_wait_tsc` and `next_timer_tsc` with its own TSC. `pylond` converts them
-to host TSC with `PylonSharedPage::guest_to_host_tsc` (subtracting vCPU 0's `guest_tsc_offset`).
-Every other TSC field is host TSC. The conversion assumes the guest TSC runs at the host rate
-(no TSC scaling); an offset of 0 leaves values unconverted.
+Every `*_tsc` field and `tsc_khz` count **host counter ticks** (`spec/07-aarch64-support.md` §3):
+the TSC on x86_64 and the virtual counter `CNTVCT_EL0` on aarch64, both read with
+`pylon_abi::clock::read_counter`. The field names and the layout don't change.
+
+The guest writes `head_wait_tsc` and `next_timer_tsc` with its own counter. `pylond` converts them
+to the host counter with `PylonSharedPage::guest_to_host_tsc` (subtracting vCPU 0's
+`guest_tsc_offset`). Every other `*_tsc` field is in the host counter. The conversion assumes the
+guest counter runs at the host rate (no TSC scaling on x86_64); an offset of 0 leaves values
+unconverted.

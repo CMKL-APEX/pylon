@@ -296,8 +296,8 @@ parallel.
 
 | ID | Task | Depends on | Owner | Branch / PR | Status | Verification | Result |
 | :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` | `IN_REVIEW` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Not yet merged. |
-| A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
+| A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` (#22) | `DONE` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Merged in #22. |
+| A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` | `IN_PROGRESS` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
 | A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
 | A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-guest-agent` | — |
@@ -351,6 +351,16 @@ Host facts (for A-T1/A-T2/A-T5/A-T6):
 - `/sys/kernel/sched_ext` and `/sys/kernel/btf/vmlinux` exist. The BPF LSM is **not** in `/sys/kernel/security/lsm` (`lockdown,capability,landlock,yama,apparmor,ima,evm`).
 - The build did not fail on the x86 `vmlinux.h` or the `x86_64-linux-gnu` include path (A6), but nothing loaded the BPF object, so A6 stays open until A-T6's live attach.
 - An earlier run on kernel `6.17.0-1021-nvidia` failed only because `libelf-dev` was missing; the dev host's kernel has since changed to 7.0.0-1019.
+
+#### A-T1
+Interface for A-T2, A-T3 and A-T4:
+- `pylon_abi::clock::read_counter() -> u64` and `architectural_counter_khz() -> Option<u64>`, behind the default-on `clock` feature of `pylon-abi`. Q-A2 resolved as "in `pylon-abi`, behind a feature".
+- `architectural_counter_khz()` is `None` on x86_64 (keep `calibrate_tsc_khz` there) and also on aarch64 if `CNTFRQ_EL0` is 0.
+- On aarch64 the read is `isb; mrs cntvct_el0`. The `CNTVCTSS_EL0` optimisation (spec §3.2) isn't done.
+- The old per-crate copies (`pylond/src/engine.rs` `read_tsc`, `vmm/src/pylon.rs` `read_host_tsc`, `pylon-guest-agent/src/lib.rs`) are untouched: A-T2, A-T3 and A-T4 switch them over.
+- No layout change and no `PYLON_ABI_VERSION` bump; only doc comments and spec 01 *Time bases*.
+
+Verification (aarch64 host): `cargo test -p pylon-abi` passes (5; with `--no-default-features` the 3 layout tests), clippy `-D warnings` is clean for both feature sets. x86_64 was only **compiled** (`cargo clippy --target x86_64-unknown-linux-gnu`, after `rustup target add x86_64-unknown-linux-gnu`), not run, because this host can't execute x86_64. CI must run the x86_64 tests.
 
 ---
 
