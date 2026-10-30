@@ -299,7 +299,7 @@ parallel.
 | A-T0 | Native aarch64 baseline (build + existing tests) | — | Akkarit Sangpetch (Claude Code) | `pylon/a64-t0-baseline` (#22) | `DONE` | `cargo build --all --features kvm`; `cargo test -p pylon-abi -p pylond -p pylon-guest-agent -p scx-pylon`; `cargo test -p vmm --features kvm --lib pylon` | Build and `scx-pylon` pass; 4 `pylond` tests and one clippy lint fail on aarch64 (see notes). Merged in #22. |
 | A-T1 | `pylon_abi::clock` + ABI docs + spec 01 | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t1-clock` | `IN_PROGRESS` | `cargo test -p pylon-abi` (both arches); x86 tests in other crates unchanged | — |
 | A-T2 | `pylond` counter, ns sweep, `WFET`, `--engine-cpu` | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylond`; unit test that a timed wait returns after ≥ interval | — |
-| A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
+| A-T3 | VMM counter, `get_vtimer`, timer publication, MSHV reject | A-T1 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t3-vmm-counter` | `IN_REVIEW` | `cargo test -p vmm --features kvm --lib pylon`; `cargo test -p hypervisor --features kvm` | — |
 | A-T4 | Guest agent counter + no-RMW test | A-T1 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p pylon-guest-agent` | — |
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | *Unassigned* | — | `NOT_STARTED` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
@@ -362,6 +362,24 @@ Interface for A-T2, A-T3 and A-T4:
 
 Verification (aarch64 host): `cargo test -p pylon-abi` passes (5; with `--no-default-features` the 3 layout tests), clippy `-D warnings` is clean for both feature sets. x86_64 was only **compiled** (`cargo clippy --target x86_64-unknown-linux-gnu`, after `rustup target add x86_64-unknown-linux-gnu`), not run, because this host can't execute x86_64. CI must run the x86_64 tests.
 
+#### A-T3
+Built on `main` after A-T1 (#23); independent of A-T2.
+
+What changed:
+- `hypervisor`: `Vcpu::get_vtimer() -> (CNTV_CTL_EL0, CNTV_CVAL_EL0)` (aarch64 + `kvm`; MSHV is `unimplemented!()` like `get_cntvct`), via `KVM_REG_ARM_TIMER_CTL` (`0x6030_0000_0013_df19`) and `KVM_REG_ARM_TIMER_CVAL` (`0x6030_0000_0013_df02`). A unit test pins these ids, and `CNT` (`..._df1a`), to the kernel's `kvm.h` values.
+- `vmm/src/pylon.rs`: `read_host_tsc` is `pylon_abi::clock::read_counter` on every arch (A3). `read_guest_tsc` is `get_cntvct`, and `read_guest_tsc_deadline` is `CVAL` when `CTL.ENABLE == 1 && CTL.IMASK == 0`, else 0 (A4). Without `kvm` on aarch64 both still return `None`.
+- `pylon::check_hypervisor`, called from `CpuManager::new`: `--pylon` on MSHV on aarch64 fails with "--pylon is not supported on MSHV on aarch64". MSHV on x86_64 is unchanged (spec 06 Q4 still open).
+- `test_measure_guest_tsc_offset` now runs on both arches. New: `test_vtimer_deadline_needs_enable_and_no_mask`, `test_real_kvm_vcpu_counter_offset_and_idle_timer` (real vCPU: offset, conversion, idle timer reads 0) and, in `hypervisor`, `test_timer_register_ids` and `test_vtimer_and_counter_read`.
+
+Findings:
+- KVM starts a new vCPU's counter near 0, like the x86 TSC: on the reference host `guest_tsc_offset` was about -5.0e12 ticks (the host's uptime) in three runs, so it is never the reserved 0 and the "offset unknown" handling doesn't hide timers on aarch64.
+- Converting a fresh guest counter to the host counter is off by 660 to 850 ticks (0.7 to 0.85 µs at 1 GHz): half the duration of the register read between the two host reads. It applies to `head_wait_tsc` and published timer deadlines, against the 8 µs grace window.
+- The guest's armed timer is read from the vCPU's saved state outside `KVM_RUN`, as `check_and_park_vcpu` does. Only the EL1 virtual timer is read; a guest using the physical timer (`CNTP_*`) would publish no deadline (Q-A6).
+
+Verification (aarch64 host): `cargo test -p vmm --features kvm --lib` passes (148, 13 `pylon`), `cargo test -p hypervisor --features kvm` passes (8 lib, 4 more). `cargo clippy --locked -p vmm -p hypervisor -p cloud-hypervisor --all-targets -- -D warnings` is clean with `kvm`, `mshv` and `mshv,kvm`, and `cargo +nightly fmt --all --check` is clean.
+
+Not verified: x86_64. `vmm` cross-builds fail here (`zstd-sys` needs an x86_64 C toolchain), so CI must build and test it. The x86 code is unchanged except `read_host_tsc`, the removed `_rdtsc` import and the widened `cfg`s of the non-x86 stubs. The forced-park-by-signal end-to-end test with a running guest exists only for x86_64; an aarch64 equivalent needs a bootable guest and is left to A-T8.
+
 ---
 
 ## 10. Open Questions
@@ -378,3 +396,4 @@ Verification (aarch64 host): `cargo test -p pylon-abi` passes (5; with `--no-def
   or does it have to be a documented host requirement?
 - **Q-A5:** Should hosts without `WFXT` (before Armv8.7) be supported at all,
   given that the fallback is a hot spin?
+- **Q-A6:** Should the VMM also read the physical timer (`CNTP_CTL_EL0`/`CNTP_CVAL_EL0`) when it publishes a parked vCPU's timer? Linux guests use the virtual timer by default, and `get_vtimer` reads only that.
