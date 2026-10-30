@@ -169,11 +169,11 @@ impl PylonMemoryBackend {
     #[inline]
     pub fn as_shared_page(&self) -> &PylonSharedPage {
         match self {
-            // SAFETY: The mmap covers at least PYLON_SHARED_PAGE_SIZE bytes aligned to page boundary.
             #[expect(
                 clippy::cast_ptr_alignment,
                 reason = "mmap(2) returns page-aligned memory"
             )]
+            // SAFETY: The mmap covers at least PYLON_SHARED_PAGE_SIZE bytes aligned to page boundary.
             Self::Mmap(m) => unsafe { &*(m.as_ptr() as *const PylonSharedPage) },
             // SAFETY: Caller guarantees the raw pointer points to a valid PylonSharedPage.
             Self::RawPtr(p) => unsafe { &**p },

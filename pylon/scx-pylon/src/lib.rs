@@ -243,13 +243,13 @@ impl PcpuOwnerMap {
     #[inline]
     fn slots(&self) -> &[AtomicPcpuOwnerSlot; MAX_PCPUS] {
         debug_assert!(self.mmap.len() >= PCPU_OWNER_MAP_BYTES);
-        // SAFETY: `self.mmap` is page-aligned by `mmap(2)` and guaranteed to be
-        // at least `PCPU_OWNER_MAP_BYTES` (`256 * 8 = 2048` bytes) long.
-        // `AtomicPcpuOwnerSlot` has size 8 and alignment 4 with no invalid bit patterns.
         #[expect(
             clippy::cast_ptr_alignment,
             reason = "mmap(2) returns page-aligned memory"
         )]
+        // SAFETY: `self.mmap` is page-aligned by `mmap(2)` and guaranteed to be
+        // at least `PCPU_OWNER_MAP_BYTES` (`256 * 8 = 2048` bytes) long.
+        // `AtomicPcpuOwnerSlot` has size 8 and alignment 4 with no invalid bit patterns.
         unsafe {
             &*(self.mmap.as_ptr() as *const [AtomicPcpuOwnerSlot; MAX_PCPUS])
         }
