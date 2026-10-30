@@ -85,7 +85,10 @@ pub struct PylonVcpuSlot {
     pub revoke_requested: AtomicU8,
     /// Physical CPU core ID (pCPU) currently assigned to this vCPU by pylond.
     pub assigned_pcpu: AtomicU8,
-    pub _pad_host: [u8; 2],
+    /// Non-zero while the VMM wants this vCPU parked once the guest has booted (spec 07 A-F2).
+    /// Set and cleared by the VMM; pylond asks for the park once `guest_heartbeat` is non-zero.
+    pub park_on_boot: AtomicU8,
+    pub _pad_host: [u8; 1],
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
     pub host_tid: AtomicU32,
     /// Hard TSC deadline after which pylond will forcibly preempt the vCPU if it hasn't parked.
