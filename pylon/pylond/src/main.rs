@@ -17,7 +17,7 @@ use clap::Parser;
 use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
-use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, calibrate_tsc_khz};
+use pylond::engine::{DEFAULT_ENGINE_CPU, MatrixEngine, calibrate_tsc_khz, default_counter_khz};
 use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
 use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 use tokio::runtime::Builder;
@@ -38,6 +38,11 @@ struct CliArgs {
     /// Comma-separated list or ranges of tenant physical CPU cores managed by Plane 2 (e.g. "2-7" or "2,3,4,5").
     #[arg(long, default_value = "2-7")]
     cores: String,
+
+    /// Host CPU the Plane 2 polling engine pins itself to. It busy-polls, so it shouldn't be one
+    /// of the tenant CPUs in `--cores`; on a host with big and little cores, pick a big one.
+    #[arg(long, default_value_t = DEFAULT_ENGINE_CPU)]
+    engine_cpu: usize,
 
     /// Optional path to a memory-mapped `pylon_pcpu_owners` backing file.
     #[arg(long)]
@@ -181,11 +186,22 @@ fn main() -> Result<()> {
     let args = CliArgs::parse();
     let tenant_pcpus = parse_core_list(&args.cores)?;
 
-    // VMMs leave the header's TSC rate unset, so measure the host's once.
+    if tenant_pcpus.contains(&args.engine_cpu) {
+        warn!(
+            "--engine-cpu {} is also a tenant CPU in --cores; the polling engine will compete \
+             with the vCPU that owns it",
+            args.engine_cpu
+        );
+    }
+
+    // VMMs leave the header's counter rate unset, so find the host's once.
     let host_tsc_khz = calibrate_tsc_khz(Duration::from_millis(50));
     match host_tsc_khz {
-        Some(tsc_khz) => info!("Host TSC rate: {tsc_khz} kHz"),
-        None => warn!("Could not measure the host TSC rate; assuming {DEFAULT_TSC_KHZ} kHz"),
+        Some(tsc_khz) => info!("Host counter rate: {tsc_khz} kHz"),
+        None => warn!(
+            "Could not find the host counter rate; assuming {} kHz",
+            default_counter_khz()
+        ),
     }
     info!(
         "Starting pylond: socket={}, tenant_pcpus={tenant_pcpus:?}",
@@ -267,10 +283,12 @@ fn main() -> Result<()> {
     let engine_snapshot = Arc::clone(&vm_snapshot);
     let engine_owners = Arc::clone(&pcpu_owners);
     let engine_stop = Arc::clone(&stop_flag);
+    let engine_cpu = args.engine_cpu;
     let engine_thread = thread::Builder::new()
         .name("pylond-engine".to_owned())
         .spawn(move || {
             let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus);
+            engine.set_engine_cpu(engine_cpu);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);
             }
@@ -342,6 +360,12 @@ mod tests {
     fn scx_attaches_when_the_kernel_has_sched_ext() {
         assert_eq!(scx_attach(&args(&[]), true), ScxAttach::Try);
         assert_eq!(scx_attach(&args(&[]), false), ScxAttach::No);
+    }
+
+    #[test]
+    fn engine_cpu_defaults_to_the_engine_default() {
+        assert_eq!(args(&[]).engine_cpu, DEFAULT_ENGINE_CPU);
+        assert_eq!(args(&["--engine-cpu", "9"]).engine_cpu, 9);
     }
 
     #[test]

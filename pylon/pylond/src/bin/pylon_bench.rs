@@ -27,7 +27,7 @@ use memmap2::MmapMut;
 use pylon_abi::{
     PCPU_UNASSIGNED, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
 };
-use pylond::engine::{DEFAULT_TSC_KHZ, MatrixEngine, read_tsc};
+use pylond::engine::{MatrixEngine, default_counter_khz, read_tsc};
 use pylond::{
     CoreState, PcpuOwnerTable, VmHandle, VmRegistrationRequest, VmSnapshot, create_eventfd,
     read_eventfd, write_eventfd,
@@ -226,7 +226,7 @@ fn run_pylon_elastic_benchmark(
     let mut shm_mmap = unsafe { MmapMut::map_mut(&shm_file).expect("mmap failed") };
     // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned.
     let page = unsafe { &mut *(shm_mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
-    page.init(1, max_vcpus, DEFAULT_TSC_KHZ);
+    page.init(1, max_vcpus, default_counter_khz());
 
     let stop = Arc::new(AtomicBool::new(false));
     let work_queue = Arc::new(WaveWorkQueue::new(iters_per_task));
