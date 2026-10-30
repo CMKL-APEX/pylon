@@ -902,6 +902,9 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         // Pylon reads the guest TSC and TSC deadline from the vCPU thread.
         #[cfg(target_arch = "x86_64")]
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSRS)?],
+        // On aarch64 it reads the guest counter and virtual timer registers.
+        #[cfg(target_arch = "aarch64")]
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_ONE_REG)?],
     ])
 }
 

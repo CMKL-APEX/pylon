@@ -309,7 +309,7 @@ parallel.
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` (#29) | `DONE` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
-| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `IN_PROGRESS` (bench and forced-park e2e done; book page done in #31; booting a guest and `pylond` end to end open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
+| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `IN_PROGRESS` (real guest under `pylond` run, see notes; kick path, `scx_pylon` under load and the idle-state test open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 
 ### 9.2 Handoffs & Questions
@@ -324,7 +324,8 @@ The addressee answers inline and marks the entry **resolved**.
 Issues discovered during this work that are outside its scope. Give each one
 an ID (`A-F1`, `A-F2`, …) and a pointer to evidence.
 
-- *(none yet)*
+- **A-F1** (A-T3, found by A-T8; fixed in the same PR as this note): the vCPU-thread seccomp filter allowed `KVM_GET_MSRS` for Pylon on x86_64 but not `KVM_GET_ONE_REG` on aarch64, so an aarch64 VM with `--pylon` died with SIGSYS (`si_syscall=29`, `ioctl`) at vCPU start. The unit tests and the real-KVM tests don't apply seccomp, which is why A-T3 missed it. Cloud Hypervisor's own filter is enforced by default.
+- **A-F2** (open): on aarch64, vCPUs that start parked (`initial_active_vcpus` below the vCPU count) never answer their `PSCI CPU_ON`. The guest kernel waits 5 s for each secondary, prints "CPUn: failed to come online" and boots with 1 CPU (15 s for 3 secondaries); the CPUs can be onlined later with `echo 1 > /sys/devices/system/cpu/cpuN/online`, but only while `pylond` has a reason to wake the parked vCPU. So the quick start's "boots with eight vCPUs, two of them running" doesn't hold on aarch64 today. On x86_64 the same wait applies to the INIT/SIPI start-up (spec 06 Q2 notes the effect for parked vCPUs); I haven't run it there. A fix has to let the vCPU thread run far enough to answer the power-on request before it parks, or have the guest not wait.
 
 ### 9.4 Task Notes
 
@@ -477,6 +478,16 @@ About 72% of the parks complete within 10 µs, before a re-signal is needed. Pin
 **Finding: the wake has two modes.** The median wake is 3 to 5 µs, but about 10% take 90 to 105 µs. The reference host's cpuidle states match: `LPI-1` has a 42 µs exit latency and `LPI-3` 433 µs (driver `acpi_idle`, governor `menu`), and a parked vCPU thread's core idles. A core handoff wakes a thread on a possibly idle core, so these exits would sit in `pylond`'s revoke-to-running path. Not yet tested: whether holding the cores out of deep idle (a PM QoS latency request on `/dev/cpu_dma_latency`, root only) removes the 90 µs mode. This may also bear on the 138 µs on x86_64.
 
 What this does not measure: the guest never cooperates and no `pylond` decides anything, so it isolates the VMM's kick, KVM exit, park and wake mechanics. The 8 µs grace window and the cooperative path need `pv-pylon` (spec 06 S5).
+
+**Real aarch64 guest under `pylond`** (A-T8, same host; `pylond --no-scx`, so core ownership is accounted but not enforced, because `sched_ext` needs root). Method: Cloud Hypervisor built from this tree (`--features kvm`, seccomp on); guest kernel `Image-arm64` from `cloud-hypervisor/linux` release `ch-release-v7.2.8-20261009`, the one `scripts/test-util.sh` pins; an initramfs of static `busybox`, `pylon-guest-agent` (1 ms polling) and a small burst workload (4 threads, about 25 ms of compute each, per wave, with an idle gap between waves). `pylond --cores 5-8 --engine-cpu 9` (X925 cores). The harness lives in the scratch directory and is not committed.
+
+- A guest boots under `--pylon` with seccomp on, after the A-F1 fix, and runs the workload at host speed: without `--pylon`, 4 vCPUs, 20 waves: 25.0 ms mean per wave.
+- A-F2 is why this needs `maxcpus=1` and a guest-side step. The guest boots with 1 CPU, starts busy loops so the agent reports more runnable threads than running vCPUs, then onlines CPUs 1 to 3 through sysfs. `pylond` wakes the parked vCPUs on that demand, and all 4 CPUs come online: the wake-on-demand, the metering (8.96 s of core time for one VM) and the allocation work end to end on aarch64.
+- One VM alone is never revoked: `pylond` only revokes under contention, and four managed cores were free.
+- Two 4-vCPU VMs started together on four managed cores (150 waves each, 30 ms gaps): both reached 4 online CPUs, and both ran their waves at 25.4 ms mean (25.35 and 25.39), 1.4% over the unmanaged 25.0 ms. `pylond` counted 9 parks with a measured request-to-park latency, mean 13.1 µs; cumulative buckets: 4 within 1 µs, 5 within 4 µs, 6 within 8 µs, 7 within 32 µs, 9 within 64 µs. It recorded 7 forced preemptions and 4 handoffs without park (the core was handed over after the 50 µs force-handoff delay because the donor hadn't parked): the guests never cooperate (no `pv-pylon`), so every revocation is forced. The donors were idle guests, whose vCPU threads sleep in the kernel; a signal has to wake a possibly deeply idle core first, which fits the 90 to 105 µs wake tail and the cpuidle states recorded above, but this run doesn't prove it.
+- Small numbers: 9 parks across two VMs, with the revocations concentrated in the hotplug phase. A longer run with a steady contended load would give a distribution.
+
+Not done: `pylond --enable-scx` with a VM (root), the cooperative path (needs `pv-pylon`), and the idle-state test.
 
 ---
 
