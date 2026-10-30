@@ -28,7 +28,7 @@ use pylon_abi::{
 use pylond::control::{
     ControlPlane, query_vm_stats, run_prometheus_server, send_policy_update, send_registration,
 };
-use pylond::engine::{DEFAULT_TSC_KHZ, FORCE_HANDOFF_US, MatrixEngine, read_tsc};
+use pylond::engine::{FORCE_HANDOFF_US, MatrixEngine, default_counter_khz, read_tsc};
 use pylond::{
     CoreState, PcpuOwnerTable, VmPolicyUpdateRequest, VmRegistrationRequest, VmSnapshot,
     create_eventfd, read_eventfd, write_eventfd,
@@ -104,7 +104,7 @@ impl SimulatedVmm {
         let mut shm_mmap = unsafe { MmapMut::map_mut(&shm_file).expect("mmap failed") };
         // SAFETY: `shm_mmap` is page-aligned and 8,192 bytes long.
         let page = unsafe { &mut *(shm_mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
-        page.init(vm_id, num_vcpus, DEFAULT_TSC_KHZ);
+        page.init(vm_id, num_vcpus, default_counter_khz());
 
         let stop = Arc::new(AtomicBool::new(false));
         let cooperative_flag = Arc::new(AtomicBool::new(cooperative));
@@ -666,7 +666,7 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
     // 4. The simulated donor registered no kick signal and never parks, so the core moves
     //    FORCE_HANDOFF_US after the deadline and counts as a handoff without park.
     let tsc_khz = match donor_page.header.tsc_khz {
-        0 => DEFAULT_TSC_KHZ,
+        0 => default_counter_khz(),
         khz => khz,
     };
     engine.poll_once(deadline + FORCE_HANDOFF_US * tsc_khz / 1000);
