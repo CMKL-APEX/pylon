@@ -168,6 +168,28 @@ const KVM_REG_ARM_TIMER_CNT: u64 = KVM_REG_ARM64
     | ((3_u64 << KVM_REG_ARM64_SYSREG_CRM_SHIFT) & KVM_REG_ARM64_SYSREG_CRM_MASK as u64)
     | (2_u64 & KVM_REG_ARM64_SYSREG_OP2_MASK as u64);
 
+// `KVM_REG_ARM_TIMER_CTL` and `KVM_REG_ARM_TIMER_CVAL`: the EL1 virtual timer's control and
+// compare registers, `ARM64_SYS_REG(3, 3, 14, 3, 1)` and `ARM64_SYS_REG(3, 3, 14, 0, 2)` in the
+// kernel's `arch/arm64/include/uapi/asm/kvm.h`. Built like `KVM_REG_ARM_TIMER_CNT`; note that
+// CVAL's `crm` is 0 and CNT's is 3.
+#[cfg(target_arch = "aarch64")]
+const fn arm64_timer_reg(crm: u32, op2: u32) -> u64 {
+    KVM_REG_ARM64
+        | KVM_REG_SIZE_U64
+        | KVM_REG_ARM64_SYSREG as u64
+        | ((3_u64 << KVM_REG_ARM64_SYSREG_OP0_SHIFT) & KVM_REG_ARM64_SYSREG_OP0_MASK as u64)
+        | ((3_u64 << KVM_REG_ARM64_SYSREG_OP1_SHIFT) & KVM_REG_ARM64_SYSREG_OP1_MASK as u64)
+        | ((14_u64 << KVM_REG_ARM64_SYSREG_CRN_SHIFT) & KVM_REG_ARM64_SYSREG_CRN_MASK as u64)
+        | (((crm as u64) << KVM_REG_ARM64_SYSREG_CRM_SHIFT) & KVM_REG_ARM64_SYSREG_CRM_MASK as u64)
+        | (op2 as u64 & KVM_REG_ARM64_SYSREG_OP2_MASK as u64)
+}
+
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM_TIMER_CTL: u64 = arm64_timer_reg(3, 1);
+
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM_TIMER_CVAL: u64 = arm64_timer_reg(0, 2);
+
 #[cfg(target_arch = "aarch64")]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
@@ -2720,6 +2742,20 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(u64::from_le_bytes(bytes))
     }
 
+    /// Gets the guest's EL1 virtual timer control and compare registers.
+    #[cfg(target_arch = "aarch64")]
+    fn get_vtimer(&self) -> cpu::Result<(u64, u64)> {
+        let mut ctl = [0_u8; 8];
+        self.fd
+            .get_one_reg(KVM_REG_ARM_TIMER_CTL, &mut ctl)
+            .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?;
+        let mut cval = [0_u8; 8];
+        self.fd
+            .get_one_reg(KVM_REG_ARM_TIMER_CVAL, &mut cval)
+            .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?;
+        Ok((u64::from_le_bytes(ctl), u64::from_le_bytes(cval)))
+    }
+
     /// Sets the guest virtual counter via `KVM_REG_ARM_TIMER_CNT`.
     #[cfg(target_arch = "aarch64")]
     fn set_cntvct(&self, val: u64) -> cpu::Result<()> {
@@ -3686,6 +3722,44 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod tests {
+    /// The ids the kernel's `kvm.h` gives these registers, spelled out. CVAL and CNT have
+    /// different `crm`, which is easy to get wrong.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_timer_register_ids() {
+        use super::*;
+
+        assert_eq!(KVM_REG_ARM_TIMER_CTL, 0x6030_0000_0013_df19);
+        assert_eq!(KVM_REG_ARM_TIMER_CVAL, 0x6030_0000_0013_df02);
+        assert_eq!(KVM_REG_ARM_TIMER_CNT, 0x6030_0000_0013_df1a);
+    }
+
+    /// An unarmed timer reads as disabled, and the guest counter runs at the host's rate, offset
+    /// from the host counter by a constant.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vtimer_and_counter_read() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        use super::*;
+
+        let hypervisor = KvmHypervisor::new().unwrap();
+        let vm = hypervisor.create_vm(HypervisorVmConfig::default()).unwrap();
+        let vcpu = vm.create_vcpu(0, None).unwrap();
+        let mut kvi = vcpu.create_vcpu_init();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+
+        let (ctl, _cval) = vcpu.get_vtimer().unwrap();
+        assert_eq!(ctl & 1, 0, "the guest's virtual timer starts disabled");
+
+        let first = vcpu.get_cntvct().unwrap();
+        sleep(Duration::from_millis(10));
+        let second = vcpu.get_cntvct().unwrap();
+        assert!(second > first, "{first} then {second}");
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_tsc_offset_round_trip() {

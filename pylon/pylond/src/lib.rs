@@ -824,7 +824,9 @@ mod tests {
 
     use super::*;
     use crate::control::{ControlPlane, send_policy_update, send_registration};
-    use crate::engine::{MatrixEngine, calibrate_tsc_khz, pause_cycles, read_tsc};
+    use crate::engine::{
+        MatrixEngine, calibrate_tsc_khz, detect_timed_wait, pause_cycles, read_tsc,
+    };
 
     struct TestVmRig {
         req: VmRegistrationRequest,
@@ -1648,9 +1650,11 @@ mod tests {
 
     #[test]
     fn test_calibrated_tsc_rate_is_plausible() {
-        let tsc_khz = calibrate_tsc_khz(Duration::from_millis(20)).expect("x86_64 has a TSC");
-        // Any x86_64 TSC from the last two decades runs between 500 MHz and 10 GHz.
-        assert!((500_000..10_000_000).contains(&tsc_khz), "{tsc_khz} kHz");
+        let tsc_khz =
+            calibrate_tsc_khz(Duration::from_millis(20)).expect("this architecture has a counter");
+        // Any x86_64 TSC from the last two decades, and any Arm generic counter (1 GHz since
+        // Armv8.6, 10 to 100 MHz before), runs between 10 MHz and 10 GHz.
+        assert!((10_000..10_000_000).contains(&tsc_khz), "{tsc_khz} kHz");
     }
 
     #[test]
@@ -1691,5 +1695,31 @@ mod tests {
         pause_cycles(t1, 100, false);
         let t2 = read_tsc();
         assert!(t2 >= t1);
+    }
+
+    /// With and without the timed wait, a pause neither hangs nor (over many calls) returns much
+    /// sooner than asked. A single `WFET` may wake early, so the check is on the total.
+    #[test]
+    fn test_pause_cycles_waits_about_the_interval() {
+        let khz =
+            calibrate_tsc_khz(Duration::from_millis(20)).expect("this architecture has a counter");
+        let interval = khz / 1000; // 1 µs
+        for timed in [false, detect_timed_wait()] {
+            let calls = 200;
+            let start = read_tsc();
+            for _ in 0..calls {
+                let now = read_tsc();
+                pause_cycles(now, interval, timed);
+                assert!(read_tsc() - now < khz * 50, "a pause took over 50 ms");
+            }
+            let total = read_tsc() - start;
+            // Without the timed wait the pause is only a spin hint and may be far shorter.
+            if timed {
+                assert!(
+                    total >= calls * interval / 2,
+                    "timed={timed}: {total} ticks"
+                );
+            }
+        }
     }
 }
