@@ -123,8 +123,14 @@ impl PcpuOwnerStorage {
         assert!(pcpu_id < MAX_PCPUS, "pcpu_id out of bounds");
         match self {
             Self::Mmap(mmap) => {
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "mmap(2) returns page-aligned memory"
+                )]
                 // SAFETY: `mmap` was verified to be at least `MAX_PCPUS * 8` bytes and page-aligned.
-                unsafe { &*mmap.as_ptr().cast::<PcpuOwnerEntry>().add(pcpu_id) }
+                unsafe {
+                    &*mmap.as_ptr().cast::<PcpuOwnerEntry>().add(pcpu_id)
+                }
             }
             Self::Heap(entries) => &entries[pcpu_id],
         }
@@ -604,9 +610,15 @@ impl VmHandle {
     /// Returns a reference to the memory-mapped `PylonSharedPage`.
     #[inline]
     pub fn shared_page(&self) -> &PylonSharedPage {
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "mmap(2) returns page-aligned memory"
+        )]
         // SAFETY: `shm_mmap` length was verified to be >= `PYLON_SHARED_PAGE_SIZE` (8192)
         // and `mmap` guarantees page alignment (4096 bytes), matching `PylonSharedPage`.
-        unsafe { &*(self.inner.shm_mmap.as_ptr().cast::<PylonSharedPage>()) }
+        unsafe {
+            &*(self.inner.shm_mmap.as_ptr().cast::<PylonSharedPage>())
+        }
     }
 
     /// Reads the host-side vDPA/virtio RX doorbell index for 0-core wakeups.
@@ -838,6 +850,10 @@ mod tests {
         let file = File::from(owned.try_clone().unwrap());
         // SAFETY: `file` is truncated to `PYLON_SHARED_PAGE_SIZE` (8192 bytes).
         let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "mmap(2) returns page-aligned memory"
+        )]
         // SAFETY: `mmap` is page-aligned and 8192 bytes, matching `PylonSharedPage`.
         let page = unsafe { &mut *(mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
         page.init(vm_id, num_vcpus, tsc_khz);

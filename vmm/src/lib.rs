@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write, stdout};
+use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "guest_debug")]
@@ -62,7 +63,8 @@ use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::transport::{
-    self, ReceiveAdditionalConnections, ReceiveListener, SendAdditionalConnections, SocketStream,
+    self, CONNECTION_SETUP_TIMEOUT, ReceiveAdditionalConnections, ReceiveListener,
+    SendAdditionalConnections, SocketStream,
 };
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
@@ -741,6 +743,8 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     console_socket_listener: Option<Arc<LockedUnixListener>>,
+    serial_tcp_listener: Option<Arc<TcpListener>>,
+    console_tcp_listener: Option<Arc<TcpListener>>,
     shutdown_action: GuestShutdownAction,
     reset_action: GuestResetAction,
     check_migration_evt: EventFd,
@@ -968,6 +972,8 @@ impl Vmm {
             console_info: None,
             serial_socket_listener: None,
             console_socket_listener: None,
+            serial_tcp_listener: None,
+            console_tcp_listener: None,
             shutdown_action,
             reset_action,
             check_migration_evt,
@@ -1146,6 +1152,11 @@ impl Vmm {
         event!("vm", "migration-receive-ready");
         // Accept the connection and get the socket
         let mut socket = listener.accept()?;
+        // The sender sends its first request right after connecting. Without
+        // a timeout, a peer that stays silent blocks the receiver forever.
+        socket
+            .set_read_timeout(Some(CONNECTION_SETUP_TIMEOUT))
+            .map_err(MigratableError::MigrateSocket)?;
 
         event!("vm", "migration-receive-starting");
         let mut state = ReceiveMigrationState::Established;
@@ -1166,6 +1177,14 @@ impl Vmm {
                 )))
             })?;
             debug!("Command '{:?}' received", req.command());
+
+            if matches!(state, ReceiveMigrationState::Established) {
+                // Later requests can take long, e.g. while the memory goes over
+                // the additional connections.
+                socket
+                    .set_read_timeout(None)
+                    .map_err(MigratableError::MigrateSocket)?;
+            }
 
             state = self
                 .vm_receive_migration_step(
@@ -1704,7 +1723,7 @@ impl Vmm {
         let memory_mode = send_data_migration.effective_memory_mode();
 
         // Set up the socket connection
-        let mut socket = transport::send_migration_socket(
+        let mut socket = transport::connect_and_setup_socket(
             &send_data_migration.destination_url,
             send_data_migration.tls_dir.as_deref(),
         )?;
@@ -2120,6 +2139,7 @@ impl Vmm {
 
     /// Handles the outcome of the migration worker thread.
     fn check_migration(&mut self) {
+        #[expect(clippy::panic, reason = "only called during a migration")]
         let VmOwnership::Migration {
             migration_worker_handle,
             ..
@@ -2665,8 +2685,11 @@ impl RequestHandler for Vmm {
                 // Swap each VFIO device's saved path or stale FD for the cdev
                 // FD received with the restore request, and install the fresh
                 // iommufd FD backing them. The one saved in the snapshot is
-                // stale, and validate() has confirmed both accompany vfio_fds.
-                if let Some(restored_vfios) = restore_cfg.vfio_fds {
+                // stale, and validate() has confirmed both accompany a
+                // non-empty vfio_fds.
+                if let Some(restored_vfios) = restore_cfg.vfio_fds
+                    && !restored_vfios.is_empty()
+                {
                     let mut config = vm_config.lock().unwrap();
                     if let Some(vm_device_configs) = config.devices.as_mut() {
                         for v in restored_vfios.iter() {
@@ -2897,6 +2920,8 @@ impl RequestHandler for Vmm {
         self.console_info = None;
         self.serial_socket_listener = None;
         self.console_socket_listener = None;
+        self.serial_tcp_listener = None;
+        self.console_tcp_listener = None;
         self.vm_config = None;
         event!("vm", "deleted");
 
@@ -3608,6 +3633,7 @@ mod tests {
 
     use super::*;
     use crate::config::RestoredVfioConfig;
+    use crate::console_devices::ConsoleDeviceError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
@@ -3691,6 +3717,7 @@ mod tests {
                     file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
+                    tcp: None,
                 },
             },
             console: ConsoleConfig {
@@ -3699,6 +3726,7 @@ mod tests {
                     // Caution: Don't use `Tty` to not mess with users terminal
                     mode: ConsoleOutputMode::Off,
                     socket: None,
+                    tcp: None,
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
@@ -3737,6 +3765,21 @@ mod tests {
         assert!(matches!(
             vmm.vm_create(config),
             Err(VmError::VmAlreadyCreated)
+        ));
+    }
+
+    // vm.create sets up the console devices before the config is validated.
+    #[test]
+    fn test_vmm_vm_create_serial_file_without_path() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.serial.common.mode = ConsoleOutputMode::File;
+
+        assert!(matches!(
+            vmm.vm_create(config),
+            Err(VmError::CreateConsoleDevices(
+                ConsoleDeviceError::MissingFilePath
+            ))
         ));
     }
 

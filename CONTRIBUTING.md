@@ -194,6 +194,8 @@ commits instead of pushing `<component>: addressing review for A`-style commits.
 
 If you have a problem, please report it in the
 [CMKL-APEX/pylon GitHub issues](https://github.com/CMKL-APEX/pylon/issues) tracker. Do **not** file Pylon issues on the upstream `cloud-hypervisor/cloud-hypervisor` issue tracker unless the project owner explicitly requests it.
+Report security vulnerabilities as described in [SECURITY.md](SECURITY.md)
+instead.
 
 ## Closing issues
 

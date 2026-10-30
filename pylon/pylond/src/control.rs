@@ -116,6 +116,7 @@ impl ControlPlane {
 
     /// Lists registered VMs' vCPU threads in `table`, so `scx_pylon` isolates them from the
     /// start. The list is brought up to date once a second.
+    #[must_use]
     pub fn with_vcpu_domains(mut self, table: impl VcpuDomainTable + 'static) -> Self {
         self.vcpu_domains = Some(Box::new(table));
         self
@@ -124,6 +125,7 @@ impl ControlPlane {
     /// Sets the socket's permission bits and group once it is created. Without them, the
     /// socket keeps the process umask and group, which root's umask makes unwritable for
     /// non-root VMMs.
+    #[must_use]
     pub fn with_socket_permissions(mut self, mode: Option<u32>, gid: Option<u32>) -> Self {
         self.socket_mode = mode;
         self.socket_gid = gid;
