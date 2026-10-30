@@ -235,6 +235,9 @@ pub enum Error {
     #[error("Error enabling core scheduling")]
     CoreScheduling(#[source] io::Error),
 
+    #[error("Error setting vCPU affinity")]
+    VcpuAffinity(#[source] io::Error),
+
     #[error("Error generating MSR configuration update")]
     MsrConfigurationUpdate(#[source] arch::Error),
 
@@ -1251,6 +1254,7 @@ impl CpuManager {
         vcpu: Arc<Mutex<Vcpu>>,
         vcpu_id: u32,
         vcpu_thread_barrier: Arc<Barrier>,
+        vcpu_start_error: Arc<Mutex<Option<Error>>>,
         vcpu_seccomp_filter: Arc<BpfProgram>,
         inserting: bool,
     ) -> Result<()> {
@@ -1303,99 +1307,93 @@ impl CpuManager {
             thread::Builder::new()
                 .name(format!("vcpu{vcpu_id}"))
                 .spawn(move || {
-                    // Schedule the thread to run on the expected CPU set
-                    if let Some(cpuset) = cpuset.as_ref() {
-                        let cpuset: *const libc::cpu_set_t = cpuset;
-                        // SAFETY: FFI call with correct arguments
-                        let ret = unsafe {
-                            libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), cpuset)
-                        };
+                    // Set up the thread. A failure is recorded rather than
+                    // returned, so that every thread still reaches the barrier
+                    // and activate_vcpus() can report it.
+                    let setup = || -> Result<()> {
+                        // Schedule the thread to run on the expected CPU set
+                        if let Some(cpuset) = cpuset.as_ref() {
+                            let cpuset: *const libc::cpu_set_t = cpuset;
+                            // SAFETY: FFI call with correct arguments
+                            let ret = unsafe {
+                                libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), cpuset)
+                            };
 
-                        if ret != 0 {
-                            error!(
-                                "Failed scheduling the vCPU {} on the expected CPU set: {}",
-                                vcpu_id,
-                                io::Error::last_os_error()
-                            );
-                            return;
-                        }
-                    }
-
-                    // Set up core scheduling before seccomp locks down prctl.
-                    match core_scheduling {
-                        CoreScheduling::Vcpu => {
-                            // Each vCPU gets its own unique cookie
-                            if let Err(e) = core_scheduling_create() {
-                                error!(
-                                    "Failed to enable core scheduling for vCPU {vcpu_id}: {e:?}"
-                                );
-                                return;
+                            if ret != 0 {
+                                return Err(Error::VcpuAffinity(io::Error::last_os_error()));
                             }
                         }
-                        CoreScheduling::Vm => {
-                            // First vCPU creates a cookie; all others share from it.
-                            // SAFETY: gettid() is always safe to call.
-                            let my_tid = unsafe { libc::gettid() };
-                            if core_scheduling_group_leader
-                                .compare_exchange(
-                                    CoreSchedulingLeader::Initial as i32,
-                                    CoreSchedulingLeader::Elected as i32,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
-                            {
-                                // We are the group leader — create the cookie
-                                if let Err(e) = core_scheduling_create() {
-                                    error!("Failed to create core scheduling cookie: {e:?}");
-                                    // This will force the loop in the other threads to break out
-                                    core_scheduling_group_leader.store(
-                                        CoreSchedulingLeader::Error as i32,
-                                        Ordering::Release,
-                                    );
-                                    return;
-                                }
-                                // Signal that the cookie is ready by storing real TID
-                                core_scheduling_group_leader.store(my_tid, Ordering::Release);
-                            } else {
-                                // Wait for the leader to finish creating the cookie
-                                let leader_tid = loop {
-                                    let v = core_scheduling_group_leader.load(Ordering::Acquire);
-                                    match CoreSchedulingLeader::try_from(v) {
-                                        Ok(CoreSchedulingLeader::Error) => return,
-                                        Ok(
-                                            CoreSchedulingLeader::Initial
-                                            | CoreSchedulingLeader::Elected,
-                                        ) => hint::spin_loop(),
-                                        Err(()) => break v,
+
+                        // Set up core scheduling before seccomp locks down prctl.
+                        match core_scheduling {
+                            CoreScheduling::Vcpu => {
+                                // Each vCPU gets its own unique cookie
+                                core_scheduling_create()?;
+                            }
+                            CoreScheduling::Vm => {
+                                // First vCPU creates a cookie; all others share from it.
+                                // SAFETY: gettid() is always safe to call.
+                                let my_tid = unsafe { libc::gettid() };
+                                if core_scheduling_group_leader
+                                    .compare_exchange(
+                                        CoreSchedulingLeader::Initial as i32,
+                                        CoreSchedulingLeader::Elected as i32,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                                {
+                                    // We are the group leader — create the cookie
+                                    if let Err(e) = core_scheduling_create() {
+                                        // This will force the loop in the other threads to break out
+                                        core_scheduling_group_leader.store(
+                                            CoreSchedulingLeader::Error as i32,
+                                            Ordering::Release,
+                                        );
+                                        return Err(e);
                                     }
-                                };
-                                if let Err(e) = core_scheduling_share_from(leader_tid) {
-                                    error!(
-                                        "Failed to share core scheduling cookie \
-                                         to vCPU {vcpu_id}: {e:?}"
-                                    );
-                                    return;
+                                    // Signal that the cookie is ready by storing real TID
+                                    core_scheduling_group_leader.store(my_tid, Ordering::Release);
+                                } else {
+                                    // Wait for the leader to finish creating the cookie
+                                    let leader_tid = loop {
+                                        let v =
+                                            core_scheduling_group_leader.load(Ordering::Acquire);
+                                        match CoreSchedulingLeader::try_from(v) {
+                                            // The leader records its error; this
+                                            // thread stops after the barrier.
+                                            Ok(CoreSchedulingLeader::Error) => return Ok(()),
+                                            Ok(
+                                                CoreSchedulingLeader::Initial
+                                                | CoreSchedulingLeader::Elected,
+                                            ) => hint::spin_loop(),
+                                            Err(()) => break v,
+                                        }
+                                    };
+                                    core_scheduling_share_from(leader_tid)?;
                                 }
                             }
+                            CoreScheduling::Off => {}
                         }
-                        CoreScheduling::Off => {}
-                    }
 
-                    if core_scheduling != CoreScheduling::Off {
-                        info!(
-                            "vCPU {vcpu_id}: core scheduling cookie = {:#x}",
-                            core_scheduling_cookie()
-                        );
-                    }
+                        if core_scheduling != CoreScheduling::Off {
+                            info!(
+                                "vCPU {vcpu_id}: core scheduling cookie = {:#x}",
+                                core_scheduling_cookie()
+                            );
+                        }
 
-                    // Apply seccomp filter for vcpu thread.
-                    if !vcpu_seccomp_filter.is_empty()
-                        && let Err(e) =
-                            apply_filter(&vcpu_seccomp_filter).map_err(Error::ApplySeccompFilter)
-                    {
-                        error!("Error applying seccomp filter: {e:?}");
-                        return;
+                        // Apply seccomp filter for vcpu thread.
+                        if !vcpu_seccomp_filter.is_empty() {
+                            apply_filter(&vcpu_seccomp_filter)
+                                .map_err(Error::ApplySeccompFilter)?;
+                        }
+
+                        Ok(())
+                    };
+                    if let Err(e) = setup() {
+                        error!("Failed to start vCPU {vcpu_id}: {e:?}");
+                        vcpu_start_error.lock().unwrap().get_or_insert(e);
                     }
 
                     extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
@@ -1404,6 +1402,10 @@ impl CpuManager {
                         .expect("Failed to register vcpu signal handler");
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
+                    // If any vCPU started with this one failed, none of them runs.
+                    if vcpu_start_error.lock().unwrap().is_some() {
+                        return;
+                    }
                     pylon::on_vcpu_thread_start(vcpu_id, || {
                         pylon::read_guest_tsc(vcpu.lock().unwrap().vcpu.as_ref())
                     });
@@ -1573,6 +1575,7 @@ impl CpuManager {
         let present_vcpus = self.present_vcpus();
         let vcpu_thread_barrier =
             Arc::new(Barrier::new((desired_vcpus - present_vcpus + 1) as usize));
+        let vcpu_start_error = Arc::new(Mutex::new(None));
 
         if let Some(paused) = paused {
             self.vcpus_pause_signalled.store(paused, Ordering::SeqCst);
@@ -1603,6 +1606,7 @@ impl CpuManager {
                     vcpu,
                     vcpu_id,
                     Arc::clone(&vcpu_thread_barrier),
+                    Arc::clone(&vcpu_start_error),
                     Arc::clone(&vcpu_seccomp_filter),
                     inserting,
                 )?;
@@ -1611,6 +1615,20 @@ impl CpuManager {
 
         // Unblock all CPU threads.
         vcpu_thread_barrier.wait();
+
+        if vcpu_start_error.lock().unwrap().is_some() {
+            // The threads started above see the error and return. Join them
+            // so that they no longer count as present, then report it.
+            let mut vcpu_states = self.vcpu_states.lock().unwrap();
+            for state in &mut vcpu_states[present_vcpus as usize..desired_vcpus as usize] {
+                state.inserting = false;
+                if let Some(handle) = state.handle.take() {
+                    handle.join().map_err(Error::ThreadCleanup)?;
+                }
+            }
+            return Err(vcpu_start_error.lock().unwrap().take().unwrap());
+        }
+
         Ok(())
     }
 
