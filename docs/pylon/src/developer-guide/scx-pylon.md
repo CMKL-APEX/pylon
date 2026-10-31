@@ -61,6 +61,12 @@ queue:
 - The owner of its CPU goes on that CPU's owner queue (DSQ id = CPU)
   with a 20 ms slice, and the CPU is kicked with `SCX_KICK_PREEMPT`.
   This is what preempts a donor whose CPU was given to a recipient.
+- A parked vCPU that KVM woke goes on its VM's queue, if its VM owns a
+  CPU, and that CPU is kicked. This applies to VMs that park inside KVM
+  (`PYLON_PARK_IN_KVM`, [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
+  `pylond`'s engine marks such vCPUs in `pylon_vm_vcpus` while they are
+  `PARKED` with no CPU assigned. `enqueue` sets the vCPU's *woken* bit
+  there, and `quiescent` clears it when the vCPU stops being runnable.
 - Another vCPU thread with a domain goes on the vCPU queue. If it owns
   a CPU elsewhere, that CPU is kicked.
 - A host task allowed on only one CPU, such as a per-CPU kworker, goes
@@ -78,8 +84,14 @@ so `enqueue` kicks it to schedule again.
 
 1. The CPU's owner queue. Tasks that no longer own the CPU are moved to
    the vCPU or host queue.
+   - While woken vCPUs wait on the queue of the owner's VM, the owner and
+     they take 100 µs turns. The owner entry's flags carry the VM's slot.
 2. The vCPU queue, skipping threads that own another CPU.
 3. The host queue.
+
+Each `dispatch` also checks one VM queue in turn. If that VM no longer
+owns a CPU, its vCPUs move to the vCPU queue, so they don't wait until
+the stall watchdog fires.
 
 Each step only dispatches what the SMT claims allow. If nothing fits,
 the CPU idles.

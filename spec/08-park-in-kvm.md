@@ -169,6 +169,30 @@ small value (§7).
 - **When the VM has no cores** (zero-core state), the woken bit is demand,
   as `zero_core_wakeup` is today.
 
+**How `scx_pylon` knows a vCPU is parked (P1).** It can't read the shared
+pages, and the vCPU list it gets from `pylond` changes only once a second.
+So:
+
+- **VM slots:** `pylond` gives each registered VM a slot (0–63), the lowest
+  free one.
+- **Parked and woken bits:** a new mmapable array, `pylon_vm_vcpus`, holds
+  two `u64` bitmasks per slot.
+  - *parked:* written by the engine at the end of each sweep. A vCPU's bit
+    is set while it is `PARKED` with no core assigned. Only VMs that
+    registered with `wake_by_signal` get bits.
+  - *woken:* set by `scx_pylon` when such a vCPU is enqueued, and cleared
+    in `quiescent` or once it owns a CPU.
+- **Thread lookup:** `pylon_vcpu_dom` maps each vCPU thread to its VMM's
+  tgid, its VM's slot, and its vCPU index.
+- **Owned CPUs:** the owner entry's flags carry the owning VM's slot plus
+  one, in bits 16–31. `scx_pylon` finds a VM's CPUs by scanning the owner
+  entries.
+- **Queues:** each slot has a DSQ, `PYLON_VM_DSQ + slot`.
+- **When the VM owns no CPU,** a woken vCPU goes on the shared vCPU queue
+  and runs anywhere, as in P0. Each `dispatch` also checks one VM queue
+  in turn, and moves vCPUs whose VM no longer owns a CPU there, before the
+  stall watchdog fires.
+
 ### 4.4 ABI (version 3)
 
 - **`state` loses a writer.** The VMM can't write `RUNNING` after an
