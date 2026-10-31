@@ -1,6 +1,6 @@
 # Specification 08: Parking vCPUs Inside KVM
 
-> **Status:** `DRAFT`. Prototype first (§7); nothing here is implemented.
+> **Status:** `DRAFT`. Prototype first (§7). P0 is done (§7.1); P1–P3 aren't.
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 
@@ -227,6 +227,45 @@ x86_64 `sched_ext` host is needed for V1 and §3.4.
 
 Only after P3: an ABI v3 spec update, and a decision on whether this design
 replaces the park of spec 06 for KVM, or sits next to it.
+
+### 7.1 P0 result (2026-10-31)
+
+**Implementation** (`pylon/park-in-kvm-p0`):
+- The VMM parks inside KVM when `PYLON_PARK_IN_KVM=1`. Halt polling is
+  off.
+- It registers with `wake_by_signal`. `pylond` then signals the vCPU on
+  assignment, and again every 10 µs while the vCPU stays `PARKED`. A
+  signal that lands just before `KVM_RUN` would otherwise be lost.
+- The vCPU seccomp filter needed `KVM_SET_MP_STATE` and, on x86_64,
+  `KVM_GET_REGS`.
+
+**Run:**
+- *Host:* x86_64, Ubuntu `7.0.0-42`.
+- *VMs and `pylond`:* the §1 setup, two 4-vCPU guests with
+  `initial_active_vcpus=1` on 4 managed CPUs under `pylond --no-scx`.
+- *Guest load:* a busy loop pinned to every guest CPU, watched for 5
+  minutes.
+- *Also on the host:* an unrelated, unmanaged VM.
+
+| | Park in the VMM | Park in KVM (P0) |
+|---|---|---|
+| Cores, VM 1 / VM 2 | 1 / 3 | 2 / 2 |
+| Soft lockups, RCU stalls | VM 1: 16 and 2, then the guest stopped responding | none in either VM |
+| Guests alive at the end | VM 2 only | both, load average about 4 |
+
+**What it answers:**
+- **V2:** the guests resumed after every park and ran their load to the
+  end, with no errors in the guest log.
+- **V3:** every core assignment ran its vCPU. No assigned vCPU stayed
+  `PARKED`.
+- **V5, partly:** a parked vCPU with a busy pinned task wakes on its next
+  timer tick. It then never halts again, so it keeps running with no core
+  of its own, on any CPU, until it is assigned one. The guests' load
+  average of 4 on 2 cores each shows this. P1 has to bound it.
+- **Not answered:**
+  - V1 (§3.4 avoids the case, so the run never tested it);
+  - wake rates for idle or TLB-heavy guests;
+  - V4 and V6 (P1).
 
 ## 8. Alternatives Considered
 
