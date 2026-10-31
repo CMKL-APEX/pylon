@@ -6,7 +6,7 @@
 use std::error::Error;
 use std::io::{self, ErrorKind};
 use std::mem::{size_of, zeroed};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use log::{info, warn};
-use pylon_guest_agent::{GuestAgentStatus, LinuxProcfsReader, PylonGuestAgent, PylonMemoryBackend};
+use pylon_guest_agent::{
+    GuestAgentStatus, LinuxProcfsReader, PV_PYLON_DEVICE, PylonGuestAgent, PylonMemoryBackend,
+};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
@@ -110,6 +112,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend = if let Some(ref shm_path) = args.shm {
         info!("Connecting to Pylon shared memory file: {shm_path:?}");
         PylonMemoryBackend::from_file(shm_path)?
+    } else if Path::new(PV_PYLON_DEVICE).exists() {
+        // `pv-pylon` maps the page itself, and x86 then refuses a `/dev/mem` mapping of it.
+        info!("Connecting to Pylon shared memory via {PV_PYLON_DEVICE}");
+        PylonMemoryBackend::from_file(PV_PYLON_DEVICE)?
     } else {
         info!(
             "Connecting to Pylon shared memory via /dev/mem at GPA 0x{:X}",

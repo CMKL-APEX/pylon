@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright © 2026 CMKL-APEX
+
+# Kbuild output
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.module-common.o
+.tmp_versions/
