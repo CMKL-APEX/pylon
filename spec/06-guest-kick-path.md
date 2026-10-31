@@ -320,6 +320,62 @@ A Linux kernel module `pv-pylon` (`pylon/guest/linux/`) must:
 An Asterinas `ostd` integration follows the same contract. It is out of scope
 for the first cut.
 
+*As implemented (S5):* `pylon/guest/linux/pv_pylon.c`, with the page layout
+mirrored in `pv_pylon_abi.h` (static assertions pin the same offsets as
+`pylon-abi`). It covers items 1–4. Items 5 and 6 are still open.
+
+- **Binding (item 1).** The driver checks the BAR0 magic and ABI version, maps
+  the page from the GPA in BAR0 with `memremap(MEMREMAP_WB)`, and checks the
+  page's magic, version and `num_vcpus` against BAR0. One device per guest.
+- **Vectors (item 2): not managed.** `min(num_vcpus, nr_cpu_ids)` MSI-X
+  vectors. Linux CPU *i* is assumed to be vCPU *i*. Managed affinity was
+  dropped: Linux 7.0 spread vector 0 to CPU 1 of a two-CPU guest. Instead, a
+  CPU-hotplug callback pins vector *i* to CPU *i* whenever CPU *i* comes
+  online, and `IRQF_NOBALANCING` keeps irqbalance and userspace off it.
+- **Kick handler (item 3).** If `revoke_requested == 0`, the kick is
+  counted as spurious and ignored. Otherwise the handler sets vCPU *i*'s
+  *park pending* flag and wakes CPU *i*'s park thread. A kick can land on
+  another CPU in two cases:
+  - The vector's CPU is offline, so the kernel moved the vector away.
+  - On x86 without interrupt remapping, an affinity change takes effect at
+    the vector's next interrupt, so the first kick after binding still lands
+    on the old CPU.
+
+  Either way the handler forwards the kick to CPU *i*'s thread with an IPI.
+  It doesn't drop it.
+- **Safe point (item 4).** Each CPU has a `SCHED_FIFO` kthread
+  (`smpboot`, `pylon_park/<cpu>`). When it runs, the interrupted task was
+  preempted with preemption enabled and no spinlock held.
+  - The thread re-checks `revoke_requested`.
+  - If another task is runnable (`!single_task_running()`), it sets its
+    `stranded_work_bitmap` bit.
+  - With preemption disabled, it writes `state = PARKING` (Release) and then
+    `PARK_DOORBELL`.
+  - After the wake, it clears the stranded bit.
+- **`/dev/pylon`.** The module exposes the page as a misc device that can be
+  mapped. The guest agent prefers it to `/dev/mem`. On x86, PAT refuses the
+  agent's uncached `/dev/mem` mapping while the kernel holds a write-back
+  one; `/dev/pylon` maps the page write-back too. Spec 07 §4.4's long-term
+  plan wants that write-back mapping on aarch64 as well, but it hasn't been
+  run there yet.
+- **Counters.** `/sys/bus/pci/devices/<bdf>/stats` has `kicks`,
+  `spurious`, `forwarded`, `parks` and `stale`. `stale` counts park-thread
+  wakeups that found the revocation already gone.
+- **Kernels and license.**
+  - Builds warning-free (`W=1 -Werror`, checkpatch clean) against Ubuntu
+    6.8 and 7.0 headers. `vm_flags_set` needs Linux 6.3 or later.
+  - Licensed `GPL-2.0-only OR BSD-3-Clause`, so it can use GPL-only kernel
+    symbols (`smpboot`, `irq_set_affinity`) and stay compatible with the
+    repository's BSD-3-Clause.
+- **Not done:**
+  - Item 5, `in_critical_section`. The paravirt spinlock slow path and
+    IRQ entry/exit have no module hooks.
+  - Item 6, `vcpu_is_preempted`. `pv_ops` is read-only after init.
+
+  Both need guest kernel changes (Q3). Until then, `pylond` doesn't see
+  guest critical sections. It does no worse than before: it only ever sees
+  0.
+
 ---
 
 ## 5. Upstream Touch Points
@@ -389,7 +445,7 @@ Each step is a single reviewable commit series and leaves the tree working.
 | **S2** | `pylond`: stop writing `state`; `peer_cred` PID; `tgkill` on expiry; `ForceRevoking` substate; latency metric. | P5, P6 | `pylond` unit tests; `e2e_pylon` with a real KVM VM (no guest driver) shows forced parks with `state == PARKED` written by the VMM. |
 | **S3** | `pylon-guest-agent` telemetry-only; ABI v2 bump. | P4 | `cargo test -p pylon-guest-agent -p pylon-abi`. |
 | **S4** | `pylon-kick` device; the VMM's kick `EventFd`s become its MSI-X notifiers (§4.2). | P1 | Device unit tests (BAR0 decode); KVM test that writes a notifier and observes the interrupt in a guest. **Done (2026-10-31):** `cargo test -p vmm --features kvm --lib pylon_kick` covers the registers, config space, MSI-X table and a real-KVM check that a kick waits while its vector is disabled or masked and reaches KVM's irqfd once enabled. A Linux 7.0 guest booted with `--pylon` enumerated `1af4:10f0`, read the BAR0 registers, and, after enabling vector 0 by hand, logged `No irq handler for 0.208` for the kick that a stand-in `pylond` wrote. |
-| **S5** | `pv-pylon` Linux kmod (`pylon/guest/linux/`). | — | Guest integration test: cooperative parks with `forced_preempt_count == 0` under a spinlock-heavy workload. |
+| **S5** | `pv-pylon` Linux kmod (`pylon/guest/linux/`). | — | Guest integration test: cooperative parks with `forced_preempt_count == 0` under a spinlock-heavy workload. **Built (2026-10-31), §4.6 items 1–4; items 5–6 open.**<br>**Stand-in `pylond`:** 4-vCPU Ubuntu 6.8 and 7.0 guests, every CPU running two spinners and a `/proc` reader. A stand-in revoked each vCPU 200 times, with a deadline that never expires so only a cooperative park counts. On both kernels, all 800 revocations parked cooperatively, with `forced_preempt_count == 0`. The VMM cleared `revoke_requested` each time, and the stranded-work bit was set while parked and cleared after. A kick with no revocation pending was ignored. Taking a CPU offline and back, and unloading the module, worked with no kernel warnings. Kick to `PARKED` was about 20 µs at the median, as seen by a Python poller, which includes Python's own overhead (S6 will measure it properly).<br>**Real `pylond`:** two VMs, `initial_active_vcpus=1`. Kicks reached the guests and some revocations parked cooperatively. Neither the 8 µs grace nor a 200 µs test build gave a clean result: `pylond` stopped revoking after boot because of a separate issue that also happens without `pv-pylon` (spec 05 K7). The real-`pylond` check is still to do. |
 | **S6** | End-to-end latency: kick→`PARKED`, revoke→recipient running. | — | p99 within the 8 µs grace window on reference hardware. |
 
 S1–S3 don't depend on S4/S5 and can land first. After S3, every park is a
@@ -425,7 +481,9 @@ forced park, which is honest about the current state, and the metrics show it.
   vCPUs. This needs prototyping. The same issue already affects vCPUs that are
   initially parked (`vcpu_id >= initial_active_vcpus`).
 - **Q3:** The minimum guest kernel version, and the exact hook points for
-  `in_critical_section`.
+  `in_critical_section`. `pv-pylon` builds against Linux 6.3 and later
+  (`vm_flags_set`). The hook points are still open, and they need guest
+  kernel changes, not just the module (§4.6, items 5 and 6).
 - **Q4:** Whether the MSHV backend turns signal-interrupted runs into
   `VmExit::Ignore`.
 - **Q5:** The VMM reconnect protocol after a `pylond` restart.
