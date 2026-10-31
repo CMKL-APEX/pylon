@@ -96,6 +96,10 @@ macro_rules! impl_method {
 
 impl InterruptSourceGroup for MaybeMutInterruptSourceGroup {
     impl_method! {
+        fn enable(&self) -> interrupt::Result<()>;
+
+        fn disable(&self) -> interrupt::Result<()>;
+
         fn trigger(&self, index: InterruptIndex) -> interrupt::Result<()>;
 
         fn notifier(&self, index: InterruptIndex) -> Option<EventFd>;
@@ -646,6 +650,8 @@ impl MsixCap {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     struct TestInterruptSourceGroup;
@@ -700,5 +706,65 @@ mod tests {
             config.set_pba_bit(vector, true);
             assert_eq!(config.pba_entries, expected, "Clearing vector {vector}");
         }
+    }
+
+    /// Counts `enable()` and `disable()` calls.
+    #[derive(Default)]
+    struct CountingInterruptSourceGroup {
+        enabled: AtomicUsize,
+        disabled: AtomicUsize,
+    }
+
+    impl InterruptSourceGroup for CountingInterruptSourceGroup {
+        fn enable(&self) -> io::Result<()> {
+            self.enabled.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn disable(&self) -> io::Result<()> {
+            self.disabled.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn trigger(&self, _index: InterruptIndex) -> io::Result<()> {
+            unreachable!()
+        }
+
+        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
+            unreachable!()
+        }
+
+        fn update(
+            &self,
+            _index: InterruptIndex,
+            _config: InterruptSourceConfig,
+            _masked: bool,
+            _set_gsi: bool,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_gsi(&self) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_disabling_msix_disables_a_mutable_group() {
+        let group = Arc::new(Mutex::new(CountingInterruptSourceGroup::default()));
+        let mut config = MsixConfig::new(
+            2,
+            MaybeMutInterruptSourceGroup::Mutable(Arc::clone(&group) as _),
+            0,
+            None,
+        )
+        .unwrap();
+
+        config.set_msg_ctl(MSIX_ENABLE_MASK);
+        config.set_msg_ctl(0);
+
+        let group = group.lock().unwrap();
+        assert_eq!(group.disabled.load(Ordering::Relaxed), 1);
+        assert_eq!(group.enabled.load(Ordering::Relaxed), 0);
     }
 }
