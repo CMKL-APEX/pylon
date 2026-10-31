@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{fs, io, ptr, result};
+use std::{env, fs, io, ptr, result};
 
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{MsrEntry, msr_index};
@@ -48,6 +48,14 @@ pub const UNKNOWN_TSC_KHZ: u64 = 0;
 
 /// Default VM priority weight for Pylon core arbitration.
 pub const DEFAULT_PRIORITY_WEIGHT: u32 = 100;
+
+/// Environment variable that parks vCPUs inside KVM instead of in the VMM
+/// (`spec/08-park-in-kvm.md`, prototype step P0) when set to `1`.
+pub const PARK_IN_KVM_ENV: &str = "PYLON_PARK_IN_KVM";
+
+/// Halt polling limit, in nanoseconds, for a VM that parks vCPUs inside KVM. P0 turns halt
+/// polling off, so a parked vCPU costs no host CPU (`spec/08-park-in-kvm.md` §3.5).
+const PARK_IN_KVM_HALT_POLL_NS: u32 = 0;
 
 static GLOBAL_PYLON_STATE: Mutex<Option<Arc<PylonVmmState>>> = Mutex::new(None);
 
@@ -134,6 +142,8 @@ pub struct PylonConfig {
     pub priority_weight: u32,
     /// Identifier for this VM in `PylonHeader` and `pylond`.
     pub vm_id: u64,
+    /// Park vCPUs inside KVM (`spec/08-park-in-kvm.md`), from `PYLON_PARK_IN_KVM`.
+    pub park_in_kvm: bool,
 }
 
 impl PylonConfig {
@@ -214,6 +224,7 @@ impl PylonConfig {
             max_cores,
             priority_weight,
             vm_id,
+            park_in_kvm: env::var(PARK_IN_KVM_ENV).is_ok_and(|v| v == "1"),
         })
     }
 }
@@ -229,6 +240,11 @@ struct DaemonRegistrationPayload {
     /// `vmm/src/cpu.rs`). `pylond` sends it to a donor vCPU whose revocation deadline has
     /// passed, so the post-exit hook force-parks it (`spec/06-guest-kick-path.md` §4.4).
     kick_signal: i32,
+    /// Set when vCPUs park inside KVM: the wake `EventFd` can't reach a thread blocked in
+    /// `KVM_RUN`, so `pylond` also sends `kick_signal` when it assigns a core
+    /// (`spec/08-park-in-kvm.md` §3.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    wake_by_signal: bool,
 }
 
 /// VMM-side Pylon runtime state managing the 8,192-byte `PylonSharedPage` and per-vCPU park/wake primitives.
@@ -242,7 +258,12 @@ pub struct PylonVmmState {
     /// One per vCPU. `pylond` writes one to deliver a revocation; the `pylon-kick` device
     /// installs them as its MSI-X notifiers (`vmm/src/pylon_kick.rs`).
     kick_eventfds: Vec<EventFd>,
+    /// One per vCPU, written by `pylond` when it assigns a core. Non-blocking when vCPUs park
+    /// inside KVM: the vCPU thread then only checks it after an exit.
     wake_eventfds: Vec<EventFd>,
+    /// One per vCPU: whether it is parked inside KVM (`spec/08-park-in-kvm.md` §3.1). Only the
+    /// vCPU's own thread uses it.
+    parked_in_kvm: Vec<AtomicBool>,
     shutting_down: AtomicBool,
 }
 
@@ -337,11 +358,17 @@ impl PylonVmmState {
             slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
         }
 
+        let wake_flags = if config.park_in_kvm {
+            info!("Pylon: VM {} parks vCPUs inside KVM", config.vm_id);
+            libc::EFD_NONBLOCK
+        } else {
+            0
+        };
         let mut kick_eventfds = Vec::with_capacity(num_vcpus as usize);
         let mut wake_eventfds = Vec::with_capacity(num_vcpus as usize);
         for _ in 0..num_vcpus {
             kick_eventfds.push(EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdCreate)?);
-            wake_eventfds.push(EventFd::new(0).map_err(Error::EventFdCreate)?);
+            wake_eventfds.push(EventFd::new(wake_flags).map_err(Error::EventFdCreate)?);
         }
 
         let initial_active_vcpus = config
@@ -358,6 +385,7 @@ impl PylonVmmState {
             shared_page,
             kick_eventfds,
             wake_eventfds,
+            parked_in_kvm: (0..num_vcpus).map(|_| AtomicBool::new(false)).collect(),
             shutting_down: AtomicBool::new(false),
         });
 
@@ -390,6 +418,7 @@ impl PylonVmmState {
             max_cores: self.config.max_cores.unwrap_or(self.max_vcpus),
             priority_weight: self.config.priority_weight,
             kick_signal: SIGRTMIN(),
+            wake_by_signal: self.config.park_in_kvm,
         };
         let mut json_bytes =
             serde_json::to_vec(&payload).map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
@@ -563,14 +592,37 @@ impl PylonVmmState {
     /// Before parking, publishes the guest's armed TSC-deadline timer (`read_guest_timer`, in
     /// guest TSC) as `park_timer_deadline_tsc` in host TSC, so `pylond` can give the vCPU a
     /// core back when the timer is due: a parked vCPU's timer interrupt can't fire.
+    ///
+    /// With `park_in_kvm`, the vCPU parks inside KVM instead (`spec/08-park-in-kvm.md`):
+    /// `vcpu_op` sets it halted and this returns at once, so the run loop's next `KVM_RUN`
+    /// sleeps in KVM until an interrupt or a signal. An interrupt runs the guest again without
+    /// an exit; `state` stays `PARKED`. After each later exit, the vCPU becomes runnable and
+    /// `RUNNING` only once `pylond` has written its wake `EventFd`.
     pub fn check_and_park_vcpu(
         &self,
         vcpu_id: u32,
         read_guest_timer: impl FnOnce() -> Option<u64>,
+        mut vcpu_op: impl FnMut(KvmParkOp) -> bool,
     ) -> bool {
         let Some(slot) = self.vcpu_slot(vcpu_id) else {
             return false;
         };
+        let parked_in_kvm = &self.parked_in_kvm[vcpu_id as usize];
+
+        if parked_in_kvm.load(Ordering::Relaxed) {
+            // Parked inside KVM: an exit (an interrupt-woken guest, or `pylond`'s signal) only
+            // ends the park once `pylond` assigned a core (`spec/08-park-in-kvm.md` §3.3).
+            if self.wake_eventfds[vcpu_id as usize].read().is_err() {
+                return false;
+            }
+            if !vcpu_op(KvmParkOp::Run) {
+                warn!("Pylon: failed to make parked vCPU {vcpu_id} runnable");
+            }
+            parked_in_kvm.store(false, Ordering::Relaxed);
+            slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
+            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            return true;
+        }
 
         let revoke_requested = slot.revoke_requested.load(Ordering::Acquire);
         let decision = if slot.park_on_boot.load(Ordering::Acquire) != 0 && revoke_requested == 1 {
@@ -586,6 +638,15 @@ impl PylonVmmState {
             )
         };
         if decision == ParkDecision::Continue {
+            return false;
+        }
+        // A halted x86 vCPU with interrupts disabled wouldn't wake for an IPI, so it doesn't
+        // park yet; `pylond` signals again (`spec/08-park-in-kvm.md` §3.4). Halting happens
+        // before anything is published, so a failure leaves the vCPU running as if it hadn't
+        // been asked.
+        if self.config.park_in_kvm
+            && !(vcpu_op(KvmParkOp::InterruptsEnabled) && vcpu_op(KvmParkOp::Halt))
+        {
             return false;
         }
 
@@ -606,6 +667,11 @@ impl PylonVmmState {
         );
         slot.park_timer_deadline_tsc.store(timer, Ordering::Relaxed);
         slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+
+        if self.config.park_in_kvm {
+            parked_in_kvm.store(true, Ordering::Relaxed);
+            return true;
+        }
 
         self.park_vcpu(vcpu_id);
 
@@ -648,6 +714,58 @@ impl PylonVmmState {
         for wake_evt in &self.wake_eventfds {
             let _ = wake_evt.write(1);
         }
+    }
+}
+
+/// What `check_and_park_vcpu` asks of the vCPU when it parks inside KVM
+/// (`spec/08-park-in-kvm.md`). The caller runs it with the vCPU locked and returns whether it
+/// succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvmParkOp {
+    /// Whether the guest can take an interrupt now (`RFLAGS.IF` on x86_64; always on aarch64,
+    /// where `WFI` wakes on a masked interrupt).
+    InterruptsEnabled,
+    /// Make the vCPU halted (x86_64) or suspended (aarch64), so `KVM_RUN` sleeps until an
+    /// interrupt or a signal.
+    Halt,
+    /// Make the vCPU runnable again.
+    Run,
+}
+
+/// Runs `op` on `vcpu` (see `KvmParkOp`). Only KVM has the states it needs.
+pub fn kvm_park_op(vcpu: &dyn Vcpu, op: KvmParkOp) -> bool {
+    #[cfg(feature = "kvm")]
+    {
+        use hypervisor::MpState;
+        use hypervisor::kvm::{kvm_bindings, kvm_mp_state};
+
+        let mp_state = |mp_state| MpState::Kvm(kvm_mp_state { mp_state });
+        match op {
+            #[cfg(target_arch = "x86_64")]
+            KvmParkOp::InterruptsEnabled => {
+                const X86_EFLAGS_IF: u64 = 1 << 9;
+                vcpu.get_regs()
+                    .is_ok_and(|regs| regs.get_rflags() & X86_EFLAGS_IF != 0)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            KvmParkOp::InterruptsEnabled => true,
+            #[cfg(target_arch = "x86_64")]
+            KvmParkOp::Halt => vcpu
+                .set_mp_state(mp_state(kvm_bindings::KVM_MP_STATE_HALTED))
+                .is_ok(),
+            #[cfg(not(target_arch = "x86_64"))]
+            KvmParkOp::Halt => vcpu
+                .set_mp_state(mp_state(kvm_bindings::KVM_MP_STATE_SUSPENDED))
+                .is_ok(),
+            KvmParkOp::Run => vcpu
+                .set_mp_state(mp_state(kvm_bindings::KVM_MP_STATE_RUNNABLE))
+                .is_ok(),
+        }
+    }
+    #[cfg(not(feature = "kvm"))]
+    {
+        let _ = (vcpu, op);
+        false
     }
 }
 
@@ -840,6 +958,11 @@ pub fn setup_memory_region(
 ) -> result::Result<Option<Arc<GuestRegionMmap>>, Error> {
     if let Some(state) = global_state() {
         let region = state.setup_gpa_mapping(vm, next_memory_slot)?;
+        if state.config.park_in_kvm
+            && let Err(e) = vm.set_halt_poll_ns(PARK_IN_KVM_HALT_POLL_NS)
+        {
+            warn!("Pylon: failed to turn halt polling off: {e}");
+        }
         Ok(Some(region))
     } else {
         Ok(None)
@@ -855,10 +978,15 @@ pub fn on_vcpu_thread_start(vcpu_id: u32, read_guest_tsc: impl FnOnce() -> Optio
 }
 
 /// Hook for the `vcpu.run()` exit loop (`vmm/src/cpu.rs`): parks the vCPU thread if the
-/// guest asked to or a revocation's deadline passed. `read_guest_timer` is only called then.
-pub fn check_and_park_vcpu(vcpu_id: u32, read_guest_timer: impl FnOnce() -> Option<u64>) -> bool {
+/// guest asked to or a revocation's deadline passed. `read_guest_timer` is only called then,
+/// and `vcpu_op` only when parking inside KVM.
+pub fn check_and_park_vcpu(
+    vcpu_id: u32,
+    read_guest_timer: impl FnOnce() -> Option<u64>,
+    vcpu_op: impl FnMut(KvmParkOp) -> bool,
+) -> bool {
     if let Some(state) = global_state() {
-        state.check_and_park_vcpu(vcpu_id, read_guest_timer)
+        state.check_and_park_vcpu(vcpu_id, read_guest_timer, vcpu_op)
     } else {
         false
     }
@@ -1023,7 +1151,7 @@ mod tests {
         let slot1 = state.vcpu_slot(1).unwrap();
 
         // Nothing asked: an exit to userspace leaves it running.
-        assert!(!state.check_and_park_vcpu(1, || None));
+        assert!(!state.check_and_park_vcpu(1, || None, |_| false));
         assert_eq!(slot1.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
         assert_eq!(slot1.park_on_boot.load(Ordering::Acquire), 1);
 
@@ -1042,7 +1170,7 @@ mod tests {
         // deadline.
         slot1.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
         slot1.revoke_requested.store(1, Ordering::Release);
-        assert!(!state.check_and_park_vcpu(1, || None));
+        assert!(!state.check_and_park_vcpu(1, || None, |_| false));
         assert_eq!(slot1.revoke_requested.load(Ordering::Acquire), 1);
     }
 
@@ -1095,8 +1223,9 @@ mod tests {
     ) -> (bool, u64) {
         let slot = state.vcpu_slot(vcpu_id).unwrap();
         let state_worker = Arc::clone(state);
-        let worker =
-            thread::spawn(move || state_worker.check_and_park_vcpu(vcpu_id, || guest_timer));
+        let worker = thread::spawn(move || {
+            state_worker.check_and_park_vcpu(vcpu_id, || guest_timer, |_| false)
+        });
 
         for _ in 0..200 {
             if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
@@ -1127,6 +1256,83 @@ mod tests {
         state
     }
 
+    /// Like `running_vcpu0_state`, with vCPUs parking inside KVM.
+    fn running_vcpu0_state_parking_in_kvm(dir: &TempDir) -> Arc<PylonVmmState> {
+        let shm_path = dir.path().join("vm-park-kvm-pylon");
+        let mut cfg = PylonConfig::parse(&format!("shm={}", shm_path.display())).unwrap();
+        cfg.park_in_kvm = true;
+        let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.on_vcpu_thread_start(0, || None);
+        state
+    }
+
+    #[test]
+    fn test_park_in_kvm_halts_and_runs_again_only_when_woken() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        let mut ops = Vec::new();
+
+        // A forced park halts the vCPU and returns at once, without blocking.
+        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+        assert!(state.check_and_park_vcpu(
+            0,
+            || None,
+            |op| {
+                ops.push(op);
+                true
+            }
+        ));
+        assert_eq!(ops, [KvmParkOp::InterruptsEnabled, KvmParkOp::Halt]);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 0);
+        assert_eq!(slot0.forced_preempt_count.load(Ordering::Relaxed), 1);
+
+        // An exit while parked, from an interrupt-woken guest or a stray signal, changes nothing.
+        ops.clear();
+        assert!(!state.check_and_park_vcpu(
+            0,
+            || None,
+            |op| {
+                ops.push(op);
+                true
+            }
+        ));
+        assert!(ops.is_empty());
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+
+        // Once pylond has assigned a core, the next exit makes the vCPU runnable.
+        state.wake_vcpu(0).unwrap();
+        assert!(state.check_and_park_vcpu(
+            0,
+            || None,
+            |op| {
+                ops.push(op);
+                true
+            }
+        ));
+        assert_eq!(ops, [KvmParkOp::Run]);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_park_in_kvm_waits_while_interrupts_are_off_or_halting_fails() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+
+        for refused in [KvmParkOp::InterruptsEnabled, KvmParkOp::Halt] {
+            assert!(!state.check_and_park_vcpu(0, || None, |op| op != refused));
+            assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+            assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 1);
+            assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 0);
+        }
+    }
+
     #[test]
     fn test_revoke_within_grace_period_does_not_park() {
         let dir = TempDir::new().unwrap();
@@ -1134,13 +1340,13 @@ mod tests {
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // Without a revocation or a request from the guest, nothing happens.
-        assert!(!state.check_and_park_vcpu(0, || None));
+        assert!(!state.check_and_park_vcpu(0, || None, |_| false));
 
         // A revocation still inside its grace period leaves the vCPU running and the
         // request pending.
         slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
         slot0.revoke_requested.store(1, Ordering::Release);
-        assert!(!state.check_and_park_vcpu(0, || None));
+        assert!(!state.check_and_park_vcpu(0, || None, |_| false));
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
         assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 1);
         assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 0);
@@ -1427,7 +1633,11 @@ mod tests {
                     VmExit::Ignore => {}
                     other => panic!("unexpected VM exit: {other:?}"),
                 }
-                if state_vcpu.check_and_park_vcpu(0, || read_guest_tsc_deadline(vcpu.as_ref())) {
+                if state_vcpu.check_and_park_vcpu(
+                    0,
+                    || read_guest_tsc_deadline(vcpu.as_ref()),
+                    |_| false,
+                ) {
                     break;
                 }
             }
@@ -1563,7 +1773,11 @@ mod tests {
                         VmExit::Ignore => {}
                         other => panic!("unexpected VM exit: {other:?}"),
                     }
-                    state_vcpu.check_and_park_vcpu(0, || read_guest_tsc_deadline(vcpu.as_ref()));
+                    state_vcpu.check_and_park_vcpu(
+                        0,
+                        || read_guest_tsc_deadline(vcpu.as_ref()),
+                        |_| false,
+                    );
                 }
             });
 
@@ -1846,7 +2060,11 @@ mod tests {
             }
 
             // Post-exit hook: sees VCPU_STATE_PARKING, parks in VCPU_STATE_PARKED until woken via wake_eventfd.
-            assert!(state_vcpu.check_and_park_vcpu(0, || read_guest_tsc_deadline(vcpu.as_ref())));
+            assert!(state_vcpu.check_and_park_vcpu(
+                0,
+                || read_guest_tsc_deadline(vcpu.as_ref()),
+                |_| false
+            ));
 
             // Second KVM_RUN after host wakeup: guest writes runnable_threads = 7 and executes final HLT.
             match vcpu.run().expect("2nd vcpu.run failed") {
