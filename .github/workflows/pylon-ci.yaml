@@ -130,6 +130,31 @@ jobs:
           cargo build --release -p pylon-abi -p pylond -p scx-pylon -p cloud-hypervisor --features cloud-hypervisor/kvm
           cargo run --release -p pylond --bin pylon-bench -- --quick
 
+  # The pv-pylon guest kernel module (spec 06 S5), built against the runner's own kernel
+  # headers on both architectures. Booting it needs a guest and /dev/kvm, so that is a manual
+  # check (spec 06 §8).
+  pv-pylon:
+    name: pv-pylon guest module (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq build-essential "linux-headers-$(uname -r)"
+      - name: Build with warnings as errors
+        run: make -C pylon/guest/linux KCFLAGS=-Werror W=1
+      - name: checkpatch
+        run: |
+          "/lib/modules/$(uname -r)/build/scripts/checkpatch.pl" --no-tree -q \
+            -f pylon/guest/linux/pv_pylon.c pylon/guest/linux/pv_pylon_abi.h
+
   # The same crates on a native aarch64 runner (spec 07). The cross-compiling `quality` jobs in
   # ci.yaml can't build `pylond` and `scx-pylon` (libbpf needs the target's libelf), so this is
   # where aarch64 Pylon code is built and tested. Hosted arm64 runners have no /dev/kvm: tests
