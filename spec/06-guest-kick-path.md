@@ -483,7 +483,8 @@ forced park, which is honest about the current state, and the metrics show it.
   2026-10-31:* two 4-vCPU VMs on 4 managed CPUs settled at 2 cores each.
   Each VM's third managed vCPU then stayed parked, while guest tasks were
   pinned to it, and both guests reported soft lockups and RCU stalls
-  within 30 s. With the thread
+  within 30 s. `spec/08-park-in-kvm.md` proposes parking inside KVM, so
+  that KVM wakes a parked vCPU when an interrupt arrives (prototype first). With the thread
   blocked in userspace, the interrupt stays pending in the in-kernel LAPIC, and
   a sender doing `smp_call_function_many(wait=1)` spins until `pylond` wakes the
   target. Options: (a) the guest marks parked vCPUs preempted so PV TLB flush
