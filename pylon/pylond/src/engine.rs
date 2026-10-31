@@ -252,6 +252,16 @@ pub struct MatrixEngine {
     revoke_requested_tsc: [u64; MAX_PCPUS],
     /// TSC at which the donor was last signalled after its deadline passed (0 if not yet).
     revoke_signalled_tsc: [u64; MAX_PCPUS],
+    /// TSC at which the donor was first signalled (0 if not yet). `FORCE_HANDOFF_US` counts from
+    /// here, so a donor always has that long to park after a signal, even if the engine ran late.
+    revoke_first_signal_tsc: [u64; MAX_PCPUS],
+    /// The donor's `yield_count` when its revocation was requested. The donor has parked for the
+    /// revocation only once it is `PARKED` with a higher count: a vCPU that was just assigned is
+    /// still `PARKED` until its thread wakes.
+    revoke_yield_count: [u64; MAX_PCPUS],
+    /// When each vCPU (by VM index in the snapshot) that kept running after a handoff without park
+    /// was last signalled (0 if not yet).
+    orphan_signalled_tsc: [[u64; MAX_VCPUS]; MAX_TRACKED_VMS],
     /// Host TSC rate, used for VMs whose header gives none.
     host_tsc_khz: u64,
     has_timed_wait: bool,
@@ -285,6 +295,9 @@ impl MatrixEngine {
             assigned_yield_count: [0; MAX_PCPUS],
             revoke_requested_tsc: [0; MAX_PCPUS],
             revoke_signalled_tsc: [0; MAX_PCPUS],
+            revoke_first_signal_tsc: [0; MAX_PCPUS],
+            revoke_yield_count: [0; MAX_PCPUS],
+            orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
@@ -453,6 +466,7 @@ impl MatrixEngine {
         self.core_last_metered_tsc[pcpu] = now_tsc;
         self.revoke_requested_tsc[pcpu] = 0;
         self.revoke_signalled_tsc[pcpu] = 0;
+        self.revoke_first_signal_tsc[pcpu] = 0;
     }
 
     /// Executes one full 3-phase arbitration sweep at timestamp `now_tsc`.
@@ -477,6 +491,7 @@ impl MatrixEngine {
         // Phase 2: Progress In-Flight Revocations
         // =====================================================================
         self.progress_revocations_phase2(vms, vm_count, now_tsc);
+        self.signal_orphaned_donors(vms, vm_count, now_tsc);
 
         // =====================================================================
         // Phase 3: Match Hungry VMs with Idle or Donor Cores
@@ -653,15 +668,20 @@ impl MatrixEngine {
                     let donor_slot = &donor.shared_page().vcpus[donor_vcpu as usize];
                     let tsc_khz = self.tsc_khz_of(donor);
                     let signalled_tsc = self.revoke_signalled_tsc[pcpu];
+                    let first_signal_tsc = self.revoke_first_signal_tsc[pcpu];
                     // Only the VMM writes `PARKED`, once the donor thread has left `KVM_RUN`
-                    // (`spec/06-guest-kick-path.md` §3).
-                    let parked = donor_slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED;
+                    // (`spec/06-guest-kick-path.md` §3), and it bumps `yield_count` first. A
+                    // `PARKED` donor with the old count hasn't run since it was assigned.
+                    let parked = donor_slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
+                        && donor_slot.yield_count.load(Ordering::Acquire)
+                            != self.revoke_yield_count[pcpu];
 
                     if !parked && now_tsc >= deadline_tsc {
                         // Interrupt the donor's `KVM_RUN` so the VMM force-parks it, and repeat
                         // in case a signal lands while the thread is outside `KVM_RUN`.
                         if signalled_tsc == 0 {
                             donor.record_forced_preempt();
+                            self.revoke_first_signal_tsc[pcpu] = now_tsc;
                         }
                         if signalled_tsc == 0
                             || now_tsc
@@ -684,9 +704,10 @@ impl MatrixEngine {
                             );
                         }
                         true
-                    } else if now_tsc
-                        >= deadline_tsc
-                            .saturating_add(Self::us_to_cycles(FORCE_HANDOFF_US, tsc_khz))
+                    } else if first_signal_tsc != 0
+                        && now_tsc
+                            >= first_signal_tsc
+                                .saturating_add(Self::us_to_cycles(FORCE_HANDOFF_US, tsc_khz))
                     {
                         // The donor still hasn't parked; give the core away regardless and let
                         // `scx_pylon` preempt the donor thread. It parks at its next exit.
@@ -721,9 +742,48 @@ impl MatrixEngine {
                     self.core_last_metered_tsc[pcpu] = 0;
                     self.revoke_requested_tsc[pcpu] = 0;
                     self.revoke_signalled_tsc[pcpu] = 0;
+                    self.revoke_first_signal_tsc[pcpu] = 0;
                 }
             }
             pcpu += 1;
+        }
+    }
+
+    /// Keeps signalling donors whose core was handed over before they parked (a handoff
+    /// without park): such a vCPU still has `revoke_requested` set and its deadline passed, so
+    /// the VMM parks it at its next exit, but a guest that doesn't exit to userspace on its own
+    /// would otherwise keep running without a core.
+    fn signal_orphaned_donors(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
+        let mut i = 0usize;
+        while i < vm_count {
+            let vm = &vms[i];
+            let tsc_khz = self.tsc_khz_of(vm);
+            let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+            let mut vcpu = 0usize;
+            while vcpu < num_vcpus {
+                let slot = &vm.shared_page().vcpus[vcpu];
+                let deadline = slot.revoke_deadline_tsc.load(Ordering::Relaxed);
+                // A donor still being revoked keeps its `assigned_pcpu` until the handover, and
+                // boot parks (`park_on_boot`) are the control plane's to signal.
+                let orphaned = slot.revoke_requested.load(Ordering::Acquire) == 1
+                    && slot.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
+                    && slot.park_on_boot.load(Ordering::Acquire) == 0
+                    && slot.state.load(Ordering::Acquire) != VCPU_STATE_PARKED
+                    && deadline != 0
+                    && now_tsc >= deadline;
+                let last = &mut self.orphan_signalled_tsc[i][vcpu];
+                if !orphaned {
+                    *last = 0;
+                } else if *last == 0
+                    || now_tsc
+                        >= last.saturating_add(Self::us_to_cycles(REVOKE_RESIGNAL_US, tsc_khz))
+                {
+                    let _ = vm.signal_vcpu(vcpu);
+                    *last = now_tsc;
+                }
+                vcpu += 1;
+            }
+            i += 1;
         }
     }
 
@@ -773,6 +833,8 @@ impl MatrixEngine {
                 ));
 
                 let donor_slot = &donor_page.vcpus[donor_vcpu as usize];
+                self.revoke_yield_count[donor_pcpu] =
+                    donor_slot.yield_count.load(Ordering::Acquire);
                 donor_slot
                     .revoke_deadline_tsc
                     .store(deadline_tsc, Ordering::Relaxed);
@@ -788,6 +850,7 @@ impl MatrixEngine {
                 };
                 self.revoke_requested_tsc[donor_pcpu] = now_tsc;
                 self.revoke_signalled_tsc[donor_pcpu] = 0;
+                self.revoke_first_signal_tsc[donor_pcpu] = 0;
                 // Reserve the recipient vCPU so later matches don't pick it for another core.
                 recipient_vm.shared_page().vcpus[recipient_vcpu as usize]
                     .assigned_pcpu
@@ -915,14 +978,29 @@ impl MatrixEngine {
                 let over_desired = donor_eval.assigned_cores > donor_eval.desired_cores;
                 let over_fair_share =
                     donor_eval.assigned_cores > recipient.committed_cores().saturating_add(1);
-                let lower_urgency = donor_eval.urgency < recipient.urgency;
+                // Urgency alone may move a core only while the donor keeps at least as many
+                // cores per unit of weight as the recipient will have. Without that bound, the
+                // more urgent VM takes the donor below its fair share, `over_fair_share` takes
+                // the core back, and the two trade it on every sweep (spec 05 K7).
+                let donor_weight = u64::from(vms[donor_eval.vm_idx].priority_weight().max(1));
+                let recipient_weight = u64::from(vms[recipient.vm_idx].priority_weight().max(1));
+                let within_share = u64::from(recipient.committed_cores() + 1) * donor_weight
+                    <= u64::from(donor_eval.assigned_cores) * recipient_weight;
+                let lower_urgency = donor_eval.urgency < recipient.urgency && within_share;
                 let above_min = donor_eval.assigned_cores > donor_eval.min_cores;
 
                 let eligible = (above_min && (over_desired || over_fair_share || lower_urgency))
                     || (recipient.zero_core_wakeup && lower_urgency);
+                // A `PARKED` vCPU on an assigned core either hasn't woken since the assignment
+                // or has given the core back, which phase 0 reclaims. Revoking it would race
+                // its wakeup.
+                let donor_vm = &vms[donor_eval.vm_idx];
+                let donor_running = donor_vm.shared_page().vcpus[donor_vcpu as usize]
+                    .state
+                    .load(Ordering::Acquire)
+                    != VCPU_STATE_PARKED;
 
-                if eligible {
-                    let donor_vm = &vms[donor_eval.vm_idx];
+                if eligible && donor_running {
                     let in_cs = donor_vm.shared_page().vcpus[donor_vcpu as usize]
                         .in_critical_section
                         .load(Ordering::Acquire)

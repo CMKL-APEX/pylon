@@ -1297,7 +1297,10 @@ mod tests {
         assert_eq!(read_eventfd(donor.kick_fds[1].as_raw_fd()).unwrap(), 1);
 
         // Step 3: Cooperative handoff before deadline (now_tsc = 5,000 < 26,000).
-        // Donor vCPU 1 parks cooperatively.
+        // Donor vCPU 1 parks cooperatively; the VMM bumps `yield_count` before `PARKED`.
+        donor_page.vcpus[1]
+            .yield_count
+            .fetch_add(1, Ordering::Relaxed);
         donor_page.vcpus[1]
             .state
             .store(VCPU_STATE_PARKED, Ordering::Release);
@@ -1401,6 +1404,9 @@ mod tests {
             .revoke_requested
             .store(0, Ordering::Release);
         donor_page.vcpus[0]
+            .yield_count
+            .fetch_add(1, Ordering::Relaxed);
+        donor_page.vcpus[0]
             .state
             .store(VCPU_STATE_PARKED, Ordering::Release);
         engine.poll_once(40_000);
@@ -1423,6 +1429,131 @@ mod tests {
             VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[1].as_raw_fd()).unwrap(), 1);
+    }
+
+    /// Spec 05 K7: a vCPU that was just given a core stays `PARKED` until its thread wakes. It
+    /// must not be revoked meanwhile, and a `PARKED` donor counts as parked only once its
+    /// `yield_count` has moved since the revocation began.
+    #[test]
+    fn test_plane2_waking_vcpu_is_not_taken_for_a_parked_donor() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
+
+        let donor = build_test_vm(60, 1, 0, 1, 1);
+        let recipient = build_test_vm(70, 1, 0, 1, 100);
+        let donor_slot = &donor.handle.shared_page().vcpus[0];
+        let recipient_page = recipient.handle.shared_page();
+        donor
+            .handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, donor.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, recipient.handle.clone());
+
+        engine.poll_once(1_000);
+        assert_eq!(
+            engine.core_state(7),
+            CoreState::Assigned { vm_id: 60, vcpu: 0 }
+        );
+
+        // The recipient becomes hungry before the donor's thread has woken.
+        recipient_page
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        recipient_page
+            .telemetry
+            .head_wait_tsc
+            .store(1_500, Ordering::Release);
+        engine.poll_once(2_000);
+        assert_eq!(
+            engine.core_state(7),
+            CoreState::Assigned { vm_id: 60, vcpu: 0 }
+        );
+        assert_eq!(donor_slot.revoke_requested.load(Ordering::Acquire), 0);
+
+        // Once it runs, it can be revoked.
+        donor_slot
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        engine.poll_once(3_000);
+        assert!(matches!(engine.core_state(7), CoreState::Revoking { .. }));
+        assert_eq!(donor_slot.revoke_requested.load(Ordering::Acquire), 1);
+
+        // `PARKED` with the count from before the revocation isn't a park for it.
+        donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+        engine.poll_once(4_000);
+        assert!(matches!(engine.core_state(7), CoreState::Revoking { .. }));
+        assert_eq!(donor.handle.cooperative_yield_count(), 0);
+
+        // The VMM's park bumps `yield_count` before publishing `PARKED`.
+        donor_slot.revoke_requested.store(0, Ordering::Release);
+        donor_slot.yield_count.fetch_add(1, Ordering::Relaxed);
+        engine.poll_once(5_000);
+        assert_eq!(
+            engine.core_state(7),
+            CoreState::Assigned { vm_id: 70, vcpu: 0 }
+        );
+        assert_eq!(donor.handle.cooperative_yield_count(), 1);
+        assert_eq!(
+            donor_slot.assigned_pcpu.load(Ordering::Acquire),
+            PCPU_UNASSIGNED
+        );
+    }
+
+    /// Two VMs with 2 cores each both want 4. Returns how many of the 4 cores the engine starts
+    /// revoking when VM 80, whose backlog is older, has weight `weight_a` and VM 90 `weight_b`.
+    fn revocations_between_two_hungry_vms(weight_a: u32, weight_b: u32) -> usize {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let cores = [20, 21, 22, 23];
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &cores);
+        let a = build_test_vm(80, 4, 1, 4, weight_a);
+        let b = build_test_vm(90, 4, 1, 4, weight_b);
+        ControlPlane::publish_vm_handle(&snapshot, a.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, b.handle.clone());
+
+        for (rig, now) in [(&a, 1_000), (&b, 2_000)] {
+            let page = rig.handle.shared_page();
+            page.telemetry.runnable_threads.store(2, Ordering::Release);
+            engine.poll_once(now);
+            for slot in &page.vcpus[..2] {
+                slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            }
+            page.telemetry.runnable_threads.store(0, Ordering::Release);
+        }
+        for rig in [&a, &b] {
+            assert_eq!(
+                rig.handle.shared_page().vcpus[..2]
+                    .iter()
+                    .filter(|slot| slot.assigned_pcpu.load(Ordering::Acquire) != PCPU_UNASSIGNED)
+                    .count(),
+                2
+            );
+        }
+
+        for (rig, head_wait) in [(&a, 1_000), (&b, 2_500)] {
+            let telemetry = &rig.handle.shared_page().telemetry;
+            telemetry.runnable_threads.store(4, Ordering::Release);
+            telemetry.head_wait_tsc.store(head_wait, Ordering::Release);
+        }
+        engine.poll_once(3_000);
+        cores
+            .iter()
+            .filter(|&&pcpu| matches!(engine.core_state(pcpu), CoreState::Revoking { .. }))
+            .count()
+    }
+
+    /// Spec 05 K7: with equal weights, an even split is final. The more urgent VM used to take
+    /// a core, the other took it back as over its fair share, and so on every sweep.
+    #[test]
+    fn test_plane2_urgency_does_not_take_cores_below_the_weighted_share() {
+        assert_eq!(revocations_between_two_hungry_vms(100, 100), 0);
+        // Twice the weight is worth a third core.
+        assert_eq!(revocations_between_two_hungry_vms(200, 100), 1);
     }
 
     #[test]
@@ -1632,6 +1763,9 @@ mod tests {
         donor_slot
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
+        donor_slot
+            .revoke_deadline_tsc
+            .store(1_000, Ordering::Relaxed);
         donor_slot.revoke_requested.store(1, Ordering::Release);
 
         ControlPlane::publish_vm_handle(&snapshot, donor_handle.clone());
@@ -1661,7 +1795,11 @@ mod tests {
         assert_eq!(donor_handle.forced_preempt_count(), 1);
         assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
 
-        // The donor never parks: the core moves anyway, counted separately.
+        // The donor never parks: the core moves anyway, counted separately. The bound counts
+        // from the first signal, sent at the deadline here.
+        engine.poll_once(1_000 + 149_999);
+        assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
+        let before_handoff = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
         engine.poll_once(1_000 + 150_000);
         assert_eq!(
             engine.core_state(6),
@@ -1674,6 +1812,23 @@ mod tests {
             donor_slot.assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
         );
+
+        // The donor keeps running without a core, so it is signalled every 10 us until the VMM
+        // parks it (spec 05 K7).
+        wait_for_kick_signals(before_handoff + 1);
+        engine.poll_once(151_000 + 29_999);
+        engine.poll_once(151_000 + 30_000);
+        wait_for_kick_signals(before_handoff + 2);
+
+        donor_slot.revoke_requested.store(0, Ordering::Release);
+        donor_slot.yield_count.fetch_add(1, Ordering::Relaxed);
+        donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+        // Let signals already sent arrive before counting.
+        thread::sleep(Duration::from_millis(20));
+        let parked = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
+        engine.poll_once(151_000 + 90_000);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(KICK_SIGNALS_SEEN.load(Ordering::SeqCst), parked);
 
         stop.store(true, Ordering::SeqCst);
         vcpu_thread.join().unwrap();
