@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only OR BSD-3-Clause
 #
+# Copyright © 2026 CMKL-APEX
+#
 # Builds pv_pylon.ko against the headers of the running kernel, or of KDIR.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
