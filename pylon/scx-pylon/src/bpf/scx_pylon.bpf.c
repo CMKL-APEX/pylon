@@ -24,6 +24,10 @@
 #define MAX_SMT 8
 /* Most tasks examined per dispatch in the vCPU queue */
 #define MAX_VCPU_SCAN 32
+/* VM slots in pylon_vm_vcpus, and vCPUs per VM (MAX_TRACKED_VMS and MAX_VCPUS in pylond) */
+#define MAX_VM_SLOTS 64
+#define MAX_VM_VCPUS 64
+#define VM_SLOT_NONE 0xffffU
 
 /* sched_ext DSQ and slice constants */
 #define SCX_DSQ_FLAG_BUILTIN (1ULL << 63)
@@ -35,6 +39,11 @@
  * task (a per-CPU kworker, say) before the watchdog ejects scx_pylon.
  */
 #define PYLON_OWNER_SLICE SCX_SLICE_DFL
+/*
+ * Slice of a CPU shared between its owner and woken parked vCPUs of the same
+ * VM (spec 08 §4.3). Both get it in turns while any of them waits.
+ */
+#define PYLON_SHARE_SLICE 100000ULL /* 100 us */
 
 /* sched_ext kick flags */
 #define SCX_KICK_IDLE (1ULL << 0)
@@ -47,6 +56,8 @@
  */
 #define PYLON_HOST_DSQ 1024ULL
 #define PYLON_VCPU_DSQ 1025ULL
+/* DSQ PYLON_VM_DSQ + slot holds that VM's parked vCPUs that woke (spec 08 §4.3) */
+#define PYLON_VM_DSQ 2048ULL
 
 /*
  * Per-CPU claims: what a CPU runs or is about to run. CLAIM_NONE is idle,
@@ -78,6 +89,8 @@
 /* Flags in struct pcpu_owner_entry */
 #define PCPU_OWNER_FLAG_ACTIVE (1U << 0)
 #define PCPU_OWNER_FLAG_PREEMPT (1U << 1)
+/* Bits 16-31 of the flags: the owner's VM slot plus one, or 0 if unknown */
+#define PCPU_OWNER_SLOT_SHIFT 16
 
 struct pcpu_owner_entry {
     __u32 target_tid;
@@ -103,17 +116,43 @@ struct {
     __type(value, __u32);
 } pylon_smt_next SEC(".maps");
 
+/* A registered vCPU thread: its VMM's tgid, its VM's slot and its index. */
+struct pylon_vcpu_id {
+    __u32 tgid;
+    /* Slot in pylon_vm_vcpus, or VM_SLOT_NONE */
+    __u16 slot;
+    __u16 vcpu;
+};
+
 /*
- * vCPU threads of registered VMs, written by pylond: thread ID to the tgid of
- * its VMM process. A listed thread is a managed vCPU even before it owns a
- * pCPU, so it is SMT-isolated from the start.
+ * vCPU threads of registered VMs, written by pylond, by thread ID. A listed
+ * thread is a managed vCPU even before it owns a pCPU, so it is SMT-isolated
+ * from the start.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
     __type(key, __u32);
-    __type(value, __u32);
+    __type(value, struct pylon_vcpu_id);
 } pylon_vcpu_dom SEC(".maps");
+
+/*
+ * Per-VM vCPU bitmasks, by VM slot (spec 08 §4.3). pylond's engine sets a
+ * vCPU's `parked` bit while it is PARKED with no pCPU assigned; scx_pylon sets
+ * `woken` while such a vCPU is runnable, for pylond to read.
+ */
+struct pylon_vm_vcpus {
+    __u64 parked;
+    __u64 woken;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_VM_SLOTS);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __type(key, __u32);
+    __type(value, struct pylon_vm_vcpus);
+} pylon_vm_vcpus SEC(".maps");
 
 struct pylon_task_ctx {
     /* tgid of the VMM process once the task has owned a pCPU or pylond has
@@ -121,6 +160,9 @@ struct pylon_task_ctx {
     __u32 dom;
     /* Last pCPU found owned by the task */
     __s32 owned_cpu;
+    /* VM slot and vCPU index from pylon_vcpu_dom; slot is VM_SLOT_NONE until listed */
+    __u16 slot;
+    __u16 vcpu;
 };
 
 struct {
@@ -155,6 +197,8 @@ static char core_sched_fmt[] =
     "core scheduling turned on by pid %llu; this kernel lacks the sched_ext fixes";
 
 __u32 cpu_claim[MAX_PCPUS];
+/* Next VM queue that dispatch checks for vCPUs left without a CPU of their VM */
+__u32 vm_dsq_cursor;
 
 static __always_inline bool owns_cpu(struct task_struct *p, s32 cpu)
 {
@@ -236,6 +280,9 @@ static __always_inline void mark_owner(struct task_struct *p, s32 cpu)
     struct pylon_task_ctx *tctx =
         bpf_task_storage_get(&pylon_task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (tctx) {
+        if (!tctx->dom) {
+            tctx->slot = VM_SLOT_NONE;
+        }
         tctx->dom = (__u32)p->tgid;
         tctx->owned_cpu = cpu;
     }
@@ -249,21 +296,68 @@ static __always_inline void mark_owner(struct task_struct *p, s32 cpu)
 static struct pylon_task_ctx *vcpu_ctx(struct task_struct *p)
 {
     struct pylon_task_ctx *tctx = task_ctx(p);
-    if (tctx && tctx->dom) {
+    if (tctx && tctx->dom && tctx->slot != VM_SLOT_NONE) {
         return tctx;
     }
 
+    /* Not listed yet, or tagged as an owner before pylond listed it. */
     __u32 tid = (__u32)p->pid;
-    __u32 *tgid = bpf_map_lookup_elem(&pylon_vcpu_dom, &tid);
-    if (!tgid || *tgid != (__u32)p->tgid) {
-        return NULL;
+    struct pylon_vcpu_id *id = bpf_map_lookup_elem(&pylon_vcpu_dom, &tid);
+    if (!id || id->tgid != (__u32)p->tgid) {
+        return tctx && tctx->dom ? tctx : NULL;
     }
-    tctx = bpf_task_storage_get(&pylon_task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-    if (tctx) {
-        tctx->dom = *tgid;
+    if (!tctx) {
+        tctx = bpf_task_storage_get(&pylon_task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (!tctx) {
+            return NULL;
+        }
         tctx->owned_cpu = -1;
     }
+    tctx->dom = id->tgid;
+    tctx->slot = id->slot;
+    tctx->vcpu = id->vcpu;
     return tctx;
+}
+
+static __always_inline struct pylon_vm_vcpus *vm_vcpus(__u16 slot)
+{
+    __u32 key = slot;
+    return slot < MAX_VM_SLOTS ? bpf_map_lookup_elem(&pylon_vm_vcpus, &key) : NULL;
+}
+
+/* Whether pylond reports @tctx's vCPU as parked with no pCPU assigned. */
+static __always_inline bool is_parked(const struct pylon_task_ctx *tctx)
+{
+    struct pylon_vm_vcpus *v = vm_vcpus(tctx->slot);
+    return v && tctx->vcpu < MAX_VM_VCPUS &&
+           (*(volatile __u64 *)&v->parked & (1ULL << tctx->vcpu));
+}
+
+/* Sets or clears @tctx's vCPU's bit in its VM's woken mask. */
+static __always_inline void set_woken(const struct pylon_task_ctx *tctx, bool woken)
+{
+    struct pylon_vm_vcpus *v = vm_vcpus(tctx->slot);
+    if (!v || tctx->vcpu >= MAX_VM_VCPUS) {
+        return;
+    }
+    __u64 bit = 1ULL << tctx->vcpu;
+    if (woken) {
+        __sync_fetch_and_or(&v->woken, bit);
+    } else if (*(volatile __u64 *)&v->woken & bit) {
+        __sync_fetch_and_and(&v->woken, ~bit);
+    }
+}
+
+/* The VM slot of @cpu's owner, from its owner entry, or VM_SLOT_NONE. */
+static __always_inline __u16 owner_slot(s32 cpu)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS) {
+        return VM_SLOT_NONE;
+    }
+    __u32 key = (__u32)cpu;
+    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
+    __u32 slot = entry && entry->target_tid ? entry->flags >> PCPU_OWNER_SLOT_SHIFT : 0;
+    return slot ? (__u16)(slot - 1) : VM_SLOT_NONE;
 }
 
 static __always_inline __u32 read_claim(s32 cpu)
@@ -402,6 +496,22 @@ static void kick_idle_cpu(struct task_struct *p, __u32 claim)
 }
 
 /*
+ * A CPU that @slot's VM owns and @p may run on, or -1. A woken parked vCPU
+ * of that VM shares it with the owner (spec 08 §4.3).
+ */
+static s32 vm_owned_cpu(struct task_struct *p, __u16 slot)
+{
+    s32 cpu;
+
+    bpf_for(cpu, 0, MAX_PCPUS) {
+        if (owner_slot(cpu) == slot && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+            return cpu;
+        }
+    }
+    return -1;
+}
+
+/*
  * scx_ops.select_cpu(p, prev_cpu, wake_flags)
  *
  * If task p->pid matches a target_tid in pylon_pcpu_owners, return that
@@ -455,9 +565,31 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
     } else if (owns_cpu(p, cpu)) {
         mark_owner(p, cpu);
+        if ((tctx = task_ctx(p))) {
+            set_woken(tctx, false);
+        }
         scx_bpf_dsq_insert(p, (u64)cpu, PYLON_OWNER_SLICE, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-    } else if ((tctx = vcpu_ctx(p))) {
+    } else if ((tctx = vcpu_ctx(p)) && !owns_cpu(p, tctx->owned_cpu) && is_parked(tctx)) {
+        /*
+         * A parked vCPU that KVM woke for an interrupt (spec 08 §3.2). It
+         * runs only on a CPU its VM owns, in turns with the owner. Its woken
+         * bit tells pylond it wants to run. A VM that owns no CPU has nowhere
+         * to share, so its vCPU runs as any other managed vCPU.
+         */
+        s32 shared = vm_owned_cpu(p, tctx->slot);
+
+        set_woken(tctx, true);
+        if (shared >= 0) {
+            scx_bpf_dsq_insert(p, PYLON_VM_DSQ + tctx->slot, PYLON_SHARE_SLICE, enq_flags);
+            scx_bpf_kick_cpu(shared, SCX_KICK_PREEMPT);
+        } else {
+            scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
+            if (fenced(cpu, tctx->dom, false)) {
+                kick_idle_cpu(p, tctx->dom);
+            }
+        }
+    } else if (tctx) {
         scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
         if (owns_cpu(p, tctx->owned_cpu)) {
             scx_bpf_kick_cpu(tctx->owned_cpu, SCX_KICK_PREEMPT);
@@ -484,11 +616,11 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /*
- * Dispatches this pCPU's owner if it is queued, and moves any other task
- * left on the owner queue (its ownership changed) to the queue it now
- * belongs on. Returns true if the owner was dispatched.
+ * Dispatches this pCPU's owner with @slice if it is queued, and moves any
+ * other task left on the owner queue (its ownership changed) to the queue it
+ * now belongs on. Returns true if the owner was dispatched.
  */
-static bool dispatch_owner(s32 cpu)
+static bool dispatch_owner(s32 cpu, u64 slice)
 {
     struct task_struct *p;
     __u32 tid = owner_tid(cpu);
@@ -496,9 +628,9 @@ static bool dispatch_owner(s32 cpu)
 
     bpf_for_each(scx_dsq, p, (u64)cpu, 0) {
         if (!dispatched && tid != 0 && (__u32)p->pid == tid) {
-            if (claim_cpu(cpu, task_claim(p), true) &&
-                scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
-                dispatched = true;
+            if (claim_cpu(cpu, task_claim(p), true)) {
+                scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, slice);
+                dispatched = scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
             }
             continue;
         }
@@ -543,6 +675,49 @@ static bool dispatch_vcpu(s32 cpu)
 }
 
 /*
+ * Dispatches the first woken parked vCPU of @slot's VM to @cpu, which that VM
+ * owns, for one PYLON_SHARE_SLICE. They share the VM's domain claim.
+ */
+static bool dispatch_woken(s32 cpu, __u16 slot)
+{
+    struct task_struct *p;
+
+    bpf_for_each(scx_dsq, p, PYLON_VM_DSQ + slot, 0) {
+        if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+            continue;
+        }
+        return claim_cpu(cpu, task_claim(p), true) &&
+               scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+    }
+    return false;
+}
+
+/*
+ * Checks one VM queue per call, in turn. If that VM no longer owns a CPU
+ * (its last core was revoked, or it has none), no CPU would drain the queue
+ * and the watchdog would eject scx_pylon, so its vCPUs move to the vCPU
+ * queue and run as in P0.
+ */
+static void rescue_stranded_vcpus(void)
+{
+    __u32 slot = __sync_fetch_and_add(&vm_dsq_cursor, 1) % MAX_VM_SLOTS;
+    struct task_struct *p;
+    s32 cpu;
+
+    if (scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) <= 0) {
+        return;
+    }
+    bpf_for(cpu, 0, MAX_PCPUS) {
+        if (owner_slot(cpu) == slot) {
+            return;
+        }
+    }
+    bpf_for_each(scx_dsq, p, PYLON_VM_DSQ + slot, 0) {
+        scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, PYLON_VCPU_DSQ, 0);
+    }
+}
+
+/*
  * scx_ops.dispatch(cpu, prev)
  *
  * Run the pCPU's owner if it is queued. Otherwise run a vCPU thread or a
@@ -553,7 +728,24 @@ SEC("struct_ops/pylon_dispatch")
 void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
 {
     exit_on_core_sched();
-    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu)) {
+    rescue_stranded_vcpus();
+
+    /*
+     * While woken parked vCPUs of the owner's VM wait, the owner and they
+     * take PYLON_SHARE_SLICE turns: a woken vCPU goes first after the owner
+     * ran, and the owner after a woken vCPU (spec 08 §4.3).
+     */
+    __u16 slot = owner_slot(cpu);
+    bool share = slot < MAX_VM_SLOTS && scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) > 0;
+
+    if (share && prev && (__u32)prev->pid == owner_tid(cpu) && dispatch_woken(cpu, slot)) {
+        return;
+    }
+    if (cpu >= 0 && cpu < MAX_PCPUS &&
+        dispatch_owner(cpu, share ? PYLON_SHARE_SLICE : PYLON_OWNER_SLICE)) {
+        return;
+    }
+    if (share && dispatch_woken(cpu, slot)) {
         return;
     }
     if (dispatch_vcpu(cpu)) {
@@ -602,6 +794,22 @@ void BPF_PROG(pylon_running, struct task_struct *p)
 }
 
 /*
+ * scx_ops.quiescent(p, deq_flags)
+ *
+ * A vCPU that stops being runnable (it halted again, or was parked again)
+ * no longer counts as woken.
+ */
+SEC("struct_ops/pylon_quiescent")
+void BPF_PROG(pylon_quiescent, struct task_struct *p, u64 deq_flags)
+{
+    struct pylon_task_ctx *tctx = task_ctx(p);
+
+    if (tctx && tctx->dom) {
+        set_woken(tctx, false);
+    }
+}
+
+/*
  * scx_ops.update_idle(cpu, idle)
  *
  * An idle CPU claims nothing.
@@ -625,6 +833,12 @@ s32 BPF_PROG(pylon_init)
     }
     for (u32 cpu = 0; cpu < nr_cpus && cpu < MAX_PCPUS; cpu++) {
         ret = scx_bpf_create_dsq(cpu, -1);
+        if (ret) {
+            return ret;
+        }
+    }
+    for (u32 slot = 0; slot < MAX_VM_SLOTS; slot++) {
+        ret = scx_bpf_create_dsq(PYLON_VM_DSQ + slot, -1);
         if (ret) {
             return ret;
         }
@@ -693,6 +907,7 @@ struct sched_ext_ops pylon_ops = {
     .enqueue = (void *)pylon_enqueue,
     .dispatch = (void *)pylon_dispatch,
     .running = (void *)pylon_running,
+    .quiescent = (void *)pylon_quiescent,
     .update_idle = (void *)pylon_update_idle,
     .init = (void *)pylon_init,
     .exit = (void *)pylon_exit,

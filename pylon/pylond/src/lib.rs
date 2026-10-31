@@ -192,6 +192,102 @@ impl Default for PcpuOwnerTable {
     }
 }
 
+/// A started vCPU thread of a registered VM, as `scx_pylon` lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VcpuThread {
+    /// The VMM's process ID.
+    pub pid: u32,
+    /// The VM's slot (`VM_SLOT_NONE` if it has none).
+    pub vm_slot: u16,
+    /// The vCPU's index.
+    pub vcpu: u16,
+}
+
+/// VM slots for `VmVcpusTable`, as in `scx_pylon`'s `pylon_vm_vcpus`.
+pub const MAX_VM_SLOTS: usize = scx_pylon::MAX_VM_SLOTS;
+
+/// No VM slot: the VM gets no `VmVcpusTable` entry.
+pub const VM_SLOT_NONE: u16 = u16::MAX;
+
+/// One VM's vCPU bitmasks in `pylon_vm_vcpus` (`spec/08-park-in-kvm.md` §4.3).
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct VmVcpusEntry {
+    /// vCPUs that are `PARKED` with no core assigned. Written by the engine.
+    pub parked: AtomicU64,
+    /// Parked vCPUs that KVM woke and that are runnable. Written by `scx_pylon`.
+    pub woken: AtomicU64,
+}
+
+const _: () = {
+    assert!(size_of::<VmVcpusEntry>() * MAX_VM_SLOTS == scx_pylon::VM_VCPUS_MAP_BYTES);
+};
+
+/// Per-VM vCPU bitmasks shared with `scx_pylon`, indexed by VM slot: a memory-mapped
+/// `pylon_vm_vcpus`, or heap memory when `scx_pylon` isn't attached.
+#[derive(Debug)]
+pub struct VmVcpusTable {
+    storage: VmVcpusStorage,
+}
+
+#[derive(Debug)]
+enum VmVcpusStorage {
+    Mmap(MmapMut),
+    Heap(Box<[VmVcpusEntry; MAX_VM_SLOTS]>),
+}
+
+impl VmVcpusTable {
+    /// Creates a heap-backed table, for `--no-scx` and tests.
+    pub fn new_in_memory() -> Self {
+        Self {
+            storage: VmVcpusStorage::Heap(Box::new(from_fn(|_| VmVcpusEntry::default()))),
+        }
+    }
+
+    /// Wraps a mapping of `pylon_vm_vcpus`.
+    pub fn from_mmap(mmap: MmapMut) -> Result<Self, Error> {
+        let expected = scx_pylon::VM_VCPUS_MAP_BYTES;
+        if mmap.len() < expected {
+            return Err(Error::SharedMemoryTooSmall {
+                actual: mmap.len(),
+                expected,
+            });
+        }
+        Ok(Self {
+            storage: VmVcpusStorage::Mmap(mmap),
+        })
+    }
+
+    /// The entry of VM slot `slot`, or `None` if out of range.
+    #[inline]
+    pub fn entry(&self, slot: u16) -> Option<&VmVcpusEntry> {
+        let slot = slot as usize;
+        if slot >= MAX_VM_SLOTS {
+            return None;
+        }
+        Some(match &self.storage {
+            VmVcpusStorage::Mmap(mmap) => {
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "mmap(2) returns page-aligned memory"
+                )]
+                // SAFETY: `mmap` is page-aligned and at least `MAX_VM_SLOTS` entries long, and
+                // `VmVcpusEntry` is two `AtomicU64`s with no invalid bit patterns.
+                unsafe {
+                    &*mmap.as_ptr().cast::<VmVcpusEntry>().add(slot)
+                }
+            }
+            VmVcpusStorage::Heap(entries) => &entries[slot],
+        })
+    }
+}
+
+impl Default for VmVcpusTable {
+    fn default() -> Self {
+        Self::new_in_memory()
+    }
+}
+
 /// JSON payload sent by Cloud Hypervisor over `/run/pylon/pylond.sock` during VM registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRegistrationRequest {
@@ -294,6 +390,9 @@ struct VmHandleInner {
     park_latency: ParkLatencyHistogram,
     kick_signal: Option<i32>,
     wake_by_signal: bool,
+    /// Slot in `VmVcpusTable` and `scx_pylon`'s per-VM queues, given when the handle is
+    /// published (`VM_SLOT_NONE` until then, or if all are taken).
+    vm_slot: AtomicU32,
     /// The registering VMM's PID from `SO_PEERCRED` (0 if unknown), and a pidfd that keeps
     /// referring to that process, so a reused PID is never signalled.
     vmm_pid: i32,
@@ -384,6 +483,7 @@ impl VmHandle {
                 kick_irqfds,
                 wake_eventfds,
                 host_rx_doorbell: AtomicU32::new(0),
+                vm_slot: AtomicU32::new(u32::from(VM_SLOT_NONE)),
             }),
         };
 
@@ -530,21 +630,40 @@ impl VmHandle {
         Some(ret != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
     }
 
-    /// The VM's started vCPU threads, as `(thread ID, VMM process ID)` pairs. Empty when the
-    /// registration had no PID.
-    pub fn vcpu_threads(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+    /// The VM's started vCPU threads, by thread ID. Empty when the registration had no PID.
+    pub fn vcpu_threads(&self) -> impl Iterator<Item = (u32, VcpuThread)> + '_ {
         let pid = u32::try_from(self.inner.vmm_pid).unwrap_or(0);
         let num_vcpus = if pid == 0 {
             0
         } else {
             (self.inner.num_vcpus as usize).min(MAX_VCPUS)
         };
+        let vm_slot = self.vm_slot();
         self.shared_page().vcpus[..num_vcpus]
             .iter()
-            .filter_map(move |slot| {
+            .enumerate()
+            .filter_map(move |(vcpu, slot)| {
                 let tid = slot.host_tid.load(Ordering::Acquire);
-                (tid != 0).then_some((tid, pid))
+                (tid != 0).then_some((
+                    tid,
+                    VcpuThread {
+                        pid,
+                        vm_slot,
+                        vcpu: vcpu as u16,
+                    },
+                ))
             })
+    }
+
+    /// The VM's slot in `VmVcpusTable`, or `VM_SLOT_NONE`.
+    #[inline]
+    pub fn vm_slot(&self) -> u16 {
+        u16::try_from(self.inner.vm_slot.load(Ordering::Relaxed)).unwrap_or(VM_SLOT_NONE)
+    }
+
+    /// Sets the VM's slot. `ControlPlane::publish_vm_handle` gives each VM the lowest free one.
+    pub fn set_vm_slot(&self, slot: u16) {
+        self.inner.vm_slot.store(u32::from(slot), Ordering::Relaxed);
     }
 
     /// Whether the VMM parks vCPUs inside KVM, so waking one takes a signal as well as the wake
@@ -877,12 +996,12 @@ mod tests {
         MatrixEngine, calibrate_tsc_khz, detect_timed_wait, pause_cycles, read_tsc,
     };
 
-    struct TestVmRig {
+    pub(crate) struct TestVmRig {
         req: VmRegistrationRequest,
         shm_fd: OwnedFd,
         kick_fds: Vec<OwnedFd>,
         wake_fds: Vec<OwnedFd>,
-        handle: VmHandle,
+        pub(crate) handle: VmHandle,
     }
 
     fn create_memfd_shared_page(vm_id: u64, num_vcpus: u32, tsc_khz: u64) -> OwnedFd {
@@ -915,7 +1034,7 @@ mod tests {
         owned
     }
 
-    fn build_test_vm(
+    pub(crate) fn build_test_vm(
         vm_id: u64,
         num_vcpus: u32,
         min_cores: u32,
@@ -1572,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vcpu_threads_lists_started_vcpus_with_the_vmm_pid() {
+    fn test_vcpu_threads_lists_started_vcpus_with_the_vmm_pid_and_slot() {
         let rig = build_test_vm(50, 3, 0, 1, 1);
         // Only vCPU 1's thread has started.
         for (idx, slot) in rig.handle.shared_page().vcpus[..3].iter().enumerate() {
@@ -1597,9 +1716,17 @@ mod tests {
         .unwrap()
         .with_vmm_pid(process_id() as i32)
         .unwrap();
+        handle.set_vm_slot(7);
         assert_eq!(
             handle.vcpu_threads().collect::<Vec<_>>(),
-            [(4242, process_id())]
+            [(
+                4242,
+                VcpuThread {
+                    pid: process_id(),
+                    vm_slot: 7,
+                    vcpu: 1
+                }
+            )]
         );
     }
 
@@ -1716,6 +1843,68 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// The engine publishes the parked, unassigned vCPUs of VMs that park inside KVM, and
+    /// marks the cores it gives them with the VM's slot (spec 08 §4.3).
+    #[test]
+    fn test_plane2_publishes_parked_vcpus_and_owner_slots() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6])
+            .with_vm_vcpus(Arc::clone(&vm_vcpus));
+
+        // VM 70 parks inside KVM; VM 71 parks in the VMM. All their vCPUs start PARKED.
+        let mut kvm = build_test_vm(70, 3, 0, 3, 1);
+        kvm.req.wake_by_signal = true;
+        let kvm_handle = VmHandle::new(
+            &kvm.req,
+            kvm.shm_fd.try_clone().unwrap(),
+            kvm.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            kvm.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let vmm = build_test_vm(71, 2, 0, 2, 1);
+        ControlPlane::publish_vm_handle(&snapshot, kvm_handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, vmm.handle.clone());
+        let (kvm_slot, vmm_slot) = (kvm_handle.vm_slot(), vmm.handle.vm_slot());
+        let parked = |slot: u16| vm_vcpus.entry(slot).unwrap().parked.load(Ordering::Acquire);
+        kvm_handle.shared_page().vcpus[1]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+
+        engine.poll_once(1_000);
+        assert_eq!(parked(kvm_slot), 0b101);
+        assert_eq!(parked(vmm_slot), 0);
+
+        // A core for VM 70's vCPU 0: its bit clears, and the owner entry names the slot.
+        kvm_handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        engine.poll_once(2_000);
+        assert_eq!(
+            engine.core_state(6),
+            CoreState::Assigned { vm_id: 70, vcpu: 0 }
+        );
+        assert_eq!(
+            pcpu_owners.read_owner(6).1 >> scx_pylon::PCPU_OWNER_SLOT_SHIFT,
+            u32::from(kvm_slot) + 1
+        );
+        assert_eq!(parked(kvm_slot), 0b100);
+
+        // VM 70 leaves: its mask is cleared.
+        snapshot.store(Arc::new(vec![vmm.handle.clone()]));
+        engine.poll_once(3_000);
+        assert_eq!(parked(kvm_slot), 0);
     }
 
     static WAKE_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);

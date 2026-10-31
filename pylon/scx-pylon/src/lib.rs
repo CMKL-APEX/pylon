@@ -34,6 +34,19 @@ pub const SMT_NEXT_MAP_NAME: &str = "pylon_smt_next";
 /// Name of the hash map of registered vCPU threads inside `scx_pylon.bpf.o`.
 pub const VCPU_DOM_MAP_NAME: &str = "pylon_vcpu_dom";
 
+/// Name of the `BPF_F_MMAPABLE` array of per-VM parked and woken vCPU bitmasks inside
+/// `scx_pylon.bpf.o` (`spec/08-park-in-kvm.md` §4.3).
+pub const VM_VCPUS_MAP_NAME: &str = "pylon_vm_vcpus";
+
+/// VM slots in `pylon_vm_vcpus`.
+pub const MAX_VM_SLOTS: usize = 64;
+
+/// Byte size of `pylon_vm_vcpus`: one `parked` and one `woken` `u64` per VM slot.
+pub const VM_VCPUS_MAP_BYTES: usize = MAX_VM_SLOTS * 2 * size_of::<u64>();
+
+/// Shift of the owner's VM slot plus one in a `pylon_pcpu_owners` entry's flags (0: unknown).
+pub const PCPU_OWNER_SLOT_SHIFT: u32 = 16;
+
 /// Name of the core scheduling guard array map inside `scx_pylon.bpf.o`.
 pub const GUARD_MAP_NAME: &str = "pylon_guard";
 
@@ -366,10 +379,16 @@ pub struct VcpuDomainMap {
 }
 
 impl VcpuDomainMap {
-    /// Lists thread `tid` as a vCPU of the VMM process `tgid`.
-    pub fn insert(&self, tid: u32, tgid: u32) -> Result<()> {
+    /// Lists thread `tid` as vCPU `vcpu` of the VMM process `tgid`, whose VM has slot
+    /// `slot` in `pylon_vm_vcpus` (`u16::MAX` if none).
+    pub fn insert(&self, tid: u32, tgid: u32, slot: u16, vcpu: u16) -> Result<()> {
+        // struct pylon_vcpu_id { __u32 tgid; __u16 slot; __u16 vcpu; }
+        let mut value = [0u8; 8];
+        value[..4].copy_from_slice(&tgid.to_ne_bytes());
+        value[4..6].copy_from_slice(&slot.to_ne_bytes());
+        value[6..].copy_from_slice(&vcpu.to_ne_bytes());
         self.map
-            .update(&tid.to_ne_bytes(), &tgid.to_ne_bytes(), MapFlags::ANY)
+            .update(&tid.to_ne_bytes(), &value, MapFlags::ANY)
             .map_err(Error::Bpf)
     }
 
@@ -635,6 +654,26 @@ impl ScxPylonUserspace {
         Ok(VcpuDomainMap { map: handle })
     }
 
+    /// Memory-maps `pylon_vm_vcpus` (`VM_VCPUS_MAP_BYTES`, shared). The mapping keeps the map
+    /// alive, so it outlives `self`.
+    pub fn vm_vcpus_mmap(&self) -> Result<MmapMut> {
+        let map = self
+            ._obj
+            .maps()
+            .find(|m| m.name() == VM_VCPUS_MAP_NAME)
+            .ok_or(Error::MissingMap {
+                map_name: VM_VCPUS_MAP_NAME,
+            })?;
+        // SAFETY: `map` is the loaded `BPF_F_MMAPABLE` array `pylon_vm_vcpus` of
+        // `VM_VCPUS_MAP_BYTES` bytes, and every access to it goes through 64-bit atomics.
+        unsafe {
+            MmapOptions::new()
+                .len(VM_VCPUS_MAP_BYTES)
+                .map_mut(map.as_fd().as_raw_fd())
+                .map_err(Error::Io)
+        }
+    }
+
     /// Consumes the loader handle and returns the `PcpuOwnerMap`, the struct_ops
     /// `Link`, the guard's `Link`s, and the `Object`.
     pub fn into_parts(self) -> (PcpuOwnerMap, Link, Vec<Link>, Object) {
@@ -653,6 +692,30 @@ mod tests {
         assert_eq!(size_of::<PcpuOwnerEntry>(), 8);
         assert_eq!(offset_of!(PcpuOwnerEntry, target_tid), 0);
         assert_eq!(offset_of!(PcpuOwnerEntry, flags), 4);
+    }
+
+    /// The layouts that `pylond` writes into match the BPF object (spec 08 §4.3).
+    #[test]
+    fn test_vm_vcpus_and_vcpu_dom_map_layout() {
+        let open_obj = ScxPylonUserspace::open_embedded().unwrap();
+        let layout = |name: &str| {
+            let map = open_obj.maps().find(|m| m.name() == name).unwrap();
+            let raw_map = map.as_libbpf_object().as_ptr();
+            // SAFETY: `raw_map` is a valid non-null `bpf_map` pointer owned by `open_obj`.
+            unsafe {
+                (
+                    libbpf_sys::bpf_map__value_size(raw_map) as usize,
+                    libbpf_sys::bpf_map__max_entries(raw_map) as usize,
+                    libbpf_sys::bpf_map__map_flags(raw_map),
+                )
+            }
+        };
+        let (value_size, max_entries, flags) = layout(VM_VCPUS_MAP_NAME);
+        assert_eq!(value_size * max_entries, VM_VCPUS_MAP_BYTES);
+        assert_eq!(max_entries, MAX_VM_SLOTS);
+        assert_ne!(flags & BPF_F_MMAPABLE, 0);
+        // struct pylon_vcpu_id { tgid: u32, slot: u16, vcpu: u16 }
+        assert_eq!(layout(VCPU_DOM_MAP_NAME).0, 8);
     }
 
     #[test]

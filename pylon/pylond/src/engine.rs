@@ -20,7 +20,8 @@ use pylon_abi::clock::{architectural_counter_khz, read_counter};
 use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonVcpuSlot, VCPU_STATE_PARKED};
 
 use crate::{
-    CoreState, Error, MAX_PCPUS, PcpuOwnerTable, VmHandle, VmSnapshot, pin_current_thread_to_core,
+    CoreState, Error, MAX_PCPUS, PcpuOwnerTable, VM_SLOT_NONE, VmHandle, VmSnapshot, VmVcpusTable,
+    pin_current_thread_to_core,
 };
 
 /// Maximum number of concurrent VMs evaluated per stack-allocated sweep in Plane 2.
@@ -271,6 +272,10 @@ pub struct MatrixEngine {
     engine_cpu: usize,
     /// SMT sibling ring: the next CPU on the same core, or the CPU itself.
     smt_next: [u16; MAX_PCPUS],
+    /// Per-VM parked vCPU bitmasks shared with `scx_pylon` (`spec/08-park-in-kvm.md` §4.3).
+    vm_vcpus: Arc<VmVcpusTable>,
+    /// VM slots whose `parked` mask the engine last left non-zero.
+    parked_slots: u64,
 }
 
 impl MatrixEngine {
@@ -302,6 +307,8 @@ impl MatrixEngine {
             revoke_yield_count: [0; MAX_PCPUS],
             wake_signalled_tsc: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
+            vm_vcpus: Arc::new(VmVcpusTable::new_in_memory()),
+            parked_slots: 0,
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
@@ -337,6 +344,13 @@ impl MatrixEngine {
 
     /// Explicitly sets the `CoreState` of physical core `pcpu_id` (used for setup/testing).
     #[inline]
+    /// Publishes parked vCPUs in `table`, the `scx_pylon` map, instead of heap memory.
+    #[must_use]
+    pub fn with_vm_vcpus(mut self, table: Arc<VmVcpusTable>) -> Self {
+        self.vm_vcpus = table;
+        self
+    }
+
     pub fn set_core_state(&mut self, pcpu_id: usize, state: CoreState) {
         if pcpu_id < MAX_PCPUS {
             self.core_states[pcpu_id] = state;
@@ -458,7 +472,14 @@ impl MatrixEngine {
     fn assign_pcpu(&mut self, pcpu: usize, vm: &VmHandle, vcpu: u8, now_tsc: u64) {
         let slot = &vm.shared_page().vcpus[vcpu as usize];
         let tid = slot.host_tid.load(Ordering::Acquire);
-        self.pcpu_owners.write_owner(pcpu, tid, 0);
+        // `scx_pylon` finds the CPUs a VM owns by the slot in the flags (spec 08 §4.3).
+        let vm_slot = vm.vm_slot();
+        let flags = if vm_slot == VM_SLOT_NONE {
+            0
+        } else {
+            (u32::from(vm_slot) + 1) << scx_pylon::PCPU_OWNER_SLOT_SHIFT
+        };
+        self.pcpu_owners.write_owner(pcpu, tid, flags);
         self.assigned_yield_count[pcpu] = slot.yield_count.load(Ordering::Acquire);
         slot.assigned_pcpu.store(pcpu as u8, Ordering::Release);
         let _ = vm.wake_vcpu(vcpu as usize);
@@ -508,6 +529,9 @@ impl MatrixEngine {
         // Phase 3: Match Hungry VMs with Idle or Donor Cores
         // =====================================================================
         self.match_hungry_vms_phase3(vms, vm_count, now_tsc);
+
+        // Last, so the cores assigned in this sweep are already out of the masks.
+        self.publish_parked_vcpus(vms, vm_count);
     }
 
     fn reclaim_idle_assigned_cores(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
@@ -830,6 +854,47 @@ impl MatrixEngine {
             }
             pcpu += 1;
         }
+    }
+
+    /// Tells `scx_pylon` which vCPUs of VMs that park inside KVM are `PARKED` with no core
+    /// assigned, so it keeps them on their own VM's cores when KVM wakes them
+    /// (`spec/08-park-in-kvm.md` §4.3). Masks of VMs that left are cleared.
+    fn publish_parked_vcpus(&mut self, vms: &[VmHandle], vm_count: usize) {
+        let mut seen = 0u64;
+        let mut i = 0usize;
+        while i < vm_count {
+            let vm = &vms[i];
+            let slot = vm.vm_slot();
+            if let Some(entry) = self.vm_vcpus.entry(slot) {
+                let mut mask = 0u64;
+                if vm.wake_by_signal() {
+                    let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+                    for (vcpu, v) in vm.shared_page().vcpus[..num_vcpus].iter().enumerate() {
+                        if v.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
+                            && v.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
+                        {
+                            mask |= 1 << vcpu;
+                        }
+                    }
+                }
+                if entry.parked.load(Ordering::Relaxed) != mask {
+                    entry.parked.store(mask, Ordering::Release);
+                }
+                if mask != 0 {
+                    seen |= 1 << slot;
+                }
+            }
+            i += 1;
+        }
+        let mut stale = self.parked_slots & !seen;
+        while stale != 0 {
+            let slot = stale.trailing_zeros() as u16;
+            if let Some(entry) = self.vm_vcpus.entry(slot) {
+                entry.parked.store(0, Ordering::Release);
+            }
+            stale &= stale - 1;
+        }
+        self.parked_slots = seen;
     }
 
     fn match_hungry_vms_phase3(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
