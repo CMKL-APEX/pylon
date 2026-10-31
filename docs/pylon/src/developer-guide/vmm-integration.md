@@ -17,7 +17,7 @@ pub struct PylonVmmState {
     initial_active_vcpus: u32,
     shm_file: File,
     shared_page: NonNull<PylonSharedPage>,   // mmap of shm_file, MAP_SHARED
-    kick_eventfds: Vec<EventFd>,             // non-blocking, sent to pylond
+    kick_eventfds: Vec<EventFd>,             // sent to pylond; pylon-kick's MSI-X notifiers
     wake_eventfds: Vec<EventFd>,             // blocking, parked threads read them
     shutting_down: AtomicBool,
 }
