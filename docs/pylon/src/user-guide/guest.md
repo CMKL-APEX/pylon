@@ -20,8 +20,9 @@ explains what the guest sees and how it reports demand.
 ## Reporting demand: pylon-guest-agent
 
 `pylon-guest-agent` is a small userspace daemon for Linux guests. It
-maps the shared page through `/dev/mem` and, every interval (50 ms by
-default):
+maps the shared page through `/dev/pylon` when the `pv-pylon` module is
+loaded, or through `/dev/mem` otherwise. Every interval (50 ms by
+default), it:
 
 - writes the number of runnable threads, from the fourth field of
   `/proc/loadavg` (or `procs_running` in `/proc/stat`), to
@@ -54,11 +55,52 @@ agree to park one. Older versions of the agent marked revoked vCPUs as
 parked while they kept running; this version doesn't, and a mismatched
 agent refuses to start against a version-2 page.
 
-## Limits of a userspace agent
+## Parking cooperatively: the pv-pylon module
 
-The agent samples at a fixed interval, so demand reaches `pylond`
-milliseconds late. Pylon's microsecond handoff needs the signal sooner
-than that. A userspace process also can't see kernel critical sections,
-can't react to a revocation on the vCPU being revoked, and can't run at
-all when every vCPU is parked. The planned `pv-pylon` guest kernel
-module covers these ([Enhancements](../developer-guide/enhancements.md)).
+A userspace process can't stop a vCPU, so the agent can't agree to give
+a core back. `pv-pylon` is a Linux kernel module that can
+(`pylon/guest/linux/`). It binds to the `pylon-kick` PCI device
+(`1af4:10f0`, a provisional ID) that the VMM adds to every `--pylon` VM.
+
+When `pylond` revokes a vCPU, the module parks it at the next safe
+point: no spinlock held, preemption enabled. The vCPU then gives up its
+core cooperatively, instead of being stopped by a signal once the grace
+period runs out.
+
+Build it against the guest kernel's headers, and load it as root:
+
+```bash
+make -C pylon/guest/linux KDIR=/lib/modules/<guest-kernel>/build
+# in the guest:
+insmod pv_pylon.ko
+cat /sys/bus/pci/drivers/pv_pylon/*/stats
+```
+
+Start `pylon-guest-agent` after loading the module. It then maps the
+page through `/dev/pylon`; on x86 a `/dev/mem` mapping fails once the
+module has the page mapped.
+
+`stats` counts:
+- the kicks received;
+- kicks that arrived with nothing to do (`spurious`);
+- kicks passed on to another CPU (`forwarded`);
+- the parks;
+- wakeups that found the revocation already handled (`stale`).
+
+The module needs Linux 6.3 or later. It has been run on Ubuntu 6.8 and
+7.0 guests on x86_64; aarch64 is untested.
+
+## Limits
+
+- **Demand is reported late.** The agent samples at a fixed interval,
+  so demand reaches `pylond` milliseconds late, and Pylon's microsecond
+  handoff needs it sooner.
+- **No critical-section or preemption reporting.** `pv-pylon` doesn't
+  yet report kernel critical sections, and doesn't make other vCPUs
+  treat a parked vCPU as preempted. Both need guest kernel changes, not
+  just a module.
+- **The cooperative park is slow.** On the hosts tested so far it is
+  slower than `pylond`'s 8 µs grace period. Until the latency work
+  (S6), many revocations still end in a forced park.
+
+[Enhancements](../developer-guide/enhancements.md) has the design.

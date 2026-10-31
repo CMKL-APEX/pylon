@@ -21,23 +21,33 @@ planned. It reflects `main` as of 2026-10-29. The detailed tracker is
 
 ## What doesn't work yet
 
-**Cooperative revocation.** Taking a core from a VM that is still
-running works, but never cooperatively yet:
+**Cooperative revocation, within the grace period.** Taking a core
+from a VM that is still running works. The parts for doing it
+cooperatively now exist:
+- the `pylon-kick` device interrupts the donor vCPU;
+- the `pv-pylon` guest module parks it at a safe point.
 
-- The per-vCPU "kick" that should interrupt the donor vCPU isn't
-  connected to a guest interrupt, so the guest isn't told about a
-  revocation.
-- No guest component writes `PARKING` to agree to park.
+Neither is fast enough yet:
 
-The host side is in place. The VMM parks a vCPU only when the guest
-asks to (by writing `PARKING`) or when the revocation's deadline has
-passed, so it no longer parks a vCPU that may hold a guest lock. When a
-deadline passes, `pylond` signals the donor's thread so the VMM parks it,
-and moves the core once it has. So today **every contended revocation
-is a forced preemption**: expect `forced_preemptions` to grow, and
-`handoffs_without_park` to stay at zero. The design for the cooperative
-part is in [Enhancements](developer-guide/enhancements.md) (spec 06,
-tracks 4 and 5).
+- **Too slow for the grace period.** Kick to park takes about 20 µs on
+  the hosts tested so far (measured coarsely), more than `pylond`'s
+  8 µs grace period. Many revocations still end in a forced park.
+- **No module, no cooperation.** A guest without `pv-pylon` never
+  cooperates.
+- **Not run end to end.** A `pylond` issue with boot-time parks (spec 05
+  K7) keeps the real `pylond` from being tested with the module.
+
+The host side is in place:
+- The VMM parks a vCPU only when the guest asks to (by writing
+  `PARKING`) or when the revocation's deadline has passed. It no longer
+  parks a vCPU that may hold a guest lock.
+- When a deadline passes, `pylond` signals the donor's thread so the VMM
+  parks it, and moves the core once it has.
+
+Expect `forced_preemptions` to grow, and `handoffs_without_park` to stay
+at zero. The design is in
+[Enhancements](developer-guide/enhancements.md) (spec 06, tracks 4 and
+5).
 
 **Other gaps** (tracked as K1–K6 in the status tracker's
 [known issues](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md#known-issues-other)):
@@ -76,7 +86,7 @@ tracks 4 and 5).
 | Track | Work | State |
 |---|---|---|
 | 4 | Fix the VMM's park decision, make `pylond` force a clean park on deadline, add the `pylon-kick` device that delivers revocations as interrupts, measure handoff latency. | S1–S4 done ([spec 06](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md)); latency (S6) not measured |
-| 5 | `pv-pylon` Linux guest kernel module: report critical sections, park at safe points. | Designed (spec 06 §4.6); not started |
+| 5 | `pv-pylon` Linux guest kernel module: report critical sections, park at safe points. | Parking at safe points, the stranded-work bit and `/dev/pylon` are built. Critical sections and `vcpu_is_preempted` need guest kernel changes |
 | — | Move the shared page from the fixed address into a PCI BAR. | Follow-up in spec 06 §9 |
 | — | Run an aarch64 guest with Pylon end to end (the host side is done: [spec 07](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md)). | In progress |
 | — | Snapshot, restore and migration support. | Not designed; refused with `--pylon` until then |

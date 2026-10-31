@@ -23,6 +23,10 @@ new file) and add the smallest possible call in the upstream file.
 | `scx-pylon` | [`pylon/scx-pylon`](https://github.com/CMKL-APEX/pylon/tree/main/pylon/scx-pylon) | ~880 | Library + binary `scx_pylon` | The BPF scheduler, its build script and loader. |
 | `pylon-guest-agent` | [`pylon/pylon-guest-agent`](https://github.com/CMKL-APEX/pylon/tree/main/pylon/pylon-guest-agent) | ~620 | Library + binary | The userspace guest daemon. |
 
+`pylon/guest/linux/` isn't a crate: it is the `pv-pylon` Linux kernel
+module, in C, built with Kbuild (`make -C pylon/guest/linux`). See [the
+guest module](#pylonguestlinux) below.
+
 Line counts include tests and were taken on 2026-10-29.
 
 ## Files
@@ -61,6 +65,18 @@ Line counts include tests and were taken on 2026-10-29.
 |---|---|
 | `src/lib.rs` | `PylonMemoryBackend` (`/dev/mem` or file), `TelemetryReader` and its `/proc` implementation, `PylonGuestAgent`. |
 | `src/main.rs` | The binary. |
+
+### `pylon/guest/linux`
+
+| File | Contents |
+|---|---|
+| `pv_pylon.c` | The `pv-pylon` module: the PCI driver for `pylon-kick`, the kick handler, the per-CPU park threads, `/dev/pylon` and the `stats` attribute. |
+| `pv_pylon_abi.h` | The shared page and BAR0 registers in C, with static assertions on the same offsets `pylon-abi` pins. |
+| `Kbuild`, `Makefile` | Out-of-tree module build; `KDIR` selects the kernel headers. |
+
+It follows kernel coding style (tabs; `checkpatch.pl` clean), and is
+licensed `GPL-2.0-only OR BSD-3-Clause`, so it can use GPL-only kernel
+symbols.
 
 ## VMM hook points
 

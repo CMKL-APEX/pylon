@@ -103,10 +103,25 @@ handler, so `KVM_RUN` returns `EINTR`, the KVM backend reports
 ### The guest kernel module
 
 `pv-pylon` (`pylon/guest/linux/`, spec 06 §4.6) binds to the device,
-maps the page, allocates the vectors, keeps `in_critical_section` up to
-date, and in its interrupt handler arranges to park at the next safe
-point. It also has to make other vCPUs treat parked ones as preempted.
-`pylon-guest-agent` is already telemetry-only (S3).
+maps the page, and allocates one MSI-X vector per vCPU.
+
+- **Vectors.** Vector *i* is pinned to CPU *i* whenever that CPU comes
+  online. The kernel's managed spreading isn't used, because it doesn't
+  keep that order.
+- **The kick.** The kick handler wakes CPU *i*'s `SCHED_FIFO` park
+  thread. A kick that lands on another CPU is forwarded to that thread,
+  not dropped.
+- **The park.** The thread runs at a safe point. It sets the vCPU's
+  `stranded_work_bitmap` bit if other tasks are waiting, writes
+  `state = PARKING`, then writes the doorbell. The vCPU stops at that
+  write until `pylond` wakes it.
+- **`/dev/pylon`.** The module exposes the page there, and
+  `pylon-guest-agent` maps it instead of `/dev/mem`. The agent has been
+  telemetry-only since S3.
+
+Still to do: keeping `in_critical_section` up to date, and making other
+vCPUs treat parked ones as preempted. Neither can be done from a module;
+both need guest kernel changes (spec 06 Q3).
 
 ## Implementation steps
 
@@ -116,14 +131,21 @@ point. It also has to make other vCPUs treat parked ones as preempted.
 | S2 | `pylond`: stop writing `state`; `SO_PEERCRED`; `tgkill` on deadline; wait for `PARKED`; latency metric. **Done.** | P5, P6 (`pylond`'s part) |
 | S3 | Guest agent telemetry-only; ABI version 2. **Done.** | P4, P6 |
 | S4 | The `pylon-kick` device; the VMM's kick `eventfd`s become its MSI-X notifiers. **Done.** | P1 |
-| S5 | The `pv-pylon` kernel module. | — |
+| S5 | The `pv-pylon` kernel module. **Built**, except critical sections and `vcpu_is_preempted`. | — |
 | S6 | End-to-end latency: kick to `PARKED`, and revocation to recipient running. | — |
 
-S1–S4 have landed. A kick now reaches the guest as an interrupt once a
-driver enables the vector, but no guest driver exists until S5, so every
-contended revocation still ends in a forced park. That's honest about
-where things stand, and the metrics show it. S4 uses a provisional PCI
-ID (Q1).
+S1–S4 have landed and S5 is built. With `pv-pylon` loaded, a revoked
+vCPU parks itself.
+
+- **Stand-in `pylond`.** All 800 test revocations parked cooperatively
+  on Ubuntu 6.8 and 7.0 guests.
+- **Not inside the grace period yet.** Kick to `PARKED` takes about
+  20 µs, measured coarsely. That's longer than the 8 µs grace, so under
+  the real `pylond` many revocations still end in a forced park. S6 is
+  about that latency.
+- **The real-`pylond` run** is blocked by a separate `pylond` issue
+  with boot parks (spec 05 K7).
+- **S4 uses a provisional PCI ID** (Q1).
 
 ## Open questions
 

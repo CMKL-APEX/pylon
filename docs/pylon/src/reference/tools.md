@@ -30,7 +30,7 @@ pylon-guest-agent [--gpa <addr>] [--shm <path>] [--interval-us <n>] [--status] [
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--gpa <addr>` | `0xFEDF0000` | Guest-physical address of the page, mapped through `/dev/mem`. |
+| `--gpa <addr>` | `0xFEDF0000` | Guest-physical address of the page, mapped through `/dev/mem`. Not used when `/dev/pylon` exists (the `pv-pylon` module is loaded): the agent maps that instead. |
 | `--shm <path>` | none | Map this file instead of `/dev/mem`. For testing on the host. |
 | `--interval-us <n>` | `50000` | Time between updates, in microseconds. |
 | `--status` | | Print the header and every vCPU slot, and exit. |
