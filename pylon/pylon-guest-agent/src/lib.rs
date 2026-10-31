@@ -107,6 +107,9 @@ impl TelemetryReader for LinuxProcfsReader {
     }
 }
 
+/// The shared page as the `pv-pylon` guest kernel module exposes it (`pylon/guest/linux`).
+pub const PV_PYLON_DEVICE: &str = "/dev/pylon";
+
 /// Backing memory handle for the Pylon shared page.
 pub enum PylonMemoryBackend {
     Mmap(memmap2::MmapMut),
