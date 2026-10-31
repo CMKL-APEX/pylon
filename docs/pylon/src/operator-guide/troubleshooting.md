@@ -54,7 +54,8 @@ donor's vCPU thread and the VMM parks it.
 ## Handoffs without park are above zero
 
 `pylond` gave a core away because the donor hadn't parked 50 µs after
-its deadline, although it was signalled. Check:
+it was first signalled. `pylond` keeps signalling that donor until it
+parks. Check:
 
 - **The VMM is a version from before `kick_signal`.** Such a VMM
   registers without one, so `pylond` can't signal it. Upgrade it.

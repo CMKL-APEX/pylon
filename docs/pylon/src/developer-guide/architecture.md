@@ -105,7 +105,7 @@ When no managed CPU is idle, the engine takes one from a donor:
    CPU to the recipient as in the fast path. If the deadline passes
    first, it signals the donor's thread with the VMM's `kick_signal`
    until the VMM force-parks it, and gives up waiting 50 µs after the
-   deadline ([phase 2](arbitration.md#phase-2-revocations-in-flight)).
+   first signal ([phase 2](arbitration.md#phase-2-revocations-in-flight)).
 4. **Kernel.** With `scx_pylon`, `dispatch` on that CPU sees a new owner
    and preempts the donor thread if it's still there.
 

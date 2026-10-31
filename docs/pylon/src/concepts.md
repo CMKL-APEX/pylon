@@ -52,8 +52,9 @@ vCPU that owns it. `scx_pylon` reads that table.
 **cooperative yield**. When the deadline passes, the revocation counts
 as a **forced preemption**: `pylond` signals the donor's thread so the
 VMM parks it, and hands the core over once it has. If the donor still
-hasn't parked 50 µs later, `pylond` hands the core over anyway, which is
-counted as a **handoff without park**. See [Status and roadmap](status.md)
+hasn't parked 50 µs after the first signal, `pylond` hands the core over
+anyway, which is counted as a **handoff without park**. It keeps
+signalling that donor until it parks. See [Status and roadmap](status.md)
 for how much of this path works today.
 
 **Critical section.** The guest sets a vCPU's `in_critical_section`
