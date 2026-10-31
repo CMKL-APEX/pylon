@@ -34,8 +34,10 @@ Neither is fast enough yet:
   8 µs grace period. Many revocations still end in a forced park.
 - **No module, no cooperation.** A guest without `pv-pylon` never
   cooperates.
-- **Not run end to end.** A `pylond` issue with boot-time parks (spec 05
-  K7) keeps the real `pylond` from being tested with the module.
+- **A vCPU can stay parked indefinitely.** Nothing yet wakes a parked
+  vCPU that the guest still has work or IPIs for. When a VM gets fewer
+  cores than it has managed vCPUs for a long time, the guest can report
+  soft lockups (spec 06 Q2).
 
 The host side is in place:
 - The VMM parks a vCPU only when the guest asks to (by writing

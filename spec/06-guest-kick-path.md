@@ -268,8 +268,16 @@ runs as the same UID as the VMM or holds `CAP_KILL`. Using `tgkill` instead of
   parks. A signal that arrives while the vCPU thread is outside `KVM_RUN`
   (handling an exit) is consumed by the no-op handler and doesn't stop the
   next guest entry, so a single signal can be lost.
-- **`FORCE_HANDOFF_US` (50 µs) counts from the deadline**, which is when the
-  first signal is sent.
+- **`FORCE_HANDOFF_US` (50 µs) counts from the first signal.** That is
+  usually the deadline. When the engine runs late, it would otherwise hand
+  the core over in the same sweep that first signals the donor (spec 05
+  K7).
+- **A donor parks for the revocation** only when it is `PARKED` with a
+  `yield_count` higher than at the request. A vCPU that was just assigned
+  is still `PARKED` until its thread wakes. Such a vCPU is also never
+  chosen as a donor.
+- **After a handoff without park**, `pylond` keeps signalling the donor
+  every `REVOKE_RESIGNAL_US` until the VMM parks it.
 - **Counting.** A revocation is counted as forced once, when its deadline
   passes, and as cooperative when the donor parked before that. The park
   latency (request to `PARKED`) goes into a per-VM histogram,
@@ -445,7 +453,7 @@ Each step is a single reviewable commit series and leaves the tree working.
 | **S2** | `pylond`: stop writing `state`; `peer_cred` PID; `tgkill` on expiry; `ForceRevoking` substate; latency metric. | P5, P6 | `pylond` unit tests; `e2e_pylon` with a real KVM VM (no guest driver) shows forced parks with `state == PARKED` written by the VMM. |
 | **S3** | `pylon-guest-agent` telemetry-only; ABI v2 bump. | P4 | `cargo test -p pylon-guest-agent -p pylon-abi`. |
 | **S4** | `pylon-kick` device; the VMM's kick `EventFd`s become its MSI-X notifiers (§4.2). | P1 | Device unit tests (BAR0 decode); KVM test that writes a notifier and observes the interrupt in a guest. **Done (2026-10-31):** `cargo test -p vmm --features kvm --lib pylon_kick` covers the registers, config space, MSI-X table and a real-KVM check that a kick waits while its vector is disabled or masked and reaches KVM's irqfd once enabled. A Linux 7.0 guest booted with `--pylon` enumerated `1af4:10f0`, read the BAR0 registers, and, after enabling vector 0 by hand, logged `No irq handler for 0.208` for the kick that a stand-in `pylond` wrote. |
-| **S5** | `pv-pylon` Linux kmod (`pylon/guest/linux/`). | — | Guest integration test: cooperative parks with `forced_preempt_count == 0` under a spinlock-heavy workload. **Built (2026-10-31), §4.6 items 1–4; items 5–6 open.**<br>**Stand-in `pylond`:** 4-vCPU Ubuntu 6.8 and 7.0 guests, every CPU running two spinners and a `/proc` reader. A stand-in revoked each vCPU 200 times, with a deadline that never expires so only a cooperative park counts. On both kernels, all 800 revocations parked cooperatively, with `forced_preempt_count == 0`. The VMM cleared `revoke_requested` each time, and the stranded-work bit was set while parked and cleared after. A kick with no revocation pending was ignored. Taking a CPU offline and back, and unloading the module, worked with no kernel warnings. Kick to `PARKED` was about 20 µs at the median, as seen by a Python poller, which includes Python's own overhead (S6 will measure it properly).<br>**Real `pylond`:** two VMs, `initial_active_vcpus=1`. Kicks reached the guests and some revocations parked cooperatively. Neither the 8 µs grace nor a 200 µs test build gave a clean result: `pylond` stopped revoking after boot because of a separate issue that also happens without `pv-pylon` (spec 05 K7). The real-`pylond` check is still to do. |
+| **S5** | `pv-pylon` Linux kmod (`pylon/guest/linux/`). | — | Guest integration test: cooperative parks with `forced_preempt_count == 0` under a spinlock-heavy workload. **Built (2026-10-31), §4.6 items 1–4; items 5–6 open.**<br>**Stand-in `pylond`:** 4-vCPU Ubuntu 6.8 and 7.0 guests, every CPU running two spinners and a `/proc` reader. A stand-in revoked each vCPU 200 times, with a deadline that never expires so only a cooperative park counts. On both kernels, all 800 revocations parked cooperatively, with `forced_preempt_count == 0`. The VMM cleared `revoke_requested` each time, and the stranded-work bit was set while parked and cleared after. A kick with no revocation pending was ignored. Taking a CPU offline and back, and unloading the module, worked with no kernel warnings. Kick to `PARKED` was about 20 µs at the median, as seen by a Python poller, which includes Python's own overhead (S6 will measure it properly).<br>**Real `pylond`:** two VMs, `initial_active_vcpus=1`. Kicks reached the guests and some revocations parked cooperatively. Neither the 8 µs grace nor a 200 µs test build gave a clean result: `pylond` stopped revoking after boot (spec 05 K7, since fixed). With K7 fixed, the allocation settles and the guests stall on a vCPU that stays parked (Q2). The real-`pylond` check is still to do. |
 | **S6** | End-to-end latency: kick→`PARKED`, revoke→recipient running. | — | p99 within the 8 µs grace window on reference hardware. |
 
 S1–S3 don't depend on S4/S5 and can land first. After S3, every park is a
@@ -471,7 +479,11 @@ forced park, which is honest about the current state, and the metrics show it.
   **Provisional (2026-10-31):** `0x1AF4:0x10F0` from QEMU's experimental range
   (§4.2), which unblocks S4. **Open:** request a PCI-SIG vendor ID for CMKL,
   and give `pylon-kick` a device ID under it before Pylon ships.
-- **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. With the thread
+- **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. *Seen
+  2026-10-31:* two 4-vCPU VMs on 4 managed CPUs settled at 2 cores each.
+  Each VM's third managed vCPU then stayed parked, while guest tasks were
+  pinned to it, and both guests reported soft lockups and RCU stalls
+  within 30 s. With the thread
   blocked in userspace, the interrupt stays pending in the in-kernel LAPIC, and
   a sender doing `smp_call_function_many(wait=1)` spins until `pylond` wakes the
   target. Options: (a) the guest marks parked vCPUs preempted so PV TLB flush

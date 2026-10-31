@@ -66,7 +66,7 @@ echo '{"action":"stats","vm_id":17}' | socat - UNIX-CONNECT:/run/pylon/pylond.so
 | `allocated_core_microseconds` | Total time managed CPUs have been assigned to this VM, in core-microseconds, since it registered. |
 | `cooperative_yields` | Revocations where the donor vCPU parked within the grace period. |
 | `forced_preemptions` | Revocations where the grace period ran out. `pylond` then signals the donor's vCPU thread so the VMM parks it. |
-| `handoffs_without_park` | Revocations where the donor still hadn't parked 50 µs after the deadline, so the core moved anyway. Should stay at 0. |
+| `handoffs_without_park` | Revocations where the donor still hadn't parked 50 µs after it was first signalled, so the core moved anyway. Should stay at 0. |
 | `runnable_threads` | What the guest last reported. `0` if nothing in the guest reports it. |
 
 Counters start at zero when the VM registers and are lost when `pylond`

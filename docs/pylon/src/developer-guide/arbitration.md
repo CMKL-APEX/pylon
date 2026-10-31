@@ -115,8 +115,12 @@ rest, priority weight scales how long a thread has waited.
 ## Phase 2: revocations in flight
 
 For each `Revoking` CPU, the engine checks the donor's slot. Only the
-VMM writes `PARKED`, once the donor's thread has left `KVM_RUN`, so
-`PARKED` means the donor has really stopped.
+VMM writes `PARKED`, once the donor's thread has left `KVM_RUN`, and it
+increments `yield_count` first. The engine records the donor's
+`yield_count` when it starts the revocation, and treats the donor as
+parked only when it is `PARKED` with a higher count. A donor that was
+just given its core is still `PARKED` from before, until its thread
+wakes, and that doesn't count.
 
 | Donor | Time | Action |
 |---|---|---|
@@ -124,10 +128,21 @@ VMM writes `PARKED`, once the donor's thread has left `KVM_RUN`, so
 | `PARKED`, signalled | any | The VMM force-parked it. Hand the CPU over (already counted as forced). |
 | not parked | before the deadline | Wait. |
 | not parked | deadline passed | A *forced preemption*, counted once. Send the VMM's `kick_signal` to the donor's thread with `tgkill`, and again every `REVOKE_RESIGNAL_US` (10 µs). `KVM_RUN` returns `EINTR` and the VMM's post-exit hook force-parks the vCPU. |
-| not parked | `FORCE_HANDOFF_US` (50 µs) after the deadline | Hand the CPU over anyway, counted as a *handoff without park*. `scx_pylon` preempts the donor thread, which parks at its next exit. |
+| not parked | `FORCE_HANDOFF_US` (50 µs) after the first signal | Hand the CPU over anyway, counted as a *handoff without park*. `scx_pylon` preempts the donor thread, which parks at its next exit. |
 
 The signal is resent because one that arrives while the vCPU thread is
 outside `KVM_RUN` (handling an exit) doesn't stop the next guest entry.
+The 50 µs bound counts from the first signal, not the deadline, so a
+donor always has that long after being signalled, even when the engine
+runs late.
+
+After a handoff without park, the donor still has `revoke_requested`
+set and is no longer on any `Revoking` CPU. Each sweep therefore also
+looks for such vCPUs and keeps signalling them every 10 µs until the VMM
+parks them. These are vCPUs with `revoke_requested = 1`, no
+`assigned_pcpu`, not `PARKED`, and a deadline that has passed. Without
+this, a guest that never exits to userspace on its own kept running
+without a core.
 `pylond` signals only a VMM that registered a `kick_signal`, and checks
 through a pidfd that the VMM process still exists before each
 `tgkill`.
@@ -166,12 +181,28 @@ that order, while it needs more cores (desired minus committed):
 A CPU `Assigned` to another VM is an eligible donor if:
 
 ```text
-(donor above its min_cores
-   and (donor holds more than it desires
-        or donor holds more than recipient's committed cores + 1
-        or donor's urgency < recipient's urgency))
-or (recipient is a zero-core wakeup and donor's urgency < recipient's urgency)
+donor's vCPU isn't PARKED
+and ((donor above its min_cores
+        and (donor holds more than it desires
+             or donor holds more than recipient's committed cores + 1
+             or (donor's urgency < recipient's urgency
+                 and (recipient's committed + 1) × donor's weight
+                     ≤ donor's cores × recipient's weight)))
+     or (recipient is a zero-core wakeup
+         and donor's urgency < recipient's urgency))
 ```
+
+A `PARKED` vCPU on an assigned CPU either hasn't woken since it was
+given the CPU, or has given it back and phase 0 will reclaim it.
+Revoking it would race its wakeup.
+
+Urgency alone moves a core only while the donor keeps at least as
+many cores per unit of `priority_weight` as the recipient will have.
+Without that bound, two hungry VMs with equal weights traded a core on
+every sweep: the more urgent one took the other below an even split,
+then *more than committed + 1* gave it back. With the bound, an even
+split is final, and a VM with twice the weight ends up with two cores
+for every one.
 
 Among eligible donors, the engine prefers, in order:
 

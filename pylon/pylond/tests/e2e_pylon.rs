@@ -664,12 +664,16 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
     );
 
     // 4. The simulated donor registered no kick signal and never parks, so the core moves
-    //    FORCE_HANDOFF_US after the deadline and counts as a handoff without park.
+    //    FORCE_HANDOFF_US after the first signal (sent at `deadline + 1`) and counts as a
+    //    handoff without park.
     let tsc_khz = match donor_page.header.tsc_khz {
         0 => default_counter_khz(),
         khz => khz,
     };
-    engine.poll_once(deadline + FORCE_HANDOFF_US * tsc_khz / 1000);
+    let handoff = deadline + 1 + FORCE_HANDOFF_US * tsc_khz / 1000;
+    engine.poll_once(handoff - 1);
+    assert_eq!(pcpu_owners.read_owner(4).0, donor_tid);
+    engine.poll_once(handoff);
     let recip_tid = recip_page.vcpus[0].host_tid.load(Ordering::Acquire);
     assert_eq!(pcpu_owners.read_owner(4).0, recip_tid);
     let stats = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");

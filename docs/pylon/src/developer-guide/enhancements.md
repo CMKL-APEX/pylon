@@ -143,8 +143,9 @@ vCPU parks itself.
   20 µs, measured coarsely. That's longer than the 8 µs grace, so under
   the real `pylond` many revocations still end in a forced park. S6 is
   about that latency.
-- **The real-`pylond` run** is blocked by a separate `pylond` issue
-  with boot parks (spec 05 K7).
+- **The real-`pylond` run** first hit a `pylond` bug with boot parks
+  (spec 05 K7, now fixed). It now settles cores, and the guests then
+  stall on a vCPU that stays parked (Q2).
 - **S4 uses a provisional PCI ID** (Q1).
 
 ## Open questions
