@@ -23,9 +23,9 @@
 | **E2E** | `main` (`d2c1485b2`, `dff66af86`) | `pylond/tests/e2e_pylon.rs`, real-KVM VMM test, `pylon-bench` (Pylon vs. ACPI hotplug) | Coordinator | `DONE` | `cargo test -p pylond --test e2e_pylon`; `cargo run --release -p pylond --bin pylon-bench -- --quick` |
 | **CI** | `main` (`45b35ba6d`, `e03b59cb7`) → re-enable in progress | `.github/workflows/pylon-ci.yaml`; upstream `ci.yaml` targets & feature matrix | Coordinator | `IN_PROGRESS` | See [CI Coverage](#ci-coverage) |
 | **Docs** | `docs/pylon-book` (#11) | Pylon book in `docs/pylon/` (mdBook) and `pylon-docs.yaml`, publishing to `gh-pages` | Coordinator | `DONE` | `mdbook build docs/pylon` |
-| **Track 4** | S1–S2: `pylon/s1-park-decision` (#12); S3: `pylon/s3-and-fixes` | Spec 06 S1–S4, S6: VMM park decision table, `pylond` forced-park via `tgkill`, guest agent telemetry-only and ABI v2, `pylon-kick` PCI device + MSI-X kick FDs, latency metrics | Coordinator | `IN_PROGRESS` (S1–S3 done; S4 not started, using the provisional PCI ID `0x1AF4:0x10F0` from spec 06 Q1; S6 not started) | `cargo test -p vmm --features kvm --lib pylon`, `cargo test -p pylond`, `cargo test -p pylon-guest-agent`; later steps per `spec/06-guest-kick-path.md §8` |
+| **Track 4** | S1–S2: `pylon/s1-park-decision` (#12); S3: `pylon/s3-and-fixes` | Spec 06 S1–S4, S6: VMM park decision table, `pylond` forced-park via `tgkill`, guest agent telemetry-only and ABI v2, `pylon-kick` PCI device + MSI-X kick FDs, latency metrics | Coordinator | `IN_PROGRESS` (S1–S4 done, S4 with the provisional PCI ID `0x1AF4:0x10F0` from spec 06 Q1; S6 not started) | `cargo test -p vmm --features kvm --lib pylon`, `cargo test -p pylond`, `cargo test -p pylon-guest-agent`; later steps per `spec/06-guest-kick-path.md §8` |
 | **Track 5** | *TBD* | Spec 06 S5: `pylon/guest/linux` `pv-pylon` kernel module | *Unassigned* | `NOT_STARTED` | Guest integration test (spec 06 §8) |
-| **Track 6** | `pylon/a64-<task>-<slug>` | Spec 07: aarch64 host & guest support (counter abstraction, `WFET`, guest virtual timer, arm64 `scx-pylon`, CI). Per-task board: `spec/07-aarch64-support.md §9` | Coordinator | `IN_PROGRESS` (A-T0 to A-T7 done; A-T8 in progress; A-T9 blocked on spec 06 S4) | Spec 07 §7 |
+| **Track 6** | `pylon/a64-<task>-<slug>` | Spec 07: aarch64 host & guest support (counter abstraction, `WFET`, guest virtual timer, arm64 `scx-pylon`, CI). Per-task board: `spec/07-aarch64-support.md §9` | Coordinator | `IN_PROGRESS` (A-T0 to A-T7 done; A-T8 in progress; A-T9 can start now that spec 06 S4 is done) | Spec 07 §7 |
 
 ---
 
@@ -35,7 +35,7 @@ These were found while drafting `spec/06-guest-kick-path.md`; full details are i
 
 | ID | Summary | Fixed by |
 | :- | :--- | :--- |
-| P1 | Kick `EventFd`s are sent to `pylond` but never wired to a guest interrupt. | Track 4 S4 |
+| P1 | Kick `EventFd`s are sent to `pylond` but never wired to a guest interrupt. | **Fixed** by Track 4 S4 (`pylon-kick`); a guest driver has to enable the vectors (S5) |
 | P2 | The HLT fast-park hook sits on `VmExit::Reset`. It never fires under KVM's in-kernel LAPIC, and it can swallow a guest triple-fault reset. | **Fixed** by Track 4 S1 |
 | P3 | The VMM parks on any userspace exit while `revoke_requested == 1`, ignoring `in_critical_section`. | **Fixed** by Track 4 S1 |
 | P4 | The guest agent marks other vCPUs `PARKED` and clears `revoke_requested` while those vCPUs are still running. | **Fixed** by Track 4 S3 (agent is telemetry-only) |
