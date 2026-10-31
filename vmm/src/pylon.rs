@@ -239,6 +239,8 @@ pub struct PylonVmmState {
     initial_active_vcpus: u32,
     shm_file: File,
     shared_page: NonNull<PylonSharedPage>,
+    /// One per vCPU. `pylond` writes one to deliver a revocation; the `pylon-kick` device
+    /// installs them as its MSI-X notifiers (`vmm/src/pylon_kick.rs`).
     kick_eventfds: Vec<EventFd>,
     wake_eventfds: Vec<EventFd>,
     shutting_down: AtomicBool,
@@ -503,7 +505,7 @@ impl PylonVmmState {
         self.wake_eventfds.get(vcpu_id as usize)
     }
 
-    /// Returns the kick `EventFd` for `vcpu_id`.
+    /// Returns the kick `EventFd` for `vcpu_id`, which raises its `pylon-kick` MSI-X vector.
     pub fn kick_eventfd(&self, vcpu_id: u32) -> Option<&EventFd> {
         self.kick_eventfds.get(vcpu_id as usize)
     }
