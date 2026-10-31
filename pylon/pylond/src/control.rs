@@ -790,6 +790,7 @@ mod tests {
             max_cores: 1,
             priority_weight: 1,
             kick_signal: None,
+            wake_by_signal: false,
         };
         // One FD instead of three: rejected, but the reply is still sent.
         let payload = serde_json::to_vec(&req).unwrap();

@@ -205,6 +205,11 @@ pub struct VmRegistrationRequest {
     /// (`spec/06-guest-kick-path.md` §4.4). Without it, `pylond` never signals the VMM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kick_signal: Option<i32>,
+    /// Set by a VMM that parks vCPUs inside KVM (`spec/08-park-in-kvm.md`). The wake `eventfd`
+    /// can't reach a thread blocked in `KVM_RUN`, so `pylond` also sends `kick_signal` when it
+    /// assigns a core, and again until the vCPU leaves `PARKED`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_by_signal: bool,
 }
 
 /// JSON response returned by `pylond` after processing a `VmRegistrationRequest`.
@@ -288,6 +293,7 @@ struct VmHandleInner {
     handoff_without_park_count: AtomicU64,
     park_latency: ParkLatencyHistogram,
     kick_signal: Option<i32>,
+    wake_by_signal: bool,
     /// The registering VMM's PID from `SO_PEERCRED` (0 if unknown), and a pidfd that keeps
     /// referring to that process, so a reused PID is never signalled.
     vmm_pid: i32,
@@ -371,6 +377,7 @@ impl VmHandle {
                 handoff_without_park_count: AtomicU64::new(0),
                 park_latency: ParkLatencyHistogram::default(),
                 kick_signal: req.kick_signal,
+                wake_by_signal: req.wake_by_signal,
                 vmm_pid: 0,
                 vmm_pidfd: None,
                 shm_mmap,
@@ -538,6 +545,13 @@ impl VmHandle {
                 let tid = slot.host_tid.load(Ordering::Acquire);
                 (tid != 0).then_some((tid, pid))
             })
+    }
+
+    /// Whether the VMM parks vCPUs inside KVM, so waking one takes a signal as well as the wake
+    /// `eventfd` (`spec/08-park-in-kvm.md` §3.3).
+    #[inline]
+    pub fn wake_by_signal(&self) -> bool {
+        self.inner.wake_by_signal
     }
 
     /// Sends the VMM's `kick_signal` to the thread of `vcpu_idx`, interrupting its `KVM_RUN`
@@ -915,6 +929,7 @@ mod tests {
             max_cores,
             priority_weight,
             kick_signal: None,
+            wake_by_signal: false,
         };
         let shm_fd = create_memfd_shared_page(vm_id, num_vcpus, 3_000_000);
         let mut kick_fds = Vec::with_capacity(num_vcpus as usize);
@@ -1701,6 +1716,104 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    static WAKE_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn count_wake_signal(_: libc::c_int) {
+        WAKE_SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wait_for_wake_signals(at_least: u64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while WAKE_SIGNALS_SEEN.load(Ordering::SeqCst) < at_least {
+            assert!(Instant::now() < deadline, "vCPU thread wasn't signalled");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A VM that parks vCPUs inside KVM gets a signal with each assignment, and another every
+    /// `REVOKE_RESIGNAL_US` until the vCPU leaves `PARKED`.
+    #[test]
+    fn test_plane2_signals_a_recipient_parked_in_kvm_until_it_runs() {
+        let kick_signal = libc::SIGRTMIN() + 5;
+        // SAFETY: installs a handler that only increments an atomic, which is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = zeroed();
+            action.sa_sigaction = count_wake_signal as *const () as usize;
+            assert_eq!(libc::sigaction(kick_signal, &action, ptr::null_mut()), 0);
+        }
+
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
+
+        let mut vm = build_test_vm(60, 1, 0, 1, 1);
+        vm.req.kick_signal = Some(kick_signal);
+        vm.req.wake_by_signal = true;
+        let handle = VmHandle::new(
+            &vm.req,
+            vm.shm_fd.try_clone().unwrap(),
+            vm.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            vm.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_vmm_pid(process_id() as i32)
+        .unwrap();
+
+        // The parked vCPU's thread: a thread of this process that just sleeps.
+        let stop = Arc::new(AtomicBool::new(false));
+        let tid = Arc::new(AtomicU64::new(0));
+        let vcpu_thread = {
+            let stop = Arc::clone(&stop);
+            let tid = Arc::clone(&tid);
+            thread::spawn(move || {
+                // SAFETY: `gettid` has no preconditions.
+                tid.store(unsafe { libc::gettid() } as u64, Ordering::SeqCst);
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        while tid.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        let page = handle.shared_page();
+        page.vcpus[0]
+            .host_tid
+            .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
+        page.telemetry.runnable_threads.store(1, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+
+        // At 3 GHz, the signal is resent every 10 us (30,000 cycles).
+        let before = WAKE_SIGNALS_SEEN.load(Ordering::SeqCst);
+        engine.poll_once(1_000_000);
+        assert_eq!(
+            engine.core_state(6),
+            CoreState::Assigned { vm_id: 60, vcpu: 0 }
+        );
+        wait_for_wake_signals(before + 1);
+
+        engine.poll_once(1_010_000);
+        engine.poll_once(1_030_000);
+        wait_for_wake_signals(before + 2);
+
+        // Running again: no more signals.
+        page.vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        engine.poll_once(1_100_000);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(WAKE_SIGNALS_SEEN.load(Ordering::SeqCst), before + 2);
+
+        stop.store(true, Ordering::SeqCst);
+        vcpu_thread.join().unwrap();
     }
 
     #[test]

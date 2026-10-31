@@ -259,6 +259,9 @@ pub struct MatrixEngine {
     /// revocation only once it is `PARKED` with a higher count: a vCPU that was just assigned is
     /// still `PARKED` until its thread wakes.
     revoke_yield_count: [u64; MAX_PCPUS],
+    /// TSC at which an assigned vCPU of a VM that parks inside KVM was last signalled to wake
+    /// (0 if not, or once it left `PARKED`).
+    wake_signalled_tsc: [u64; MAX_PCPUS],
     /// When each vCPU (by VM index in the snapshot) that kept running after a handoff without park
     /// was last signalled (0 if not yet).
     orphan_signalled_tsc: [[u64; MAX_VCPUS]; MAX_TRACKED_VMS],
@@ -297,6 +300,7 @@ impl MatrixEngine {
             revoke_signalled_tsc: [0; MAX_PCPUS],
             revoke_first_signal_tsc: [0; MAX_PCPUS],
             revoke_yield_count: [0; MAX_PCPUS],
+            wake_signalled_tsc: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
@@ -458,6 +462,12 @@ impl MatrixEngine {
         self.assigned_yield_count[pcpu] = slot.yield_count.load(Ordering::Acquire);
         slot.assigned_pcpu.store(pcpu as u8, Ordering::Release);
         let _ = vm.wake_vcpu(vcpu as usize);
+        // A vCPU parked inside KVM only sees the wake `eventfd` after an exit
+        // (`spec/08-park-in-kvm.md` §3.3).
+        self.wake_signalled_tsc[pcpu] = 0;
+        if vm.wake_by_signal() && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
+            self.wake_signalled_tsc[pcpu] = now_tsc;
+        }
 
         self.core_states[pcpu] = CoreState::Assigned {
             vm_id: vm.vm_id(),
@@ -492,6 +502,7 @@ impl MatrixEngine {
         // =====================================================================
         self.progress_revocations_phase2(vms, vm_count, now_tsc);
         self.signal_orphaned_donors(vms, vm_count, now_tsc);
+        self.signal_unwoken_recipients(vms, vm_count, now_tsc);
 
         // =====================================================================
         // Phase 3: Match Hungry VMs with Idle or Donor Cores
@@ -784,6 +795,40 @@ impl MatrixEngine {
                 vcpu += 1;
             }
             i += 1;
+        }
+    }
+
+    /// Keeps signalling assigned vCPUs of VMs that park inside KVM while they are still
+    /// `PARKED` since the assignment. A signal that lands just before the vCPU thread re-enters
+    /// `KVM_RUN` interrupts nothing, and the thread would sleep in KVM with a core assigned.
+    fn signal_unwoken_recipients(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
+        let mut pcpu = 0usize;
+        while pcpu < MAX_PCPUS {
+            let mut unwoken = false;
+            if self.managed_pcpus[pcpu]
+                && let CoreState::Assigned { vm_id, vcpu } = self.core_states[pcpu]
+                && let Some(vm) = Self::find_vm(vms, vm_count, vm_id)
+                && vm.wake_by_signal()
+            {
+                let slot = &vm.shared_page().vcpus[vcpu as usize];
+                unwoken = slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
+                    && slot.yield_count.load(Ordering::Acquire) == self.assigned_yield_count[pcpu];
+                let last = self.wake_signalled_tsc[pcpu];
+                if unwoken
+                    && now_tsc
+                        >= last.saturating_add(Self::us_to_cycles(
+                            REVOKE_RESIGNAL_US,
+                            self.tsc_khz_of(vm),
+                        ))
+                    && vm.signal_vcpu(vcpu as usize).unwrap_or(false)
+                {
+                    self.wake_signalled_tsc[pcpu] = now_tsc;
+                }
+            }
+            if !unwoken {
+                self.wake_signalled_tsc[pcpu] = 0;
+            }
+            pcpu += 1;
         }
     }
 

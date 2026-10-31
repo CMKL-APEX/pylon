@@ -221,6 +221,7 @@ impl SimulatedVmm {
             max_cores,
             priority_weight,
             kick_signal: None,
+            wake_by_signal: false,
         };
         let kick_raws: Vec<RawFd> = kick_fds.iter().map(AsRawFd::as_raw_fd).collect();
         let wake_raws: Vec<RawFd> = wake_fds.iter().map(AsRawFd::as_raw_fd).collect();
