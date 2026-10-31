@@ -148,7 +148,24 @@ A small PCI device, created when `--pylon` is set:
   `devices/src/ivshmem.rs` implements only ivshmem-plain.
 - *A virtio device:* too heavy for a single doorbell and N interrupts.
 
-**PCI IDs:** TBD (open question Q1). We must not reuse another vendor's IDs.
+**PCI IDs:** `0x1AF4:0x10F0` for now. QEMU's `docs/specs/pci-ids.rst`
+leaves `1af4:10f0` to `1af4:10ff` in Red Hat's vendor ID "available for
+experimental usage without registration", and requires an official ID "when
+the code leaves the test lab (i.e. when seeking upstream merge or shipping a
+distro/product)". Shipping Pylon in Glidex Cloud counts, so before release
+`pylon-kick` moves to a device ID under a CMKL vendor ID (Q1). Rules until then:
+
+- Keep the vendor and device ID in one constant, so the move is a one-line
+  change in the VMM and in `pv-pylon`'s ID table.
+- The range is shared with anyone else's experiments. Give the device a
+  Pylon-specific subsystem ID, and have the guest driver check a magic and
+  version register in BAR0 before it binds.
+- We must not take any other ID under another vendor's ID without an
+  allocation.
+
+A guest kernel enumerates the device at boot whatever its ID. No upstream
+driver binds `1af4:10f0`, and `pv-pylon` is autoloaded through its
+`MODULE_DEVICE_TABLE` modalias.
 
 ### 4.3 Park Doorbell (Cooperative Path)
 
@@ -375,6 +392,9 @@ forced park, which is honest about the current state, and the metrics show it.
 ## 10. Open Questions
 
 - **Q1:** Which PCI vendor/device ID can the project use for `pylon-kick`?
+  **Provisional (2026-10-31):** `0x1AF4:0x10F0` from QEMU's experimental range
+  (§4.2), which unblocks S4. **Open:** request a PCI-SIG vendor ID for CMKL,
+  and give `pylon-kick` a device ID under it before Pylon ships.
 - **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. With the thread
   blocked in userspace, the interrupt stays pending in the in-kernel LAPIC, and
   a sender doing `smp_call_function_many(wait=1)` spins until `pylond` wakes the

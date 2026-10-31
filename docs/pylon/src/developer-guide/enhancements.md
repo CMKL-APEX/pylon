@@ -114,14 +114,18 @@ point. It also has to make other vCPUs treat parked ones as preempted.
 
 S1–S3 didn't depend on the device or the module and have landed. Now
 every contended revocation ends in a forced park. That's honest about
-where things stand, and the metrics show it. S4 needs a decision on
-Q1.
+where things stand, and the metrics show it. S4 can start: it uses a
+provisional PCI ID (Q1).
 
 ## Open questions
 
 These are from spec 06 §10:
 
-- **Q1.** The PCI vendor and device ID for `pylon-kick`.
+- **Q1.** The PCI vendor and device ID for `pylon-kick`. For now it is
+  `0x1AF4:0x10F0`, from the range that QEMU's PCI ID list leaves free for
+  experiments. That range isn't for shipped products, so a PCI-SIG vendor ID
+  for CMKL is still to be requested, with a device ID under it before
+  release.
 - **Q2.** Interrupts sent to a parked vCPU. A guest waiting for a TLB
   shootdown to finish spins until `pylond` wakes the target. Options:
   mark parked vCPUs preempted so the guest defers the flush, have the
