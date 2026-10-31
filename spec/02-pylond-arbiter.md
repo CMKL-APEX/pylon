@@ -43,7 +43,7 @@ For each managed tenant physical core (`pCPU`) in `CoreState::Revoking { donor_v
 ### Phase 3: Match Hungry VMs with Idle or Donor Cores
 For each hungry VM (ordered by SLO urgency / `head_wait`):
 1. **Fast Path (Idle Core Available):** If a tenant `pCPU` is in `CoreState::Idle`, immediately assign `recipient_tid` in the BPF map and wake the recipient vCPU (`~1.5 us` total latency).
-2. **Preemption Path (Rebalance from Over-Allocated Donor):** Select a donor VM whose active core count exceeds its fair share or has lower urgency:
+2. **Preemption Path (Rebalance from Over-Allocated Donor):** Select a donor VM whose active core count exceeds its fair share or has lower urgency. Lower urgency alone qualifies only while the donor keeps at least the recipient's weighted share of cores after the move, and a donor vCPU that is still `PARKED` (not yet woken after its assignment) is never chosen (spec 05 K7):
    - Prefer preempting a donor vCPU where `in_critical_section.load(Acquire) == 0`.
    - Set `donor_slot.revoke_deadline_tsc.store(now_tsc + eight_us_in_cycles, Relaxed)`.
    - Set `donor_slot.revoke_requested.store(1, Release)`.
