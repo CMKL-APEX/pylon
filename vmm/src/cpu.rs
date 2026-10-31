@@ -1419,6 +1419,7 @@ impl CpuManager {
                         // `vcpu` is shadowed by its lock guard inside the loop.
                         let read_guest_timer =
                             || pylon::read_guest_tsc_deadline(vcpu.lock().unwrap().vcpu.as_ref());
+                        let vcpu_for_park = &vcpu;
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1537,7 +1538,9 @@ impl CpuManager {
                                 }
                             }
                             drop(vcpu);
-                            pylon::check_and_park_vcpu(vcpu_id, read_guest_timer);
+                            pylon::check_and_park_vcpu(vcpu_id, read_guest_timer, |op| {
+                                pylon::kvm_park_op(vcpu_for_park.lock().unwrap().vcpu.as_ref(), op)
+                            });
 
                             // We've been told to terminate
                             if vcpus_kill_signalled.load(Ordering::SeqCst)

@@ -100,6 +100,9 @@ pub enum HypervisorVmError {
     /// Enable x2apic API error
     #[error("Failed to enable x2apic API")]
     EnableX2ApicApi(#[source] anyhow::Error),
+    /// Set halt polling error
+    #[error("Failed to set halt polling")]
+    SetHaltPoll(#[source] anyhow::Error),
     /// Get clock error
     #[error("Failed to get clock")]
     GetClock(#[source] anyhow::Error),
@@ -388,6 +391,12 @@ pub trait Vm: Send + Sync + Any {
 
     #[cfg(feature = "sev_snp")]
     fn gain_page_access(&self, _gpa: u64, _size: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// Limits how long, in nanoseconds, the hypervisor polls for a wake-up before putting a
+    /// halted vCPU of this VM to sleep. Backends without such a limit ignore it.
+    fn set_halt_poll_ns(&self, _ns: u32) -> Result<()> {
         Ok(())
     }
 

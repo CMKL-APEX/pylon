@@ -319,6 +319,7 @@ fn run_pylon_elastic_benchmark(
         max_cores: max_vcpus,
         priority_weight: 100,
         kick_signal: None,
+        wake_by_signal: false,
     };
     let vm_handle = VmHandle::new(
         &req,

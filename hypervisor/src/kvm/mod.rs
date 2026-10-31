@@ -1202,6 +1202,17 @@ impl vm::Vm for KvmVm {
         Ok(())
     }
 
+    fn set_halt_poll_ns(&self, ns: u32) -> vm::Result<()> {
+        let mut cap = kvm_bindings::kvm_enable_cap {
+            cap: kvm_bindings::KVM_CAP_HALT_POLL,
+            ..Default::default()
+        };
+        cap.args[0] = ns.into();
+        self.fd
+            .enable_cap(&cap)
+            .map_err(|e| vm::HypervisorVmError::SetHaltPoll(e.into()))
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn enable_x2apic_api(&self) -> vm::Result<()> {
         // From https://docs.kernel.org/virt/kvm/api.html:
