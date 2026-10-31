@@ -41,11 +41,18 @@ to 2 because the writer rules change, although the layout doesn't:
 
 A small virtual PCI device, created with `--pylon`, with one MSI-X
 vector per vCPU (spec 06 §4.2). The guest driver allocates the vectors
-with managed affinity, so vector *i* interrupts vCPU *i*. The VMM sends
-`pylond` the device's MSI-X `eventfd`s in place of its own kick
-`eventfd`s, so a write from `pylond` goes through the existing irqfd
+with managed affinity, so vector *i* interrupts vCPU *i*. The device
+installs the VMM's kick `eventfd`s, the ones `pylond` already has, as
+its MSI-X notifiers, so a write from `pylond` goes through the irqfd
 path and arrives as an interrupt. BAR0 exposes the magic, ABI version,
-vCPU count and the shared page's address, plus a park doorbell.
+vCPU count and the shared page's address, plus a park doorbell; BAR1
+holds the MSI-X table.
+
+**Implemented (S4)** in `vmm/src/pylon_kick.rs`, as `1af4:10f0` (Q1).
+While the guest hasn't enabled a vector, or has masked it, a kick waits
+in its `eventfd` and is delivered once the vector is enabled. A VM with
+`--pylon` now refuses to snapshot or migrate. Nothing in the guest uses
+the device yet: that is S5.
 
 Alternatives the spec rejected: a raw vector chosen by the guest (Linux
 has no supported way for a module to own one), `KVM_SIGNAL_MSI` from
@@ -108,14 +115,15 @@ point. It also has to make other vCPUs treat parked ones as preempted.
 | S1 | VMM: the decision table; remove the `Reset` hook. **Done.** | P2, P3 |
 | S2 | `pylond`: stop writing `state`; `SO_PEERCRED`; `tgkill` on deadline; wait for `PARKED`; latency metric. **Done.** | P5, P6 (`pylond`'s part) |
 | S3 | Guest agent telemetry-only; ABI version 2. **Done.** | P4, P6 |
-| S4 | The `pylon-kick` device and its MSI-X `eventfd`s; register with `pylond` after the device exists. | P1 |
+| S4 | The `pylon-kick` device; the VMM's kick `eventfd`s become its MSI-X notifiers. **Done.** | P1 |
 | S5 | The `pv-pylon` kernel module. | — |
 | S6 | End-to-end latency: kick to `PARKED`, and revocation to recipient running. | — |
 
-S1–S3 didn't depend on the device or the module and have landed. Now
-every contended revocation ends in a forced park. That's honest about
-where things stand, and the metrics show it. S4 can start: it uses a
-provisional PCI ID (Q1).
+S1–S4 have landed. A kick now reaches the guest as an interrupt once a
+driver enables the vector, but no guest driver exists until S5, so every
+contended revocation still ends in a forced park. That's honest about
+where things stand, and the metrics show it. S4 uses a provisional PCI
+ID (Q1).
 
 ## Open questions
 

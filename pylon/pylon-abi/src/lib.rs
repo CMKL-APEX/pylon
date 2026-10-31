@@ -49,6 +49,32 @@ pub const PYLON_DEFAULT_GPA: u64 = 0xFEDF_0000;
 /// Total size in bytes of the Pylon shared memory region (2 * 4096B pages).
 pub const PYLON_SHARED_PAGE_SIZE: usize = 8192;
 
+/// PCI vendor ID of the `pylon-kick` device (`spec/06-guest-kick-path.md` §4.2).
+///
+/// Provisional: `1af4:10f0` lies in the range QEMU's PCI ID list leaves free for
+/// experiments. It has to move to a device ID under a CMKL vendor ID before Pylon ships
+/// (spec 06 Q1), so nothing else may hard-code it.
+pub const PYLON_KICK_VENDOR_ID: u16 = 0x1AF4;
+/// PCI device ID of the `pylon-kick` device. See [`PYLON_KICK_VENDOR_ID`].
+pub const PYLON_KICK_DEVICE_ID: u16 = 0x10F0;
+
+/// Size of `pylon-kick`'s register BAR (BAR0).
+pub const PYLON_KICK_BAR0_SIZE: u64 = 0x1000;
+/// BAR0, read-only: the low 32 bits of [`PYLON_MAGIC`]. A guest driver checks it before
+/// binding, since the provisional device ID is shared with other experiments.
+pub const PYLON_KICK_REG_MAGIC: u64 = 0x00;
+/// BAR0, read-only: [`PYLON_ABI_VERSION`].
+pub const PYLON_KICK_REG_ABI_VERSION: u64 = 0x04;
+/// BAR0, read-only: `PylonHeader::num_vcpus`, which is also the number of MSI-X vectors.
+pub const PYLON_KICK_REG_NUM_VCPUS: u64 = 0x08;
+/// BAR0, read-only: low 32 bits of the shared page's guest physical address.
+pub const PYLON_KICK_REG_SHM_GPA_LO: u64 = 0x0C;
+/// BAR0, read-only: high 32 bits of the shared page's guest physical address.
+pub const PYLON_KICK_REG_SHM_GPA_HI: u64 = 0x10;
+/// BAR0, write-only: the park doorbell. Any write exits the writing vCPU to the VMM, which
+/// parks it if its slot is `VCPU_STATE_PARKING`. The value is the vCPU index, for tracing.
+pub const PYLON_KICK_REG_PARK_DOORBELL: u64 = 0x40;
+
 /// Cache Line 0: Header metadata written once by VMM at VM creation.
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

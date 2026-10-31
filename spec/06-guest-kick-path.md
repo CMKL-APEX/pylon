@@ -117,12 +117,24 @@ A small PCI device, created when `--pylon` is set:
   with managed affinity (`pci_alloc_irq_vectors_affinity` / `PCI_IRQ_AFFINITY`),
   so vector *i* targets vCPU *i*. The guest programs the MSI address/data, so
   the VMM needs no knowledge of APIC IDs or vectors.
-- **Kick FDs:** the VMM no longer creates its own `kick_eventfds`. It takes the
-  per-vector notifier `EventFd`s from the device's MSI-X interrupt group
-  (`InterruptSourceGroup::notifier(index)` in `vm-device/src/interrupt/mod.rs`)
-  and sends those to `pylond` over `SCM_RIGHTS`. When `pylond` writes one, the
-  existing irqfd route delivers the MSI. No new hypervisor plumbing is needed,
-  and the same path works with MSHV's interrupt manager.
+- **Kick FDs:** the VMM keeps its own per-vCPU `kick_eventfds`, which it sends
+  to `pylond` at registration. The device creates its MSI-X group with
+  `create_group_mut` and installs them as the vectors' notifiers
+  (`InterruptSourceGroup::set_notifier` in `vm-device/src/interrupt/mod.rs`).
+  When `pylond` writes one, the irqfd route delivers the MSI. No new hypervisor
+  plumbing is needed, and the same path works with MSHV's interrupt manager.
+
+  *As implemented (S4):* the first design took the group's own notifiers and
+  sent those instead. That would have made registration wait for the device,
+  and a guest reboot, which creates a new device, would have left `pylond`
+  with dead `EventFd`s. With the VMM's `EventFd`s, registration stays where it
+  is and survives a reboot.
+- **Masked vectors:** Cloud Hypervisor's `MsixConfig` only reroutes unmasked
+  vectors and leaves it to a device to check the mask before it triggers one.
+  `pylond` writes the `EventFd` directly, so the device removes a vector's irqfd
+  when the guest masks it. A kick then waits in the `EventFd`, and KVM delivers
+  it when the guest unmasks the vector, as PCI's pending bit would. Disabling
+  MSI-X, or setting the function mask, removes all of them.
 - **BAR0 (MMIO, 4 KiB):**
 
   | Offset | Name | Access | Semantics |
@@ -136,6 +148,10 @@ A small PCI device, created when `--pylon` is set:
 
   The GPA registers let the guest driver find the shared page without hardcoding
   `0xFEDF_0000`. This makes the later BAR move (§9) a device-side change only.
+- **BAR1 (MMIO, 4 KiB):** the MSI-X table in the first half and the pending bit
+  array in the second, so the registers in BAR0 don't share a page with them.
+- **Snapshots:** the device refuses to snapshot, so a VM with `--pylon` can't
+  be snapshotted or migrated (§7).
 
 **Why a PCI device instead of the alternatives:**
 - *Guest-allocated raw vector + VMM-programmed MSI:* Linux has no supported way
@@ -157,9 +173,10 @@ distro/product)". Shipping Pylon in Glidex Cloud counts, so before release
 
 - Keep the vendor and device ID in one constant, so the move is a one-line
   change in the VMM and in `pv-pylon`'s ID table.
-- The range is shared with anyone else's experiments. Give the device a
-  Pylon-specific subsystem ID, and have the guest driver check a magic and
-  version register in BAR0 before it binds.
+- The range is shared with anyone else's experiments, so the guest driver
+  checks `MAGIC` and `ABI_VERSION` in BAR0 before it binds. The subsystem IDs
+  repeat the vendor and device ID: without an allocation, no subsystem ID would
+  be Pylon's own either.
 - We must not take any other ID under another vendor's ID without an
   allocation.
 
@@ -311,19 +328,20 @@ To match the isolation rules in `spec/00-architecture.md §2`:
 
 | File | Change |
 | :--- | :--- |
-| `vmm/src/pylon.rs` | Decision table (§4.4); remove the self-created `kick_eventfds`; take notifiers from the device; delay daemon registration until the device exists. |
+| `vmm/src/pylon.rs` | Decision table (§4.4). The kick `EventFd`s and the registration stay (§4.2). |
 | `vmm/src/pylon_kick.rs` *(new)* | `PylonKickDevice`: `PciDevice` + `BusDevice` impl, MSI-X config, BAR0 registers. It sits beside `pylon.rs` so `pylon.rs` stays focused on shared-page and park state. |
 | `vmm/src/device_manager.rs` | One `add_pylon_kick_device()` call when `--pylon` is set, modelled on `add_pvpanic_device()`. |
+| `pci/src/msix.rs` | Forward `enable()` and `disable()` through `MaybeMutInterruptSourceGroup`. Upstream's wrapper falls back to the trait's no-op defaults, so disabling MSI-X never removed a mutable group's irqfds. |
 | `vmm/src/cpu.rs` | Remove the `VmExit::Reset` hook. The existing post-exit hook stays. |
 | `pylon/pylon-abi` | `PYLON_ABI_VERSION = 2`; doc comments for the §3 ownership table; BAR0 offset constants. |
 | `pylon/pylond` | §4.5; record `peer_cred()` PID; `tgkill`. |
 | `pylon/pylon-guest-agent` | Telemetry-only (§4.6). |
 
-**Registration ordering:** today `PylonVmmState::new` registers with `pylond`
-during config parsing, before any devices exist. Registration has to move to
-after `DeviceManager` creates `pylon-kick`, so the MSI-X notifiers exist when
-they are sent. Until the guest driver enables MSI-X, kicks are dropped by the
-masked route. That is harmless: the forced path (§4.4) still applies.
+**Registration ordering:** `PylonVmmState::new` registers with `pylond` during
+config parsing, before any devices exist. That stays: the `EventFd`s it sends
+are the VMM's own, and the device installs them later (§4.2). Until the guest
+driver enables MSI-X, a kick waits in its `EventFd`. That is harmless: the
+forced path (§4.4) still applies.
 
 ---
 
@@ -348,7 +366,9 @@ masked route. That is harmless: the forced path (§4.4) still applies.
 
 - **Snapshot/restore and live migration:** reject them when `--pylon` is
   active, with an explicit error, until the shared page and `pylond`
-  registration have a defined migration story.
+  registration have a defined migration story. *Implemented (S4):* the
+  `pylon-kick` device's snapshot fails with "VMs with --pylon can't be
+  snapshotted or migrated".
 - **vCPU hotplug:** `num_vcpus` is fixed at `max_vcpus`, so the MSI-X table
   size doesn't change. A hot-removed vCPU must be woken and must not be
   revoked again. `pylond` must skip slots with `host_tid == 0` when choosing
@@ -368,7 +388,7 @@ Each step is a single reviewable commit series and leaves the tree working.
 | **S1** | VMM: remove the `Reset` hook; §4.4 decision table (consent + deadline). | P2, P3 | Unit tests for every row of the §4.4 table; existing `vmm --features kvm --lib pylon` tests. |
 | **S2** | `pylond`: stop writing `state`; `peer_cred` PID; `tgkill` on expiry; `ForceRevoking` substate; latency metric. | P5, P6 | `pylond` unit tests; `e2e_pylon` with a real KVM VM (no guest driver) shows forced parks with `state == PARKED` written by the VMM. |
 | **S3** | `pylon-guest-agent` telemetry-only; ABI v2 bump. | P4 | `cargo test -p pylon-guest-agent -p pylon-abi`. |
-| **S4** | `pylon-kick` device + MSI-X notifiers handed to `pylond`; deferred registration. | P1 | Device unit tests (BAR0 decode); KVM test that writes a notifier and observes the interrupt in a guest. |
+| **S4** | `pylon-kick` device; the VMM's kick `EventFd`s become its MSI-X notifiers (§4.2). | P1 | Device unit tests (BAR0 decode); KVM test that writes a notifier and observes the interrupt in a guest. **Done (2026-10-31):** `cargo test -p vmm --features kvm --lib pylon_kick` covers the registers, config space, MSI-X table and a real-KVM check that a kick waits while its vector is disabled or masked and reaches KVM's irqfd once enabled. A Linux 7.0 guest booted with `--pylon` enumerated `1af4:10f0`, read the BAR0 registers, and, after enabling vector 0 by hand, logged `No irq handler for 0.208` for the kick that a stand-in `pylond` wrote. |
 | **S5** | `pv-pylon` Linux kmod (`pylon/guest/linux/`). | — | Guest integration test: cooperative parks with `forced_preempt_count == 0` under a spinlock-heavy workload. |
 | **S6** | End-to-end latency: kick→`PARKED`, revoke→recipient running. | — | p99 within the 8 µs grace window on reference hardware. |
 

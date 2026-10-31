@@ -151,6 +151,8 @@ use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::locked_unix_listener::LockedUnixListener;
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
+use crate::pylon::PylonVmmState;
+use crate::pylon_kick::{Error as PylonKickError, PylonKickDevice};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::SevSnpSharedPageTracker;
@@ -163,7 +165,7 @@ use crate::vm_config::{
     PciDeviceCommonConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig,
     VsockConfig,
 };
-use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
+use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node, pylon};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MMIO_LEN: u64 = 0x1000;
@@ -188,6 +190,7 @@ const PVMEMCONTROL_DEVICE_NAME: &str = "__pvmemcontrol";
 const BALLOON_DEVICE_NAME: &str = "__balloon";
 const CONSOLE_DEVICE_NAME: &str = "__console";
 const PVPANIC_DEVICE_NAME: &str = "__pvpanic";
+const PYLON_KICK_DEVICE_NAME: &str = "__pylon_kick";
 #[cfg(feature = "ivshmem")]
 const IVSHMEM_DEVICE_NAME: &str = "__ivshmem";
 
@@ -643,6 +646,10 @@ pub enum DeviceManagerError {
     /// Cannot create a PvPanic device
     #[error("Cannot create a PvPanic device")]
     PvPanicCreate(#[source] pvpanic::PvPanicError),
+
+    /// Cannot create the pylon-kick device
+    #[error("Cannot create the pylon-kick device")]
+    PylonKickCreate(#[source] PylonKickError),
 
     #[cfg(feature = "ivshmem")]
     /// Cannot create a ivshmem device
@@ -1579,6 +1586,10 @@ impl DeviceManager {
 
         if Arc::clone(&self.config).lock().unwrap().pvpanic {
             self.pvpanic_device = self.add_pvpanic_device(snapshot)?;
+        }
+
+        if let Some(pylon) = pylon::global_state() {
+            self.add_pylon_kick_device(&pylon)?;
         }
 
         #[cfg(feature = "ivshmem")]
@@ -5109,6 +5120,47 @@ impl DeviceManager {
         )?;
 
         Ok(Some(pvpanic_device))
+    }
+
+    /// Adds the device that delivers Pylon revocations as interrupts
+    /// (`spec/06-guest-kick-path.md` §4.2).
+    fn add_pylon_kick_device(&mut self, pylon: &PylonVmmState) -> DeviceManagerResult<()> {
+        let id = String::from(PYLON_KICK_DEVICE_NAME);
+        info!("Creating pylon-kick device {id}");
+
+        let (pci_segment_id, pci_device_bdf, resources) = self.pci_resources(&id, 0, None)?;
+
+        let device = PylonKickDevice::create(
+            id.clone(),
+            pci_device_bdf,
+            pylon,
+            self.msi_interrupt_manager.as_ref(),
+            self.address_manager.vm.as_ref(),
+        )
+        .map_err(DeviceManagerError::PylonKickCreate)?;
+        let device = Arc::new(Mutex::new(device));
+
+        let (bars, new_resources) = self.allocate_pci_bars(
+            Arc::clone(&device) as Arc<Mutex<dyn PciDevice>>,
+            pci_segment_id,
+            resources,
+        )?;
+
+        let mut node = device_node!(id, device);
+        node.resources = new_resources;
+        node.pci_bdf = Some(pci_device_bdf);
+        node.pci_device_handle = None;
+        self.device_tree.lock().unwrap().insert(id, node);
+
+        self.commit_pci_device(
+            Arc::clone(&device) as Arc<dyn BusDeviceSync>,
+            device as Arc<Mutex<dyn PciDevice>>,
+            pci_segment_id,
+            pci_device_bdf,
+            bars,
+        )?;
+
+        Ok(())
     }
 
     #[cfg(feature = "ivshmem")]

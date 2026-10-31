@@ -101,6 +101,7 @@ mod pagemap;
 mod pci_segment;
 mod prefault;
 pub mod pylon;
+pub mod pylon_kick;
 pub mod seccomp_filters;
 mod serial_manager;
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]

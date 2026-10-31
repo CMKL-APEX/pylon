@@ -67,19 +67,19 @@ tracks 4 and 5).
   Hypervisor's layout doesn't reserve. Moving the page into a PCI BAR
   (see the roadmap) removes it. We haven't yet booted a guest to check
   its memory map since the change.
-- **Lifecycle.** Snapshot, restore and live migration don't account for
-  Pylon state. vCPU hotplug and a `pylond` restart aren't handled: the
+- **Lifecycle.** Snapshot and live migration are refused with
+  `--pylon`, since they don't account for Pylon state. vCPU hotplug and a `pylond` restart aren't handled: the
   VMM registers once, at boot, and doesn't reconnect.
 
 ## Roadmap
 
 | Track | Work | State |
 |---|---|---|
-| 4 | Fix the VMM's park decision, make `pylond` force a clean park on deadline, add the `pylon-kick` device that delivers revocations as interrupts, measure handoff latency. | Designed ([spec 06](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md)); not started |
+| 4 | Fix the VMM's park decision, make `pylond` force a clean park on deadline, add the `pylon-kick` device that delivers revocations as interrupts, measure handoff latency. | S1–S4 done ([spec 06](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md)); latency (S6) not measured |
 | 5 | `pv-pylon` Linux guest kernel module: report critical sections, park at safe points. | Designed (spec 06 §4.6); not started |
 | — | Move the shared page from the fixed address into a PCI BAR. | Follow-up in spec 06 §9 |
 | — | Run an aarch64 guest with Pylon end to end (the host side is done: [spec 07](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md)). | In progress |
-| — | Snapshot, restore and migration support. | Not designed; to be rejected explicitly until then |
+| — | Snapshot, restore and migration support. | Not designed; refused with `--pylon` until then |
 
 [Enhancements](developer-guide/enhancements.md) explains the track 4
 and 5 design.

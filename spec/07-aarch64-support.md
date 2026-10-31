@@ -310,7 +310,7 @@ parallel.
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` (#29) | `DONE` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
 | A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `IN_PROGRESS` (real guest under `pylond` run, see notes; kick path, `scx_pylon` under load and the idle-state test open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
-| A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `BLOCKED (spec 06 S4)` | Spec 06 §8 S4/S6 checks on aarch64 | — |
+| A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `NOT_STARTED` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 
 ### 9.2 Handoffs & Questions
 
