@@ -1796,10 +1796,11 @@ mod tests {
         assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
 
         // The donor never parks: the core moves anyway, counted separately. The bound counts
-        // from the first signal, sent at the deadline here.
+        // from the first signal, sent at the deadline here. Count from before this poll: it
+        // signals the donor, and the handoff poll 1 cycle later doesn't signal again.
+        let before_handoff = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
         engine.poll_once(1_000 + 149_999);
         assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
-        let before_handoff = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
         engine.poll_once(1_000 + 150_000);
         assert_eq!(
             engine.core_state(6),
