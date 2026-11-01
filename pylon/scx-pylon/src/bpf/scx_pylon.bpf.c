@@ -520,6 +520,18 @@ static void kick_idle_cpu(struct task_struct *p, __u32 claim)
 }
 
 /*
+ * Whether a vCPU thread queued on the vCPU queue can't count on @cpu, the CPU
+ * it was last on, to pick it up soon: an owner of @cpu runs first there, and
+ * a sibling's claim may keep @cpu off it. Without a kick it would then wait
+ * until some other CPU happened to look at the vCPU queue, for seconds on a
+ * quiet host.
+ */
+static bool vcpu_blocked_on(s32 cpu, __u32 claim)
+{
+    return owner_tid(cpu) != 0 || fenced(cpu, claim, false);
+}
+
+/*
  * A CPU that @slot's VM owns and @p may run on, or -1. A woken parked vCPU
  * of that VM shares it with the owner (spec 08 §4.3).
  */
@@ -609,7 +621,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
             scx_bpf_kick_cpu(shared, SCX_KICK_PREEMPT);
         } else {
             scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
-            if (fenced(cpu, tctx->dom, false)) {
+            if (vcpu_blocked_on(cpu, tctx->dom)) {
                 kick_idle_cpu(p, tctx->dom);
             }
         }
@@ -617,7 +629,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
         if (owns_cpu(p, tctx->owned_cpu)) {
             scx_bpf_kick_cpu(tctx->owned_cpu, SCX_KICK_PREEMPT);
-        } else if (fenced(cpu, tctx->dom, false)) {
+        } else if (vcpu_blocked_on(cpu, tctx->dom)) {
             kick_idle_cpu(p, tctx->dom);
         }
     } else if (p->nr_cpus_allowed == 1) {
