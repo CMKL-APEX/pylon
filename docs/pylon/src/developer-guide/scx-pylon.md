@@ -86,6 +86,9 @@ so `enqueue` kicks it to schedule again.
    the vCPU or host queue.
    - While woken vCPUs wait on the queue of the owner's VM, the owner and
      they take 100 µs turns. The owner entry's flags carry the VM's slot.
+     `running` records, per CPU, whether the owner or a woken vCPU ran
+     last; host tasks that run between turns, such as per-CPU kworkers,
+     don't change it.
 2. The vCPU queue, skipping threads that own another CPU.
 3. The host queue.
 

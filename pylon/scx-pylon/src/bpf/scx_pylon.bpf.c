@@ -197,6 +197,12 @@ static char core_sched_fmt[] =
     "core scheduling turned on by pid %llu; this kernel lacks the sched_ext fixes";
 
 __u32 cpu_claim[MAX_PCPUS];
+/*
+ * Per CPU: set when the owner was the last managed task to run there, so the
+ * next turn goes to a woken parked vCPU of its VM (spec 08 §4.3). Host tasks,
+ * such as per-CPU kworkers, run between turns and don't change it.
+ */
+__u32 woken_turn[MAX_PCPUS];
 /* Next VM queue that dispatch checks for vCPUs left without a CPU of their VM */
 __u32 vm_dsq_cursor;
 
@@ -358,6 +364,24 @@ static __always_inline __u16 owner_slot(s32 cpu)
     struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
     __u32 slot = entry && entry->target_tid ? entry->flags >> PCPU_OWNER_SLOT_SHIFT : 0;
     return slot ? (__u16)(slot - 1) : VM_SLOT_NONE;
+}
+
+/* Whether the next turn on @cpu goes to a woken parked vCPU. */
+static __always_inline bool is_woken_turn(s32 cpu)
+{
+    /* Unsigned, as in read_claim(). */
+    __u32 i = (__u32)cpu;
+
+    return i < MAX_PCPUS && *(volatile __u32 *)&woken_turn[i];
+}
+
+static __always_inline void set_woken_turn(s32 cpu, bool turn)
+{
+    __u32 i = (__u32)cpu;
+
+    if (i < MAX_PCPUS) {
+        *(volatile __u32 *)&woken_turn[i] = turn;
+    }
 }
 
 static __always_inline __u32 read_claim(s32 cpu)
@@ -733,12 +757,15 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
     /*
      * While woken parked vCPUs of the owner's VM wait, the owner and they
      * take PYLON_SHARE_SLICE turns: a woken vCPU goes first after the owner
-     * ran, and the owner after a woken vCPU (spec 08 §4.3).
+     * ran, and the owner after a woken vCPU (spec 08 §4.3). `running` keeps
+     * track of whose turn it is. @prev can't tell: a per-CPU kworker that
+     * runs between turns would hide the owner, and the owner would keep the
+     * CPU until the watchdog fired.
      */
     __u16 slot = owner_slot(cpu);
     bool share = slot < MAX_VM_SLOTS && scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) > 0;
 
-    if (share && prev && (__u32)prev->pid == owner_tid(cpu) && dispatch_woken(cpu, slot)) {
+    if (share && is_woken_turn(cpu) && dispatch_woken(cpu, slot)) {
         return;
     }
     if (cpu >= 0 && cpu < MAX_PCPUS &&
@@ -775,6 +802,11 @@ void BPF_PROG(pylon_running, struct task_struct *p)
     __u32 claim = task_claim(p);
 
     s32 cpu = scx_bpf_task_cpu(p);
+
+    /* The owner hands the next turn to a woken vCPU, and that vCPU back. */
+    if (claim != CLAIM_HOST) {
+        set_woken_turn(cpu, owns_cpu(p, cpu));
+    }
 
     if (claim == CLAIM_HOST && p->nr_cpus_allowed == 1) {
         claim = CLAIM_PINNED;
