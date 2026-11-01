@@ -1,0 +1,49 @@
+CPU 2   : nr_run=2 flags=0x1 cpu_rel=0 ops_qseq=21669768 ksync=43540947
+          curr=vcpu1[278704] class=ext_sched_class
+
+ *R vcpu1[278704] -18ms
+      scx_state/flags=3/0xd dsq_flags=0x0 ops_state/qseq=0/0
+      sticky/holding_cpu=-1/-1 dsq_id=(n/a)
+      dsq_vtime=0 slice=1014319 weight=100
+      cpus=ffffffff,ffffffff no_mig=0
+
+  R kworker/2:2[59833] -18ms
+      scx_state/flags=3/0x9 dsq_flags=0x0 ops_state/qseq=0/0
+      sticky/holding_cpu=-1/-1 dsq_id=0x8000000000000002
+      dsq_vtime=0 slice=20000000 weight=100
+      cpus=00000000,00000004 no_mig=0
+
+    kthread+0xf7/0x130
+    ret_from_fork+0x195/0x2a0
+    ret_from_fork_asm+0x1a/0x30
+
+CPU 4   : nr_run=2 flags=0x1 cpu_rel=0 ops_qseq=2966863 ksync=6242080
+          curr=vcpu3[278706] class=ext_sched_class
+
+ *R vcpu3[278706] -18ms
+      scx_state/flags=3/0xd dsq_flags=0x0 ops_state/qseq=0/0
+      sticky/holding_cpu=-1/-1 dsq_id=(n/a)
+      dsq_vtime=0 slice=1014419 weight=100
+      cpus=ffffffff,ffffffff no_mig=0
+
+  R vcpu2[278705] -18ms
+      scx_state/flags=3/0x1 dsq_flags=0x0 ops_state/qseq=0/0
+      sticky/holding_cpu=-1/-1 dsq_id=0x8000000000000002
+      dsq_vtime=0 slice=20000000 weight=100
+      cpus=00000000,00000010 no_mig=1
+
+    irqentry_exit+0x2e/0x6f0
+    sysvec_apic_timer_interrupt+0x54/0xd0
+    asm_sysvec_apic_timer_interrupt+0x1b/0x20
+
+Event counters
+--------------
+              SCX_EV_SELECT_CPU_FALLBACK:                0
+       SCX_EV_DISPATCH_LOCAL_DSQ_OFFLINE:                0
+               SCX_EV_DISPATCH_KEEP_LAST:                0
+                 SCX_EV_ENQ_SKIP_EXITING:                0
+      SCX_EV_ENQ_SKIP_MIGRATION_DISABLED:                0
+                 SCX_EV_REFILL_SLICE_DFL:                2
+                  SCX_EV_BYPASS_DURATION:         13450060
+                  SCX_EV_BYPASS_DISPATCH:                2
+                  SCX_EV_BYPASS_ACTIVATE:                1

@@ -1,0 +1,51 @@
+vm1 vcpu3 tid=278706 st=R cpu=4 ticks=8510 stuck=0
+vm2 vcpu0 tid=278708 st=R cpu=6 ticks=8884 stuck=0
+vm2 vcpu1 tid=278709 st=R cpu=3 ticks=5015 stuck=0
+vm2 vcpu2 tid=278710 st=R cpu=5 ticks=8626 stuck=0
+vm2 vcpu3 tid=278711 st=R cpu=3 ticks=4705 stuck=0
+MAP vv=[{"key":0,"value":{"parked":4,"woken":0}},{"key":1,"value":{"parked":2,"woken":2}}] own=[[2,278704,1],[3,278711,2],[4,278706,1],[5,278710,2]] dbg=
+T 03:17:02.831 scx=enabled
+vm1 vcpu0 tid=278703 st=R cpu=11 ticks=8970 stuck=0
+vm1 vcpu1 tid=278704 st=R cpu=2 ticks=4947 stuck=0
+vm1 vcpu2 tid=278705 st=R cpu=4 ticks=4902 stuck=2
+vm1 vcpu3 tid=278706 st=R cpu=4 ticks=8628 stuck=0
+vm2 vcpu0 tid=278708 st=R cpu=6 ticks=9002 stuck=0
+vm2 vcpu1 tid=278709 st=R cpu=3 ticks=5077 stuck=0
+vm2 vcpu2 tid=278710 st=R cpu=5 ticks=8740 stuck=0
+vm2 vcpu3 tid=278711 st=R cpu=3 ticks=4764 stuck=0
+MAP vv=[{"key":0,"value":{"parked":4,"woken":0}},{"key":1,"value":{"parked":2,"woken":2}}] own=[[2,278704,1],[3,278711,2],[4,278706,1],[5,278710,2]] dbg=
+T 03:17:04.013 scx=enabled
+vm1 vcpu0 tid=278703 st=R cpu=21 ticks=9087 stuck=0
+vm1 vcpu1 tid=278704 st=R cpu=2 ticks=5064 stuck=0
+vm1 vcpu2 tid=278705 st=R cpu=4 ticks=4902 stuck=3
+DUMP 1 for vm1 vcpu2 tid=278705
+vm1 vcpu3 tid=278706 st=R cpu=4 ticks=8746 stuck=0
+vm2 vcpu0 tid=278708 st=R cpu=21 ticks=9120 stuck=0
+vm2 vcpu1 tid=278709 st=R cpu=3 ticks=5141 stuck=0
+vm2 vcpu2 tid=278710 st=R cpu=5 ticks=8853 stuck=0
+vm2 vcpu3 tid=278711 st=R cpu=3 ticks=4822 stuck=0
+MAP vv=[{"key":0,"value":{"parked":4,"woken":0}},{"key":1,"value":{"parked":2,"woken":2}}] own=[[2,278704,1],[3,278711,2],[4,278706,1],[5,278710,2]] dbg=
+T 03:17:05.197 scx=enabled
+vm1 vcpu0 tid=278703 st=R cpu=15 ticks=9204 stuck=0
+vm1 vcpu1 tid=278704 st=R cpu=2 ticks=5183 stuck=0
+vm1 vcpu2 tid=278705 st=R cpu=4 ticks=4902 stuck=4
+vm1 vcpu3 tid=278706 st=R cpu=4 ticks=8865 stuck=0
+vm2 vcpu0 tid=278708 st=R cpu=13 ticks=9238 stuck=0
+vm2 vcpu1 tid=278709 st=R cpu=3 ticks=5203 stuck=0
+vm2 vcpu2 tid=278710 st=R cpu=5 ticks=8968 stuck=0
+vm2 vcpu3 tid=278711 st=R cpu=3 ticks=4880 stuck=0
+MAP vv=[{"key":0,"value":{"parked":4,"woken":0}},{"key":1,"value":{"parked":2,"woken":2}}] own=[[2,278704,1],[3,278711,2],[4,278706,1],[5,278710,2]] dbg=
+T 03:17:06.378 scx=enabled
+vm1 vcpu0 tid=278703 st=R cpu=12 ticks=9322 stuck=0
+vm1 vcpu1 tid=278704 st=R cpu=2 ticks=5301 stuck=0
+vm1 vcpu2 tid=278705 st=R cpu=4 ticks=4902 stuck=5
+vm1 vcpu3 tid=278706 st=R cpu=4 ticks=8983 stuck=0
+vm2 vcpu0 tid=278708 st=R cpu=10 ticks=9357 stuck=0
+vm2 vcpu1 tid=278709 st=R cpu=3 ticks=5265 stuck=0
+vm2 vcpu2 tid=278710 st=R cpu=5 ticks=9083 stuck=0
+vm2 vcpu3 tid=278711 st=R cpu=3 ticks=4939 stuck=0
+MAP vv=[{"key":0,"value":{"parked":4,"woken":0}},{"key":1,"value":{"parked":2,"woken":2}}] own=[[2,278704,1],[3,278711,2],[4,278706,1],[5,278710,2]] dbg=
+T 03:17:07.567 scx=enabled
+vm1 vcpu0 tid=278703 st=R cpu=9 ticks=9441 stuck=0
+vm1 vcpu1 tid=278704 st=R cpu=2 ticks=5420 stuck=0
+vm1 vcpu2 tid=278705 st=R cpu=4 ticks=4902 stuck=6
