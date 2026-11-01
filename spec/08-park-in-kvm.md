@@ -1,6 +1,7 @@
 # Specification 08: Parking vCPUs Inside KVM
 
-> **Status:** `DRAFT`. Prototype first (§7). P0 is done (§7.1); P1–P3 aren't.
+> **Status:** `DRAFT`. Prototype first (§7). P0 is done (§7.1); P1 runs,
+> with one open issue (§7.2); P2–P3 aren't.
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 
@@ -169,6 +170,30 @@ small value (§7).
 - **When the VM has no cores** (zero-core state), the woken bit is demand,
   as `zero_core_wakeup` is today.
 
+**How `scx_pylon` knows a vCPU is parked (P1).** It can't read the shared
+pages, and the vCPU list it gets from `pylond` changes only once a second.
+So:
+
+- **VM slots:** `pylond` gives each registered VM a slot (0–63), the lowest
+  free one.
+- **Parked and woken bits:** a new mmapable array, `pylon_vm_vcpus`, holds
+  two `u64` bitmasks per slot.
+  - *parked:* written by the engine at the end of each sweep. A vCPU's bit
+    is set while it is `PARKED` with no core assigned. Only VMs that
+    registered with `wake_by_signal` get bits.
+  - *woken:* set by `scx_pylon` when such a vCPU is enqueued, and cleared
+    in `quiescent` or once it owns a CPU.
+- **Thread lookup:** `pylon_vcpu_dom` maps each vCPU thread to its VMM's
+  tgid, its VM's slot, and its vCPU index.
+- **Owned CPUs:** the owner entry's flags carry the owning VM's slot plus
+  one, in bits 16–31. `scx_pylon` finds a VM's CPUs by scanning the owner
+  entries.
+- **Queues:** each slot has a DSQ, `PYLON_VM_DSQ + slot`.
+- **When the VM owns no CPU,** a woken vCPU goes on the shared vCPU queue
+  and runs anywhere, as in P0. Each `dispatch` also checks one VM queue
+  in turn, and moves vCPUs whose VM no longer owns a CPU there, before the
+  stall watchdog fires.
+
 ### 4.4 ABI (version 3)
 
 - **`state` loses a writer.** The VMM can't write `RUNNING` after an
@@ -266,6 +291,50 @@ replaces the park of spec 06 for KVM, or sits next to it.
   - V1 (§3.4 avoids the case, so the run never tested it);
   - wake rates for idle or TLB-heavy guests;
   - V4 and V6 (P1).
+
+### 7.2 P1 result (2026-11-01)
+
+**Implementation** (`pylon/park-in-kvm-p1`): §4.3, with `scx_pylon`
+required.
+
+**Run:**
+- *Host:* x86_64, Ubuntu `7.0.0-42`, 64 vCPUs and no SMT. The host is
+  itself a KVM guest (nested virtualization).
+- *VMs and `pylond`:* the §1 setup, two 4-vCPU Ubuntu 26.04 guests with
+  `initial_active_vcpus=1` and `PYLON_PARK_IN_KVM=1`, on 4 managed CPUs
+  under `pylond --enable-scx`.
+- *Guest load:* a busy loop pinned to every guest CPU, watched for 5
+  minutes.
+
+**First runs: the stall watchdog ejected `scx_pylon` within a minute.**
+- *What happened:* a woken vCPU stayed runnable on its VM's queue for
+  more than 30 s while its VM owned CPUs. Both guests logged soft
+  lockups, and the host logged a hung task and an RCU stall.
+- *Cause:* `dispatch` gave a woken vCPU its turn only when `prev` was the
+  CPU's owner. A per-CPU kworker woke on every tick and ran between
+  turns, so `prev` was never the owner and the owner kept the CPU.
+- *Fix:* `running` records whether the owner or a woken vCPU ran last on
+  each CPU, and `dispatch` gives the next turn by that.
+
+**With the fix:**
+
+| | Result |
+|---|---|
+| `scx_pylon` | attached for the whole run |
+| Soft lockups, RCU stalls | none in either VM; none on the host |
+| Woken vCPUs | ran only on their own VM's CPUs, about half a CPU each next to the owner |
+| Steal time | about 150 s per guest on each of the two sharing CPUs |
+
+**What it answers:**
+- **V4, partly:** steal time is counted while a woken vCPU waits its
+  turn. `KVM_VCPU_PREEMPTED` wasn't checked directly.
+- **V6:** `sched_ext` works with KVM's wake-up of a halted vCPU on this
+  kernel. The host has no SMT, so the core-scheduling issue of #15 wasn't
+  tested.
+- **Open:** a parked vCPU twice stayed runnable for about 14 s without
+  running, while its `woken` bit was clear. That is under the 30 s
+  watchdog, and the guest logged nothing, but a longer gap would eject
+  `scx_pylon`.
 
 ## 8. Alternatives Considered
 
