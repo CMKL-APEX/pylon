@@ -1,7 +1,7 @@
 # Specification 08: Parking vCPUs Inside KVM
 
-> **Status:** `DRAFT`. Prototype first (§7). P0 is done (§7.1); P1 runs,
-> with one open issue (§7.2); P2–P3 aren't.
+> **Status:** `DRAFT`. Prototype first (§7). P0 is done (§7.1); P1 is done
+> (§7.2); P2–P3 aren't.
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 
