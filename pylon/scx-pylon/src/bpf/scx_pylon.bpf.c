@@ -717,6 +717,35 @@ static bool dispatch_woken(s32 cpu, __u16 slot)
 }
 
 /*
+ * Whether @prev, which @cpu just ran, is a woken parked vCPU of @slot's VM
+ * that is still runnable. Its turn ended, but it goes back on the VM's queue
+ * only after dispatch has picked the next task, so the queue alone would
+ * say that nothing waits.
+ */
+static bool woken_prev(struct task_struct *prev, s32 cpu, __u16 slot)
+{
+    struct pylon_task_ctx *tctx;
+
+    return prev && (prev->scx.flags & SCX_TASK_QUEUED) && (tctx = task_ctx(prev)) &&
+           tctx->dom && tctx->slot == slot && !owns_cpu(prev, cpu) && is_parked(tctx);
+}
+
+/*
+ * Keeps @cpu running @prev for another @slice. For @prev that ran out of
+ * slice on @cpu and has a claim to it: it goes back on its queue only after
+ * dispatch, so the queues alone would give @cpu to another vCPU for a whole
+ * slice.
+ */
+static bool keep_prev(struct task_struct *prev, s32 cpu, u64 slice)
+{
+    if (!(prev->scx.flags & SCX_TASK_QUEUED) || !claim_cpu(cpu, task_claim(prev), true)) {
+        return false;
+    }
+    prev->scx.slice = slice;
+    return true;
+}
+
+/*
  * Checks one VM queue per call, in turn. If that VM no longer owns a CPU
  * (its last core was revoked, or it has none), no CPU would drain the queue
  * and the watchdog would eject scx_pylon, so its vCPUs move to the vCPU
@@ -761,18 +790,30 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
      * track of whose turn it is. @prev can't tell: a per-CPU kworker that
      * runs between turns would hide the owner, and the owner would keep the
      * CPU until the watchdog fired.
+     *
+     * The owner, or a woken vCPU, whose slice just ended is still @prev
+     * here, not on its queue, so it counts as waiting, and keeps the CPU
+     * when nothing else of its VM waits.
      */
     __u16 slot = owner_slot(cpu);
-    bool share = slot < MAX_VM_SLOTS && scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) > 0;
+    bool prev_woken = slot < MAX_VM_SLOTS && woken_prev(prev, cpu, slot);
+    bool share = slot < MAX_VM_SLOTS &&
+                 (scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) > 0 || prev_woken);
+    u64 owner_slice = share ? PYLON_SHARE_SLICE : PYLON_OWNER_SLICE;
 
     if (share && is_woken_turn(cpu) && dispatch_woken(cpu, slot)) {
         return;
     }
-    if (cpu >= 0 && cpu < MAX_PCPUS &&
-        dispatch_owner(cpu, share ? PYLON_SHARE_SLICE : PYLON_OWNER_SLICE)) {
+    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu, owner_slice)) {
+        return;
+    }
+    if (prev && owns_cpu(prev, cpu) && keep_prev(prev, cpu, owner_slice)) {
         return;
     }
     if (share && dispatch_woken(cpu, slot)) {
+        return;
+    }
+    if (prev_woken && keep_prev(prev, cpu, PYLON_SHARE_SLICE)) {
         return;
     }
     if (dispatch_vcpu(cpu)) {
