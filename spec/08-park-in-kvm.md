@@ -331,10 +331,45 @@ required.
 - **V6:** `sched_ext` works with KVM's wake-up of a halted vCPU on this
   kernel. The host has no SMT, so the core-scheduling issue of #15 wasn't
   tested.
-- **Open:** a parked vCPU twice stayed runnable for about 14 s without
-  running, while its `woken` bit was clear. That is under the 30 s
-  watchdog, and the guest logged nothing, but a longer gap would eject
-  `scx_pylon`.
+- **The 14 s gap, since fixed:** a parked vCPU twice stayed runnable for
+  about 14 s without running, while its `woken` bit was clear. See below.
+
+**The gap (2026-11-02).**
+- *What happened:* a timer interrupt preempted the parked vCPU while its
+  migration was disabled, so `enqueue` put it on its CPU's local queue,
+  behind the owner, a busy vCPU of the same VM. A `sched_ext` dump showed
+  it there, and a pinned kworker waiting the same way on another owned
+  CPU.
+- *Cause:* when a task's slice ends, the kernel picks the next task, then
+  puts the old one back through `enqueue`. For the owner, `enqueue`
+  kicked its CPU to preempt. The kick lands after the switch, so it took
+  the CPU from the task just picked. A task on the local queue got the
+  CPU each time the owner's slice ended, every 20 ms, and lost it at
+  once. The watchdog never fired, because the task was picked each time.
+- *Fix:* no preempting kick for a task that the CPU itself puts back.
+  This exposed two cases the kick had hidden: `dispatch` runs while the
+  owner, or a woken vCPU whose turn ended, is still `prev` and not yet on
+  its queue. It now counts that `prev` as waiting, and keeps it when
+  nothing else of its VM waits, instead of giving the CPU to any vCPU on
+  the vCPU queue.
+- *Turns* now end with the slice, which the tick rounds up to about 1 ms,
+  not at each kick: a sharing CPU switches about 1,000 times a second,
+  down from 20,000 to 50,000.
+
+**Runs (2026-11-02):** a 16-vCPU nested host (AMD EPYC, no SMT), otherwise
+the setup above, with steady or port-I/O guest load:
+
+| | Before the fix | With the fix |
+|---|---|---|
+| Runs | about 1 h 40 min; 70 min of it with Ubuntu guests | 15 min, Ubuntu guests |
+| Runnable vCPU without progress for 3 s | none | none |
+| Owner halted for most of a second, after boot | 1 to 10 in each 10-minute Ubuntu run | none |
+| Host task pinned to an owned CPU, against an unmanaged CPU | 1 to 45 % | 50 to 85 % |
+| Owner and woken vCPU on a shared CPU | about half each | about half each |
+
+The gap itself didn't recur on this host, before or after the fix. The
+pinned task shows the same cause every time. The `scx_pylon` live test
+`test_pinned_task_shares_cpu_with_busy_owner` checks it.
 
 ## 8. Alternatives Considered
 
