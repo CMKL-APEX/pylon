@@ -520,6 +520,24 @@ static void kick_idle_cpu(struct task_struct *p, __u32 claim)
 }
 
 /*
+ * Kicks @cpu to preempt what it runs, so that @p, which enqueue just queued
+ * for @cpu, runs there. Not when @cpu is putting back @p, which it was
+ * running (@p's slice ended, or a kick preempted it): @cpu is already
+ * picking its next task, and the kick, which lands after the switch, would
+ * preempt that task instead. A task that waits on @cpu's local queue would
+ * then lose the CPU each time it got it, and make almost no progress for as
+ * long as the owner stayed busy.
+ */
+static void kick_preempt(const struct task_struct *p, s32 cpu, u64 enq_flags)
+{
+    if (!(enq_flags & SCX_ENQ_WAKEUP) && cpu == (s32)bpf_get_smp_processor_id() &&
+        scx_bpf_task_cpu(p) == cpu) {
+        return;
+    }
+    scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+}
+
+/*
  * A CPU that @slot's VM owns and @p may run on, or -1. A woken parked vCPU
  * of that VM shares it with the owner (spec 08 §4.3).
  */
@@ -593,7 +611,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
             set_woken(tctx, false);
         }
         scx_bpf_dsq_insert(p, (u64)cpu, PYLON_OWNER_SLICE, enq_flags);
-        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+        kick_preempt(p, cpu, enq_flags);
     } else if ((tctx = vcpu_ctx(p)) && !owns_cpu(p, tctx->owned_cpu) && is_parked(tctx)) {
         /*
          * A parked vCPU that KVM woke for an interrupt (spec 08 §3.2). It
@@ -606,7 +624,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         set_woken(tctx, true);
         if (shared >= 0) {
             scx_bpf_dsq_insert(p, PYLON_VM_DSQ + tctx->slot, PYLON_SHARE_SLICE, enq_flags);
-            scx_bpf_kick_cpu(shared, SCX_KICK_PREEMPT);
+            kick_preempt(p, shared, enq_flags);
         } else {
             scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
             if (fenced(cpu, tctx->dom, false)) {
@@ -616,7 +634,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
     } else if (tctx) {
         scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
         if (owns_cpu(p, tctx->owned_cpu)) {
-            scx_bpf_kick_cpu(tctx->owned_cpu, SCX_KICK_PREEMPT);
+            kick_preempt(p, tctx->owned_cpu, enq_flags);
         } else if (fenced(cpu, tctx->dom, false)) {
             kick_idle_cpu(p, tctx->dom);
         }
