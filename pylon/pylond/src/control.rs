@@ -24,9 +24,9 @@ use tokio::sync::watch;
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::{
-    Error, PARK_LATENCY_BUCKETS_US, VmHandle, VmPolicyUpdateRequest, VmPolicyUpdateResponse,
-    VmRegistrationRequest, VmRegistrationResponse, VmSnapshot, VmStats, VmStatsRequest,
-    VmStatsResponse, pin_current_thread_to_core,
+    Error, MAX_VM_SLOTS, PARK_LATENCY_BUCKETS_US, VM_SLOT_NONE, VcpuThread, VmHandle,
+    VmPolicyUpdateRequest, VmPolicyUpdateResponse, VmRegistrationRequest, VmRegistrationResponse,
+    VmSnapshot, VmStats, VmStatsRequest, VmStatsResponse, pin_current_thread_to_core,
 };
 
 /// Maximum number of file descriptors passed in a single `SCM_RIGHTS` registration message
@@ -53,15 +53,15 @@ pub struct ControlPlane {
 /// `pylon_vcpu_dom` map, which makes `scx_pylon` keep a listed thread's SMT siblings apart
 /// before the thread ever owns a pCPU.
 pub trait VcpuDomainTable: Send + Sync {
-    /// Lists thread `tid` as a vCPU of the VMM process `pid`.
-    fn insert(&self, tid: u32, pid: u32) -> scx_pylon::Result<()>;
+    /// Lists thread `tid` as the vCPU `thread`.
+    fn insert(&self, tid: u32, thread: VcpuThread) -> scx_pylon::Result<()>;
     /// Removes thread `tid`.
     fn remove(&self, tid: u32) -> scx_pylon::Result<()>;
 }
 
 impl VcpuDomainTable for scx_pylon::VcpuDomainMap {
-    fn insert(&self, tid: u32, pid: u32) -> scx_pylon::Result<()> {
-        scx_pylon::VcpuDomainMap::insert(self, tid, pid)
+    fn insert(&self, tid: u32, thread: VcpuThread) -> scx_pylon::Result<()> {
+        scx_pylon::VcpuDomainMap::insert(self, tid, thread.pid, thread.vm_slot, thread.vcpu)
     }
 
     fn remove(&self, tid: u32) -> scx_pylon::Result<()> {
@@ -70,15 +70,15 @@ impl VcpuDomainTable for scx_pylon::VcpuDomainMap {
 }
 
 /// Brings `table` in line with `current`, the vCPU threads of the registered VMs by thread
-/// ID, with their VMM's PID. `listed` holds what the table holds, so only changes are
-/// written. A thread that fails to be listed is tried again next time.
+/// ID. `listed` holds what the table holds, so only changes are written. A thread that fails
+/// to be listed is tried again next time.
 pub fn sync_vcpu_domains(
     table: &dyn VcpuDomainTable,
-    listed: &mut HashMap<u32, u32>,
-    current: HashMap<u32, u32>,
+    listed: &mut HashMap<u32, VcpuThread>,
+    current: HashMap<u32, VcpuThread>,
 ) {
-    listed.retain(|tid, pid| {
-        if current.get(tid) == Some(pid) {
+    listed.retain(|tid, thread| {
+        if current.get(tid) == Some(thread) {
             return true;
         }
         if let Err(err) = table.remove(*tid) {
@@ -86,13 +86,13 @@ pub fn sync_vcpu_domains(
         }
         false
     });
-    for (tid, pid) in current {
+    for (tid, thread) in current {
         if listed.contains_key(&tid) {
             continue;
         }
-        match table.insert(tid, pid) {
+        match table.insert(tid, thread) {
             Ok(()) => {
-                listed.insert(tid, pid);
+                listed.insert(tid, thread);
             }
             Err(err) => warn!("Failed to list vCPU thread {tid} in scx_pylon: {err}"),
         }
@@ -236,6 +236,10 @@ impl ControlPlane {
             .filter(|existing| existing.vm_id() != handle.vm_id())
             .cloned()
             .collect();
+        // The lowest VM slot no other registered VM holds (spec 08 §4.3).
+        let free_slot =
+            (0..MAX_VM_SLOTS as u16).find(|slot| next.iter().all(|vm| vm.vm_slot() != *slot));
+        handle.set_vm_slot(free_slot.unwrap_or(VM_SLOT_NONE));
         next.push(handle);
         vm_snapshot.store(Arc::new(next));
     }
@@ -757,20 +761,21 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::tests::build_test_vm;
 
     /// A `VcpuDomainTable` that records its contents and can refuse inserts.
     #[derive(Default)]
     struct FakeTable {
-        entries: Mutex<HashMap<u32, u32>>,
+        entries: Mutex<HashMap<u32, VcpuThread>>,
         refuse: Mutex<bool>,
     }
 
     impl VcpuDomainTable for FakeTable {
-        fn insert(&self, tid: u32, pid: u32) -> scx_pylon::Result<()> {
+        fn insert(&self, tid: u32, thread: VcpuThread) -> scx_pylon::Result<()> {
             if *self.refuse.lock().unwrap() {
                 return Err(scx_pylon::Error::Io(io::Error::other("map full")));
             }
-            self.entries.lock().unwrap().insert(tid, pid);
+            self.entries.lock().unwrap().insert(tid, thread);
             Ok(())
         }
 
@@ -804,27 +809,29 @@ mod tests {
         handle_client_connection(daemon, snapshot).await.unwrap();
     }
 
+    /// vCPU `vcpu` of the VM in slot `vm_slot`, whose VMM is `pid`.
+    fn thread(pid: u32, vm_slot: u16, vcpu: u16) -> VcpuThread {
+        VcpuThread { pid, vm_slot, vcpu }
+    }
+
     #[test]
     fn sync_vcpu_domains_follows_the_registered_threads() {
         let table = FakeTable::default();
         let mut listed = HashMap::new();
 
-        sync_vcpu_domains(
-            &table,
-            &mut listed,
-            HashMap::from([(10, 1), (11, 1), (20, 2)]),
-        );
-        assert_eq!(
-            *table.entries.lock().unwrap(),
-            HashMap::from([(10, 1), (11, 1), (20, 2)])
-        );
+        let first = HashMap::from([
+            (10, thread(1, 0, 0)),
+            (11, thread(1, 0, 1)),
+            (20, thread(2, 1, 0)),
+        ]);
+        sync_vcpu_domains(&table, &mut listed, first.clone());
+        assert_eq!(*table.entries.lock().unwrap(), first);
 
-        // VM 2 is gone, VM 1 lost a thread, and thread 11's ID now belongs to VM 3.
-        sync_vcpu_domains(&table, &mut listed, HashMap::from([(10, 1), (11, 3)]));
-        assert_eq!(
-            *table.entries.lock().unwrap(),
-            HashMap::from([(10, 1), (11, 3)])
-        );
+        // VM 2 is gone, VM 1 lost a thread, thread 11's ID now belongs to VM 3, and VM 1
+        // moved to slot 2.
+        let second = HashMap::from([(10, thread(1, 2, 0)), (11, thread(3, 0, 0))]);
+        sync_vcpu_domains(&table, &mut listed, second.clone());
+        assert_eq!(*table.entries.lock().unwrap(), second);
         assert_eq!(listed, *table.entries.lock().unwrap());
     }
 
@@ -832,13 +839,39 @@ mod tests {
     fn sync_vcpu_domains_retries_a_failed_insert() {
         let table = FakeTable::default();
         let mut listed = HashMap::new();
+        let current = HashMap::from([(10, thread(1, 0, 0))]);
 
         *table.refuse.lock().unwrap() = true;
-        sync_vcpu_domains(&table, &mut listed, HashMap::from([(10, 1)]));
+        sync_vcpu_domains(&table, &mut listed, current.clone());
         assert!(listed.is_empty());
 
         *table.refuse.lock().unwrap() = false;
-        sync_vcpu_domains(&table, &mut listed, HashMap::from([(10, 1)]));
-        assert_eq!(*table.entries.lock().unwrap(), HashMap::from([(10, 1)]));
+        sync_vcpu_domains(&table, &mut listed, current.clone());
+        assert_eq!(*table.entries.lock().unwrap(), current);
+    }
+
+    /// Each published VM gets the lowest slot no other registered VM holds, and a VM that
+    /// registers again keeps none of its old one.
+    #[test]
+    fn publish_vm_handle_gives_the_lowest_free_slot() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(VmSnapshot::from_pointee(Vec::new()));
+        let vms: Vec<_> = (1..=3).map(|id| build_test_vm(id, 1, 0, 1, 1)).collect();
+        for vm in &vms {
+            ControlPlane::publish_vm_handle(&snapshot, vm.handle.clone());
+        }
+        let slots: Vec<_> = vms.iter().map(|vm| vm.handle.vm_slot()).collect();
+        assert_eq!(slots, [0, 1, 2]);
+
+        // VM 2's VMM exits and is removed; a new VM takes its slot.
+        let remaining: Vec<_> = snapshot
+            .load()
+            .iter()
+            .filter(|vm| vm.vm_id() != 2)
+            .cloned()
+            .collect();
+        snapshot.store(Arc::new(remaining));
+        let vm4 = build_test_vm(4, 1, 0, 1, 1);
+        ControlPlane::publish_vm_handle(&snapshot, vm4.handle.clone());
+        assert_eq!(vm4.handle.vm_slot(), 1);
     }
 }

@@ -18,7 +18,7 @@ use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::{DEFAULT_ENGINE_CPU, MatrixEngine, calibrate_tsc_khz, default_counter_khz};
-use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot};
+use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot, VmVcpusTable};
 use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -247,12 +247,18 @@ fn main() -> Result<()> {
     // give two VMs sibling threads of one core.
     let smt_ring = scx.as_ref().map(|_| scx_pylon::host_smt_ring());
 
-    let (pcpu_owners, vcpu_domains, _scx_handle) = if let Some(scx) = scx {
+    let (pcpu_owners, vcpu_domains, vm_vcpus, _scx_handle) = if let Some(scx) = scx {
         // Plane 1 lists registered vCPU threads here, so scx_pylon isolates them before they
         // own a pCPU.
         let vcpu_domains = scx
             .vcpu_domain_map()
             .context("failed to open scx_pylon's vCPU thread map")?;
+        // Plane 2 publishes parked vCPUs here, so scx_pylon keeps them on their VM's cores
+        // when KVM wakes them (spec 08 §4.3).
+        let vm_vcpus = VmVcpusTable::from_mmap(
+            scx.vm_vcpus_mmap()
+                .context("failed to map scx_pylon's per-VM vCPU map")?,
+        )?;
         let (owner_map, link, guard_links, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
         let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
@@ -260,6 +266,7 @@ fn main() -> Result<()> {
         (
             Arc::new(table),
             Some(vcpu_domains),
+            Arc::new(vm_vcpus),
             Some((link, guard_links, obj)),
         )
     } else if let Some(ref path) = args.pcpu_map_file {
@@ -270,9 +277,19 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to open pcpu map file {}", path.display()))?;
         // SAFETY: `file` is opened read/write for the shared `PcpuOwnerEntry` table.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-        (Arc::new(PcpuOwnerTable::from_mmap(mmap)?), None, None)
+        (
+            Arc::new(PcpuOwnerTable::from_mmap(mmap)?),
+            None,
+            Arc::new(VmVcpusTable::new_in_memory()),
+            None,
+        )
     } else {
-        (Arc::new(PcpuOwnerTable::new_in_memory()), None, None)
+        (
+            Arc::new(PcpuOwnerTable::new_in_memory()),
+            None,
+            Arc::new(VmVcpusTable::new_in_memory()),
+            None,
+        )
     };
 
     let vm_snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
@@ -287,7 +304,8 @@ fn main() -> Result<()> {
     let engine_thread = thread::Builder::new()
         .name("pylond-engine".to_owned())
         .spawn(move || {
-            let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus);
+            let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus)
+                .with_vm_vcpus(vm_vcpus);
             engine.set_engine_cpu(engine_cpu);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);
