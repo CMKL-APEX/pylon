@@ -93,6 +93,58 @@ the host. Scale-in is now within the 3–6 µs target, and scale-out is
 still about four times over it. With 20 waves per run, each p99 is the
 run's slowest wave.
 
+### `scx_pylon`'s cost to the benchmark (modelled, 2026-10-30 and 2026-11-02)
+
+`scx_pylon` makes the Pylon column slower. The benchmark's worker
+threads aren't vCPUs, so to `scx_pylon` they are host tasks, and each
+wake of one goes through `scx_pylon`'s host path: `enqueue`, the shared
+host queue, then `dispatch` with its claim checks. Without `sched_ext`
+the kernel wakes them directly.
+
+**On the EPYC 9124 host (2026-10-30).** One `pylon-bench` build from
+`main`, with sched_ext off or with `scx_pylon` from one of two commits
+attached by a test `pylond`. Means, rounded. The raw results were lost
+when the host restarted, so only these figures remain.
+
+| Configuration | Scale-out, mean | Scale-in, mean |
+|---|---|---|
+| sched_ext off, with or without `pylond` | about 20 µs | about 2.5 µs |
+| `scx_pylon` at `e679f1133` (the 2026-10-29 build) | about 55 µs | about 12 µs |
+| `scx_pylon` at `main` then (after #16, #17 and #21) | about 65 µs | about 24 µs |
+
+Most of the cost is `scx_pylon` itself. The rest came with #16, which
+sent every waking host thread through the host queue and `dispatch`;
+before it, the kernel's global queue took them without calling into
+BPF. Earlier runs that day were 4 to 5 times slower in every
+configuration, sched_ext off too, because of other load on the host.
+
+**A fast path, tried in the dev VM (2026-11-02).** The change: in
+`select_cpu`, a host task that wakes onto an idle CPU whose siblings
+allow host work is inserted on that CPU's local queue, skipping the host
+queue and `dispatch`. Six interleaved rounds of `pylon-bench` (defaults)
+in a 16-vCPU KVM guest on the same host (kernel `7.0.0-38-generic`), one
+bench build, `scx_pylon` attached by a test `pylond` (`--cores 2-5`).
+Medians of the six runs:
+
+| Configuration | Scale-out, mean | Scale-out, p99 | Scale-in, mean | Scale-in, p99 |
+|---|---|---|---|---|
+| sched_ext off | 62 µs | 147 µs | 4.3 µs | 11 µs |
+| `scx_pylon` at `4d7106ae5` (spec 08 P1) | 108 µs | 155 µs | 95 µs | 1,040 µs |
+| The same with the fast path | 311 µs | 3,184 µs | 122 µs | 1,858 µs |
+
+The fast path didn't help. Its scale-out was slower in five of the six
+rounds and about the same in the other; its scale-in was faster in some
+rounds and much slower in others. It wasn't merged. A likely reason is
+that a task inserted this way runs a default 20 ms slice on a CPU that
+another task may want soon. The guest's own vCPUs halt and wake through the
+host, so every figure here is noisier and higher than on the host
+itself: single runs of sched_ext off reached 252 µs out and 155 µs in.
+Read the table for its order, not its values.
+
+**Not known yet:** the cost for a real vCPU, which `scx_pylon` places
+directly instead of through the host queue. These threads are a proxy
+for host tasks, which is the open gap below.
+
 ## Other figures
 
 | Figure | Kind | Source |
@@ -113,7 +165,8 @@ be claimed:
   (`pylon_vm_park_latency_microseconds`), but no run has been recorded
   yet.
 - Wake latency of a parked vCPU in a real VM.
-- `scx_pylon`'s cost for non-VM tasks on the host.
+- `scx_pylon`'s cost for non-VM tasks on the host, beyond the
+  benchmark's threads above.
 - The same `pylon-bench` run on a CPU with `WAITPKG`.
 
 When you add a figure, add it here with its date, hardware, build and
