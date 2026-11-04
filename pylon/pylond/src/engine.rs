@@ -20,8 +20,8 @@ use pylon_abi::clock::{architectural_counter_khz, read_counter};
 use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonVcpuSlot, VCPU_STATE_PARKED};
 
 use crate::{
-    CoreState, Error, MAX_PCPUS, PcpuOwnerTable, VM_SLOT_NONE, VmHandle, VmSnapshot, VmVcpusTable,
-    pin_current_thread_to_core,
+    CoreState, Error, MAX_PCPUS, MAX_VM_SLOTS, PcpuOwnerTable, VM_SLOT_NONE, VmHandle, VmSnapshot,
+    VmVcpusTable, pin_current_thread_to_core,
 };
 
 /// Maximum number of concurrent VMs evaluated per stack-allocated sweep in Plane 2.
@@ -54,6 +54,10 @@ pub const REVOKE_RESIGNAL_US: u64 = 10;
 /// in the guest to turn them back on, and each signal takes that from it: on a nested host, a
 /// guest entry costs about as long as `REVOKE_RESIGNAL_US`.
 pub const REVOKE_RESIGNAL_MAX_US: u64 = 1000;
+
+/// How long a parked vCPU that KVM woke may stay runnable, sharing its VM's cores, before it
+/// counts as demand for a core of its own (`spec/08-park-in-kvm.md` §4.2).
+pub const WOKEN_DEMAND_US: u64 = 4_000;
 
 /// Delay between polling sweeps in nanoseconds (~1000 cycles on a 3 GHz core). The engine turns it
 /// into counter ticks with the host rate, so it doesn't depend on the counter's frequency.
@@ -219,6 +223,40 @@ struct VmDemandEval {
     zero_core_wakeup: bool,
 }
 
+/// What the engine read from one VM's `woken` mask in a sweep.
+#[derive(Debug, Clone, Copy, Default)]
+struct WokenEval {
+    /// Woken vCPUs that are still `PARKED` with no core assigned.
+    mask: u64,
+    /// How many of them have been woken for `WOKEN_DEMAND_US` or longer.
+    long: u32,
+    /// The longest current wake, in counter ticks (0 if none).
+    longest_cycles: u64,
+}
+
+/// The engine's record of one VM slot's woken vCPUs.
+#[derive(Debug, Clone, Copy)]
+struct WokenTrack {
+    /// The VM that held the slot when the record was made (0 if none).
+    vm_id: u64,
+    /// The mask seen in the last sweep.
+    mask: u64,
+    /// When each vCPU of `mask` was first seen woken.
+    since_tsc: [u64; MAX_VCPUS],
+    /// Woken vCPU time not yet added to the VM's counters, in counter ticks: while the VM owned
+    /// a core, and while it owned none.
+    pending_cycles: [u64; 2],
+}
+
+impl WokenTrack {
+    const EMPTY: Self = Self {
+        vm_id: 0,
+        mask: 0,
+        since_tsc: [0; MAX_VCPUS],
+        pending_cycles: [0; 2],
+    };
+}
+
 impl VmDemandEval {
     const EMPTY: Self = Self {
         vm_idx: 0,
@@ -283,6 +321,10 @@ pub struct MatrixEngine {
     vm_vcpus: Arc<VmVcpusTable>,
     /// VM slots whose `parked` mask the engine last left non-zero.
     parked_slots: u64,
+    /// Woken vCPUs by VM slot (`spec/08-park-in-kvm.md` §4.2).
+    woken: Box<[WokenTrack; MAX_VM_SLOTS]>,
+    /// When the previous sweep ran (0 before the first).
+    last_poll_tsc: u64,
 }
 
 impl MatrixEngine {
@@ -316,6 +358,8 @@ impl MatrixEngine {
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
             vm_vcpus: Arc::new(VmVcpusTable::new_in_memory()),
             parked_slots: 0,
+            woken: Box::new([WokenTrack::EMPTY; MAX_VM_SLOTS]),
+            last_poll_tsc: 0,
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
@@ -551,6 +595,7 @@ impl MatrixEngine {
 
         // Last, so the cores assigned in this sweep are already out of the masks.
         self.publish_parked_vcpus(vms, vm_count);
+        self.last_poll_tsc = now_tsc;
     }
 
     fn reclaim_idle_assigned_cores(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
@@ -650,6 +695,10 @@ impl MatrixEngine {
                 0
             };
 
+            let woken = self.track_woken_vcpus(vm, committed_cores > 0, now_tsc);
+            // A long wake waits like the head of the guest's run queue.
+            let head_wait = head_wait.max(woken.longest_cycles);
+
             let mut zero_core_wakeup = false;
             if committed_cores == 0 {
                 let next_timer_tsc =
@@ -663,7 +712,8 @@ impl MatrixEngine {
                         || Self::any_park_timer_due(vm, now_tsc));
                 let rx_cons = page.telemetry.rx_ring_cons_idx.load(Ordering::Relaxed);
                 let rx_pending = vm.host_rx_doorbell() > rx_cons;
-                if timer_expired || rx_pending {
+                // With no core, a woken vCPU runs on CPUs other VMs may own (spec 08 §4.2).
+                if timer_expired || rx_pending || woken.mask != 0 {
                     zero_core_wakeup = true;
                 }
             }
@@ -674,6 +724,12 @@ impl MatrixEngine {
                 runnable.clamp(vm.min_cores(), vm.max_cores())
             } else {
                 0
+            };
+            // Each long wake asks for one more core: `runnable_threads` may not show its work.
+            let desired_cores = if woken.long > 0 {
+                desired_cores.max((committed_cores + woken.long).min(vm.max_cores()))
+            } else {
+                desired_cores
             };
 
             let urgency = if zero_core_wakeup {
@@ -876,6 +932,101 @@ impl MatrixEngine {
         }
     }
 
+    /// Reads `vm`'s `woken` mask from `scx_pylon`, keeping vCPUs that are still `PARKED` with no
+    /// core assigned, records when each was first seen, and adds the woken time since the last
+    /// sweep to the VM's counters, as shared time if the VM `owned` a core
+    /// (`spec/08-park-in-kvm.md` §4.2).
+    fn track_woken_vcpus(&mut self, vm: &VmHandle, owned: bool, now_tsc: u64) -> WokenEval {
+        let slot = vm.vm_slot();
+        let Some(entry) = self.vm_vcpus.entry(slot) else {
+            return WokenEval::default();
+        };
+        if !vm.wake_by_signal() {
+            return WokenEval::default();
+        }
+        let page = vm.shared_page();
+        let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+        let mut mask = entry.woken.load(Ordering::Acquire);
+        if num_vcpus < MAX_VCPUS {
+            mask &= (1u64 << num_vcpus) - 1;
+        }
+        let mut bits = mask;
+        while bits != 0 {
+            let vcpu = bits.trailing_zeros() as usize;
+            if !Self::is_unassigned_parked(&page.vcpus[vcpu]) {
+                mask &= !(1u64 << vcpu);
+            }
+            bits &= bits - 1;
+        }
+
+        let tsc_khz = self.tsc_khz_of(vm);
+        let demand_cycles = Self::us_to_cycles(WOKEN_DEMAND_US, tsc_khz);
+        let elapsed = if self.last_poll_tsc != 0 {
+            now_tsc.saturating_sub(self.last_poll_tsc)
+        } else {
+            0
+        };
+        let track = &mut self.woken[slot as usize];
+        if track.vm_id != vm.vm_id() {
+            *track = WokenTrack::EMPTY;
+            track.vm_id = vm.vm_id();
+        }
+
+        // Time since the last sweep, for the vCPUs that were woken then and still are.
+        let pending = &mut track.pending_cycles[usize::from(!owned)];
+        *pending = pending
+            .saturating_add(elapsed.saturating_mul(u64::from((track.mask & mask).count_ones())));
+        let usec = pending.saturating_mul(1000) / tsc_khz;
+        if usec > 0 {
+            vm.add_woken_usec(owned, usec);
+            *pending -= usec * tsc_khz / 1000;
+        }
+
+        let mut eval = WokenEval {
+            mask,
+            ..WokenEval::default()
+        };
+        let mut bits = mask;
+        while bits != 0 {
+            let vcpu = bits.trailing_zeros() as usize;
+            if track.mask & (1u64 << vcpu) == 0 {
+                track.since_tsc[vcpu] = now_tsc;
+            }
+            let woken_for = now_tsc.saturating_sub(track.since_tsc[vcpu]);
+            if woken_for >= demand_cycles {
+                eval.long += 1;
+            }
+            eval.longest_cycles = eval.longest_cycles.max(woken_for);
+            bits &= bits - 1;
+        }
+        track.mask = mask;
+        eval
+    }
+
+    /// The vCPU of `vm` that has been woken longest and is still `PARKED` with no core assigned.
+    /// It is already running, so a core for it needs no wake-up.
+    fn longest_woken_vcpu(&self, vm: &VmHandle) -> Option<u8> {
+        let slot = vm.vm_slot() as usize;
+        let track = self.woken.get(slot)?;
+        if track.vm_id != vm.vm_id() {
+            return None;
+        }
+        let page = vm.shared_page();
+        let mut best: Option<(u64, u8)> = None;
+        let mut bits = track.mask;
+        while bits != 0 {
+            let vcpu = bits.trailing_zeros() as usize;
+            let since = track.since_tsc[vcpu];
+            if Self::is_unassigned_parked(&page.vcpus[vcpu])
+                && best.is_none_or(|(best_since, _)| since < best_since)
+            {
+                best = Some((since, vcpu as u8));
+            }
+            bits &= bits - 1;
+        }
+        best.map(|(_, vcpu)| vcpu)
+    }
+
     /// Tells `scx_pylon` which vCPUs of VMs that park inside KVM are `PARKED` with no core
     /// assigned, so it keeps them on their own VM's cores when KVM wakes them
     /// (`spec/08-park-in-kvm.md` §4.3). Masks of VMs that left are cleared.
@@ -936,7 +1087,10 @@ impl MatrixEngine {
             while self.eval_buf[order_idx].needed_cores() > 0 {
                 let recipient_eval = self.eval_buf[order_idx];
                 let recipient_vm = &vms[recipient_eval.vm_idx];
-                let Some(recipient_vcpu) = Self::select_parked_vcpu(recipient_vm, now_tsc) else {
+                let Some(recipient_vcpu) = self
+                    .longest_woken_vcpu(recipient_vm)
+                    .or_else(|| Self::select_parked_vcpu(recipient_vm, now_tsc))
+                else {
                     break;
                 };
 
