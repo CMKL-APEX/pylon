@@ -862,6 +862,11 @@ fn vmm_thread_rules(
         (libc::SYS_stat, vec![]),
         (libc::SYS_statfs, vec![]),
         (libc::SYS_statx, vec![]),
+        // Pylon's park bound timers (spec 08 §3.6): the vCPU threads, which inherit this
+        // filter, create them, and this thread stops them at shutdown.
+        (libc::SYS_timer_create, vec![]),
+        (libc::SYS_timer_delete, vec![]),
+        (libc::SYS_timer_settime, vec![]),
         (libc::SYS_timerfd_create, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
         (
@@ -1070,6 +1075,11 @@ fn vcpu_thread_rules(
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_stat, vec![]),
         (libc::SYS_statx, vec![]),
+        // With PYLON_PARK_IN_KVM, each vCPU thread has a timer that bounds its park
+        // (spec 08 §3.6).
+        (libc::SYS_timer_create, vec![]),
+        (libc::SYS_timer_delete, vec![]),
+        (libc::SYS_timer_settime, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_unlink, vec![]),
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
