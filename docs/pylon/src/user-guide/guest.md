@@ -26,7 +26,9 @@ default), it:
 
 - writes the number of runnable threads, from the fourth field of
   `/proc/loadavg` (or `procs_running` in `/proc/stat`), to
-  `runnable_threads`;
+  `runnable_threads`. Both count the agent itself, which is running
+  while it reads them, so the agent subtracts 1: an idle guest reports
+  0, and `pylond` can move all its cores to other VMs;
 - increments `guest_heartbeat`, which also tells `pylond` that the guest
   has booted, so it parks the vCPUs beyond `initial_active_vcpus`;
 - when there are more runnable threads than running vCPUs, records the
