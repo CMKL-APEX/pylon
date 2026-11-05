@@ -658,11 +658,40 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /*
+ * Dispatches @cpu's owner, @tid, with @slice if it waits on @dsq. pylond can
+ * give @cpu to a vCPU thread that is already queued as a woken or unowned
+ * vCPU. Enqueue doesn't run again for it, so it isn't on the owner queue,
+ * and other CPUs leave it alone because it owns @cpu.
+ */
+static bool dispatch_owner_from(s32 cpu, __u32 tid, u64 dsq, u64 slice)
+{
+    struct task_struct *p;
+    int scanned = 0;
+
+    bpf_for_each(scx_dsq, p, dsq, 0) {
+        if (++scanned > MAX_VCPU_SCAN) {
+            break;
+        }
+        if ((__u32)p->pid != tid) {
+            continue;
+        }
+        if (!claim_cpu(cpu, task_claim(p), true)) {
+            return false;
+        }
+        scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, slice);
+        return scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+    }
+    return false;
+}
+
+/*
  * Dispatches this pCPU's owner with @slice if it is queued, and moves any
  * other task left on the owner queue (its ownership changed) to the queue it
- * now belongs on. Returns true if the owner was dispatched.
+ * now belongs on. Returns true if the owner was dispatched. The owner can
+ * also wait on the vCPU queue or its VM's queue, where it was before it got
+ * this pCPU; @prev, if it is the owner, waits on neither.
  */
-static bool dispatch_owner(s32 cpu, u64 slice)
+static bool dispatch_owner(s32 cpu, struct task_struct *prev, u64 slice)
 {
     struct task_struct *p;
     __u32 tid = owner_tid(cpu);
@@ -681,13 +710,20 @@ static bool dispatch_owner(s32 cpu, u64 slice)
             scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, dsq, 0);
         }
     }
-    return dispatched;
+    if (dispatched || tid == 0 || (prev && (__u32)prev->pid == tid)) {
+        return dispatched;
+    }
+
+    __u16 slot = owner_slot(cpu);
+    return dispatch_owner_from(cpu, tid, PYLON_VCPU_DSQ, slice) ||
+           (slot < MAX_VM_SLOTS && dispatch_owner_from(cpu, tid, PYLON_VM_DSQ + slot, slice));
 }
 
 /*
  * Dispatches the first task on the vCPU queue that may run on @cpu next to
- * its SMT siblings. A thread that owns another pCPU is left for that pCPU,
- * which enqueue has kicked.
+ * its SMT siblings. A thread that owns another pCPU is left for that pCPU.
+ * Enqueue kicked that pCPU, unless the thread got it while it waited here;
+ * an idle pCPU is kicked for it then.
  */
 static bool dispatch_vcpu(s32 cpu)
 {
@@ -706,6 +742,7 @@ static bool dispatch_vcpu(s32 cpu)
             continue;
         }
         if (tctx->owned_cpu != cpu && owns_cpu(p, tctx->owned_cpu)) {
+            scx_bpf_kick_cpu(tctx->owned_cpu, SCX_KICK_IDLE);
             continue;
         }
         if (claim_cpu(cpu, tctx->dom ? tctx->dom : CLAIM_HOST, false) &&
@@ -784,7 +821,10 @@ static void rescue_stranded_vcpus(void)
         }
     }
     bpf_for_each(scx_dsq, p, PYLON_VM_DSQ + slot, 0) {
-        scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, PYLON_VCPU_DSQ, 0);
+        if (scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, PYLON_VCPU_DSQ, 0)) {
+            /* An idle CPU only looks at the vCPU queue once kicked. */
+            kick_idle_cpu(p, task_claim(p));
+        }
     }
 }
 
@@ -822,7 +862,7 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
     if (share && is_woken_turn(cpu) && dispatch_woken(cpu, slot)) {
         return;
     }
-    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu, owner_slice)) {
+    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu, prev, owner_slice)) {
         return;
     }
     if (prev && owns_cpu(prev, cpu) && keep_prev(prev, cpu, owner_slice)) {
