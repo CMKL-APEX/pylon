@@ -2006,8 +2006,9 @@ mod tests {
         .unwrap()
     }
 
-    /// A VM with no core whose parked vCPU KVM woke gets a core at once, for that vCPU before
-    /// the one in `stranded_work_bitmap` (spec 08 §4.2).
+    /// A VM with no core whose parked vCPU KVM woke gets a core at once. The core goes to the
+    /// vCPU in `stranded_work_bitmap`: its tasks can't run until it has one, while the woken
+    /// vCPU already runs (spec 08 §4.2).
     #[test]
     fn test_plane2_woken_vcpu_of_zero_core_vm_gets_a_core() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
@@ -2033,9 +2034,13 @@ mod tests {
         engine.poll_once(2_000);
         assert_eq!(
             engine.core_state(6),
-            CoreState::Assigned { vm_id: 80, vcpu: 2 }
+            CoreState::Assigned { vm_id: 80, vcpu: 1 }
         );
-        assert_eq!(page.vcpus[2].assigned_pcpu.load(Ordering::Acquire), 6);
+        assert_eq!(page.vcpus[1].assigned_pcpu.load(Ordering::Acquire), 6);
+        assert_eq!(
+            page.telemetry.stranded_work_bitmap.load(Ordering::Acquire),
+            0
+        );
     }
 
     /// A woken vCPU of a VM that owns a core shares that core until it has been woken for

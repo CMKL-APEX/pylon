@@ -445,6 +445,32 @@ impl MatrixEngine {
     /// (`park_timer_deadline_tsc`), before scanning remaining vCPU slots.
     #[inline]
     pub fn select_parked_vcpu(vm: &VmHandle, now_tsc: u64) -> Option<u8> {
+        if let Some(vcpu) = Self::take_stranded_vcpu(vm) {
+            return Some(vcpu);
+        }
+
+        let page = vm.shared_page();
+        let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+        let mut first_parked = None;
+        let mut idx = 0usize;
+        while idx < num_vcpus {
+            let slot = &page.vcpus[idx];
+            if Self::is_unassigned_parked(slot) {
+                if Self::park_timer_due(slot, now_tsc) {
+                    return Some(idx as u8);
+                }
+                first_parked = first_parked.or(Some(idx as u8));
+            }
+            idx += 1;
+        }
+        first_parked
+    }
+
+    /// Takes the lowest free parked vCPU of `vm` with guest tasks queued behind it
+    /// (`stranded_work_bitmap`) and clears its bit. The guest counts those tasks as
+    /// runnable, and they can't run until that vCPU gets a core.
+    #[inline]
+    fn take_stranded_vcpu(vm: &VmHandle) -> Option<u8> {
         let page = vm.shared_page();
         let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
         let mut bitmap = page.telemetry.stranded_work_bitmap.load(Ordering::Acquire);
@@ -460,20 +486,7 @@ impl MatrixEngine {
             }
             bitmap &= !bit;
         }
-
-        let mut first_parked = None;
-        let mut idx = 0usize;
-        while idx < num_vcpus {
-            let slot = &page.vcpus[idx];
-            if Self::is_unassigned_parked(slot) {
-                if Self::park_timer_due(slot, now_tsc) {
-                    return Some(idx as u8);
-                }
-                first_parked = first_parked.or(Some(idx as u8));
-            }
-            idx += 1;
-        }
-        first_parked
+        None
     }
 
     /// Whether the guest timer that was armed when `slot`'s vCPU parked is due. A parked
@@ -1087,8 +1100,10 @@ impl MatrixEngine {
             while self.eval_buf[order_idx].needed_cores() > 0 {
                 let recipient_eval = self.eval_buf[order_idx];
                 let recipient_vm = &vms[recipient_eval.vm_idx];
-                let Some(recipient_vcpu) = self
-                    .longest_woken_vcpu(recipient_vm)
+                // Stranded work first: those tasks wait until their vCPU runs, while a woken
+                // vCPU already runs, on cores its VM owns or on others.
+                let Some(recipient_vcpu) = Self::take_stranded_vcpu(recipient_vm)
+                    .or_else(|| self.longest_woken_vcpu(recipient_vm))
                     .or_else(|| Self::select_parked_vcpu(recipient_vm, now_tsc))
                 else {
                     break;

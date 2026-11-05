@@ -224,10 +224,13 @@ assigned. It records when each bit was set, by VM slot and vCPU.
   tick, so a vCPU that wakes for an IPI or a timer and halts again stays
   shared. The longest wake sets the
   VM's urgency, as `head_wait_tsc` does, weighted by its priority.
-- **Which vCPU gets the core:** the longest-woken vCPU first, before the
-  `stranded_work_bitmap`, a due timer, or the first parked vCPU. It is
-  already running, so the assignment needs no wake-up: the signal of
-  §3.3 interrupts its `KVM_RUN`, and the VMM writes `RUNNING`.
+- **Which vCPU gets the core:** a vCPU in `stranded_work_bitmap` first,
+  then the longest-woken vCPU, then one with a due timer, then the first
+  parked vCPU. Stranded tasks can't run until their vCPU has a core,
+  and the guest counts them as runnable, so its VM keeps asking for
+  cores. A woken vCPU already runs, so its assignment needs no wake-up:
+  the signal of §3.3 interrupts its `KVM_RUN`, and the VMM writes
+  `RUNNING`.
 - **Metering:** each VM counts the time its vCPUs spent woken, split by
   whether the VM owned a core at the time (`woken_shared_usec`) or not
   (`woken_unowned_usec`). Shared time is already inside the VM's

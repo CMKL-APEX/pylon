@@ -182,12 +182,12 @@ The engine sorts the demand records by urgency, highest first (an
 in-place insertion sort over at most 64 entries). Then, for each VM in
 that order, while it needs more cores (desired minus committed):
 
-1. **Pick a vCPU.** The longest-woken free vCPU, if any: it is already
-   running, so it needs no wake-up. Else `select_parked_vcpu` takes the
-   lowest set bit of `stranded_work_bitmap` whose vCPU is free (clearing
-   that bit), else
-   the lowest-numbered free vCPU whose parked timer is due, else the
-   lowest-numbered free vCPU. A vCPU is *free* when it is
+1. **Pick a vCPU.** The lowest set bit of `stranded_work_bitmap` whose
+   vCPU is free (clearing that bit): the guest tasks queued on it can't
+   run until it has a core. Else the longest-woken free vCPU: it is
+   already running, so it needs no wake-up. Else the lowest-numbered
+   free vCPU whose parked timer is due, else the lowest-numbered free
+   vCPU. A vCPU is *free* when it is
    `PARKED` and its `assigned_pcpu` is unassigned; a vCPU with a CPU on
    its way is still `PARKED` but already assigned or reserved. If the VM
    has no free vCPU, move on to the next VM.
