@@ -91,8 +91,9 @@ handler, so `KVM_RUN` returns `EINTR`, the KVM backend reports
 - `pylond` learns the VMM's PID from `SO_PEERCRED` and opens a pidfd for
   it. Before each signal it checks the process still exists, so a reused
   PID is never signalled.
-- The signal is resent every 10 µs, because one that arrives while the
-  thread is outside `KVM_RUN` doesn't stop the next guest entry.
+- The signal is resent, because one that arrives while the thread is
+  outside `KVM_RUN` doesn't stop the next guest entry. The interval
+  starts at 10 µs and doubles with each signal, up to 1 ms.
 - `pylond` hands the CPU over only once the VMM has written `PARKED`. As a
   last resort it hands it over 50 µs after the deadline, counted
   separately as a handoff without park.
