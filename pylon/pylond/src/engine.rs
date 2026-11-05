@@ -44,9 +44,16 @@ pub const REVOKE_GRACE_PERIOD_US: u64 = 8;
 /// hands the core over anyway (`spec/06-guest-kick-path.md` §4.5).
 pub const FORCE_HANDOFF_US: u64 = 50;
 
-/// Interval at which `pylond` re-sends the kick signal to a donor that hasn't parked. A signal
-/// that lands while the vCPU thread is outside `KVM_RUN` doesn't stop its next guest entry.
+/// Interval at which `pylond` first re-sends the kick signal to a donor that hasn't parked. A
+/// signal that lands while the vCPU thread is outside `KVM_RUN` doesn't stop its next guest
+/// entry. The interval doubles with each signal, up to `REVOKE_RESIGNAL_MAX_US`.
 pub const REVOKE_RESIGNAL_US: u64 = 10;
+
+/// Longest interval between kick signals to a donor that hasn't parked. A donor the VMM can't
+/// park yet, because the guest has interrupts off (`spec/08-park-in-kvm.md` §3.4), needs time
+/// in the guest to turn them back on, and each signal takes that from it: on a nested host, a
+/// guest entry costs about as long as `REVOKE_RESIGNAL_US`.
+pub const REVOKE_RESIGNAL_MAX_US: u64 = 1000;
 
 /// Delay between polling sweeps in nanoseconds (~1000 cycles on a 3 GHz core). The engine turns it
 /// into counter ticks with the host rate, so it doesn't depend on the counter's frequency.
@@ -452,6 +459,18 @@ impl MatrixEngine {
             && slot.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
     }
 
+    /// Whether to re-send a kick signal first sent (or due) at `first_tsc` and last sent at
+    /// `last_tsc`. The interval is the time since `first_tsc`, at least `REVOKE_RESIGNAL_US` and
+    /// at most `REVOKE_RESIGNAL_MAX_US`, so it doubles with each signal.
+    #[inline]
+    fn resignal_due(first_tsc: u64, last_tsc: u64, now_tsc: u64, tsc_khz: u64) -> bool {
+        let interval = last_tsc.saturating_sub(first_tsc).clamp(
+            Self::us_to_cycles(REVOKE_RESIGNAL_US, tsc_khz),
+            Self::us_to_cycles(REVOKE_RESIGNAL_MAX_US, tsc_khz),
+        );
+        now_tsc >= last_tsc.saturating_add(interval)
+    }
+
     /// Converts microseconds to TSC cycles at `tsc_khz`.
     #[inline]
     fn us_to_cycles(usec: u64, tsc_khz: u64) -> u64 {
@@ -719,9 +738,7 @@ impl MatrixEngine {
                             self.revoke_first_signal_tsc[pcpu] = now_tsc;
                         }
                         if signalled_tsc == 0
-                            || now_tsc
-                                >= signalled_tsc
-                                    .saturating_add(Self::us_to_cycles(REVOKE_RESIGNAL_US, tsc_khz))
+                            || Self::resignal_due(first_signal_tsc, signalled_tsc, now_tsc, tsc_khz)
                         {
                             let _ = donor.signal_vcpu(donor_vcpu as usize);
                             self.revoke_signalled_tsc[pcpu] = now_tsc;
@@ -787,7 +804,8 @@ impl MatrixEngine {
     /// Keeps signalling donors whose core was handed over before they parked (a handoff
     /// without park): such a vCPU still has `revoke_requested` set and its deadline passed, so
     /// the VMM parks it at its next exit, but a guest that doesn't exit to userspace on its own
-    /// would otherwise keep running without a core.
+    /// would otherwise keep running without a core. The interval grows from the deadline on,
+    /// as in `resignal_due`: the core already belongs to the recipient.
     fn signal_orphaned_donors(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
         let mut i = 0usize;
         while i < vm_count {
@@ -809,10 +827,7 @@ impl MatrixEngine {
                 let last = &mut self.orphan_signalled_tsc[i][vcpu];
                 if !orphaned {
                     *last = 0;
-                } else if *last == 0
-                    || now_tsc
-                        >= last.saturating_add(Self::us_to_cycles(REVOKE_RESIGNAL_US, tsc_khz))
-                {
+                } else if *last == 0 || Self::resignal_due(deadline, *last, now_tsc, tsc_khz) {
                     let _ = vm.signal_vcpu(vcpu);
                     *last = now_tsc;
                 }
@@ -1189,6 +1204,29 @@ mod tests {
 
     fn assigned(vm_id: u64) -> CoreState {
         CoreState::Assigned { vm_id, vcpu: 0 }
+    }
+
+    #[test]
+    fn resignal_interval_doubles_up_to_its_cap() {
+        // At 3 GHz: 10 us is 30,000 cycles, 1 ms 3,000,000.
+        const KHZ: u64 = 3_000_000;
+        let due = |first, last, now| MatrixEngine::resignal_due(first, last, now, KHZ);
+        let mut last = 1_000;
+        let mut sent = vec![last];
+        for now in (1_000..20_000_000).step_by(1_000) {
+            if due(1_000, last, now) {
+                last = now;
+                sent.push(now);
+            }
+        }
+        let intervals: Vec<u64> = sent.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(
+            intervals[..8],
+            [
+                30_000, 30_000, 60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000
+            ]
+        );
+        assert!(intervals[8..].iter().all(|&i| i == 3_000_000));
     }
 
     #[test]

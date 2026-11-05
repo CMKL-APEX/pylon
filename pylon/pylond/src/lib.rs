@@ -2116,12 +2116,18 @@ mod tests {
             PCPU_UNASSIGNED
         );
 
-        // The donor keeps running without a core, so it is signalled every 10 us until the VMM
-        // parks it (spec 05 K7).
+        // The donor keeps running without a core, so it is signalled until the VMM parks it
+        // (spec 05 K7), less often each time: the interval is the time since the deadline.
         wait_for_kick_signals(before_handoff + 1);
-        engine.poll_once(151_000 + 29_999);
-        engine.poll_once(151_000 + 30_000);
+        engine.poll_once(400_000);
         wait_for_kick_signals(before_handoff + 2);
+        thread::sleep(Duration::from_millis(20));
+        let seen = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
+        engine.poll_once(400_000 + 398_999);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(KICK_SIGNALS_SEEN.load(Ordering::SeqCst), seen);
+        engine.poll_once(400_000 + 399_000);
+        wait_for_kick_signals(seen + 1);
 
         donor_slot.revoke_requested.store(0, Ordering::Release);
         donor_slot.yield_count.fetch_add(1, Ordering::Relaxed);
@@ -2129,7 +2135,7 @@ mod tests {
         // Let signals already sent arrive before counting.
         thread::sleep(Duration::from_millis(20));
         let parked = KICK_SIGNALS_SEEN.load(Ordering::SeqCst);
-        engine.poll_once(151_000 + 90_000);
+        engine.poll_once(10_000_000);
         thread::sleep(Duration::from_millis(20));
         assert_eq!(KICK_SIGNALS_SEEN.load(Ordering::SeqCst), parked);
 
