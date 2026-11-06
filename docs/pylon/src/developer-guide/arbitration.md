@@ -86,7 +86,9 @@ telemetry.
 is ahead of the guest's `rx_ring_cons_idx`. The two timers don't count
 for a VM that parks inside KVM: KVM fires them, and the vCPU runs
 without a core (spec 08 §3.2). For such a VM, a vCPU that KVM woke
-(below) qualifies instead.
+(below) qualifies instead, once it is a long wake. A short wake runs on
+the shared vCPU queue: a core for it would cost another VM a forced
+preemption, and come back as soon as it halts.
 
 **Woken vCPUs** (VMs that park inside KVM, spec 08 §4.2). The engine
 reads the VM's `woken` mask from `scx_pylon`, keeps the vCPUs still

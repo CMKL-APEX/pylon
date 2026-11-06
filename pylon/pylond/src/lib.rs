@@ -2006,11 +2006,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A VM with no core whose parked vCPU KVM woke gets a core at once. The core goes to the
-    /// vCPU in `stranded_work_bitmap`: its tasks can't run until it has one, while the woken
-    /// vCPU already runs (spec 08 §4.2).
+    /// A VM with no core whose parked vCPU KVM woke gets a core once that wake has lasted
+    /// `WOKEN_DEMAND_US`; a short wake runs on the shared vCPU queue. The core goes to the vCPU
+    /// in `stranded_work_bitmap`: its tasks can't run until it has one, while the woken vCPU
+    /// already runs (spec 08 §4.2).
     #[test]
-    fn test_plane2_woken_vcpu_of_zero_core_vm_gets_a_core() {
+    fn test_plane2_long_woken_vcpu_of_zero_core_vm_gets_a_core() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
@@ -2030,8 +2031,13 @@ mod tests {
         engine.poll_once(1_000);
         assert_eq!(engine.core_state(6), CoreState::Idle);
 
+        // A short wake isn't enough. At 3 GHz, 4 ms is 12,000,000 cycles.
         entry.woken.store(1 << 2, Ordering::Release);
         engine.poll_once(2_000);
+        engine.poll_once(6_002_000);
+        assert_eq!(engine.core_state(6), CoreState::Idle);
+
+        engine.poll_once(12_002_000);
         assert_eq!(
             engine.core_state(6),
             CoreState::Assigned { vm_id: 80, vcpu: 1 }

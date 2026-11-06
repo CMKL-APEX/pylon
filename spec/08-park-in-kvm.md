@@ -212,10 +212,15 @@ vCPU was parked already, so the request is done and no park is counted.
 every sweep, keeping only vCPUs that are still `PARKED` with no core
 assigned. It records when each bit was set, by VM slot and vCPU.
 
-- **No cores:** a VM that owns no core and has a woken vCPU gets a
-  zero-core wakeup, like a due timer. Its woken vCPUs run on the shared
-  vCPU queue meanwhile, on CPUs other VMs may own, so this case has no
-  grace period.
+- **No cores:** a VM that owns no core gets a zero-core wakeup once one
+  of its vCPUs has been woken for `WOKEN_DEMAND_US`. A due timer doesn't
+  give one: KVM fires it, and the vCPU shows up woken (§4.4).
+  Until then its woken vCPUs run on the shared vCPU queue, on CPUs other
+  VMs may own. An idle guest's vCPUs wake for ticks and IPIs and halt
+  within microseconds; a core for each such wake cost a forced preemption
+  of another VM, which took the core back as soon as the guest halted.
+  With no grace period, a busy and an idle VM traded a core about 250
+  times a second (§7.3).
 - **Long wakes are demand:** a vCPU woken for longer than
   `WOKEN_DEMAND_US` (4 ms) adds one core to its VM's desired cores, up to
   `max_cores`. It shows demand that `runnable_threads` misses: work in

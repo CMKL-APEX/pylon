@@ -226,9 +226,8 @@ struct VmDemandEval {
 /// What the engine read from one VM's `woken` mask in a sweep.
 #[derive(Debug, Clone, Copy, Default)]
 struct WokenEval {
-    /// Woken vCPUs that are still `PARKED` with no core assigned.
-    mask: u64,
-    /// How many of them have been woken for `WOKEN_DEMAND_US` or longer.
+    /// How many vCPUs still `PARKED` with no core assigned have been woken for
+    /// `WOKEN_DEMAND_US` or longer.
     long: u32,
     /// The longest current wake, in counter ticks (0 if none).
     longest_cycles: u64,
@@ -725,8 +724,10 @@ impl MatrixEngine {
                         || Self::any_park_timer_due(vm, now_tsc));
                 let rx_cons = page.telemetry.rx_ring_cons_idx.load(Ordering::Relaxed);
                 let rx_pending = vm.host_rx_doorbell() > rx_cons;
-                // With no core, a woken vCPU runs on CPUs other VMs may own (spec 08 §4.2).
-                if timer_expired || rx_pending || woken.mask != 0 {
+                // With no core, a woken vCPU runs on CPUs other VMs may own. A short wake (a
+                // tick or an IPI, then a halt) costs them less than a forced preemption would,
+                // so only a long one wakes the VM (spec 08 §4.2).
+                if timer_expired || rx_pending || woken.long > 0 {
                     zero_core_wakeup = true;
                 }
             }
@@ -995,10 +996,7 @@ impl MatrixEngine {
             *pending -= usec * tsc_khz / 1000;
         }
 
-        let mut eval = WokenEval {
-            mask,
-            ..WokenEval::default()
-        };
+        let mut eval = WokenEval::default();
         let mut bits = mask;
         while bits != 0 {
             let vcpu = bits.trailing_zeros() as usize;
