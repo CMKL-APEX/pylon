@@ -9,8 +9,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::{env, fs, io, ptr, result};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use std::{env, fs, io, mem, ptr, result};
 
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{MsrEntry, msr_index};
@@ -56,6 +57,11 @@ pub const PARK_IN_KVM_ENV: &str = "PYLON_PARK_IN_KVM";
 /// Halt polling limit, in nanoseconds, for a VM that parks vCPUs inside KVM. P0 turns halt
 /// polling off, so a parked vCPU costs no host CPU (`spec/08-park-in-kvm.md` §3.5).
 const PARK_IN_KVM_HALT_POLL_NS: u32 = 0;
+
+/// Longest a vCPU stays parked inside KVM with nothing waking it, before the VMM lets it run
+/// again without a core (`spec/08-park-in-kvm.md` §3.6). A parked vCPU of a busy guest wakes
+/// on its own tick, every 1 to 4 ms, so this only matters for one parked with no timer armed.
+const PARK_IN_KVM_BOUND: Duration = Duration::from_millis(4);
 
 static GLOBAL_PYLON_STATE: Mutex<Option<Arc<PylonVmmState>>> = Mutex::new(None);
 
@@ -264,7 +270,88 @@ pub struct PylonVmmState {
     /// One per vCPU: whether it is parked inside KVM (`spec/08-park-in-kvm.md` §3.1). Only the
     /// vCPU's own thread uses it.
     parked_in_kvm: Vec<AtomicBool>,
+    /// One per vCPU: the bound on how long it stays parked inside KVM (§3.6).
+    park_bounds: Vec<ParkBound>,
     shutting_down: AtomicBool,
+}
+
+/// Ends a park inside KVM that nothing else ends (`spec/08-park-in-kvm.md` §3.6).
+#[derive(Default)]
+struct ParkBound {
+    /// Interrupts the vCPU's `KVM_RUN`, created on its thread when it starts.
+    timer: OnceLock<ThreadTimer>,
+    /// When the vCPU runs again, if `pylond` hasn't given it a core by then. Only the
+    /// vCPU's own thread uses it.
+    deadline: Mutex<Option<Instant>>,
+}
+
+/// A POSIX timer that sends `SIGRTMIN`, the signal that interrupts `KVM_RUN` (installed in
+/// `vmm/src/cpu.rs`), to the thread that created it.
+struct ThreadTimer(libc::timer_t);
+
+// SAFETY: a `timer_t` is an id the kernel and libc look up; `timer_settime` and
+// `timer_delete` may be called from any thread of the process.
+unsafe impl Send for ThreadTimer {}
+// SAFETY: as for `Send`; `timer_settime` is thread-safe.
+unsafe impl Sync for ThreadTimer {}
+
+impl ThreadTimer {
+    fn new() -> io::Result<Self> {
+        // SAFETY: `sigevent` is plain data, and all zeros is a valid value.
+        let mut event: libc::sigevent = unsafe { mem::zeroed() };
+        event.sigev_notify = libc::SIGEV_THREAD_ID;
+        event.sigev_signo = SIGRTMIN();
+        // SAFETY: `gettid` has no preconditions.
+        event.sigev_notify_thread_id = unsafe { libc::gettid() };
+        let mut timer: libc::timer_t = null_mut();
+        // SAFETY: `event` and `timer` are valid for the call, and `event` names a thread of
+        // this process.
+        let ret = unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &mut event, &mut timer) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(timer))
+    }
+
+    /// Fires after `period`, then again every `period`, until set again. A zero `period`
+    /// stops it. Firing again covers a signal that lands just before `KVM_RUN` sleeps: the
+    /// handler does nothing, so that one is lost.
+    fn set(&self, period: Duration) {
+        let period = libc::timespec {
+            tv_sec: period.as_secs() as _,
+            tv_nsec: period.subsec_nanos() as _,
+        };
+        let value = libc::itimerspec {
+            it_interval: period,
+            it_value: period,
+        };
+        // SAFETY: `self.0` is a timer created by `timer_create` and not yet deleted, and
+        // `value` is valid for the call.
+        if unsafe { libc::timer_settime(self.0, 0, &value, null_mut()) } != 0 {
+            warn!(
+                "Pylon: failed to set the park bound timer: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+impl ThreadTimer {
+    fn is_armed(&self) -> bool {
+        // SAFETY: all zeros is a valid `itimerspec`.
+        let mut value: libc::itimerspec = unsafe { mem::zeroed() };
+        // SAFETY: `self.0` is a live timer, and `value` is valid for the call.
+        assert_eq!(unsafe { libc::timer_gettime(self.0, &mut value) }, 0);
+        value.it_value.tv_sec != 0 || value.it_value.tv_nsec != 0
+    }
+}
+
+impl Drop for ThreadTimer {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a timer created by `timer_create`, deleted only here.
+        unsafe { libc::timer_delete(self.0) };
+    }
 }
 
 // SAFETY: `PylonVmmState` owns an `mmap`-backed `PylonSharedPage` whose fields after initialization
@@ -386,6 +473,7 @@ impl PylonVmmState {
             kick_eventfds,
             wake_eventfds,
             parked_in_kvm: (0..num_vcpus).map(|_| AtomicBool::new(false)).collect(),
+            park_bounds: (0..num_vcpus).map(|_| ParkBound::default()).collect(),
             shutting_down: AtomicBool::new(false),
         });
 
@@ -572,6 +660,14 @@ impl PylonVmmState {
         if vcpu_id >= self.initial_active_vcpus {
             slot.park_on_boot.store(1, Ordering::Release);
         }
+        if self.config.park_in_kvm {
+            match ThreadTimer::new() {
+                Ok(timer) => {
+                    let _ = self.park_bounds[vcpu_id as usize].timer.set(timer);
+                }
+                Err(e) => warn!("Pylon: no park bound for vCPU {vcpu_id}: {e}"),
+            }
+        }
         slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
     }
 
@@ -597,7 +693,10 @@ impl PylonVmmState {
     /// `vcpu_op` sets it halted and this returns at once, so the run loop's next `KVM_RUN`
     /// sleeps in KVM until an interrupt or a signal. An interrupt runs the guest again without
     /// an exit; `state` stays `PARKED`. After each later exit, the vCPU becomes runnable and
-    /// `RUNNING` only once `pylond` has written its wake `EventFd`.
+    /// `RUNNING` only once `pylond` has written its wake `EventFd`. A vCPU that the guest or a
+    /// revocation parked (not a boot park) also becomes runnable, still `PARKED`, once it has
+    /// been parked for `PARK_IN_KVM_BOUND`: the guest may have armed no timer, and may queue
+    /// work on a CPU it thinks is running without waking it (§3.6).
     pub fn check_and_park_vcpu(
         &self,
         vcpu_id: u32,
@@ -612,9 +711,22 @@ impl PylonVmmState {
         if parked_in_kvm.load(Ordering::Relaxed) {
             // Parked inside KVM: an exit (an interrupt-woken guest, or `pylond`'s signal) only
             // ends the park once `pylond` assigned a core (`spec/08-park-in-kvm.md` §3.3).
+            //
+            // A guest park thread that saw the revocation before this vCPU was forced to park
+            // writes `PARKING` over `PARKED` once KVM lets the vCPU run, then rings the doorbell,
+            // which is this exit. The vCPU is parked already, so the request is done; leaving
+            // `PARKING` would hide the vCPU from `pylond`, which only assigns cores to `PARKED`
+            // vCPUs (§3.7).
+            if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKING {
+                slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+            }
             if self.wake_eventfds[vcpu_id as usize].read().is_err() {
+                if self.take_passed_park_bound(vcpu_id) && !vcpu_op(KvmParkOp::Run) {
+                    warn!("Pylon: failed to make parked vCPU {vcpu_id} runnable");
+                }
                 return false;
             }
+            self.stop_park_bound(vcpu_id);
             if !vcpu_op(KvmParkOp::Run) {
                 warn!("Pylon: failed to make parked vCPU {vcpu_id} runnable");
             }
@@ -670,6 +782,9 @@ impl PylonVmmState {
 
         if self.config.park_in_kvm {
             parked_in_kvm.store(true, Ordering::Relaxed);
+            if decision != ParkDecision::Boot {
+                self.start_park_bound(vcpu_id);
+            }
             return true;
         }
 
@@ -681,6 +796,41 @@ impl PylonVmmState {
         }
 
         true
+    }
+
+    /// Starts the bound on a park inside KVM: the vCPU's timer interrupts `KVM_RUN` from
+    /// `PARK_IN_KVM_BOUND` on (`spec/08-park-in-kvm.md` §3.6).
+    fn start_park_bound(&self, vcpu_id: u32) {
+        let bound = &self.park_bounds[vcpu_id as usize];
+        let Some(timer) = bound.timer.get() else {
+            return;
+        };
+        *bound.deadline.lock().unwrap() = Some(Instant::now() + PARK_IN_KVM_BOUND);
+        timer.set(PARK_IN_KVM_BOUND);
+    }
+
+    /// Stops the bound on the vCPU's park, if it has passed, and returns whether it had.
+    fn take_passed_park_bound(&self, vcpu_id: u32) -> bool {
+        let bound = &self.park_bounds[vcpu_id as usize];
+        let mut deadline = bound.deadline.lock().unwrap();
+        if deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            return false;
+        }
+        *deadline = None;
+        if let Some(timer) = bound.timer.get() {
+            timer.set(Duration::ZERO);
+        }
+        true
+    }
+
+    /// Stops the bound on the vCPU's park, if any.
+    fn stop_park_bound(&self, vcpu_id: u32) {
+        let bound = &self.park_bounds[vcpu_id as usize];
+        if bound.deadline.lock().unwrap().take().is_some()
+            && let Some(timer) = bound.timer.get()
+        {
+            timer.set(Duration::ZERO);
+        }
     }
 
     /// Blocks the calling vCPU thread on its per-vCPU wake `EventFd` until signaled by `pylond`
@@ -713,6 +863,11 @@ impl PylonVmmState {
         self.shutting_down.store(true, Ordering::Release);
         for wake_evt in &self.wake_eventfds {
             let _ = wake_evt.write(1);
+        }
+        for bound in &self.park_bounds {
+            if let Some(timer) = bound.timer.get() {
+                timer.set(Duration::ZERO);
+            }
         }
     }
 }
@@ -1003,10 +1158,10 @@ pub fn shutdown_all() {
 mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
-    use std::time::Duration;
 
     use pylon_abi::VCPU_STATE_WAKING;
     use tempfile::TempDir;
+    use vmm_sys_util::signal::register_signal_handler;
 
     use super::*;
 
@@ -1256,8 +1411,11 @@ mod tests {
         state
     }
 
-    /// Like `running_vcpu0_state`, with vCPUs parking inside KVM.
+    /// Like `running_vcpu0_state`, with vCPUs parking inside KVM. vCPU 0 is the calling
+    /// thread, which receives its park bound's `SIGRTMIN`, as `vmm/src/cpu.rs` does.
     fn running_vcpu0_state_parking_in_kvm(dir: &TempDir) -> Arc<PylonVmmState> {
+        extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+        register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
         let shm_path = dir.path().join("vm-park-kvm-pylon");
         let mut cfg = PylonConfig::parse(&format!("shm={}", shm_path.display())).unwrap();
         cfg.park_in_kvm = true;
@@ -1315,6 +1473,105 @@ mod tests {
         assert_eq!(ops, [KvmParkOp::Run]);
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
         assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_park_in_kvm_runs_without_a_core_once_its_bound_passes() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        let mut ops = Vec::new();
+        let exit = |ops: &mut Vec<KvmParkOp>| {
+            ops.clear();
+            state.check_and_park_vcpu(
+                0,
+                || None,
+                |op| {
+                    ops.push(op);
+                    true
+                },
+            )
+        };
+
+        // A forced park starts the bound.
+        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+        let timer = state.park_bounds[0].timer.get().unwrap();
+        assert!(exit(&mut ops));
+        assert!(timer.is_armed());
+
+        // Before it passes, an exit changes nothing.
+        assert!(!exit(&mut ops));
+        assert!(ops.is_empty());
+
+        // Once it has passed, the next exit makes the vCPU runnable and stops the timer. The
+        // vCPU stays parked: it has no core.
+        thread::sleep(PARK_IN_KVM_BOUND * 2);
+        assert!(timer.is_armed());
+        assert!(!exit(&mut ops));
+        assert_eq!(ops, [KvmParkOp::Run]);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert!(!timer.is_armed());
+
+        // The bound ends there: later exits leave the vCPU alone.
+        thread::sleep(PARK_IN_KVM_BOUND * 2);
+        assert!(!exit(&mut ops));
+        assert!(ops.is_empty());
+
+        // A core assignment ends the park as before.
+        state.wake_vcpu(0).unwrap();
+        assert!(exit(&mut ops));
+        assert_eq!(ops, [KvmParkOp::Run]);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+    }
+
+    #[test]
+    fn test_park_in_kvm_guest_park_request_after_forced_park_leaves_vcpu_parked() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+        assert!(state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        let yields = slot0.yield_count.load(Ordering::Relaxed);
+
+        // KVM woke the vCPU, and the guest's park thread asks to park: the doorbell's exit
+        // finds the vCPU parked already, with no new park counted.
+        slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
+        assert!(!state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert_eq!(slot0.yield_count.load(Ordering::Relaxed), yields);
+
+        // A core assignment still ends the park.
+        state.wake_vcpu(0).unwrap();
+        assert!(state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+    }
+
+    #[test]
+    fn test_park_in_kvm_boot_park_has_no_bound() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        slot0.park_on_boot.store(1, Ordering::Release);
+        slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+        assert!(state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert!(!state.park_bounds[0].timer.get().unwrap().is_armed());
+
+        thread::sleep(PARK_IN_KVM_BOUND * 2);
+        let mut ops = Vec::new();
+        assert!(!state.check_and_park_vcpu(
+            0,
+            || None,
+            |op| {
+                ops.push(op);
+                true
+            }
+        ));
+        assert!(ops.is_empty());
     }
 
     #[test]

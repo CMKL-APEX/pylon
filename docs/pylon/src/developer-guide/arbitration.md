@@ -83,7 +83,9 @@ telemetry.
 **Zero-core wakeup.** A VM with no committed cores qualifies if its
 `next_timer_tsc` has passed, if a free parked vCPU's
 `park_timer_deadline_tsc` has passed, or if the host's receive doorbell
-is ahead of the guest's `rx_ring_cons_idx`.
+is ahead of the guest's `rx_ring_cons_idx`. The two timers don't count
+for a VM that parks inside KVM: KVM fires them, and the vCPU runs
+without a core (spec 08 §3.2).
 
 **Time bases.** Every `*_tsc` field counts host counter ticks (the TSC,
 or `CNTVCT_EL0` on aarch64). The guest writes `head_wait_tsc` and
@@ -127,19 +129,22 @@ wakes, and that doesn't count.
 | `PARKED`, never signalled | any | A *cooperative yield*. Hand the CPU over. |
 | `PARKED`, signalled | any | The VMM force-parked it. Hand the CPU over (already counted as forced). |
 | not parked | before the deadline | Wait. |
-| not parked | deadline passed | A *forced preemption*, counted once. Send the VMM's `kick_signal` to the donor's thread with `tgkill`, and again every `REVOKE_RESIGNAL_US` (10 µs). `KVM_RUN` returns `EINTR` and the VMM's post-exit hook force-parks the vCPU. |
+| not parked | deadline passed | A *forced preemption*, counted once. Send the VMM's `kick_signal` to the donor's thread with `tgkill`, and again after `REVOKE_RESIGNAL_US` (10 µs), with the interval doubling each time up to `REVOKE_RESIGNAL_MAX_US` (1 ms). `KVM_RUN` returns `EINTR` and the VMM's post-exit hook force-parks the vCPU. |
 | not parked | `FORCE_HANDOFF_US` (50 µs) after the first signal | Hand the CPU over anyway, counted as a *handoff without park*. `scx_pylon` preempts the donor thread, which parks at its next exit. |
 
 The signal is resent because one that arrives while the vCPU thread is
 outside `KVM_RUN` (handling an exit) doesn't stop the next guest entry.
+The interval doubles because each signal also costs the guest an exit:
+a guest the VMM can't park yet, with interrupts off, needs time in the
+guest to turn them back on.
 The 50 µs bound counts from the first signal, not the deadline, so a
 donor always has that long after being signalled, even when the engine
 runs late.
 
 After a handoff without park, the donor still has `revoke_requested`
 set and is no longer on any `Revoking` CPU. Each sweep therefore also
-looks for such vCPUs and keeps signalling them every 10 µs until the VMM
-parks them. These are vCPUs with `revoke_requested = 1`, no
+looks for such vCPUs and keeps signalling them until the VMM parks them,
+at an interval that grows from the deadline on, up to 1 ms. These are vCPUs with `revoke_requested = 1`, no
 `assigned_pcpu`, not `PARKED`, and a deadline that has passed. Without
 this, a guest that never exits to userspace on its own kept running
 without a core.

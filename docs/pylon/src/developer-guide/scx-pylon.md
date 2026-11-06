@@ -84,17 +84,24 @@ so `enqueue` kicks it to schedule again.
 
 1. The CPU's owner queue. Tasks that no longer own the CPU are moved to
    the vCPU or host queue.
+   - `pylond` can give the CPU to a vCPU thread that already waits on the
+     vCPU queue or on its VM's queue. `enqueue` doesn't run again for a
+     queued thread, so `dispatch` also looks for the owner on those two
+     queues.
    - While woken vCPUs wait on the queue of the owner's VM, the owner and
      they take 100 µs turns. The owner entry's flags carry the VM's slot.
      `running` records, per CPU, whether the owner or a woken vCPU ran
      last; host tasks that run between turns, such as per-CPU kworkers,
      don't change it.
-2. The vCPU queue, skipping threads that own another CPU.
+2. The vCPU queue, skipping threads that own another CPU. Such a
+   thread's CPU is kicked if it is idle, in case it got the CPU while it
+   waited here.
 3. The host queue.
 
 Each `dispatch` also checks one VM queue in turn. If that VM no longer
 owns a CPU, its vCPUs move to the vCPU queue, so they don't wait until
-the stall watchdog fires.
+the stall watchdog fires. An idle CPU is kicked for each, because idle
+CPUs only look at the vCPU queue when kicked.
 
 Each step only dispatches what the SMT claims allow. If nothing fits,
 the CPU idles.

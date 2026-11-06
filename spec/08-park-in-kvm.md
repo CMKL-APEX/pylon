@@ -117,6 +117,14 @@ doesn't park. It returns `Continue`, and `pylond` re-signals 10 µs later
 (`REVOKE_RESIGNAL_US`), which is the existing behaviour for a signal that
 lands at a bad moment.
 
+Each signal costs the guest an exit and an entry. On a nested host, an
+entry takes about as long as the 10 µs interval, so a guest with
+interrupts off made no progress between signals: a P2 trace showed
+storms of 0.35 s, about 21,600 entries at the same instruction (§7.3).
+So the interval doubles with each signal, from `REVOKE_RESIGNAL_US` up to
+`REVOKE_RESIGNAL_MAX_US` (1 ms). After a handoff without park, it grows
+from the revocation's deadline.
+
 aarch64 doesn't need this. `WFI` wakes on a pending interrupt even when
 it is masked.
 
@@ -130,6 +138,51 @@ This also changes halt polling for the guest's own `HLT`, which then wakes
 more slowly. The limit is a tunable. The prototype measures 0 and a
 small value (§7).
 
+### 3.6 Bounded park
+
+§3.2 assumes something will interrupt a parked vCPU. That holds for a
+vCPU the guest halted itself, but not for one parked where the guest
+thinks it is running:
+- **No timer armed.** A vCPU force-parked as it leaves idle, before its
+  tick restarts, has no timer pending. A trace of a P2 run showed one
+  that nothing woke for at least 47 s (§7.3).
+- **No IPI.** The guest queues work on a CPU it thinks is running without
+  sending an IPI, unless the new task should preempt the current one. The
+  `pv-pylon` FIFO kthread is never preempted by ordinary tasks, so
+  cooperative parks are exposed too.
+
+So the VMM bounds a park inside KVM:
+1. At a forced or cooperative park, it arms a per-vCPU POSIX timer that
+   sends `kick_signal` to the vCPU thread after `PARK_IN_KVM_BOUND`
+   (4 ms), and every 4 ms after that. Firing again covers a signal that
+   lands just before `KVM_RUN` sleeps. A boot park has no bound: the
+   vCPU has just come online and is idle.
+2. At an exit with no core assigned, once the bound has passed, the VMM
+   sets the vCPU runnable and stops the timer. The vCPU stays `PARKED`
+   and runs as a woken vCPU (§4.3), on its VM's cores, until it halts
+   again.
+3. A core assignment stops the timer.
+
+A busy guest's tick wakes its parked vCPUs about as often, so the bound
+adds little for them. An idle vCPU that is parked gets one extra wake.
+
+### 3.7 Guest park request after a forced park
+
+The guest's park thread (`pv-pylon`, spec 06 §4.3) checks
+`revoke_requested`, writes `PARKING`, then rings the park doorbell. If
+the revocation's deadline passes between the kick and that thread, the
+VMM force-parks the vCPU at its next exit, maybe in the middle of the
+thread. With a park in userspace, the guest doesn't run again until a
+core is assigned. Inside KVM, an interrupt lets it run (§3.2): the
+thread writes `PARKING` over `PARKED` and rings the doorbell.
+
+`pylond` assigns cores only to `PARKED` vCPUs, and only the VMM ends a
+park. Left as it is, the vCPU drops out of arbitration and runs on the
+host's terms. A P2 run left all three parkable vCPUs of an idle VM that
+way (§7.3). So at an exit while parked inside KVM, the VMM turns
+`PARKING` back into `PARKED` before it looks for a core assignment. The
+vCPU was parked already, so the request is done and no park is counted.
+
 ## 4. Component Changes
 
 ### 4.1 VMM (`vmm/src/pylon.rs`, `vmm/src/cpu.rs`)
@@ -137,6 +190,8 @@ small value (§7).
 - Park as in §3.1, and handle `EINTR` as in §3.3. The run loop already
   returns `VmExit::Ignore` for `EINTR` and runs the post-exit hook.
 - The interrupt check of §3.4, x86_64 only.
+- The park bound of §3.6.
+- Restoring `PARKED` over a late guest park request (§3.7).
 - `KVM_CAP_HALT_POLL` at VM creation when `--pylon` is set.
 - Drop the wake `EventFd`s, or keep them only for MSHV.
 - Snapshot and migration stay refused (spec 06 §7).
@@ -200,9 +255,14 @@ So:
   interrupt wake, because it never sees one. `state` keeps its spec 06 §3
   meaning only for parks and assignments. Whether a parked vCPU is running
   on a shared CPU comes from `scx_pylon`'s woken map.
-- **`park_timer_deadline_tsc` may become unused.** KVM fires the timer
-  itself. `pylond` still uses it to decide which vCPU of a zero-core VM to
-  wake first. Keep it until the prototype shows whether that matters.
+- **`park_timer_deadline_tsc` only orders vCPUs.** KVM fires the timer
+  itself, so a due timer no longer wakes a VM with no core, and neither
+  does the guest's `next_timer_tsc`. `pylond` still uses the deadline to
+  pick which vCPU of a VM gets a core first. The deadline was also
+  stale: the VMM records it at the park and clears it only when the vCPU
+  gets a core, while the guest re-arms its timer unseen. So once it
+  passed, a VM with no core looked due again as soon as it lost a core,
+  and traded one with a busy VM about ten times a second (§7.3).
 - **The wake `EventFd`s drop out of registration** for KVM VMs.
 
 ## 5. Guest Impact (Unmodified Linux)
@@ -213,7 +273,7 @@ So:
 | Guest timer on a parked vCPU | VMM publishes it; `pylond` wakes a zero-core VM | KVM fires it; the vCPU runs on a shared CPU |
 | Guest checks `vcpu_is_preempted` | Never true for a parked vCPU | True while a shared vCPU waits its turn |
 | Steal time | None counted while parked | Counted while runnable and waiting |
-| Busy vCPU parked mid-work | Makes no progress | Wakes on its tick (every 1–4 ms) and makes progress on a shared CPU |
+| Busy vCPU parked mid-work | Makes no progress | Wakes on its tick (every 1–4 ms), or after 4 ms if no timer is armed (§3.6), and makes progress on a shared CPU |
 | Other VMs | Unaffected | Unaffected: sharing stays within the VM |
 
 The cost is concentrated in the parked VM. When its vCPUs have more work
@@ -370,6 +430,120 @@ the setup above, with steady or port-I/O guest load:
 The gap itself didn't recur on this host, before or after the fix. The
 pinned task shows the same cause every time. The `scx_pylon` live test
 `test_pinned_task_shares_cpu_with_busy_owner` checks it.
+
+### 7.3 Stalls in parked guests (2026-11-05)
+
+**Setup:**
+- *Host:* the 16-vCPU nested host of §7.2.
+- *VMs:* two 4-vCPU Ubuntu guests with the fixed guest agent, which no
+  longer counts itself as runnable.
+- *Load:* VM 1 runs a busy loop on every CPU. VM 2 is either idle, or
+  bursty: every 7 s, its CPUs 1 to 3 spin for 100 ms.
+- *`pylond`:* 3 managed CPUs, `min_cores=0`.
+- *Runs:* 180 s each. Lockups and RCU stalls are counted in the guests'
+  serial logs.
+
+**Before the fixes:**
+
+| Run | Guest soft lockups | Guest RCU stalls |
+|---|---|---|
+| P1, VM 2 idle | 0 | 0 |
+| P1, VM 2 bursty | 0 | 2 |
+| P2, VM 2 idle | 2 | 0 |
+| P2, VM 2 bursty | 6 | 4 |
+
+**A traced P2 bursty run showed two causes:**
+- *Signal storms (§3.4).*
+  - A donor with interrupts off isn't parked, and `pylond` signalled it
+    every 10 µs.
+  - Each signal costs an exit and an entry, about 10 µs on this host,
+    so the guest stayed at the same instruction.
+  - The worst storm lasted 0.35 s, with about 21,600 entries.
+- *Parks nothing ended (§3.6).*
+  - A vCPU force-parked as it left idle had no timer armed.
+  - Nothing woke it for at least 47 s, and its guest logged an RCU
+    stall.
+- In the same trace, a timer interrupt reached a vCPU halted by a
+  cooperative park, but KVM didn't enter the guest. That is unexplained.
+  One suspect is an x86 interrupt shadow (just after `sti`), which the
+  `RFLAGS.IF` check of §3.4 doesn't see.
+
+**With the bound of §3.6 and the backoff of §3.4:**
+
+| Run | Guest soft lockups | Guest RCU stalls |
+|---|---|---|
+| P1, VM 2 idle | 0 | 0 |
+| P1, VM 2 bursty (2 runs) | 0 | 0 |
+| P2, VM 2 idle | 3 | 0 |
+| P2, VM 2 bursty (2 runs) | 0 | 0 |
+
+**The P2 idle run hit a gap in `scx_pylon`:**
+- *What happened:* a vCPU of VM 2 stayed runnable on the vCPU queue for
+  30 s, during VM 2's boot. The watchdog ejected `scx_pylon`.
+- *Why no CPU ran it:*
+  - `pylond` made that vCPU the owner of CPU 2 while it already waited
+    on the vCPU queue. `enqueue` doesn't run again for a queued thread,
+    so it never reached CPU 2's owner queue.
+  - CPU 2 gave its turns to VM 2's woken vCPUs instead, because its
+    owner wasn't queued there.
+  - Every other CPU skipped the vCPU, because it owned CPU 2.
+- *Fix:*
+  - `dispatch` also looks for a CPU's owner on the vCPU queue and on its
+    VM's queue.
+  - A CPU that skips a thread owning an idle CPU kicks that CPU.
+  - When `rescue_stranded_vcpus` moves vCPUs to the vCPU queue, it kicks
+    an idle CPU.
+- *Test:* the live test `test_owner_given_its_cpu_while_queued_runs`
+  gives a CPU to a thread while it is queued, ten times. Without the
+  fix, the owner didn't run at all in 2 of the 10 cycles. With it, the
+  test passed three times out of three.
+
+**With the `scx_pylon` fix too,** no run had a lockup or an RCU stall,
+and `scx_pylon` stayed loaded. P2 churned, though: 13,000 to 25,000
+forced preemptions per run, against a few hundred for P1. Sampling each
+vCPU's slot every 3 s showed two causes:
+- *P2 woke a VM with no core for any woken vCPU.* An idle guest's
+  vCPUs wake for ticks and IPIs and halt again within microseconds.
+  Each wake took a core from VM 1 by a forced preemption, and VM 1 took
+  it back once VM 2 halted: about 250 trades a second. P2 now waits for
+  a long wake, as for a VM that owns a core (§4.2 on the P2 branch).
+- *vCPUs stuck in `PARKING` (§3.7).* The trading stopped only once all
+  three parkable vCPUs of VM 2 sat in `PARKING` with no core, out of
+  `pylond`'s reach. A guest park thread had written `PARKING` over a
+  forced park.
+
+**With both fixes:**
+
+| Run | Guest soft lockups | Guest RCU stalls | VM 2 forced preemptions |
+|---|---|---|---|
+| P1, VM 2 idle | 0 | 0 | 562 |
+| P1, VM 2 bursty (2 runs) | 0 | 0 | 1,077 and 785 |
+| P2, VM 2 idle | 0 | 0 | 875 |
+| P2, VM 2 bursty (2 runs) | 0 | 0 | 2,106 and 3,186 |
+
+No sample found a vCPU in `PARKING`. VM 2's metered core time fell to
+5 to 11 s per run, about what its bursts need: 3 vCPUs spinning 100 ms
+every 7 s is 7.7 s over 180 s. Earlier runs metered 70 to 160 s, mostly
+cores it held while idle.
+
+**Most of the remaining preemptions were stale timers.** Logging every
+revocation in a P2 bursty run showed 1,550 of 3,726 were VM 2 taking a
+core for a due park timer, and 1,820 were VM 1 taking it back once VM 2
+wanted none. P1 had the same pattern: 842 and 925 of 1,890. Only about
+120 per run were the two VMs contending for a core. A due timer no
+longer wakes a VM that parks inside KVM (§4.4):
+
+| Run | Forced preemptions (VM 2), before → after | vCPU run time, VM 1 / VM 2 (s), before → after |
+|---|---|---|
+| P1, VM 2 idle | 562 → 29 | 697 / 15 → 691 / 15 |
+| P1, VM 2 bursty (2 runs) | 1,077 and 785 → 89 and 73 | 685 / 21 and 694 / 22 → 692 / 22 and 689 / 21 |
+| P2, VM 2 idle | 875 → 97 | 690 / 16 → 695 / 16 |
+| P2, VM 2 bursty (2 runs) | 2,106 and 3,186 → 335 and 386 | 690 / 22 and 688 / 20 → 692 / 21 and 693 / 22 |
+
+Run time is the vCPU threads' time on a CPU, summed from the harness's
+samples. VM 2's bursts spin for a fixed 100 ms of wall time, so equal
+run time means they got as much done. No run had a lockup or an RCU
+stall. P2's figures include its own changes (§4.2 on its branch).
 
 ## 8. Alternatives Considered
 
