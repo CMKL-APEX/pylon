@@ -654,8 +654,13 @@ impl MatrixEngine {
             if committed_cores == 0 {
                 let next_timer_tsc =
                     page.guest_to_host_tsc(page.telemetry.next_timer_tsc.load(Ordering::Relaxed));
-                let timer_expired = (next_timer_tsc != 0 && now_tsc >= next_timer_tsc)
-                    || Self::any_park_timer_due(vm, now_tsc);
+                // KVM fires the timers of a vCPU parked inside it, which then runs without a
+                // core (`spec/08-park-in-kvm.md` §3.2). A due timer needs no core, and the
+                // deadline the VMM recorded at the park stays due until the vCPU gets one: the
+                // guest re-arms its timer without the VMM seeing it.
+                let timer_expired = !vm.wake_by_signal()
+                    && ((next_timer_tsc != 0 && now_tsc >= next_timer_tsc)
+                        || Self::any_park_timer_due(vm, now_tsc));
                 let rx_cons = page.telemetry.rx_ring_cons_idx.load(Ordering::Relaxed);
                 let rx_pending = vm.host_rx_doorbell() > rx_cons;
                 if timer_expired || rx_pending {

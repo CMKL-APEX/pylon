@@ -83,7 +83,9 @@ telemetry.
 **Zero-core wakeup.** A VM with no committed cores qualifies if its
 `next_timer_tsc` has passed, if a free parked vCPU's
 `park_timer_deadline_tsc` has passed, or if the host's receive doorbell
-is ahead of the guest's `rx_ring_cons_idx`.
+is ahead of the guest's `rx_ring_cons_idx`. The two timers don't count
+for a VM that parks inside KVM: KVM fires them, and the vCPU runs
+without a core (spec 08 §3.2).
 
 **Time bases.** Every `*_tsc` field counts host counter ticks (the TSC,
 or `CNTVCT_EL0` on aarch64). The guest writes `head_wait_tsc` and

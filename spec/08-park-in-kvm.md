@@ -255,9 +255,14 @@ So:
   interrupt wake, because it never sees one. `state` keeps its spec 06 §3
   meaning only for parks and assignments. Whether a parked vCPU is running
   on a shared CPU comes from `scx_pylon`'s woken map.
-- **`park_timer_deadline_tsc` may become unused.** KVM fires the timer
-  itself. `pylond` still uses it to decide which vCPU of a zero-core VM to
-  wake first. Keep it until the prototype shows whether that matters.
+- **`park_timer_deadline_tsc` only orders vCPUs.** KVM fires the timer
+  itself, so a due timer no longer wakes a VM with no core, and neither
+  does the guest's `next_timer_tsc`. `pylond` still uses the deadline to
+  pick which vCPU of a VM gets a core first. The deadline was also
+  stale: the VMM records it at the park and clears it only when the vCPU
+  gets a core, while the guest re-arms its timer unseen. So once it
+  passed, a VM with no core looked due again as soon as it lost a core,
+  and traded one with a busy VM about ten times a second (§7.3).
 - **The wake `EventFd`s drop out of registration** for KVM VMs.
 
 ## 5. Guest Impact (Unmodified Linux)
@@ -520,6 +525,25 @@ No sample found a vCPU in `PARKING`. VM 2's metered core time fell to
 5 to 11 s per run, about what its bursts need: 3 vCPUs spinning 100 ms
 every 7 s is 7.7 s over 180 s. Earlier runs metered 70 to 160 s, mostly
 cores it held while idle.
+
+**Most of the remaining preemptions were stale timers.** Logging every
+revocation in a P2 bursty run showed 1,550 of 3,726 were VM 2 taking a
+core for a due park timer, and 1,820 were VM 1 taking it back once VM 2
+wanted none. P1 had the same pattern: 842 and 925 of 1,890. Only about
+120 per run were the two VMs contending for a core. A due timer no
+longer wakes a VM that parks inside KVM (§4.4):
+
+| Run | Forced preemptions (VM 2), before → after | vCPU run time, VM 1 / VM 2 (s), before → after |
+|---|---|---|
+| P1, VM 2 idle | 562 → 29 | 697 / 15 → 691 / 15 |
+| P1, VM 2 bursty (2 runs) | 1,077 and 785 → 89 and 73 | 685 / 21 and 694 / 22 → 692 / 22 and 689 / 21 |
+| P2, VM 2 idle | 875 → 97 | 690 / 16 → 695 / 16 |
+| P2, VM 2 bursty (2 runs) | 2,106 and 3,186 → 335 and 386 | 690 / 22 and 688 / 20 → 692 / 21 and 693 / 22 |
+
+Run time is the vCPU threads' time on a CPU, summed from the harness's
+samples. VM 2's bursts spin for a fixed 100 ms of wall time, so equal
+run time means they got as much done. No run had a lockup or an RCU
+stall. P2's figures include its own changes (§4.2 on its branch).
 
 ## 8. Alternatives Considered
 

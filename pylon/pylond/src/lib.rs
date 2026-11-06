@@ -1296,6 +1296,51 @@ mod tests {
         assert_eq!(read_eventfd(vm.wake_fds[3].as_raw_fd()).unwrap(), 1);
     }
 
+    /// A VM that parks inside KVM gets no zero-core wakeup for a due timer: KVM fires it, and
+    /// the deadline recorded at the park stays due until the vCPU has a core. Waking the VM
+    /// for it traded a core with a busy VM about ten times a second (spec 08 §4.4).
+    #[test]
+    fn test_plane2_park_timer_does_not_wake_vm_parked_in_kvm() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
+
+        let mut vm = build_test_vm(1, 4, 0, 4, 1);
+        vm.req.wake_by_signal = true;
+        let handle = VmHandle::new(
+            &vm.req,
+            vm.shm_fd.try_clone().unwrap(),
+            vm.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            vm.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let page = handle.shared_page();
+        page.vcpus[3]
+            .park_timer_deadline_tsc
+            .store(5_000, Ordering::Release);
+        page.telemetry
+            .next_timer_tsc
+            .store(5_000, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+
+        engine.poll_once(6_000);
+        assert_eq!(engine.core_state(2), CoreState::Idle);
+
+        // Demand still gets it a core, and the vCPU with the due timer goes first.
+        page.telemetry.runnable_threads.store(1, Ordering::Release);
+        engine.poll_once(7_000);
+        assert_eq!(
+            engine.core_state(2),
+            CoreState::Assigned { vm_id: 1, vcpu: 3 }
+        );
+    }
+
     #[test]
     fn test_plane2_head_wait_uses_guest_tsc_offset() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
