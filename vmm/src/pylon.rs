@@ -711,6 +711,15 @@ impl PylonVmmState {
         if parked_in_kvm.load(Ordering::Relaxed) {
             // Parked inside KVM: an exit (an interrupt-woken guest, or `pylond`'s signal) only
             // ends the park once `pylond` assigned a core (`spec/08-park-in-kvm.md` §3.3).
+            //
+            // A guest park thread that saw the revocation before this vCPU was forced to park
+            // writes `PARKING` over `PARKED` once KVM lets the vCPU run, then rings the doorbell,
+            // which is this exit. The vCPU is parked already, so the request is done; leaving
+            // `PARKING` would hide the vCPU from `pylond`, which only assigns cores to `PARKED`
+            // vCPUs (§3.7).
+            if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKING {
+                slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+            }
             if self.wake_eventfds[vcpu_id as usize].read().is_err() {
                 if self.take_passed_park_bound(vcpu_id) && !vcpu_op(KvmParkOp::Run) {
                     warn!("Pylon: failed to make parked vCPU {vcpu_id} runnable");
@@ -1513,6 +1522,30 @@ mod tests {
         state.wake_vcpu(0).unwrap();
         assert!(exit(&mut ops));
         assert_eq!(ops, [KvmParkOp::Run]);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+    }
+
+    #[test]
+    fn test_park_in_kvm_guest_park_request_after_forced_park_leaves_vcpu_parked() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
+        slot0.revoke_requested.store(1, Ordering::Release);
+        assert!(state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        let yields = slot0.yield_count.load(Ordering::Relaxed);
+
+        // KVM woke the vCPU, and the guest's park thread asks to park: the doorbell's exit
+        // finds the vCPU parked already, with no new park counted.
+        slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
+        assert!(!state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert_eq!(slot0.yield_count.load(Ordering::Relaxed), yields);
+
+        // A core assignment still ends the park.
+        state.wake_vcpu(0).unwrap();
+        assert!(state.check_and_park_vcpu(0, || None, |_| true));
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
     }
 

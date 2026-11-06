@@ -166,6 +166,23 @@ So the VMM bounds a park inside KVM:
 A busy guest's tick wakes its parked vCPUs about as often, so the bound
 adds little for them. An idle vCPU that is parked gets one extra wake.
 
+### 3.7 Guest park request after a forced park
+
+The guest's park thread (`pv-pylon`, spec 06 §4.3) checks
+`revoke_requested`, writes `PARKING`, then rings the park doorbell. If
+the revocation's deadline passes between the kick and that thread, the
+VMM force-parks the vCPU at its next exit, maybe in the middle of the
+thread. With a park in userspace, the guest doesn't run again until a
+core is assigned. Inside KVM, an interrupt lets it run (§3.2): the
+thread writes `PARKING` over `PARKED` and rings the doorbell.
+
+`pylond` assigns cores only to `PARKED` vCPUs, and only the VMM ends a
+park. Left as it is, the vCPU drops out of arbitration and runs on the
+host's terms. A P2 run left all three parkable vCPUs of an idle VM that
+way (§7.3). So at an exit while parked inside KVM, the VMM turns
+`PARKING` back into `PARKED` before it looks for a core assignment. The
+vCPU was parked already, so the request is done and no park is counted.
+
 ## 4. Component Changes
 
 ### 4.1 VMM (`vmm/src/pylon.rs`, `vmm/src/cpu.rs`)
@@ -174,6 +191,7 @@ adds little for them. An idle vCPU that is parked gets one extra wake.
   returns `VmExit::Ignore` for `EINTR` and runs the post-exit hook.
 - The interrupt check of §3.4, x86_64 only.
 - The park bound of §3.6.
+- Restoring `PARKED` over a late guest park request (§3.7).
 - `KVM_CAP_HALT_POLL` at VM creation when `--pylon` is set.
 - Drop the wake `EventFd`s, or keep them only for MSHV.
 - Snapshot and migration stay refused (spec 06 §7).
