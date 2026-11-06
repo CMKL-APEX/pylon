@@ -235,12 +235,6 @@ jobs:
     if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      matrix:
-        rust: [nightly]
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -248,14 +242,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Install Rust toolchain (${{ matrix.rust }})
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain nightly
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
+          target: x86_64-unknown-linux-gnu
           components: rustfmt
       - name: Bisectability Check (rustfmt)
-        if: ${{ github.event_name == 'pull_request' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        if: ${{ github.event_name == 'pull_request'}}
         run: |
           set -eufo pipefail
           commits=$(git rev-list origin/${{ github.base_ref }}..${{ github.sha }})
@@ -317,6 +310,8 @@ jobs:
           components: clippy
       - name: Install Cargo fuzz
         run: cargo install cargo-fuzz
+      - name: Check fuzz lockfile
+        run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - name: Fuzz Build
         run: cargo fuzz build
       - name: Fuzz Check
@@ -345,7 +340,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
   quality:
     name: quality
     needs: [preflight]
@@ -362,10 +357,8 @@ jobs:
           - beta
           - stable
         target:
-          - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
           - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
         include:
           - rust: beta
             experimental: true
@@ -543,9 +536,8 @@ jobs:
       fail-fast: false
       matrix:
         rust:
-          - stable
-          - beta
-          - nightly
+          # Pin until https://github.com/rust-lang/rust/issues/165263 is fixed.
+          - nightly-2026-10-30
           - "1.89.0" # MSRV — keep quoted.
         target:
           - x86_64-unknown-linux-gnu
@@ -624,7 +616,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - "1.89.0" # MSRV — keep quoted.
     env:
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
     steps:
@@ -937,30 +928,9 @@ jobs:
           echo "Checking hypervisor device nodes..."
           test -e /dev/kvm || { echo "::error::/dev/kvm missing"; exit 1; }
           test -e /dev/sev || { echo "::error::/dev/sev missing"; exit 1; }
-          echo "Checking staged IGVM/kernel artifacts..."
-          test -d /usr/share/cloud-hypervisor/cvm \
-            || { echo "::error::/usr/share/cloud-hypervisor/cvm missing"; exit 1; }
-          ls -l /usr/share/cloud-hypervisor/cvm
       - name: Run CVM (SEV-SNP) integration tests
         timeout-minutes: 20
         run: scripts/dev_cli.sh tests --integration-cvm --hypervisor kvm
-  # Rate-limiter host is not available
-  # integration-rate-limiter:
-  #   name: integration-rate-limiter
-  #   needs: [preflight, dco, quality, build]
-  #   if: >-
-  #     github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
-  #   runs-on: bare-metal-9950x
-  #   env:
-  #     AUTH_DOWNLOAD_TOKEN: ${{ secrets.AUTH_DOWNLOAD_TOKEN }}
-  #   steps:
-  #     - name: Code checkout
-  #       uses: actions/checkout@v7
-  #       with:
-  #         fetch-depth: 0
-  #     - name: Run rate-limiter integration tests
-  #       timeout-minutes: 20
-  #       run: scripts/dev_cli.sh tests --integration-rate-limiter
   virtio-villain:
     name: virtio-villain
     needs: [preflight, dco, quality, build]

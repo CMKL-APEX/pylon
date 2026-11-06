@@ -15,15 +15,11 @@ use thiserror::Error;
 use vfio_bindings::bindings::vfio::*;
 use vfio_ioctls::VfioIrq;
 use vfio_user::{Client, Error as VfioUserError};
-use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
+use vm_allocator::{AddressAllocator, GuestRegion, MemorySlotAllocator, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_device::interrupt::{InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig};
 use vm_device::{BusDevice, Resource};
-use vm_memory::bitmap::AtomicBitmap;
-use vm_memory::{
-    Address, GuestAddress, GuestAddressSpace, GuestMemoryBackend, GuestMemoryRegion,
-    GuestRegionMmap,
-};
+use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemoryBackend, GuestMemoryRegion};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -41,7 +37,7 @@ pub struct VfioUserPciDevice {
     vm: Arc<dyn hypervisor::Vm>,
     client: Arc<Mutex<Client>>,
     common: VfioCommon,
-    memory_slot_allocator: MemorySlotAllocator,
+    memory_slot_allocator: Arc<MemorySlotAllocator>,
     bdf: PciBdf,
 }
 
@@ -93,7 +89,7 @@ impl VfioUserPciDevice {
         msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
         bdf: PciBdf,
-        memory_slot_allocator: MemorySlotAllocator,
+        memory_slot_allocator: Arc<MemorySlotAllocator>,
         snapshot: Option<&Snapshot>,
     ) -> Result<Self, VfioUserPciDeviceError> {
         let resettable = client.lock().unwrap().resettable();
@@ -266,10 +262,7 @@ impl VfioUserPciDevice {
         }
     }
 
-    pub fn dma_map(
-        &mut self,
-        region: &GuestRegionMmap<AtomicBitmap>,
-    ) -> Result<(), VfioUserPciDeviceError> {
+    pub fn dma_map(&mut self, region: &GuestRegion) -> Result<(), VfioUserPciDeviceError> {
         let (fd, offset) = match region.file_offset() {
             Some(_file_offset) => (_file_offset.file().as_raw_fd(), _file_offset.start()),
             None => return Ok(()),
@@ -282,10 +275,7 @@ impl VfioUserPciDevice {
             .map_err(VfioUserPciDeviceError::DmaMap)
     }
 
-    pub fn dma_unmap(
-        &mut self,
-        region: &GuestRegionMmap<AtomicBitmap>,
-    ) -> Result<(), VfioUserPciDeviceError> {
+    pub fn dma_unmap(&mut self, region: &GuestRegion) -> Result<(), VfioUserPciDeviceError> {
         self.client
             .lock()
             .unwrap()

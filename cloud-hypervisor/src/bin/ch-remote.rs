@@ -9,7 +9,9 @@ mod test_util;
 
 use std::io::{self, Read};
 use std::marker::PhantomData;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::{error, fs, iter, num, process};
 
 use api_client::{
@@ -32,6 +34,7 @@ use vmm::vm_config::{
 use zbus::{blocking::Connection, proxy, zvariant::Optional};
 
 type ApiResult = Result<(), Error>;
+type FdCommand = (String, Vec<Arc<OwnedFd>>);
 
 #[derive(Error, Debug)]
 enum Error {
@@ -287,16 +290,42 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
 }
 
 impl TargetApi<'_> {
-    fn do_command(&mut self, matches: &ArgMatches) -> ApiResult {
+    fn do_command(&mut self, matches: &ArgMatches, fd_command: Option<FdCommand>) -> ApiResult {
         match self {
-            Self::HttpApi(api_socket, _) => rest_api_do_command(matches, api_socket),
+            Self::HttpApi(api_socket, _) => rest_api_do_command(matches, api_socket, fd_command),
             #[cfg(feature = "dbus_api")]
-            Self::DBusApi(proxy) => dbus_api_do_command(matches, proxy),
+            Self::DBusApi(proxy) => dbus_api_do_command(matches, proxy, fd_command),
         }
     }
 }
 
-fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResult {
+fn prepare_fd_command(matches: &ArgMatches) -> Result<Option<FdCommand>, Error> {
+    let fd_command = match matches.subcommand() {
+        Some(("add-device", args)) => Some(add_device_config(
+            args.get_one::<String>("device_config").unwrap(),
+        )?),
+        Some(("add-net", args)) => Some(add_net_config(
+            args.get_one::<String>("net_config").unwrap(),
+        )?),
+        Some(("restore", args)) => Some(restore_config(
+            args.get_one::<String>("restore_config").unwrap(),
+        )?),
+        Some(("receive-migration", args)) => Some(receive_migration_data(
+            args.get_one::<String>("receive_migration_config").unwrap(),
+        )?),
+        _ => None,
+    };
+    Ok(fd_command)
+}
+
+fn rest_api_do_command(
+    matches: &ArgMatches,
+    socket: &mut UnixStream,
+    fd_command: Option<FdCommand>,
+) -> ApiResult {
+    let (fd_request_body, fds) = fd_command
+        .map(|(body, fds)| (Some(body), fds))
+        .unwrap_or_default();
     match matches.subcommand_name() {
         Some("boot") => {
             simple_api_command(socket, "PUT", "boot", None).map_err(Error::HttpApiClient)
@@ -386,17 +415,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             simple_api_command(socket, "PUT", "resize-zone", Some(&resize_zone))
                 .map_err(Error::HttpApiClient)
         }
-        Some("add-device") => {
-            let (device_config, fds) = add_device_config(
-                matches
-                    .subcommand_matches("add-device")
-                    .unwrap()
-                    .get_one::<String>("device_config")
-                    .unwrap(),
-            )?;
-            simple_api_command_with_fds(socket, "PUT", "add-device", Some(&device_config), &fds)
-                .map_err(Error::HttpApiClient)
-        }
+        Some("add-device") => simple_api_command_with_fds(
+            socket,
+            "PUT",
+            "add-device",
+            fd_request_body.as_deref(),
+            &fds.iter().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>(),
+        )
+        .map_err(Error::HttpApiClient),
         Some("remove-device") => {
             let remove_device_data = remove_device_config(
                 matches
@@ -457,17 +483,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             simple_api_command(socket, "PUT", "add-pmem", Some(&pmem_config))
                 .map_err(Error::HttpApiClient)
         }
-        Some("add-net") => {
-            let (net_config, fds) = add_net_config(
-                matches
-                    .subcommand_matches("add-net")
-                    .unwrap()
-                    .get_one::<String>("net_config")
-                    .unwrap(),
-            )?;
-            simple_api_command_with_fds(socket, "PUT", "add-net", Some(&net_config), &fds)
-                .map_err(Error::HttpApiClient)
-        }
+        Some("add-net") => simple_api_command_with_fds(
+            socket,
+            "PUT",
+            "add-net",
+            fd_request_body.as_deref(),
+            &fds.iter().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>(),
+        )
+        .map_err(Error::HttpApiClient),
         Some("add-user-device") => {
             let device_config = add_user_device_config(
                 matches
@@ -512,17 +535,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             simple_api_command(socket, "PUT", "snapshot", Some(&snapshot_config))
                 .map_err(Error::HttpApiClient)
         }
-        Some("restore") => {
-            let (restore_config, fds) = restore_config(
-                matches
-                    .subcommand_matches("restore")
-                    .unwrap()
-                    .get_one::<String>("restore_config")
-                    .unwrap(),
-            )?;
-            simple_api_command_with_fds(socket, "PUT", "restore", Some(&restore_config), &fds)
-                .map_err(Error::HttpApiClient)
-        }
+        Some("restore") => simple_api_command_with_fds(
+            socket,
+            "PUT",
+            "restore",
+            fd_request_body.as_deref(),
+            &fds.iter().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>(),
+        )
+        .map_err(Error::HttpApiClient),
         Some("coredump") => {
             let coredump_config = coredump_config(
                 matches
@@ -545,23 +565,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             simple_api_command(socket, "PUT", "send-migration", Some(&send_migration_data))
                 .map_err(Error::HttpApiClient)
         }
-        Some("receive-migration") => {
-            let (receive_migration_data, fds) = receive_migration_data(
-                matches
-                    .subcommand_matches("receive-migration")
-                    .unwrap()
-                    .get_one::<String>("receive_migration_config")
-                    .unwrap(),
-            )?;
-            simple_api_command_with_fds(
-                socket,
-                "PUT",
-                "receive-migration",
-                Some(&receive_migration_data),
-                &fds,
-            )
-            .map_err(Error::HttpApiClient)
-        }
+        Some("receive-migration") => simple_api_command_with_fds(
+            socket,
+            "PUT",
+            "receive-migration",
+            fd_request_body.as_deref(),
+            &fds.iter().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>(),
+        )
+        .map_err(Error::HttpApiClient),
         Some("create") => {
             let data = create_data(
                 matches
@@ -579,7 +590,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
 }
 
 #[cfg(feature = "dbus_api")]
-fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) -> ApiResult {
+fn dbus_api_do_command(
+    matches: &ArgMatches,
+    proxy: &DBusApi1ProxyBlocking<'_>,
+    fd_command: Option<FdCommand>,
+) -> ApiResult {
+    let (fd_request_body, _fds) = fd_command
+        .map(|(body, fds)| (Some(body), fds))
+        .unwrap_or_default();
     match matches.subcommand_name() {
         Some("boot") => proxy.api_vm_boot(),
         Some("delete") => proxy.api_vm_delete(),
@@ -628,16 +646,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             )?;
             proxy.api_vm_resize_zone(&resize_zone)
         }
-        Some("add-device") => {
-            let (device_config, _fds) = add_device_config(
-                matches
-                    .subcommand_matches("add-device")
-                    .unwrap()
-                    .get_one::<String>("device_config")
-                    .unwrap(),
-            )?;
-            proxy.api_vm_add_device(&device_config)
-        }
+        Some("add-device") => proxy.api_vm_add_device(fd_request_body.as_deref().unwrap()),
         Some("remove-device") => {
             let remove_device_data = remove_device_config(
                 matches
@@ -688,16 +697,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             )?;
             proxy.api_vm_add_pmem(&pmem_config)
         }
-        Some("add-net") => {
-            let (net_config, _fds) = add_net_config(
-                matches
-                    .subcommand_matches("add-net")
-                    .unwrap()
-                    .get_one::<String>("net_config")
-                    .unwrap(),
-            )?;
-            proxy.api_vm_add_net(&net_config)
-        }
+        Some("add-net") => proxy.api_vm_add_net(fd_request_body.as_deref().unwrap()),
         Some("add-user-device") => {
             let device_config = add_user_device_config(
                 matches
@@ -738,16 +738,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             );
             proxy.api_vm_snapshot(&snapshot_config)
         }
-        Some("restore") => {
-            let (restore_config, _fds) = restore_config(
-                matches
-                    .subcommand_matches("restore")
-                    .unwrap()
-                    .get_one::<String>("restore_config")
-                    .unwrap(),
-            )?;
-            proxy.api_vm_restore(&restore_config)
-        }
+        Some("restore") => proxy.api_vm_restore(fd_request_body.as_deref().unwrap()),
         Some("coredump") => {
             let coredump_config = coredump_config(
                 matches
@@ -770,14 +761,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             proxy.api_vm_send_migration(&send_migration_data)
         }
         Some("receive-migration") => {
-            let (receive_migration_data, _fds) = receive_migration_data(
-                matches
-                    .subcommand_matches("receive-migration")
-                    .unwrap()
-                    .get_one::<String>("receive_migration_config")
-                    .unwrap(),
-            )?;
-            proxy.api_vm_receive_migration(&receive_migration_data)
+            proxy.api_vm_receive_migration(fd_request_body.as_deref().unwrap())
         }
         Some("create") => {
             let data = create_data(
@@ -856,8 +840,10 @@ fn resize_zone_config(id: &str, size: &str) -> Result<String, Error> {
     Ok(serde_json::to_string(&resize_zone).unwrap())
 }
 
-fn add_device_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut device_config = DeviceConfig::parse(config).map_err(Error::AddDeviceConfig)?;
+fn add_device_config(config: &str) -> Result<FdCommand, Error> {
+    let mut device_config =
+        // SAFETY: The CLI transfers ownership of the inherited descriptors.
+        unsafe { DeviceConfig::parse(config) }.map_err(Error::AddDeviceConfig)?;
 
     // DeviceConfig is modified on purpose here by taking the file
     // descriptor out. Keeping it and sending it over to the server side
@@ -915,14 +901,21 @@ fn add_pmem_config(config: &str) -> Result<String, Error> {
     Ok(pmem_config)
 }
 
-fn add_net_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
+fn add_net_config(config: &str) -> Result<FdCommand, Error> {
+    // SAFETY: The CLI transfers ownership of the inherited descriptors.
+    let mut net_config = unsafe { NetConfig::parse(config) }.map_err(Error::AddNetConfig)?;
 
     // NetConfig is modified on purpose here by taking the list of file
     // descriptors out. Keeping the list and send it to the server side
     // process would not make any sense since the file descriptor may be
     // represented with different values.
-    let fds = net_config.fds.take().unwrap_or_default();
+    let fds = net_config
+        .fds
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|mut fd| fd.take())
+        .collect();
     let net_config = serde_json::to_string(&net_config).unwrap();
 
     Ok((net_config, fds))
@@ -950,16 +943,18 @@ fn snapshot_config(url: &str) -> String {
     serde_json::to_string(&snapshot_config).unwrap()
 }
 
-fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
+fn restore_config(config: &str) -> Result<FdCommand, Error> {
+    // SAFETY: The CLI transfers ownership of the inherited descriptors.
+    let mut restore_config = unsafe { RestoreConfig::parse(config) }.map_err(Error::Restore)?;
     // RestoreConfig is modified on purpose to take out the file descriptors.
     // These fds are passed to the server side process via SCM_RIGHTS, in the
     // order net_fds, then vfio_fds, then the iommufd FD, matching the
     // server's split.
-    let mut fds: Vec<i32> = match &mut restore_config.net_fds {
+    let mut fds: Vec<Arc<OwnedFd>> = match &mut restore_config.net_fds {
         Some(net_fds) => net_fds
             .iter_mut()
             .flat_map(|net| net.fds.take().unwrap_or_default())
+            .filter_map(|mut fd| fd.take())
             .collect(),
         None => Vec::new(),
     };
@@ -982,13 +977,14 @@ fn coredump_config(destination_url: &str) -> String {
     serde_json::to_string(&coredump_config).unwrap()
 }
 
-fn receive_migration_data(config: &str) -> Result<(String, Vec<i32>), Error> {
-    let mut data =
-        api::VmReceiveMigrationData::parse(config).map_err(Error::ReceiveMigrationConfig)?;
+fn receive_migration_data(config: &str) -> Result<FdCommand, Error> {
+    // SAFETY: The CLI transfers ownership of the inherited descriptors.
+    let mut data = unsafe { api::VmReceiveMigrationData::parse(config) }
+        .map_err(Error::ReceiveMigrationConfig)?;
 
     // The FDs are passed to the server side process via SCM_RIGHTS, in the
     // order vfio_fds then the iommufd FD, matching the server's split.
-    let mut fds: Vec<i32> = match data.vfio_fds.as_mut() {
+    let mut fds: Vec<Arc<OwnedFd>> = match data.vfio_fds.as_mut() {
         Some(vfio_fds) => vfio_fds.iter_mut().filter_map(|v| v.fd.take()).collect(),
         None => Vec::new(),
     };
@@ -1210,6 +1206,11 @@ fn main() {
 
     let matches = app.get_matches();
 
+    let fd_command = prepare_fd_command(&matches).unwrap_or_else(|error| {
+        cloud_hypervisor::cli_print_error_chain(&error, "ch-remote", |_, _, _| None);
+        process::exit(1);
+    });
+
     let mut target_api = match (
         matches.get_one::<String>("api-socket"),
         #[cfg(feature = "dbus_api")]
@@ -1261,7 +1262,7 @@ fn main() {
         }
     };
 
-    if let Err(top_error) = target_api.do_command(&matches) {
+    if let Err(top_error) = target_api.do_command(&matches, fd_command) {
         // Helper to join strings with a newline.
         #[expect(clippy::needless_pass_by_value)]
         fn join_strs(mut acc: String, next: String) -> String {
@@ -1350,8 +1351,9 @@ mod tests {
         let commands = get_cli_commands_sorted();
 
         // check commands itself are sorted
-        let iter = commands.iter().zip(commands.iter().skip(1));
-        for (command, next) in iter {
+        for pair in commands.windows(2) {
+            let command = &pair[0];
+            let next = &pair[1];
             assert_ne!(
                 command.get_name().cmp(next.get_name()),
                 Ordering::Greater,

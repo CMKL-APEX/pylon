@@ -23,6 +23,7 @@ use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::SnpPolicy;
 use thiserror::Error;
+use vm_memory::GuestMemoryError;
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "x86_64")]
@@ -128,10 +129,10 @@ pub enum HypervisorVmError {
     CreatePassthroughDevice(#[source] anyhow::Error),
     /// Write to Guest memory
     #[error("Failed to write to guest memory")]
-    GuestMemWrite(#[source] anyhow::Error),
+    GuestMemWrite(#[source] GuestMemoryError),
     /// Read Guest memory
     #[error("Failed to read guest memory")]
-    GuestMemRead(#[source] anyhow::Error),
+    GuestMemRead(#[source] GuestMemoryError),
     /// Start dirty log error
     #[error("Failed to get dirty log")]
     StartDirtyLog(#[source] anyhow::Error),
@@ -323,9 +324,8 @@ pub trait Vm: Send + Sync + Any {
     }
     /// Re-establish the guest clock before the vCPUs resume. `mode` distinguishes a
     /// same-host pause/resume (the clock kept running) from a restore/migration where
-    /// it must catch up to wall time; x86 ignores it (kvmclock is re-applied on every
-    /// resume). aarch64 writes the counter on all `vcpus` (older kernels track the
-    /// offset per-vCPU); x86 ignores `vcpus`.
+    /// it must catch up to wall time. aarch64 writes the counter on all `vcpus` (older
+    /// kernels track the offset per-vCPU).
     fn restore_clock(
         &self,
         _vcpus: &[&dyn Vcpu],

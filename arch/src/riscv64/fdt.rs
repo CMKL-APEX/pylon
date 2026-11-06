@@ -13,14 +13,13 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::{cmp, result, str};
 
-use byteorder::{BigEndian, ByteOrder};
 use hypervisor::arch::riscv64::aia::Vaia;
 use log::debug;
 use thiserror::Error;
 use vm_fdt::{FdtWriter, FdtWriterResult};
 use vm_memory::{Address, Bytes, GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
 
-use super::super::{DeviceType, GuestMemoryMmap, InitramfsConfig};
+use super::super::{DeviceType, GuestMemory, InitramfsConfig};
 use super::layout::{
     IRQ_BASE, MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START, MEM_PCI_IO_SIZE, MEM_PCI_IO_START,
     PCI_HIGH_BASE, PCI_MMIO_CONFIG_SIZE_PER_SEGMENT,
@@ -63,7 +62,7 @@ type Result<T> = result::Result<T, Error>;
 /// Creates the flattened device tree for this riscv64 VM.
 #[expect(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHasher>(
-    guest_mem: &GuestMemoryMmap,
+    guest_mem: &GuestMemory,
     cmdline: &str,
     num_vcpu: u32,
     isa_string: &str,
@@ -102,7 +101,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     Ok(fdt_final)
 }
 
-pub fn write_fdt_to_memory(fdt_final: &[u8], guest_mem: &GuestMemoryMmap) -> Result<()> {
+pub fn write_fdt_to_memory(fdt_final: &[u8], guest_mem: &GuestMemory) -> Result<()> {
     // Write FDT to memory.
     guest_mem
         .write_slice(fdt_final, super::layout::FDT_START)
@@ -150,7 +149,7 @@ fn create_cpu_nodes(
     Ok(())
 }
 
-fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> FdtWriterResult<()> {
+fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemory) -> FdtWriterResult<()> {
     // Note: memory regions from "GuestMemoryBackend" are sorted and non-zero sized.
     let ram_regions = {
         let mut ram_regions = Vec::new();
@@ -467,9 +466,8 @@ fn print_node(node: fdt_parser::node::FdtNode<'_, '_>, n_spaces: usize) {
                 indent = (n_spaces + 2)
             );
         } else {
-            let mut array = Vec::with_capacity(256);
-            array.resize(value.len() / 4, 0u32);
-            BigEndian::read_u32_into(value, &mut array);
+            let (chunks, _) = value.as_chunks::<4>();
+            let array: Vec<u32> = chunks.iter().map(|c| u32::from_be_bytes(*c)).collect();
             debug!(
                 "{:indent$}{} : {:X?}",
                 "",

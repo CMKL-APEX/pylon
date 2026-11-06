@@ -30,8 +30,6 @@ use arch::aarch64::cache::{CacheTopologyInfo, read_cache_topology};
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::cpu_profile::{CpuProfile, CpuProfileLoadError};
 use arch::{EntryPoint, NumaNodes, layout};
-#[cfg(target_arch = "aarch64")]
-use devices::gic::Gic;
 use devices::interrupt_controller::InterruptController;
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
@@ -103,7 +101,7 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
 use crate::vm_config::{CoreScheduling, CpusConfig};
-use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap, pylon};
+use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemory, pylon};
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -136,7 +134,7 @@ pub enum Error {
     VcpuCreate(#[source] anyhow::Error),
 
     #[error("Error running vCPU")]
-    VcpuRun(#[source] anyhow::Error),
+    VcpuRun(#[source] hypervisor::HypervisorCpuError),
 
     #[error("Error checking --pylon")]
     Pylon(#[source] pylon::Error),
@@ -219,7 +217,7 @@ pub enum Error {
 
     #[cfg(target_arch = "x86_64")]
     #[error("Error setting up AMX")]
-    AmxEnable(#[source] anyhow::Error),
+    AmxEnable(#[source] hypervisor::HypervisorError),
 
     #[error("Maximum number of vCPUs {0} exceeds host limit {1}")]
     MaximumVcpusExceeded(u32, u32),
@@ -551,7 +549,7 @@ impl Vcpu {
     /// * `cpuid` - (x86_64) CpuId, wrapper over the `kvm_cpuid2` structure.
     pub fn configure(
         &mut self,
-        boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
+        boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemory>)>,
         #[cfg(target_arch = "aarch64")] nested: bool,
         #[cfg(target_arch = "x86_64")] cpuid: Vec<CpuIdEntry>,
         #[cfg(target_arch = "x86_64")] kvm_hyperv: bool,
@@ -928,7 +926,6 @@ impl VcpuState {
 }
 
 impl CpuManager {
-    #[expect(unused_variables)]
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         config: &CpusConfig,
@@ -957,15 +954,12 @@ impl CpuManager {
         let mut vcpu_states = Vec::with_capacity(max_vcpus);
         vcpu_states.resize_with(max_vcpus, VcpuState::default);
         let vcpu_states = Arc::new(Mutex::new(vcpu_states));
-        let hypervisor_type = hypervisor.hypervisor_type();
-        #[cfg(target_arch = "x86_64")]
-        let cpu_vendor = hypervisor.get_cpu_vendor();
 
         #[cfg(target_arch = "x86_64")]
         if config.features.amx {
             hypervisor
                 .enable_amx_state_components()
-                .map_err(|e| Error::AmxEnable(e.into()))?;
+                .map_err(Error::AmxEnable)?;
         }
 
         let proximity_domain_per_cpu: BTreeMap<u32, u32> = {
@@ -1094,7 +1088,7 @@ impl CpuManager {
     pub fn configure_vcpu(
         &self,
         vcpu: &mut Vcpu,
-        boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
+        boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemory>)>,
     ) -> Result<()> {
         #[cfg(all(feature = "sev_snp", feature = "mshv"))]
         if self.sev_snp_enabled
@@ -1531,7 +1525,7 @@ impl CpuManager {
                                 },
 
                                 Err(e) => {
-                                    error!("VCPU generated error: {:?}", Error::VcpuRun(e.into()));
+                                    error!("VCPU generated error: {:?}", Error::VcpuRun(e));
                                     vcpu_run_interrupted.store(true, Ordering::SeqCst);
                                     exit_evt.write(1).unwrap();
                                     break;
@@ -1949,8 +1943,7 @@ impl CpuManager {
 
                 madt.append(gicc);
             }
-            let vgic_config = Gic::create_default_config(self.config.boot_vcpus.into())
-                .expect("the GIC was created with this vCPU count");
+            let vgic_config = vgic.lock().unwrap().config();
 
             // GIC Distributor structure. See section 5.2.12.15 in ACPI spec.
             let gicd = GicD {
@@ -2259,7 +2252,7 @@ impl CpuManager {
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     fn translate_gva(
         &self,
-        _guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        _guest_memory: &GuestMemoryAtomic<GuestMemory>,
         cpu_id: u8,
         gva: u64,
     ) -> Result<u64> {
@@ -2289,7 +2282,7 @@ impl CpuManager {
     #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
     fn translate_gva(
         &self,
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         cpu_id: u8,
         gva: u64,
     ) -> Result<u64> {
@@ -3085,7 +3078,7 @@ impl Debuggable for CpuManager {
 
     fn read_mem(
         &self,
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         cpu_id: usize,
         vaddr: GuestAddress,
         len: usize,
@@ -3116,7 +3109,7 @@ impl Debuggable for CpuManager {
 
     fn write_mem(
         &self,
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         cpu_id: usize,
         vaddr: &GuestAddress,
         data: &[u8],

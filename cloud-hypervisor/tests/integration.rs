@@ -337,6 +337,103 @@ mod common_parallel {
         test_reboot(Some("triple"));
     }
 
+    fn test_guest_lifecycle_action(
+        guest_command: &str,
+        guest_reset_action: Option<&str>,
+        guest_shutdown_action: Option<&str>,
+        exit_vmm: bool,
+    ) {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME).with_cpu(2);
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let mut command = GuestCommand::new(&guest);
+        command
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--api-socket", &api_socket])
+            .args(["--event-monitor", &format!("path={event_path}")]);
+        if let Some(action) = guest_reset_action {
+            command.args(["--guest-reset-action", action]);
+        }
+        if let Some(action) = guest_shutdown_action {
+            command.args(["--guest-shutdown-action", action]);
+        }
+        let mut child = command.capture_output().spawn().unwrap();
+
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            guest.wait_vm_boot().unwrap();
+            guest.ssh_command(guest_command).unwrap();
+
+            if exit_vmm {
+                let status = child
+                    .wait_timeout(Duration::from_secs(20))
+                    .unwrap()
+                    .expect("VMM did not exit after the guest lifecycle request");
+                assert!(status.success());
+                let events = parse_event_file(&event_path);
+                let shutdown_sources = events
+                    .iter()
+                    .filter(|event| event["event"] == "shutdown")
+                    .map(|event| event["source"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(shutdown_sources, ["vm", "vmm"]);
+            } else {
+                assert!(wait_for_latest_events_exact_str(
+                    Duration::from_secs(20),
+                    &["shutdown"],
+                    &event_path,
+                ));
+                assert!(child.try_wait().unwrap().is_none());
+                // Shutdown drops the VM instance but retains its configuration.
+                assert_eq!(vm_state(&api_socket), "Created");
+
+                assert!(remote_command(&api_socket, "boot", None));
+                guest.wait_vm_boot().unwrap();
+                assert_eq!(vm_state(&api_socket), "Running");
+                guest.validate_cpu_count(None);
+                guest.validate_memory(None);
+            }
+        }));
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_guest_reset_action_exit_vmm() {
+        test_guest_lifecycle_action("sudo reboot", Some("exit-vmm"), Some("shutdown-vm"), true);
+    }
+
+    #[test]
+    fn test_guest_reset_action_shutdown_vm() {
+        test_guest_lifecycle_action("sudo reboot", Some("shutdown-vm"), Some("exit-vmm"), false);
+    }
+
+    #[test]
+    fn test_guest_shutdown_action_default() {
+        test_guest_lifecycle_action("sudo poweroff", None, None, true);
+    }
+
+    #[test]
+    fn test_guest_shutdown_action_exit_vmm() {
+        test_guest_lifecycle_action("sudo poweroff", Some("shutdown-vm"), Some("exit-vmm"), true);
+    }
+
+    #[test]
+    fn test_guest_shutdown_action_shutdown_vm() {
+        test_guest_lifecycle_action(
+            "sudo poweroff",
+            Some("exit-vmm"),
+            Some("shutdown-vm"),
+            false,
+        );
+    }
+
     #[test]
     fn test_user_defined_memory_regions() {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
@@ -3483,6 +3580,65 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    // Start the VMM with only --api-socket and --landlock, create and boot
+    // a VM with Landlock enabled through the API, and check that a disk
+    // outside the Landlock rules is refused.
+    fn test_api_create_boot_landlock() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--landlock"])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            assert!(wait_until(Duration::from_secs(5), || remote_command(
+                &api_socket,
+                "ping",
+                None
+            )));
+
+            let mut body: serde_json::Value =
+                serde_json::from_str(&guest.api_create_body()).unwrap();
+            body["landlock_enable"] = serde_json::Value::Bool(true);
+            let config_path = guest.tmp_dir.as_path().join("config");
+            fs::write(&config_path, body.to_string()).unwrap();
+
+            assert!(remote_command(
+                &api_socket,
+                "create",
+                Some(config_path.to_str().unwrap())
+            ));
+            assert!(remote_command(&api_socket, "boot", None));
+            guest.wait_vm_boot().unwrap();
+
+            let mut blk_file_path = dirs::home_dir().unwrap();
+            blk_file_path.push("workloads");
+            blk_file_path.push("blk.img");
+            assert!(!remote_command(
+                &api_socket,
+                "add-disk",
+                Some(
+                    format!(
+                        "path={},id=test0,readonly=true,image_type=raw",
+                        blk_file_path.to_str().unwrap()
+                    )
+                    .as_str()
+                ),
+            ));
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     fn test_virtio_iommu() {
         _test_virtio_iommu(false);
     }
@@ -3923,6 +4079,85 @@ mod common_parallel {
     fn test_disk_hotplug_with_landlock() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         _test_disk_hotplug(&guest, true, false);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    // Landlock must grant a readonly=on disk read access only. Re-adding the
+    // image with readonly=off must fail with EACCES, and re-adding it
+    // read-only must work. The read-only disk is unplugged first, so its
+    // shared lock cannot refuse the write lock instead of Landlock.
+    fn test_landlock_readonly_disk() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let ro_disk = guest.tmp_dir.as_path().join("ro.img");
+        let ro_disk = ro_disk.to_str().unwrap();
+        assert!(exec_host_command_status(&format!("truncate -s 16M {ro_disk}")).success());
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .args(["--landlock"])
+            .default_disks()
+            .args([
+                "--disk",
+                format!("path={ro_disk},id=ro_disk,readonly=on,image_type=raw").as_str(),
+            ])
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            // The read-only disk is vdc, and the VMM can read it.
+            guest
+                .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
+                .unwrap();
+
+            assert!(remote_command(
+                &api_socket,
+                "remove-device",
+                Some("ro_disk")
+            ));
+            assert!(wait_until(Duration::from_secs(10), || guest
+                .ssh_command("lsblk | grep -c vdc || true")
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)));
+            // The guest drops vdc before the VMM closes the image on eject.
+            thread::sleep(Duration::new(5, 0));
+
+            let (cmd_success, _, cmd_stderr) = remote_command_w_output(
+                &api_socket,
+                "add-disk",
+                Some(format!("path={ro_disk},id=rw_disk,image_type=raw").as_str()),
+            );
+            let cmd_stderr = String::from_utf8_lossy(&cmd_stderr);
+            assert!(!cmd_success, "readonly=off re-add succeeded");
+            assert!(cmd_stderr.contains("Permission denied"), "{cmd_stderr}");
+
+            let (cmd_success, _, cmd_stderr) = remote_command_w_output(
+                &api_socket,
+                "add-disk",
+                Some(format!("path={ro_disk},id=ro_disk2,readonly=on,image_type=raw").as_str()),
+            );
+            assert!(cmd_success, "{}", String::from_utf8_lossy(&cmd_stderr));
+            assert!(wait_until(Duration::from_secs(10), || {
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 1)
+            }));
+            guest
+                .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
+                .unwrap();
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
     }
 
     #[test]

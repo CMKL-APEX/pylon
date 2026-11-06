@@ -18,6 +18,8 @@ use std::mem::offset_of;
 use std::num;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
+#[cfg(feature = "sev_snp")]
+use std::process;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::sync::Mutex;
 #[cfg(feature = "sev_snp")]
@@ -877,7 +879,7 @@ impl vm::Vm for KvmVm {
             xsave_size,
             #[cfg(target_arch = "x86_64")]
             has_xcrs: self.check_extension(Cap::Xcrs),
-            #[cfg(any(target_arch = "x86_64", feature = "sev_snp"))]
+            #[cfg(target_arch = "x86_64")]
             vm_fd: Arc::clone(&self.fd),
             #[cfg(feature = "sev_snp")]
             memory_slots: self.memory_slots.clone(),
@@ -1040,10 +1042,11 @@ impl vm::Vm for KvmVm {
 
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
-        let guest_memfd = if let Some(slots) = self
+        let guest_memfd = if self
             .memory_slots
             .as_ref()
             .filter(|_| visibility == vm::MemoryVisibility::Private)
+            .is_some()
         {
             if log_dirty_pages {
                 return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
@@ -1062,19 +1065,9 @@ impl vm::Vm for KvmVm {
                         .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?,
                 )
             };
-            let raw_fd = fd.as_raw_fd() as u32;
-            slots.write().unwrap().insert(
-                slot,
-                KvmMemorySlot {
-                    guest_memfd: fd,
-                    guest_phys_addr,
-                    memory_size: memory_size as u64,
-                    userspace_addr: userspace_addr as usize as u64,
-                },
-            );
-            raw_fd
+            Some(fd)
         } else {
-            0
+            None
         };
 
         let region = kvm_userspace_memory_region2 {
@@ -1083,19 +1076,57 @@ impl vm::Vm for KvmVm {
             guest_phys_addr,
             memory_size: memory_size as u64,
             userspace_addr: userspace_addr as usize as u64,
-            guest_memfd,
+            guest_memfd: guest_memfd.as_ref().map_or(0, |fd| fd.as_raw_fd() as u32),
             // Each guest_memfd is per-region and sized to memory_size,
             // so the region's data always starts at offset 0.
             guest_memfd_offset: 0,
             ..Default::default()
         };
-        if log_dirty_pages {
-            if (region.flags & KVM_MEM_READONLY) != 0 {
-                return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
-                    "Error creating regions with both 'dirty-pages-log' and 'read-only'."
-                )));
-            }
+        if log_dirty_pages && (region.flags & KVM_MEM_READONLY) != 0 {
+            return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
+                "Error creating regions with both 'dirty-pages-log' and 'read-only'."
+            )));
+        }
 
+        // SAFETY: Safe because caller promised this is safe.
+        unsafe {
+            self.set_user_memory_region(region)
+                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+        }
+
+        #[cfg(feature = "sev_snp")]
+        if visibility == vm::MemoryVisibility::Private
+            && self.memory_slots.is_some()
+            && let Err(e) = self.fd.set_memory_attributes(kvm_memory_attributes {
+                address: region.guest_phys_addr,
+                size: region.memory_size,
+                attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+                flags: 0,
+            })
+        {
+            let removed = kvm_userspace_memory_region2 {
+                memory_size: 0,
+                ..region
+            };
+            // SAFETY: the region was installed above and its backing is still alive.
+            if let Err(rollback) = unsafe { self.set_user_memory_region(removed) } {
+                error!("Failed to roll back memory slot {slot}: {rollback}");
+                process::exit(1);
+            }
+            return Err(vm::HypervisorVmError::CreateUserMemory(e.into()));
+        }
+        if let Some(fd) = guest_memfd {
+            self.memory_slots.as_ref().unwrap().write().unwrap().insert(
+                slot,
+                KvmMemorySlot {
+                    guest_memfd: fd,
+                    guest_phys_addr,
+                    memory_size: memory_size as u64,
+                    userspace_addr: userspace_addr as usize as u64,
+                },
+            );
+        }
+        if log_dirty_pages {
             // Keep track of the regions that need dirty pages log
             self.dirty_log_slots.write().unwrap().insert(
                 region.slot,
@@ -1111,23 +1142,6 @@ impl vm::Vm for KvmVm {
             );
         }
 
-        // SAFETY: Safe because caller promised this is safe.
-        unsafe {
-            self.set_user_memory_region(region)
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
-        }
-
-        #[cfg(feature = "sev_snp")]
-        if visibility == vm::MemoryVisibility::Private && self.memory_slots.is_some() {
-            self.fd
-                .set_memory_attributes(kvm_memory_attributes {
-                    address: region.guest_phys_addr,
-                    size: region.memory_size,
-                    attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
-                    flags: 0,
-                })
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
-        }
         Ok(())
     }
 
@@ -1156,9 +1170,6 @@ impl vm::Vm for KvmVm {
             ..Default::default()
         };
 
-        // Remove the corresponding entry from "self.dirty_log_slots" if needed
-        self.dirty_log_slots.write().unwrap().remove(&region.slot);
-
         // Setting the size to 0 means "remove"
         region.memory_size = 0;
         // SAFETY: Safe because caller promised this is safe.
@@ -1166,6 +1177,9 @@ impl vm::Vm for KvmVm {
             self.set_user_memory_region(region)
                 .map_err(|e| vm::HypervisorVmError::RemoveUserMemory(e.into()))?;
         }
+
+        // Remove the corresponding entry from "self.dirty_log_slots" if needed
+        self.dirty_log_slots.write().unwrap().remove(&region.slot);
 
         // Close the per-region guest_memfd if one was created for this slot
         if let Some(slots) = &self.memory_slots {
@@ -1284,11 +1298,38 @@ impl vm::Vm for KvmVm {
     #[cfg(target_arch = "x86_64")]
     fn restore_clock(
         &self,
-        _vcpus: &[&dyn cpu::Vcpu],
+        vcpus: &[&dyn cpu::Vcpu],
         state: &ClockState,
-        _mode: ClockRestoreMode,
+        mode: ClockRestoreMode,
     ) -> vm::Result<()> {
-        self.set_clock(state)
+        self.set_clock(state)?;
+        // A snapshot restore moves kvmclock forward but not the TSC, so an armed TSC
+        // deadline would fire late. Make it due so the guest catches up on resume.
+        if mode == ClockRestoreMode::SnapshotRestore && state.has_realtime() {
+            for vcpu in vcpus {
+                let mut msrs = vec![
+                    MsrEntry {
+                        index: msr_index::MSR_IA32_TSC,
+                        data: 0,
+                    },
+                    MsrEntry {
+                        index: msr_index::MSR_IA32_TSC_DEADLINE,
+                        data: 0,
+                    },
+                ];
+                vcpu.get_msrs(&mut msrs)
+                    .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+                let (tsc, deadline) = (msrs[0].data, msrs[1].data);
+                if deadline > tsc {
+                    vcpu.set_msrs(&[MsrEntry {
+                        index: msr_index::MSR_IA32_TSC_DEADLINE,
+                        data: tsc,
+                    }])
+                    .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Advance the guest virtual counter to current wall time before the vCPUs
@@ -1716,7 +1757,7 @@ pub struct KvmVcpu {
     xsave_size: i32,
     #[cfg(target_arch = "x86_64")]
     has_xcrs: bool,
-    #[cfg(any(target_arch = "x86_64", feature = "sev_snp"))]
+    #[cfg(target_arch = "x86_64")]
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
@@ -3445,11 +3486,6 @@ impl cpu::Vcpu for KvmVcpu {
             }
             Ok(_) => Ok(()),
         }
-    }
-
-    #[cfg(feature = "sev_snp")]
-    fn set_sev_control_register(&self, _vmsa_pfn: u64) -> cpu::Result<()> {
-        Ok(())
     }
 
     #[cfg(feature = "sev_snp")]

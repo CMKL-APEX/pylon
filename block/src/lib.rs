@@ -25,13 +25,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::{FileExt, FileTypeExt};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use std::{cmp, io, mem, result};
 
 pub use aligned_file::AlignedFile;
-use formats::qcow;
 #[cfg(feature = "io_uring")]
 use io_uring::{IoUring, Probe, opcode};
 use libc::ioctl;
@@ -41,7 +40,6 @@ use serde::{Deserialize, Serialize};
 pub use sparse::{BLKDISCARD, BLKZEROOUT};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::*;
-use vm_memory::bitmap::Bitmap;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError};
 use vmm_sys_util::fallocate::{FallocateMode, fallocate};
 use vmm_sys_util::{aio, ioctl_io_nr, ioctl_ior_nr};
@@ -73,8 +71,6 @@ pub enum Error {
     InvalidDataLength,
     #[error("Request offset or length is not aligned to {0} bytes")]
     InvalidDataAlignment(u64),
-    #[error("Failure in qcow")]
-    QcowError(#[source] qcow::Error),
     #[error("The requested operation does not support multiple descriptors")]
     TooManyDescriptors,
     #[error("Request contains too many segments ({0}, max {MAX_DISCARD_WRITE_ZEROES_SEG})")]
@@ -174,8 +170,8 @@ impl ExecuteError {
     }
 }
 
-pub fn request_type<B: Bitmap + 'static>(
-    mem: &vm_memory::GuestMemoryMmap<B>,
+pub fn request_type<M: GuestMemoryBackend>(
+    mem: &M,
     desc_addr: GuestAddress,
 ) -> result::Result<RequestType, Error> {
     let type_ = mem.read_obj(desc_addr).map_err(Error::GuestMemory)?;
@@ -190,10 +186,7 @@ pub fn request_type<B: Bitmap + 'static>(
     }
 }
 
-fn sector<B: Bitmap + 'static>(
-    mem: &vm_memory::GuestMemoryMmap<B>,
-    desc_addr: GuestAddress,
-) -> result::Result<u64, Error> {
+fn sector<M: GuestMemoryBackend>(mem: &M, desc_addr: GuestAddress) -> result::Result<u64, Error> {
     const SECTOR_OFFSET: usize = 8;
     let addr = match mem.checked_offset(desc_addr, SECTOR_OFFSET) {
         Some(v) => v,
@@ -312,8 +305,8 @@ pub(crate) fn is_block_device(file: &File) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_block_device())
 }
 
-/// Returns the kernel reported direct I/O alignment for `fd`, or `None`
-/// when `fd` was not opened with O_DIRECT.
+/// Returns the kernel reported direct I/O alignment for `file`, or `None`
+/// when `file` was not opened with O_DIRECT.
 ///
 /// When O_DIRECT is set, uses `statx(STATX_DIOALIGN)` (Linux >= 6.1) to obtain
 /// the exact memory and offset alignment the kernel requires for direct I/O on
@@ -322,9 +315,9 @@ pub(crate) fn is_block_device(file: &File) -> bool {
 /// fd direct I/O constraint accounting for the filesystem, underlying block
 /// device, and any stacking such as loop or device mapper. Falls back to
 /// [`SECTOR_SIZE`] when the kernel does not report a value.
-pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
+pub(crate) fn probe_direct_alignment(file: &File) -> Option<u64> {
     // SAFETY: fcntl(F_GETFL) is always safe on a valid fd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 || (flags & libc::O_DIRECT) == 0 {
         return None;
     }
@@ -350,7 +343,7 @@ pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_statx,
-            fd,
+            file.as_raw_fd(),
             c"".as_ptr(),
             libc::AT_EMPTY_PATH,
             STATX_DIOALIGN,
@@ -675,7 +668,7 @@ impl DiskTopology {
         };
 
         // Direct I/O can require larger transfers than logical blocks.
-        if let Some(alignment) = probe_direct_alignment(f.as_raw_fd()) {
+        if let Some(alignment) = probe_direct_alignment(f) {
             let block_size = topology.logical_block_size.max(alignment);
             Ok(topology.with_block_size(block_size))
         } else {

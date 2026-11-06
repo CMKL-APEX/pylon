@@ -16,9 +16,7 @@ use std::{cmp, io, result};
 use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use byteorder::{ByteOrder, LittleEndian};
 use hypervisor::HypervisorVmError;
-use libc::{_SC_PAGESIZE, sysconf};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -41,19 +39,16 @@ use vm_allocator::page_size::{
     align_page_size_down, align_page_size_up, get_page_size, is_4k_aligned, is_4k_multiple,
     is_page_size_aligned,
 };
-use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
+use vm_allocator::{AddressAllocator, GuestMemory, MemorySlotAllocator, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig,
 };
 use vm_device::{BusDevice, Resource};
-use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{
     Address, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
     GuestMemoryRegion, GuestUsize,
 };
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
@@ -111,13 +106,13 @@ pub enum VfioPciError {
     #[error("Invalid region size")]
     RegionSize,
     #[error("Failed to retrieve MsiConfigState")]
-    RetrieveMsiConfigState(#[source] anyhow::Error),
+    RetrieveMsiConfigState(#[source] MigratableError),
     #[error("Failed to retrieve MsixConfigState")]
-    RetrieveMsixConfigState(#[source] anyhow::Error),
+    RetrieveMsixConfigState(#[source] MigratableError),
     #[error("Failed to retrieve PciConfigurationState")]
-    RetrievePciConfigurationState(#[source] anyhow::Error),
+    RetrievePciConfigurationState(#[source] MigratableError),
     #[error("Failed to retrieve VfioCommonState")]
-    RetrieveVfioCommonState(#[source] anyhow::Error),
+    RetrieveVfioCommonState(#[source] MigratableError),
     #[error("No space left for the extended capability {0:#x}")]
     ExtendedCapNoSpace(u16),
     #[error("Mismatched dwords and write masks for the extended capability {0:#x}")]
@@ -205,13 +200,17 @@ impl VfioMsix {
         let old_enabled = self.bar.enabled();
 
         // Update "Message Control" word
-        if offset == 2 && data.len() == 2 {
-            let data = LittleEndian::read_u16(data);
+        if offset == 2
+            && let Ok(data) = <[u8; 2]>::try_from(data)
+        {
+            let data = u16::from_le_bytes(data);
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
-        } else if offset == 0 && data.len() == 4 {
+        } else if offset == 0
+            && let Ok(data) = <[u8; 4]>::try_from(data)
+        {
             // Some guests update MSI-X control through the dword config write path.
-            let data = (LittleEndian::read_u32(data) >> 16) as u16;
+            let data = (u32::from_le_bytes(data) >> 16) as u16;
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
         }
@@ -837,11 +836,7 @@ impl VfioCommon {
         config: VfioCommonConfig,
     ) -> Result<Self, VfioPciError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
-            .map_err(|e| {
-            VfioPciError::RetrievePciConfigurationState(anyhow!(
-                "Failed to get PciConfigurationState from Snapshot: {e}"
-            ))
-        })?;
+            .map_err(VfioPciError::RetrievePciConfigurationState)?;
 
         let configuration = PciConfiguration::new(
             0,
@@ -901,21 +896,11 @@ impl VfioCommon {
             .as_ref()
             .map(|s| s.to_state())
             .transpose()
-            .map_err(|e| {
-                VfioPciError::RetrieveVfioCommonState(anyhow!(
-                    "Failed to get VfioCommonState from Snapshot: {e}"
-                ))
-            })?;
-        let msi_state = vm_migration::state_from_id(snapshot, MSI_CONFIG_ID).map_err(|e| {
-            VfioPciError::RetrieveMsiConfigState(anyhow!(
-                "Failed to get MsiConfigState from Snapshot: {e}"
-            ))
-        })?;
-        let msix_state = vm_migration::state_from_id(snapshot, MSIX_CONFIG_ID).map_err(|e| {
-            VfioPciError::RetrieveMsixConfigState(anyhow!(
-                "Failed to get MsixConfigState from Snapshot: {e}"
-            ))
-        })?;
+            .map_err(VfioPciError::RetrieveVfioCommonState)?;
+        let msi_state = vm_migration::state_from_id(snapshot, MSI_CONFIG_ID)
+            .map_err(VfioPciError::RetrieveMsiConfigState)?;
+        let msix_state = vm_migration::state_from_id(snapshot, MSIX_CONFIG_ID)
+            .map_err(VfioPciError::RetrieveMsixConfigState)?;
 
         if let Some(state) = state.as_ref() {
             let mig: Option<VfioMigrationData> =
@@ -1118,11 +1103,7 @@ impl VfioCommon {
                         .allocate(
                             restored_bar_addr,
                             region_size,
-                            Some(cmp::max(
-                                // SAFETY: FFI call. Trivially safe.
-                                unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
-                                region_size,
-                            )),
+                            Some(cmp::max(get_page_size(), region_size)),
                         )
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
                 }
@@ -1846,9 +1827,10 @@ impl VfioCommon {
             2 => self
                 .configuration
                 .write_word(byte_offset, u16::from(data[0]) | (u16::from(data[1]) << 8)),
-            4 => self
-                .configuration
-                .write_reg(reg_idx, LittleEndian::read_u32(data)),
+            4 => self.configuration.write_reg(
+                reg_idx,
+                u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+            ),
             _ => {}
         }
 
@@ -2210,10 +2192,10 @@ pub struct VfioPciDevice {
     // Required for peer-to-peer DMA between VFIO devices.
     p2p_dma: bool,
     p2p_dma_mapped: bool,
-    memory_slot_allocator: MemorySlotAllocator,
+    memory_slot_allocator: Arc<MemorySlotAllocator>,
     // Guest memory layout, used to enumerate the IOVA ranges to track when
     // programming VFIO DMA logging.
-    memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    memory: GuestMemoryAtomic<GuestMemory>,
     bdf: PciBdf,
     device_path: PathBuf,
 }
@@ -2231,8 +2213,8 @@ impl VfioPciDevice {
         iommu_attached: bool,
         p2p_dma: bool,
         bdf: PciBdf,
-        memory_slot_allocator: MemorySlotAllocator,
-        memory: GuestMemoryAtomic<GuestMemoryMmap>,
+        memory_slot_allocator: Arc<MemorySlotAllocator>,
+        memory: GuestMemoryAtomic<GuestMemory>,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
         x_exclude_mmap_bars: Vec<u8>,
@@ -3358,9 +3340,6 @@ mod tests {
         type GroupConfig = MsiIrqGroupConfig;
         fn create_group(&self, _: MsiIrqGroupConfig) -> io::Result<Arc<dyn InterruptSourceGroup>> {
             unimplemented!("not exercised by the migration-helper tests")
-        }
-        fn destroy_group(&self, _: Arc<dyn InterruptSourceGroup>) -> io::Result<()> {
-            Ok(())
         }
     }
 
