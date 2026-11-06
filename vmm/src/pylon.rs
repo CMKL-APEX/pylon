@@ -318,8 +318,8 @@ impl ThreadTimer {
     /// handler does nothing, so that one is lost.
     fn set(&self, period: Duration) {
         let period = libc::timespec {
-            tv_sec: period.as_secs() as libc::time_t,
-            tv_nsec: period.subsec_nanos() as libc::c_long,
+            tv_sec: period.as_secs() as _,
+            tv_nsec: period.subsec_nanos() as _,
         };
         let value = libc::itimerspec {
             it_interval: period,
