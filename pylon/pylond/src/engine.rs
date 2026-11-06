@@ -59,6 +59,11 @@ pub const REVOKE_RESIGNAL_MAX_US: u64 = 1000;
 /// counts as demand for a core of its own (`spec/08-park-in-kvm.md` §4.2).
 pub const WOKEN_DEMAND_US: u64 = 4_000;
 
+/// Longest time a core given to a woken vCPU stays wanted while the guest agent hasn't reported
+/// since (`spec/08-park-in-kvm.md` §4.2). The agent reports every 50 ms by default; a guest
+/// without one gets the same bound.
+pub const WOKEN_GRANT_HOLD_US: u64 = 50_000;
+
 /// Delay between polling sweeps in nanoseconds (~1000 cycles on a 3 GHz core). The engine turns it
 /// into counter ticks with the host rate, so it doesn't depend on the counter's frequency.
 pub const SWEEP_INTERVAL_NS: u64 = 333;
@@ -307,6 +312,12 @@ pub struct MatrixEngine {
     /// TSC at which an assigned vCPU of a VM that parks inside KVM was last signalled to wake
     /// (0 if not, or once it left `PARKED`).
     wake_signalled_tsc: [u64; MAX_PCPUS],
+    /// When the vCPU a core is assigned or being handed to was picked while woken (0 if it
+    /// wasn't), and the guest's `guest_heartbeat` then. The core stays wanted until the agent
+    /// reports again or `WOKEN_GRANT_HOLD_US` passes (`spec/08-park-in-kvm.md` §4.2). Read only
+    /// while the core is `Assigned` or `Revoking`.
+    woken_grant_tsc: [u64; MAX_PCPUS],
+    woken_grant_heartbeat: [u64; MAX_PCPUS],
     /// When each vCPU (by VM index in the snapshot) that kept running after a handoff without park
     /// was last signalled (0 if not yet).
     orphan_signalled_tsc: [[u64; MAX_VCPUS]; MAX_TRACKED_VMS],
@@ -354,6 +365,8 @@ impl MatrixEngine {
             revoke_first_signal_tsc: [0; MAX_PCPUS],
             revoke_yield_count: [0; MAX_PCPUS],
             wake_signalled_tsc: [0; MAX_PCPUS],
+            woken_grant_tsc: [0; MAX_PCPUS],
+            woken_grant_heartbeat: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
             vm_vcpus: Arc::new(VmVcpusTable::new_in_memory()),
             parked_slots: 0,
@@ -405,6 +418,7 @@ impl MatrixEngine {
         if pcpu_id < MAX_PCPUS {
             self.core_states[pcpu_id] = state;
             self.core_last_metered_tsc[pcpu_id] = 0;
+            self.woken_grant_tsc[pcpu_id] = 0;
         }
     }
 
@@ -708,6 +722,7 @@ impl MatrixEngine {
             };
 
             let woken = self.track_woken_vcpus(vm, committed_cores > 0, now_tsc);
+            let woken_grants = self.count_woken_grants(vm, now_tsc);
             // A long wake waits like the head of the guest's run queue.
             let head_wait = head_wait.max(woken.longest_cycles);
 
@@ -745,6 +760,12 @@ impl MatrixEngine {
             } else {
                 desired_cores
             };
+            // A core given to a woken vCPU stays wanted until the guest agent reports again,
+            // or for `WOKEN_GRANT_HOLD_US`. Once it has the core, the vCPU no longer counts as
+            // woken, and `runnable_threads` doesn't show its work before that report: without
+            // this, the VM would want no core and give it back in the next sweep, before the
+            // vCPU ran on it.
+            let desired_cores = desired_cores.max(woken_grants);
 
             let urgency = if zero_core_wakeup {
                 u64::MAX
@@ -1100,8 +1121,15 @@ impl MatrixEngine {
                 let recipient_vm = &vms[recipient_eval.vm_idx];
                 // Stranded work first: those tasks wait until their vCPU runs, while a woken
                 // vCPU already runs, on cores its VM owns or on others.
-                let Some(recipient_vcpu) = Self::take_stranded_vcpu(recipient_vm)
-                    .or_else(|| self.longest_woken_vcpu(recipient_vm))
+                let stranded = Self::take_stranded_vcpu(recipient_vm);
+                let woken_vcpu = if stranded.is_none() {
+                    self.longest_woken_vcpu(recipient_vm)
+                } else {
+                    None
+                };
+                let woken_pick = woken_vcpu.is_some();
+                let Some(recipient_vcpu) = stranded
+                    .or(woken_vcpu)
                     .or_else(|| Self::select_parked_vcpu(recipient_vm, now_tsc))
                 else {
                     break;
@@ -1110,6 +1138,7 @@ impl MatrixEngine {
                 // 1. Fast Path: Check for an Idle physical core.
                 if let Some(idle_pcpu) = self.find_idle_pcpu(recipient_eval.vm_id) {
                     self.assign_pcpu(idle_pcpu, recipient_vm, recipient_vcpu, now_tsc);
+                    self.record_woken_grant(idle_pcpu, recipient_vm, woken_pick, now_tsc);
                     self.eval_buf[order_idx].assigned_cores += 1;
                     continue;
                 }
@@ -1148,6 +1177,7 @@ impl MatrixEngine {
                 self.revoke_requested_tsc[donor_pcpu] = now_tsc;
                 self.revoke_signalled_tsc[donor_pcpu] = 0;
                 self.revoke_first_signal_tsc[donor_pcpu] = 0;
+                self.record_woken_grant(donor_pcpu, recipient_vm, woken_pick, now_tsc);
                 // Reserve the recipient vCPU so later matches don't pick it for another core.
                 recipient_vm.shared_page().vcpus[recipient_vcpu as usize]
                     .assigned_pcpu
@@ -1159,6 +1189,51 @@ impl MatrixEngine {
             }
             order_idx += 1;
         }
+    }
+
+    /// Records whether `pcpu` goes to a vCPU of `vm` that was woken when it was picked.
+    fn record_woken_grant(&mut self, pcpu: usize, vm: &VmHandle, woken: bool, now_tsc: u64) {
+        self.woken_grant_tsc[pcpu] = if woken { now_tsc.max(1) } else { 0 };
+        self.woken_grant_heartbeat[pcpu] = vm
+            .shared_page()
+            .telemetry
+            .guest_heartbeat
+            .load(Ordering::Acquire);
+    }
+
+    /// How many cores `vm` has or is getting for a vCPU that was woken when it was picked, while
+    /// the guest agent hasn't reported since and `WOKEN_GRANT_HOLD_US` hasn't passed.
+    fn count_woken_grants(&self, vm: &VmHandle, now_tsc: u64) -> u32 {
+        let vm_id = vm.vm_id();
+        let heartbeat = vm
+            .shared_page()
+            .telemetry
+            .guest_heartbeat
+            .load(Ordering::Acquire);
+        let hold = Self::us_to_cycles(WOKEN_GRANT_HOLD_US, self.tsc_khz_of(vm));
+        let mut count = 0u32;
+        let mut pcpu = 0usize;
+        while pcpu < MAX_PCPUS {
+            let granted = self.woken_grant_tsc[pcpu];
+            if self.managed_pcpus[pcpu]
+                && granted != 0
+                && self.woken_grant_heartbeat[pcpu] == heartbeat
+                && now_tsc.saturating_sub(granted) < hold
+            {
+                let owner = match self.core_states[pcpu] {
+                    CoreState::Idle => None,
+                    CoreState::Assigned { vm_id, .. } => Some(vm_id),
+                    CoreState::Revoking {
+                        recipient_vm_id, ..
+                    } => Some(recipient_vm_id),
+                };
+                if owner == Some(vm_id) {
+                    count += 1;
+                }
+            }
+            pcpu += 1;
+        }
+        count
     }
 
     #[inline]
