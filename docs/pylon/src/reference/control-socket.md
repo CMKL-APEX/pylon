@@ -74,7 +74,9 @@ Attached descriptors, in order: the shared page's file, then
       "cooperative_yields": 12,
       "forced_preemptions": 4,
       "runnable_threads": 5,
-      "handoffs_without_park": 0
+      "handoffs_without_park": 0,
+      "woken_shared_microseconds": 0,
+      "woken_unowned_microseconds": 0
     }
   ]
 }
@@ -88,6 +90,8 @@ Attached descriptors, in order: the shared page's file, then
 | `forced_preemptions` | `u64` | Revocations whose deadline passed before the donor parked. |
 | `runnable_threads` | `u32` | The guest's last report. |
 | `handoffs_without_park` | `u64` | Revocations where the core was handed over although the donor never parked. Should stay at 0. |
+| `woken_shared_microseconds` | `u64` | Time the VM's parked vCPUs spent woken by KVM while the VM owned a core (spec 08). |
+| `woken_unowned_microseconds` | `u64` | The same, while the VM owned no core. |
 
 ## Policy update
 

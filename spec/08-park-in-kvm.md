@@ -208,6 +208,40 @@ vCPU was parked already, so the request is done and no park is counted.
 - Meter shared time against the VM. It is already inside the VM's own
   allocation, so no other VM is charged.
 
+**How `pylond` does it (P2).** The engine reads each VM's `woken` mask
+every sweep, keeping only vCPUs that are still `PARKED` with no core
+assigned. It records when each bit was set, by VM slot and vCPU.
+
+- **No cores:** a VM that owns no core gets a zero-core wakeup once one
+  of its vCPUs has been woken for `WOKEN_DEMAND_US`. A due timer doesn't
+  give one: KVM fires it, and the vCPU shows up woken (§4.4).
+  Until then its woken vCPUs run on the shared vCPU queue, on CPUs other
+  VMs may own. An idle guest's vCPUs wake for ticks and IPIs and halt
+  within microseconds; a core for each such wake cost a forced preemption
+  of another VM, which took the core back as soon as the guest halted.
+  With no grace period, a busy and an idle VM traded a core about 250
+  times a second (§7.3).
+- **Long wakes are demand:** a vCPU woken for longer than
+  `WOKEN_DEMAND_US` (4 ms) adds one core to its VM's desired cores, up to
+  `max_cores`. It shows demand that `runnable_threads` misses: work in
+  the guest kernel, such as interrupt handling, and work since the
+  agent's last report. 4 ms covers a few 1 ms turns and the guest's
+  tick, so a vCPU that wakes for an IPI or a timer and halts again stays
+  shared. The longest wake sets the
+  VM's urgency, as `head_wait_tsc` does, weighted by its priority.
+- **Which vCPU gets the core:** a vCPU in `stranded_work_bitmap` first,
+  then the longest-woken vCPU, then one with a due timer, then the first
+  parked vCPU. Stranded tasks can't run until their vCPU has a core,
+  and the guest counts them as runnable, so its VM keeps asking for
+  cores. A woken vCPU already runs, so its assignment needs no wake-up:
+  the signal of §3.3 interrupts its `KVM_RUN`, and the VMM writes
+  `RUNNING`.
+- **Metering:** each VM counts the time its vCPUs spent woken, split by
+  whether the VM owned a core at the time (`woken_shared_usec`) or not
+  (`woken_unowned_usec`). Shared time is already inside the VM's
+  allocation. Unowned time ran on other VMs' CPUs or unmanaged ones, and
+  the zero-core wakeup keeps it short.
+
 ### 4.3 `scx_pylon` (now required)
 
 - When a parked vCPU's thread becomes runnable (`ops.runnable` /

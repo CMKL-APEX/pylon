@@ -84,12 +84,14 @@ impl LinuxProcfsReader {
 }
 
 impl TelemetryReader for LinuxProcfsReader {
+    /// Both files count the task that reads them, which is running then. Leaving it out lets an
+    /// idle guest report 0, so `pylond` can give its cores to other VMs.
     fn read_runnable_threads(&self) -> Result<u32, PylonGuestError> {
         // Try /proc/loadavg first (very fast, <100 bytes)
         if let Ok(content) = fs::read_to_string("/proc/loadavg") {
             let res = Self::parse_loadavg_content(&content);
             if let Ok(runnable) = res {
-                return Ok(runnable);
+                return Ok(runnable.saturating_sub(1));
             }
         }
 
@@ -97,7 +99,7 @@ impl TelemetryReader for LinuxProcfsReader {
         if let Ok(content) = fs::read_to_string("/proc/stat") {
             let res = Self::parse_stat_content(&content);
             if let Some(runnable) = res {
-                return Ok(runnable);
+                return Ok(runnable.saturating_sub(1));
             }
         }
 
@@ -418,6 +420,16 @@ mod tests {
 
         let empty = "cpu  123 456 789\n";
         assert_eq!(LinuxProcfsReader::parse_stat_content(empty), None);
+    }
+
+    /// The reader leaves itself out because the kernel always counts it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_procfs_counts_the_reader() {
+        let loadavg = fs::read_to_string("/proc/loadavg").unwrap();
+        assert!(LinuxProcfsReader::parse_loadavg_content(&loadavg).unwrap() >= 1);
+        let stat = fs::read_to_string("/proc/stat").unwrap();
+        assert!(LinuxProcfsReader::parse_stat_content(&stat).unwrap() >= 1);
     }
 
     #[test]

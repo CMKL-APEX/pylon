@@ -356,6 +356,13 @@ pub struct VmStats {
     /// Revocations where the core was handed over although the donor never parked.
     #[serde(default)]
     pub handoffs_without_park: u64,
+    /// Time the VM's parked vCPUs spent woken by KVM while the VM owned a core
+    /// (`spec/08-park-in-kvm.md` §4.2).
+    #[serde(default)]
+    pub woken_shared_microseconds: u64,
+    /// Time the VM's parked vCPUs spent woken by KVM while the VM owned no core.
+    #[serde(default)]
+    pub woken_unowned_microseconds: u64,
 }
 
 /// JSON payload sent over `/run/pylon/pylond.sock` to query VM statistics.
@@ -387,6 +394,8 @@ struct VmHandleInner {
     cooperative_yield_count: AtomicU64,
     forced_preempt_count: AtomicU64,
     handoff_without_park_count: AtomicU64,
+    woken_shared_usec: AtomicU64,
+    woken_unowned_usec: AtomicU64,
     park_latency: ParkLatencyHistogram,
     kick_signal: Option<i32>,
     wake_by_signal: bool,
@@ -474,6 +483,8 @@ impl VmHandle {
                 cooperative_yield_count: AtomicU64::new(0),
                 forced_preempt_count: AtomicU64::new(0),
                 handoff_without_park_count: AtomicU64::new(0),
+                woken_shared_usec: AtomicU64::new(0),
+                woken_unowned_usec: AtomicU64::new(0),
                 park_latency: ParkLatencyHistogram::default(),
                 kick_signal: req.kick_signal,
                 wake_by_signal: req.wake_by_signal,
@@ -575,6 +586,31 @@ impl VmHandle {
         self.inner
             .handoff_without_park_count
             .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Cumulative time the VM's parked vCPUs spent woken by KVM while the VM owned a core, in
+    /// microseconds.
+    #[inline]
+    pub fn woken_shared_usec(&self) -> u64 {
+        self.inner.woken_shared_usec.load(Ordering::Acquire)
+    }
+
+    /// Cumulative time the VM's parked vCPUs spent woken by KVM while the VM owned no core, in
+    /// microseconds.
+    #[inline]
+    pub fn woken_unowned_usec(&self) -> u64 {
+        self.inner.woken_unowned_usec.load(Ordering::Acquire)
+    }
+
+    /// Adds `usec` of woken vCPU time, shared on the VM's own cores if `owned`.
+    #[inline]
+    pub fn add_woken_usec(&self, owned: bool, usec: u64) {
+        let counter = if owned {
+            &self.inner.woken_shared_usec
+        } else {
+            &self.inner.woken_unowned_usec
+        };
+        counter.fetch_add(usec, Ordering::AcqRel);
     }
 
     /// Records the time from a revocation request to the donor vCPU parking.
@@ -1950,6 +1986,119 @@ mod tests {
         snapshot.store(Arc::new(vec![vmm.handle.clone()]));
         engine.poll_once(3_000);
         assert_eq!(parked(kvm_slot), 0);
+    }
+
+    /// A handle for `rig`'s VM that registered with `wake_by_signal`: it parks inside KVM.
+    fn parks_in_kvm(rig: &mut TestVmRig) -> VmHandle {
+        rig.req.wake_by_signal = true;
+        VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            rig.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            rig.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// A VM with no core whose parked vCPU KVM woke gets a core once that wake has lasted
+    /// `WOKEN_DEMAND_US`; a short wake runs on the shared vCPU queue. The core goes to the vCPU
+    /// in `stranded_work_bitmap`: its tasks can't run until it has one, while the woken vCPU
+    /// already runs (spec 08 §4.2).
+    #[test]
+    fn test_plane2_long_woken_vcpu_of_zero_core_vm_gets_a_core() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6])
+            .with_vm_vcpus(Arc::clone(&vm_vcpus));
+
+        let mut rig = build_test_vm(80, 4, 0, 4, 1);
+        let handle = parks_in_kvm(&mut rig);
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+        let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
+        let page = handle.shared_page();
+        page.telemetry
+            .stranded_work_bitmap
+            .store(1 << 1, Ordering::Release);
+
+        // Nothing is due and nothing woke: no core.
+        engine.poll_once(1_000);
+        assert_eq!(engine.core_state(6), CoreState::Idle);
+
+        // A short wake isn't enough. At 3 GHz, 4 ms is 12,000,000 cycles.
+        entry.woken.store(1 << 2, Ordering::Release);
+        engine.poll_once(2_000);
+        engine.poll_once(6_002_000);
+        assert_eq!(engine.core_state(6), CoreState::Idle);
+
+        engine.poll_once(12_002_000);
+        assert_eq!(
+            engine.core_state(6),
+            CoreState::Assigned { vm_id: 80, vcpu: 1 }
+        );
+        assert_eq!(page.vcpus[1].assigned_pcpu.load(Ordering::Acquire), 6);
+        assert_eq!(
+            page.telemetry.stranded_work_bitmap.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    /// A woken vCPU of a VM that owns a core shares that core until it has been woken for
+    /// `WOKEN_DEMAND_US`. Then it asks for a core of its own and gets the idle one. Its time is
+    /// metered as shared (spec 08 §4.2).
+    #[test]
+    fn test_plane2_long_woken_vcpu_gets_a_core_of_its_own() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
+        let mut engine =
+            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
+                .with_vm_vcpus(Arc::clone(&vm_vcpus));
+
+        // The guest reports no runnable threads after the first core, so only wakes show
+        // demand.
+        let mut rig = build_test_vm(81, 4, 1, 4, 1);
+        let handle = parks_in_kvm(&mut rig);
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+        let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
+        let page = handle.shared_page();
+
+        // vCPU 0 gets a core for one runnable thread, and runs.
+        page.telemetry.runnable_threads.store(1, Ordering::Release);
+        engine.poll_once(1_000);
+        assert_eq!(
+            engine.core_state(6),
+            CoreState::Assigned { vm_id: 81, vcpu: 0 }
+        );
+        page.vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        page.telemetry.runnable_threads.store(0, Ordering::Release);
+
+        // vCPU 3 wakes. At 3 GHz, 4 ms is 12,000,000 cycles.
+        entry.woken.store(1 << 3, Ordering::Release);
+        engine.poll_once(2_000);
+        engine.poll_once(6_002_000);
+        assert_eq!(engine.core_state(7), CoreState::Idle);
+        assert_eq!(handle.woken_shared_usec(), 2_000);
+        assert_eq!(handle.woken_unowned_usec(), 0);
+
+        engine.poll_once(12_002_000);
+        assert_eq!(
+            engine.core_state(7),
+            CoreState::Assigned { vm_id: 81, vcpu: 3 }
+        );
+        assert_eq!(handle.woken_shared_usec(), 4_000);
+
+        // Once it has a core, its bit no longer counts.
+        engine.poll_once(15_002_000);
+        assert_eq!(handle.woken_shared_usec(), 4_000);
     }
 
     static WAKE_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);

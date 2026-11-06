@@ -287,6 +287,8 @@ async fn handle_client_connection(
                     forced_preemptions: vm.forced_preempt_count(),
                     runnable_threads: page.telemetry.runnable_threads.load(Ordering::Acquire),
                     handoffs_without_park: vm.handoff_without_park_count(),
+                    woken_shared_microseconds: vm.woken_shared_usec(),
+                    woken_unowned_microseconds: vm.woken_unowned_usec(),
                 });
             }
             let resp = VmStatsResponse {
@@ -713,6 +715,19 @@ pub async fn run_prometheus_server(
                                 "pylon_vm_handoffs_without_park_total{{vm_id=\"{}\"}} {}\n",
                                 vm.vm_id(),
                                 vm.handoff_without_park_count()
+                            ));
+                        }
+                        body.push_str("# HELP pylon_vm_woken_vcpu_microseconds_total Time parked vCPUs spent woken by KVM, by whether the VM owned a core\n");
+                        body.push_str("# TYPE pylon_vm_woken_vcpu_microseconds_total counter\n");
+                        for vm in vms.iter() {
+                            let vid = vm.vm_id();
+                            body.push_str(&format!(
+                                "pylon_vm_woken_vcpu_microseconds_total{{vm_id=\"{vid}\",cores=\"owned\"}} {}\n",
+                                vm.woken_shared_usec()
+                            ));
+                            body.push_str(&format!(
+                                "pylon_vm_woken_vcpu_microseconds_total{{vm_id=\"{vid}\",cores=\"none\"}} {}\n",
+                                vm.woken_unowned_usec()
                             ));
                         }
                         body.push_str("# HELP pylon_vm_park_latency_microseconds Time from a revocation request to the donor vCPU parking\n");

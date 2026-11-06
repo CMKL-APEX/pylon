@@ -85,7 +85,16 @@ telemetry.
 `park_timer_deadline_tsc` has passed, or if the host's receive doorbell
 is ahead of the guest's `rx_ring_cons_idx`. The two timers don't count
 for a VM that parks inside KVM: KVM fires them, and the vCPU runs
-without a core (spec 08 §3.2).
+without a core (spec 08 §3.2). For such a VM, a vCPU that KVM woke
+(below) qualifies instead, once it is a long wake. A short wake runs on
+the shared vCPU queue: a core for it would cost another VM a forced
+preemption, and come back as soon as it halts.
+
+**Woken vCPUs** (VMs that park inside KVM, spec 08 §4.2). The engine
+reads the VM's `woken` mask from `scx_pylon`, keeps the vCPUs still
+`PARKED` with no core assigned, and records when it first saw each one.
+A vCPU woken for `WOKEN_DEMAND_US` (4 ms) or longer is a *long wake*.
+The longest wake counts as waiting time, like `head_wait`.
 
 **Time bases.** Every `*_tsc` field counts host counter ticks (the TSC,
 or `CNTVCT_EL0` on aarch64). The guest writes `head_wait_tsc` and
@@ -102,8 +111,14 @@ VMM measured for vCPU 0. Everything else is already host TSC.
 | `runnable_threads > 0` | `runnable_threads` clamped to `[min_cores, max_cores]` |
 | Otherwise | 0 |
 
+Each long wake then raises desired cores to at least committed cores
+plus one, up to `max_cores`. That catches demand `runnable_threads`
+misses, such as work in the guest kernel or since the agent's last
+report.
+
 **Urgency** orders VMs in phase 3. `head_wait` is `now_tsc -
-head_wait_tsc` (0 if the guest reports no waiting thread):
+head_wait_tsc` (0 if the guest reports no waiting thread), or the
+longest wake if that is longer:
 
 | Case | Urgency |
 |---|---|
@@ -169,10 +184,12 @@ The engine sorts the demand records by urgency, highest first (an
 in-place insertion sort over at most 64 entries). Then, for each VM in
 that order, while it needs more cores (desired minus committed):
 
-1. **Pick a vCPU.** `select_parked_vcpu` takes the lowest set bit of
-   `stranded_work_bitmap` whose vCPU is free (clearing that bit), else
-   the lowest-numbered free vCPU whose parked timer is due, else the
-   lowest-numbered free vCPU. A vCPU is *free* when it is
+1. **Pick a vCPU.** The lowest set bit of `stranded_work_bitmap` whose
+   vCPU is free (clearing that bit): the guest tasks queued on it can't
+   run until it has a core. Else the longest-woken free vCPU: it is
+   already running, so it needs no wake-up. Else the lowest-numbered
+   free vCPU whose parked timer is due, else the lowest-numbered free
+   vCPU. A vCPU is *free* when it is
    `PARKED` and its `assigned_pcpu` is unassigned; a vCPU with a CPU on
    its way is still `PARKED` but already assigned or reserved. If the VM
    has no free vCPU, move on to the next VM.
@@ -246,6 +263,7 @@ even when the kernel reads it.
 | `forced_preempt_count` | `VmHandle` | Phase 2, when a deadline passes |
 | `handoff_without_park_count` | `VmHandle` | Phase 2 |
 | `park_latency` (histogram, µs) | `VmHandle` | Phase 2, when a donor parks |
+| `woken_shared_usec`, `woken_unowned_usec` | `VmHandle` | Phase 1: time vCPUs spent woken, while the VM owned a core or none |
 
 The slot's own `forced_preempt_count` belongs to the VMM, which
 increments it when it force-parks a vCPU.
