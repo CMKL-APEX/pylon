@@ -207,7 +207,9 @@ jobs:
         run: cargo test -p scx-pylon
       - name: Test arch layout
         run: cargo test -p arch --features kvm
+      # The cold resize tests match the `config` filter but create a hypervisor, which needs
+      # /dev/kvm.
       - name: Test VMM Pylon module & CLI configuration
         run: |
           cargo test -p vmm --features kvm --lib pylon
-          cargo test -p vmm --features kvm --lib config
+          cargo test -p vmm --features kvm --lib config -- --skip tests::test_vmm_vm_cold_resize
