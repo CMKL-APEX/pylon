@@ -109,8 +109,8 @@ use crate::vm_config::{
     NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use crate::{
-    CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
-    MEMORY_MANAGER_SNAPSHOT_ID, MemoryZoneUpdateError, PciDeviceInfo, acpi, cpu,
+    CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemory, MEMORY_MANAGER_SNAPSHOT_ID,
+    MemoryZoneUpdateError, PciDeviceInfo, acpi, cpu,
 };
 
 /// Errors associated with VM management
@@ -374,7 +374,7 @@ impl VmState {
 }
 
 struct VmOpsHandler {
-    memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    memory: GuestMemoryAtomic<GuestMemory>,
     #[cfg(target_arch = "x86_64")]
     io_bus: Arc<Bus>,
     mmio_bus: Arc<Bus>,
@@ -385,28 +385,27 @@ impl VmOps for VmOpsHandler {
         self.memory
             .memory()
             .write(buf, GuestAddress(gpa))
-            .map_err(|e| HypervisorVmError::GuestMemWrite(e.into()))
+            .map_err(HypervisorVmError::GuestMemWrite)
     }
 
     fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> result::Result<usize, HypervisorVmError> {
         self.memory
             .memory()
             .read(buf, GuestAddress(gpa))
-            .map_err(|e| HypervisorVmError::GuestMemRead(e.into()))
+            .map_err(HypervisorVmError::GuestMemRead)
     }
 
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
-        if let Err(vm_device::BusError::MissingAddressRange) = self.mmio_bus.read(gpa, data) {
-            debug!("Guest MMIO read from unregistered address 0x{gpa:x}");
-            data.fill(0xff); // 0xff is sentinel value for invalid reads
+        if let Err(error) = self.mmio_bus.read(gpa, data) {
+            debug!("Guest MMIO read failed: {error}");
         }
         Ok(())
     }
 
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         match self.mmio_bus.write(gpa, data) {
-            Err(vm_device::BusError::MissingAddressRange) => {
-                debug!("Guest MMIO write to unregistered address 0x{gpa:x}");
+            Err(error) => {
+                debug!("Guest MMIO write failed: {error}");
             }
             Ok(Some(barrier)) => {
                 info!("Waiting for barrier");
@@ -420,9 +419,8 @@ impl VmOps for VmOpsHandler {
 
     #[cfg(target_arch = "x86_64")]
     fn pio_read(&self, port: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
-        if let Err(vm_device::BusError::MissingAddressRange) = self.io_bus.read(port, data) {
-            debug!("Guest PIO read from unregistered address 0x{port:x}");
-            data.fill(0xff); // 0xff is sentinel value for invalid reads
+        if let Err(error) = self.io_bus.read(port, data) {
+            debug!("Guest PIO read failed: {error}");
         }
         Ok(())
     }
@@ -430,8 +428,8 @@ impl VmOps for VmOpsHandler {
     #[cfg(target_arch = "x86_64")]
     fn pio_write(&self, port: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         match self.io_bus.write(port, data) {
-            Err(vm_device::BusError::MissingAddressRange) => {
-                debug!("Guest PIO write to unregistered address 0x{port:x}");
+            Err(error) => {
+                debug!("Guest PIO write failed: {error}");
             }
             Ok(Some(barrier)) => {
                 info!("Waiting for barrier");
@@ -1086,7 +1084,7 @@ impl Vm {
         fw_cfg_config: &FwCfgConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
-        #[cfg(target_arch = "x86_64")] boot_memory: &GuestMemoryMmap,
+        #[cfg(target_arch = "x86_64")] boot_memory: &GuestMemory,
         #[cfg(target_arch = "x86_64")] kvm_sev_snp_enabled: bool,
     ) -> Result<()> {
         let mut kernel_option: Option<File> = None;
@@ -1397,7 +1395,7 @@ impl Vm {
         Ok(vm)
     }
 
-    fn load_initramfs(&mut self, guest_mem: &GuestMemoryMmap) -> Result<arch::InitramfsConfig> {
+    fn load_initramfs(&mut self, guest_mem: &GuestMemory) -> Result<arch::InitramfsConfig> {
         let initramfs = self.initramfs.as_mut().unwrap();
         let size: usize = initramfs
             .seek(SeekFrom::End(0))
@@ -2666,7 +2664,7 @@ impl Vm {
         self.memory_manager.lock().unwrap().memory_range_table(mode)
     }
 
-    pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+    pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemory> {
         self.memory_manager.lock().unwrap().guest_memory()
     }
 
@@ -3162,7 +3160,7 @@ impl Debuggable for Vm {
 
     fn read_mem(
         &self,
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         cpu_id: usize,
         vaddr: GuestAddress,
         len: usize,
@@ -3175,7 +3173,7 @@ impl Debuggable for Vm {
 
     fn write_mem(
         &self,
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         cpu_id: usize,
         vaddr: &GuestAddress,
         data: &[u8],
@@ -3338,7 +3336,7 @@ mod tests {
 
         let mem_size = 0x1000;
         let load_addr = GuestAddress(0x1000);
-        let mem = GuestMemoryMmap::from_ranges(&[(load_addr, mem_size)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(load_addr, mem_size)]).unwrap();
 
         let hv = hypervisor::new().unwrap();
         let vm = hv
@@ -3408,7 +3406,7 @@ mod tests {
             arch::aarch64::layout::RAM_START,
             (arch::aarch64::layout::FDT_MAX_SIZE + 0x1000) as usize,
         )];
-        let mem = GuestMemoryMmap::from_ranges(&regions).expect("Cannot initialize memory");
+        let mem = GuestMemory::from_ranges(&regions).expect("Cannot initialize memory");
 
         let dev_info: HashMap<(DeviceType, String), MmioDeviceInfo> = [
             (
@@ -3442,7 +3440,7 @@ mod tests {
 
         let hv = hypervisor::new().unwrap();
         let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
-        let vgic_config = Gic::create_default_config(1).unwrap();
+        let vgic_config = Gic::create_config(1, None).unwrap();
         let gic = vm.create_vgic(&vgic_config).expect("Cannot create gic");
         arch::aarch64::fdt::create_fdt(
             &mem,

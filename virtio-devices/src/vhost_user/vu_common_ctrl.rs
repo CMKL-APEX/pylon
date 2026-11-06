@@ -8,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use std::{ffi, fs, io, slice};
+use std::{ffi, fs, io};
 
 use log::{error, info};
 use vhost::vhost_kern::vhost_binding::VHOST_VRING_F_LOG;
@@ -27,7 +27,9 @@ use vhost::{
 use virtio_queue::desc::RawDescriptor;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::guest_memory::Error as MmapError;
-use vm_memory::{Address, FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
+use vm_memory::{
+    Address, FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryRegion, VolatileMemory,
+};
 use vm_migration::protocol::MemoryRangeTable;
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
@@ -36,7 +38,7 @@ use vmm_sys_util::timerfd::TimerFd;
 use super::{Error, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
-    GuestMemoryMmap, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
+    GuestMemory, GuestRegion, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
     VirtioInterrupt, VirtioInterruptType, get_host_address_range,
 };
 
@@ -71,7 +73,7 @@ pub struct VhostUserHandle {
 }
 
 impl VhostUserHandle {
-    pub fn update_mem_table(&mut self, mem: &GuestMemoryMmap) -> Result<()> {
+    pub fn update_mem_table(&mut self, mem: &GuestMemory) -> Result<()> {
         let mut regions: Vec<VhostUserMemoryRegionInfo> = Vec::new();
         for region in mem.iter() {
             let (mmap_handle, mmap_offset) = match region.file_offset() {
@@ -101,7 +103,7 @@ impl VhostUserHandle {
         Ok(())
     }
 
-    pub fn add_memory_region(&mut self, region: &Arc<GuestRegionMmap>) -> Result<()> {
+    pub fn add_memory_region(&mut self, region: &Arc<GuestRegion>) -> Result<()> {
         let (mmap_handle, mmap_offset) = match region.file_offset() {
             Some(file_offset) => (file_offset.file().as_raw_fd(), file_offset.start()),
             None => return Err(Error::MissingRegionFd),
@@ -117,7 +119,9 @@ impl VhostUserHandle {
 
         self.vu
             .add_mem_region(&region)
-            .map_err(Error::VhostUserAddMemReg)
+            .map_err(Error::VhostUserAddMemReg)?;
+
+        Ok(())
     }
 
     pub fn negotiate_features_vhost_user(
@@ -159,7 +163,7 @@ impl VhostUserHandle {
     #[expect(clippy::too_many_arguments)]
     pub fn setup_vhost_user<S: VhostUserFrontendReqHandler>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &GuestMemory,
         queues: &[(u16, Queue, EventFd)],
         virtio_interrupt: &dyn VirtioInterrupt,
         acked_features: u64,
@@ -367,7 +371,7 @@ impl VhostUserHandle {
     #[expect(clippy::too_many_arguments)]
     pub fn reinitialize_vhost_user<S: VhostUserFrontendReqHandler>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &GuestMemory,
         queues: &[(u16, Queue, EventFd)],
         virtio_interrupt: &dyn VirtioInterrupt,
         acked_features: u64,
@@ -668,7 +672,7 @@ impl VhostUserHandle {
     /// enable them if they haven't been stopped.
     pub fn resume<S: VhostUserFrontendReqHandler>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &GuestMemory,
         queues: &[(u16, Queue, EventFd)],
         virtio_interrupt: &dyn VirtioInterrupt,
         acked_features: u64,
@@ -735,7 +739,7 @@ impl VhostUserHandle {
     fn update_log_base(&mut self, last_ram_addr: u64) -> Result<Option<Arc<MmapRegion>>> {
         // Create the memfd
         let fd = memfd_create(
-            &ffi::CString::new("vhost_user_dirty_log").unwrap(),
+            c"vhost_user_dirty_log",
             libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
         )
         .map_err(Error::MemfdCreate)?;
@@ -862,20 +866,12 @@ impl VhostUserHandle {
         // region. The previous region is returned and processed to create the
         // bitmap representing the dirty pages.
         if let Some(region) = self.update_log_base(last_ram_addr)? {
-            // Be careful with the size, as it was based on u8, meaning we must
-            // divide it by 8.
-            let len = region.size() / 8;
-            // SAFETY: region is of size len
-            let bitmap: &[u64] = unsafe {
-                // Cast the pointer to u64
-                let ptr = region.as_ptr().cast();
-                slice::from_raw_parts(ptr, len)
-            };
-            Ok(MemoryRangeTable::from_dirty_bitmap(
-                bitmap.iter().copied(),
-                0,
-                4096,
-            ))
+            // The backend still has this region mapped and a misbehaving one
+            // can keep writing to it, so copy the log out with volatile reads
+            // instead of borrowing the shared mapping as a slice.
+            let mut bitmap = vec![0u64; region.size() / size_of::<u64>()];
+            region.as_volatile_slice().copy_to(&mut bitmap);
+            Ok(MemoryRangeTable::from_dirty_bitmap(bitmap, 0, 4096))
         } else {
             Err(Error::MissingShmLogRegion)
         }

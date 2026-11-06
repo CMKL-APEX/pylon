@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -15,8 +15,8 @@ use thiserror::Error;
 
 use crate::socket::SocketDev;
 use crate::{
-    Commands, MemberType, Ptm, PtmCap, PtmEst, PtmInit, PtmResult, PtmSetBufferSize,
-    TPM_CRB_BUFFER_MAX, TPM_SUCCESS,
+    Commands, Ptm, PtmCap, PtmEst, PtmInit, PtmResult, PtmSetBufferSize, TPM_CRB_BUFFER_MAX,
+    TPM_SUCCESS,
 };
 
 const TPM_REQ_HDR_SIZE: usize = 10;
@@ -61,7 +61,7 @@ pub enum Error {
     #[error("Could not initialize emulator's backend")]
     InitializeEmulator(#[source] anyhow::Error),
     #[error("Failed to create data fd to pass to swtpm")]
-    PrepareDataFd(#[source] anyhow::Error),
+    PrepareDataFd(#[source] io::Error),
     #[error("Failed to run Control Cmd")]
     RunControlCmd(#[source] anyhow::Error),
     #[error("Emulator doesn't implement min required capabilities")]
@@ -143,11 +143,7 @@ impl Emulator {
     fn prepare_data_fd(&mut self) -> Result<()> {
         let mut res: PtmResult = 0;
 
-        let (data_socket, swtpm_socket) = UnixStream::pair().map_err(|e| {
-            Error::PrepareDataFd(anyhow!(
-                "Failed to prepare data fd for tpm emulator. Error Code {e:?}"
-            ))
-        })?;
+        let (data_socket, swtpm_socket) = UnixStream::pair().map_err(Error::PrepareDataFd)?;
         self.control_socket.set_msgfd(swtpm_socket.as_raw_fd());
         debug!(
             "data fd to be configured in swtpm = {:?}",
@@ -162,11 +158,7 @@ impl Emulator {
 
         data_socket
             .set_read_timeout(Some(TPM_DATA_SOCKET_READ_TIMEOUT))
-            .map_err(|e| {
-                Error::PrepareDataFd(anyhow!(
-                    "Failed to set receive timeout on data fd socket. Error Code {e:?}"
-                ))
-            })?;
+            .map_err(Error::PrepareDataFd)?;
         self.control_socket.set_datafd(data_socket.as_raw_fd());
         self.data_socket = Some(data_socket);
         Ok(())
@@ -268,7 +260,6 @@ impl Emulator {
             // swtpm returns only the 4-byte result code on error. Propagate
             // the failure without attempting to read or parse a payload that
             // will never arrive.
-            msg.set_member_type(MemberType::Response);
             msg.set_result_code(result_code);
             return Err(Error::RunControlCmd(anyhow!(
                 "Control Cmd {cmd:02X?} returned error code : {result_code:#X}"
@@ -295,9 +286,6 @@ impl Emulator {
                         "Failed while converting response of Control Cmd: {cmd:02X?} to PTM. Error: {e:?}"
                     ))
                 })?;
-        } else {
-            // No response expected, only handle return code
-            msg.set_member_type(MemberType::Response);
         }
 
         if msg.get_result_code() != TPM_SUCCESS {

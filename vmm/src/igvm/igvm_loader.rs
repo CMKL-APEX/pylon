@@ -47,7 +47,7 @@ use zerocopy::IntoBytes;
 use zerocopy::{FromBytes, FromZeros};
 
 #[cfg(feature = "sev_snp")]
-use crate::GuestMemoryMmap;
+use crate::GuestMemory;
 use crate::cpu;
 use crate::cpu::CpuManager;
 use crate::igvm::loader::Loader;
@@ -177,9 +177,7 @@ fn igvm_memmap_from_ram_range(ram_range: (u64, u64)) -> IGVM_VHS_MEMORY_MAP_ENTR
 }
 
 #[cfg(feature = "sev_snp")]
-fn generate_memory_map(
-    guest_mem: &GuestMemoryMmap,
-) -> Result<Vec<IGVM_VHS_MEMORY_MAP_ENTRY>, Error> {
+fn generate_memory_map(guest_mem: &GuestMemory) -> Result<Vec<IGVM_VHS_MEMORY_MAP_ENTRY>, Error> {
     let mut memory_map = Vec::new();
 
     // Get usable physical memory ranges
@@ -537,7 +535,7 @@ pub(crate) fn load_igvm(
                 parameter_area_index,
                 initial_data,
             } => {
-                debug_assert!(number_of_bytes % HV_PAGE_SIZE == 0);
+                debug_assert!(number_of_bytes.is_multiple_of(HV_PAGE_SIZE));
                 debug_assert!(
                     initial_data.is_empty() || initial_data.len() as u64 == *number_of_bytes
                 );
@@ -625,9 +623,6 @@ pub(crate) fn load_igvm(
                             vcpu_locked
                                 .setup_sev_snp_regs(loaded_info.vmsa, nested)
                                 .map_err(Error::SetVmsa)?;
-                            vcpu_locked
-                                .set_sev_control_register(0)
-                                .map_err(Error::SetVmsa)?;
                         }
                     }
                 }
@@ -690,7 +685,7 @@ pub(crate) fn load_igvm(
                 compatibility_mask: _,
                 parameter_area_index,
             }) => {
-                debug_assert!(gpa % HV_PAGE_SIZE == 0);
+                debug_assert!(gpa.is_multiple_of(HV_PAGE_SIZE));
 
                 let area = parameter_areas
                     .get_mut(parameter_area_index)

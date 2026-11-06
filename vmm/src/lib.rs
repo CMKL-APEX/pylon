@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::{GuestMemory, GuestRegion};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
 use vm_migration::{
@@ -74,8 +74,8 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::flatten_error_chain_to_string;
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
-    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
+    PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
 mod acpi;
@@ -113,9 +113,6 @@ mod uffd;
 mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 
 /// Errors associated with VMM management
 #[derive(Debug, Error)]
@@ -758,7 +755,7 @@ const FAULT_CONNECTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`ReceiveMigrationState::Configured`]
 struct ReceiveMigrationConfiguredData {
     memory_manager: Arc<Mutex<MemoryManager>>,
-    guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    guest_memory: GuestMemoryAtomic<GuestMemory>,
     connections: ReceiveAdditionalConnections,
     shared_backing: bool,
     fault_rx: Receiver<SocketStream>,
@@ -1899,6 +1896,12 @@ impl Vmm {
         } else {
             Request::complete_paused()
         };
+        // The destination may already run the VM once it got this request.
+        // Giving up would resume the source as well, so wait for the answer.
+        // This needs a more careful investigation, see #9208.
+        socket
+            .set_read_timeout(None)
+            .map_err(MigratableError::MigrateSocket)?;
         let (_, complete_duration) = measure_ok(|| {
             // We might lose an ACK, but this is preferable to an inconsistent
             // source VM or both VMs running. This is a known postcopy tradeoff.
@@ -1954,7 +1957,7 @@ impl Vmm {
     fn serve_postcopy(
         seccomp_filter: &BpfProgram,
         mut socket: SocketStream,
-        guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: GuestMemoryAtomic<GuestMemory>,
     ) -> result::Result<(), MigratableError> {
         // Apply the dedicated seccomp filter for this thread. It is empty when
         // seccomp is disabled (SeccompAction::Allow), in which case there is
@@ -2428,23 +2431,20 @@ fn apply_vfio_fds_to_vm_config(
             for device in devices.iter_mut() {
                 if device.pci_common.id.as_deref() == Some(v.id.as_str()) {
                     device.path = None;
-                    device.fd = v.fd;
+                    device.fd.clone_from(&v.fd);
                 }
             }
         }
     }
 
-    let iommufd_fd = receive_data_migration
-        .iommufd_fd
-        .expect("receive-migration validated an iommufd FD accompanies vfio_fds");
+    let iommufd_fd = receive_data_migration.iommufd_fd.clone();
     config
         .platform
         .as_mut()
         .expect("receive-migration validated iommufd=on, so a platform exists")
-        .iommufd_fd = Some(iommufd_fd);
+        .iommufd_fd = iommufd_fd;
 }
 
-#[allow(unused)]
 fn update_memory_zones(
     zone_updates: &[VmMemoryZoneUpdateData],
     vm_config: &Arc<Mutex<VmConfig>>,
@@ -2697,19 +2697,17 @@ impl RequestHandler for Vmm {
                             for device_config in vm_device_configs.iter_mut() {
                                 if device_config.pci_common.id.as_ref() == Some(&v.id) {
                                     device_config.path = None;
-                                    device_config.fd = v.fd;
+                                    device_config.fd.clone_from(&v.fd);
                                 }
                             }
                         }
                     }
-                    let iommufd_fd = restore_cfg
-                        .iommufd_fd
-                        .expect("restore validated an iommufd FD accompanies vfio_fds");
+                    let iommufd_fd = restore_cfg.iommufd_fd;
                     config
                         .platform
                         .as_mut()
                         .expect("restore validated iommufd=on, so a platform exists")
-                        .iommufd_fd = Some(iommufd_fd);
+                        .iommufd_fd = iommufd_fd;
                 }
 
                 update_memory_zones(&restore_cfg.zone_updates, &vm_config).map_err(|e| {
@@ -2943,6 +2941,30 @@ impl RequestHandler for Vmm {
     ) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            if let Some(desired_vcpus) = desired_vcpus {
+                config.cpus.boot_vcpus = desired_vcpus;
+            }
+            if let Some(desired_ram) = desired_ram {
+                // A running VM stores the hotplugged virtio-mem memory separately
+                if matches!(self.vm, VmOwnership::Owned(_))
+                    && config.memory.hotplug_method == HotplugMethod::VirtioMem
+                {
+                    config.memory.hotplugged_size = desired_ram.checked_sub(config.memory.size);
+                } else {
+                    config.memory.size = desired_ram;
+                }
+            }
+            if let Some(desired_balloon) = desired_balloon
+                && let Some(balloon_config) = &mut config.balloon
+            {
+                balloon_config.size = desired_balloon;
+            }
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
+
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm
                 .resize(desired_vcpus, desired_ram, desired_balloon)
@@ -2979,6 +3001,26 @@ impl RequestHandler for Vmm {
 
     fn vm_resize_zone(&mut self, id: String, desired_ram: u64) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            if let Some(zone) = config
+                .memory
+                .zones
+                .iter_mut()
+                .flatten()
+                .find(|zone| zone.id == id)
+            {
+                // A running VM stores the hotplugged zone memory separately
+                if matches!(self.vm, VmOwnership::Owned(_)) {
+                    zone.hotplugged_size = desired_ram.checked_sub(zone.size);
+                } else {
+                    zone.size = desired_ram;
+                }
+            }
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3633,14 +3675,14 @@ mod tests {
     use arch::CpuProfileConfig;
 
     use super::*;
-    use crate::config::RestoredVfioConfig;
+    use crate::config::{RestoredVfioConfig, ValidationError};
     use crate::console_devices::ConsoleDeviceError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
-        CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
-        CpusConfig, DeviceConfig, HotplugMethod, MemoryConfig, MemoryZoneConfig, PayloadConfig,
-        PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
+        BalloonConfig, CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling,
+        CpuFeatures, CpusConfig, DeviceConfig, ExternalFd, MemoryConfig, MemoryZoneConfig,
+        PayloadConfig, PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
     };
 
     fn create_dummy_vmm() -> Vmm {
@@ -3749,12 +3791,15 @@ mod tests {
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
         })
+    }
+
+    pub(crate) fn test_fd() -> File {
+        File::open("/dev/null").unwrap()
     }
 
     #[test]
@@ -3804,7 +3849,8 @@ mod tests {
     #[test]
     fn test_vmm_vm_cold_add_device() {
         let mut vmm = create_dummy_vmm();
-        let device_config = DeviceConfig::parse("path=/path/to/device").unwrap();
+        // SAFETY: This test input contains no inherited descriptors.
+        let device_config = unsafe { DeviceConfig::parse("path=/path/to/device") }.unwrap();
 
         assert!(matches!(
             vmm.vm_add_device(device_config.clone()),
@@ -3896,6 +3942,73 @@ mod tests {
                 .clone()
                 .unwrap()[0],
             user_device_config
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_validates_config() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.cpus.boot_vcpus = 2;
+        config.cpus.max_vcpus = 4;
+        config.disks = Some(vec![
+            DiskConfig::parse("path=/path/to_file,image_type=raw,num_queues=2").unwrap(),
+        ]);
+        config.balloon = Some(BalloonConfig::parse("size=128M").unwrap());
+        let _ = vmm.vm_create(config);
+        let config = vmm.vm_config.clone().unwrap();
+
+        assert!(matches!(
+            vmm.vm_resize(Some(1), None, None),
+            Err(VmError::ConfigValidation(ValidationError::TooManyQueues(
+                2, 1
+            )))
+        ));
+        assert_eq!(config.lock().unwrap().cpus.boot_vcpus, 2);
+
+        assert!(matches!(
+            vmm.vm_resize(None, None, Some(512 << 20)),
+            Err(VmError::ConfigValidation(
+                ValidationError::BalloonLargerThanRam(_, _)
+            ))
+        ));
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            128 << 20
+        );
+
+        vmm.vm_resize(Some(4), None, Some(256 << 20)).unwrap();
+        assert_eq!(config.lock().unwrap().cpus.boot_vcpus, 4);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            256 << 20
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_zone_validates_config() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.memory = MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=512M"])).unwrap();
+        config.balloon = Some(BalloonConfig::parse("size=256M").unwrap());
+        let _ = vmm.vm_create(config);
+        let config = vmm.vm_config.clone().unwrap();
+
+        assert!(matches!(
+            vmm.vm_resize_zone("mem0".to_string(), 256 << 20),
+            Err(VmError::ConfigValidation(
+                ValidationError::BalloonLargerThanRam(_, _)
+            ))
+        ));
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            512 << 20
+        );
+
+        vmm.vm_resize_zone("mem0".to_string(), 1 << 30).unwrap();
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            1 << 30
         );
     }
 
@@ -4088,9 +4201,12 @@ mod tests {
     #[test]
     fn test_vmm_vm_cold_add_net() {
         let mut vmm = create_dummy_vmm();
-        let net_config = NetConfig::parse(
-            "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock",
-        )
+        // SAFETY: This test input contains no inherited descriptors.
+        let net_config = unsafe {
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock",
+            )
+        }
         .unwrap();
 
         assert!(matches!(
@@ -4220,7 +4336,8 @@ mod tests {
     fn vm_config_with_vfio_devices(ids: &[&str], iommufd: bool) -> Arc<Mutex<VmConfig>> {
         let mut config = *create_dummy_vm_config();
         let platform = if iommufd { "iommufd=on" } else { "iommufd=off" };
-        config.platform = Some(PlatformConfig::parse(platform).unwrap());
+        // SAFETY: This test input contains no inherited descriptors.
+        config.platform = Some(unsafe { PlatformConfig::parse(platform) }.unwrap());
         config.devices = Some(
             ids.iter()
                 .map(|id| DeviceConfig {
@@ -4229,7 +4346,7 @@ mod tests {
                         ..Default::default()
                     },
                     path: Some(PathBuf::from(format!("/sys/bus/pci/devices/{id}"))),
-                    fd: None,
+                    fd: Default::default(),
                     x_nv_gpudirect_clique: None,
                     x_exclude_mmap_bars: Vec::new(),
                     iommufd_dev_id: None,
@@ -4241,22 +4358,22 @@ mod tests {
 
     fn receive_data(
         vfio_fds: Option<Vec<RestoredVfioConfig>>,
-        iommufd_fd: Option<i32>,
+        iommufd_fd: Option<ExternalFd>,
     ) -> VmReceiveMigrationData {
         VmReceiveMigrationData {
             receiver_url: "tcp:127.0.0.1:4321".to_string(),
-            tls_dir: None,
             vfio_fds,
-            iommufd_fd,
+            iommufd_fd: iommufd_fd.unwrap_or_default(),
             zone_updates: vec![],
             background_fetch_pages: true,
+            ..Default::default()
         }
     }
 
-    fn vfio_fd(id: &str, fd: i32) -> RestoredVfioConfig {
+    fn vfio_fd(id: &str, fd: ExternalFd) -> RestoredVfioConfig {
         RestoredVfioConfig {
             id: id.to_owned(),
-            fd: Some(fd),
+            fd,
         }
     }
 
@@ -4272,34 +4389,61 @@ mod tests {
 
     #[test]
     fn test_apply_vfio_fds_swaps_path_for_fd() {
+        let vfio: ExternalFd = test_fd().into();
+        let iommu: ExternalFd = test_fd().into();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0", "vfio1"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio1", 5)]), Some(6));
+        let data = receive_data(
+            Some(vec![vfio_fd("vfio1", vfio.clone())]),
+            Some(iommu.clone()),
+        );
         apply_vfio_fds_to_vm_config(&data, &vm_config);
         let config = vm_config.lock().unwrap();
         let devices = config.devices.as_ref().unwrap();
         assert!(devices[0].path.is_some());
         assert!(devices[0].fd.is_none());
         assert!(devices[1].path.is_none());
-        assert_eq!(devices[1].fd, Some(5));
-        assert_eq!(config.platform.as_ref().unwrap().iommufd_fd, Some(6));
+        assert_eq!(
+            devices[1].fd.as_ref().unwrap().as_raw_fd(),
+            vfio.as_ref().unwrap().as_raw_fd()
+        );
+        assert_eq!(
+            config
+                .platform
+                .as_ref()
+                .unwrap()
+                .iommufd_fd
+                .as_ref()
+                .unwrap()
+                .as_raw_fd(),
+            iommu.as_ref().unwrap().as_raw_fd()
+        );
     }
 
     #[test]
     fn test_validate_vfio_fds_requires_iommufd_fd() {
+        let vfio: ExternalFd = test_fd().into();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), None);
+        let data = receive_data(Some(vec![vfio_fd("vfio0", vfio.clone())]), None);
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
     }
 
     #[test]
     fn test_validate_vfio_fds_unknown_id_fails() {
+        let vfio: ExternalFd = test_fd().into();
+        let iommu: ExternalFd = test_fd().into();
+
         // vfio0 is covered so coverage passes, the extra bogus id is what the
         // id match must reject.
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
         let data = receive_data(
-            Some(vec![vfio_fd("vfio0", 5), vfio_fd("missing", 6)]),
-            Some(7),
+            Some(vec![
+                vfio_fd("vfio0", vfio.clone()),
+                vfio_fd("missing", vfio.clone()),
+            ]),
+            Some(iommu.clone()),
         );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
@@ -4307,10 +4451,16 @@ mod tests {
 
     #[test]
     fn test_validate_vfio_fds_duplicate_id_fails() {
+        let vfio: ExternalFd = test_fd().into();
+        let iommu: ExternalFd = test_fd().into();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
         let data = receive_data(
-            Some(vec![vfio_fd("vfio0", 5), vfio_fd("vfio0", 6)]),
-            Some(7),
+            Some(vec![
+                vfio_fd("vfio0", vfio.clone()),
+                vfio_fd("vfio0", vfio.clone()),
+            ]),
+            Some(iommu.clone()),
         );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
@@ -4318,8 +4468,14 @@ mod tests {
 
     #[test]
     fn test_validate_vfio_fds_requires_iommufd_backend() {
+        let vfio: ExternalFd = test_fd().into();
+        let iommu: ExternalFd = test_fd().into();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], false);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), Some(6));
+        let data = receive_data(
+            Some(vec![vfio_fd("vfio0", vfio.clone())]),
+            Some(iommu.clone()),
+        );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
     }
@@ -4331,7 +4487,7 @@ mod tests {
             let mut config = vm_config.lock().unwrap();
             let device = &mut config.devices.as_mut().unwrap()[0];
             device.path = None;
-            device.fd = Some(-1);
+            device.fd = Default::default();
         }
         receive_data(None, None)
             .validate_vfio_fds(&vm_config.lock().unwrap())
@@ -4350,8 +4506,14 @@ mod tests {
 
     #[test]
     fn test_validate_vfio_fds_all_substituted_ok() {
+        let vfio: ExternalFd = test_fd().into();
+        let iommu: ExternalFd = test_fd().into();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), Some(6));
+        let data = receive_data(
+            Some(vec![vfio_fd("vfio0", vfio.clone())]),
+            Some(iommu.clone()),
+        );
         data.validate_vfio_fds(&vm_config.lock().unwrap()).unwrap();
     }
 

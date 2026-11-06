@@ -32,7 +32,7 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::SIGRTMIN;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::GuestRegionMmap;
+use crate::GuestRegion;
 
 // The shared page's address is declared in the architecture's layout and in the ABI crate, which
 // can't see each other, so check here that they agree.
@@ -110,8 +110,8 @@ pub enum Error {
     #[error("Failed to build Pylon MmapRegion")]
     MmapRegionBuild(#[source] MmapRegionError),
 
-    /// Failed to construct the `GuestRegionMmap` at the requested GPA.
-    #[error("Failed to create Pylon GuestRegionMmap at GPA {0:#x}")]
+    /// Failed to construct the `GuestRegion` at the requested GPA.
+    #[error("Failed to create Pylon GuestRegion at GPA {0:#x}")]
     GuestRegionNew(u64),
 
     /// Failed to register the Pylon shared memory region with the hypervisor.
@@ -442,7 +442,7 @@ impl PylonVmmState {
     /// Maps the 8,192-byte `/dev/shm/<vm-id>-pylon` backing file into guest physical memory
     /// at `self.config.gpa` (`0xFEDF_0000` by default) with `MAP_SHARED`.
     ///
-    /// The page gets its own hypervisor memory slot but stays out of `GuestMemoryMmap`, like a
+    /// The page gets its own hypervisor memory slot but stays out of `GuestMemory`, like a
     /// device BAR: anything built from guest RAM (E820, PVH memmap, ACPI, hotplug layout)
     /// would otherwise report it to the guest as RAM inside the 32-bit reserved hole. The
     /// caller must keep the returned region alive as long as the VM.
@@ -450,7 +450,7 @@ impl PylonVmmState {
         &self,
         vm: &Arc<dyn Vm>,
         next_memory_slot: &mut u32,
-    ) -> result::Result<Arc<GuestRegionMmap>, Error> {
+    ) -> result::Result<Arc<GuestRegion>, Error> {
         let shm_clone = self.shm_file.try_clone().map_err(Error::ShmOpen)?;
         let file_offset = FileOffset::new(shm_clone, 0);
 
@@ -464,14 +464,14 @@ impl PylonVmmState {
 
         let gpa = GuestAddress(self.config.gpa);
         let region = Arc::new(
-            GuestRegionMmap::new(mmap_region, gpa).ok_or(Error::GuestRegionNew(self.config.gpa))?,
+            GuestRegion::new(mmap_region, gpa).ok_or(Error::GuestRegionNew(self.config.gpa))?,
         );
 
         let slot = *next_memory_slot;
         *next_memory_slot += 1;
 
         // SAFETY: `region` is a valid `MAP_SHARED` mapping of `PYLON_SHARED_PAGE_SIZE` bytes,
-        // and the caller keeps the returned `Arc<GuestRegionMmap>` alive with the VM.
+        // and the caller keeps the returned `Arc<GuestRegion>` alive with the VM.
         unsafe {
             vm.create_user_memory_region(
                 slot,
@@ -955,7 +955,7 @@ pub fn clear_global_state() {
 pub fn setup_memory_region(
     vm: &Arc<dyn Vm>,
     next_memory_slot: &mut u32,
-) -> result::Result<Option<Arc<GuestRegionMmap>>, Error> {
+) -> result::Result<Option<Arc<GuestRegion>>, Error> {
     if let Some(state) = global_state() {
         let region = state.setup_gpa_mapping(vm, next_memory_slot)?;
         if state.config.park_in_kvm
@@ -1549,7 +1549,7 @@ mod tests {
         use vm_memory::{Bytes, GuestMemoryBackend};
         use vmm_sys_util::signal::register_signal_handler;
 
-        use crate::GuestMemoryMmap;
+        use crate::GuestMemory;
 
         extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
@@ -1571,9 +1571,9 @@ mod tests {
             .expect("failed to create KVM VM");
 
         let code_gpa = GuestAddress(0x1000);
-        let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
+        let guest_mem = GuestMemory::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
         for (index, region) in guest_mem.iter().enumerate() {
-            // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
+            // SAFETY: `region` is a valid GuestRegion backed by anonymous memory.
             unsafe {
                 vm.create_user_memory_region(
                     index as u32,
@@ -1694,7 +1694,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         thread: thread::JoinHandle<()>,
         tid: libc::pid_t,
-        _pylon_region: Arc<GuestRegionMmap>,
+        _pylon_region: Arc<GuestRegion>,
         _dir: TempDir,
     }
 
@@ -1706,7 +1706,7 @@ mod tests {
             use vm_memory::{Bytes, GuestMemoryBackend};
             use vmm_sys_util::signal::register_signal_handler;
 
-            use crate::GuestMemoryMmap;
+            use crate::GuestMemory;
 
             extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
@@ -1725,9 +1725,9 @@ mod tests {
 
             // `b .`, the branch to itself, at the start of one page of guest memory.
             let code_gpa = GuestAddress(0x4000_0000);
-            let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
+            let guest_mem = GuestMemory::from_ranges(&[(code_gpa, 0x1000)]).unwrap();
             for (index, region) in guest_mem.iter().enumerate() {
-                // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory, which
+                // SAFETY: `region` is a valid GuestRegion backed by anonymous memory, which
                 // the vCPU thread keeps alive by owning `guest_mem`.
                 unsafe {
                     vm.create_user_memory_region(
@@ -1960,7 +1960,7 @@ mod tests {
         use hypervisor::{HypervisorVmConfig, VmExit};
         use vm_memory::{Bytes, GuestMemoryBackend};
 
-        use crate::GuestMemoryMmap;
+        use crate::GuestMemory;
 
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-kvm-e2e-pylon");
@@ -1981,9 +1981,9 @@ mod tests {
             .expect("failed to create KVM VM");
 
         let code_gpa = GuestAddress(0x1000);
-        let guest_mem = GuestMemoryMmap::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
+        let guest_mem = GuestMemory::from_ranges(&[(code_gpa, 0x2000)]).unwrap();
         for (index, region) in guest_mem.iter().enumerate() {
-            // SAFETY: `region` is a valid GuestRegionMmap backed by anonymous memory.
+            // SAFETY: `region` is a valid GuestRegion backed by anonymous memory.
             unsafe {
                 vm.create_user_memory_region(
                     index as u32,

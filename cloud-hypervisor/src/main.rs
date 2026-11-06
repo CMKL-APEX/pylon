@@ -46,7 +46,7 @@ use vmm::vm_config::{
 };
 use vmm::{GuestResetAction, GuestShutdownAction, vm_config};
 use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::signal::block_signal;
+use vmm_sys_util::signal::{block_signal, register_signal_handler};
 
 use crate::logger::Logger;
 
@@ -121,8 +121,10 @@ impl SeccompSiginfo {
     }
 }
 
-fn handle_sigsys(info: &libc::siginfo_t) {
-    let info = SeccompSiginfo::from_siginfo(info);
+extern "C" fn handle_sigsys(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // SAFETY: The handler is installed with SA_SIGINFO, so the kernel passes
+    // a valid siginfo_t.
+    let info = SeccompSiginfo::from_siginfo(unsafe { &*info });
     let mut buffer = [0; SeccompSiginfo::OUTPUT_LEN];
     let message = info.format_into(&mut buffer);
     // SAFETY: message points to initialized memory for message.len() bytes.
@@ -370,18 +372,18 @@ fn get_cli_options_sorted(
             .value_parser(["exit-vmm", "shutdown-vm"])
             .default_value("exit-vmm")
             .group("vmm-config"),
-        #[cfg(feature = "igvm")]
-        Arg::new("igvm")
-            .long("igvm")
-            .help("Path to IGVM file to load.")
-            .num_args(1)
-            .group("vm-payload"),
         #[cfg(feature = "sev_snp")]
         Arg::new("host-data")
             .long("host-data")
             .help("Host specific data to SEV SNP guest")
             .num_args(1)
             .group("vm-config"),
+        #[cfg(feature = "igvm")]
+        Arg::new("igvm")
+            .long("igvm")
+            .help("Path to IGVM file to load.")
+            .num_args(1)
+            .group("vm-payload"),
         Arg::new("initramfs")
             .long("initramfs")
             .help("Path to initramfs image")
@@ -407,7 +409,7 @@ fn get_cli_options_sorted(
             .help("enable/disable Landlock.")
             .action(ArgAction::SetTrue)
             .default_value("false")
-            .group("vm-config"),
+            .group("vmm-config"),
         Arg::new("landlock-rules")
             .long("landlock-rules")
             .help(LandlockConfig::SYNTAX)
@@ -685,6 +687,36 @@ fn start_vmm(
     api_socket_path: &Option<String>,
     api_socket_fd: Option<RawFd>,
 ) -> Result<(), Error> {
+    #[cfg(feature = "igvm")]
+    let payload_present = cmd_arguments.contains_id("kernel")
+        || cmd_arguments.contains_id("firmware")
+        || cmd_arguments.contains_id("igvm");
+    #[cfg(not(feature = "igvm"))]
+    let payload_present =
+        cmd_arguments.contains_id("kernel") || cmd_arguments.contains_id("firmware");
+
+    let vm_config = if payload_present {
+        let vm_params = VmParams::from_arg_matches(cmd_arguments);
+        // SAFETY: The CLI transfers inherited FDs before the VMM opens new FDs.
+        Some(unsafe { VmConfig::parse(vm_params) }.map_err(Error::ParsingConfig)?)
+    } else {
+        None
+    };
+    let restore_config = if vm_config.is_none() {
+        cmd_arguments
+            .get_one::<String>("restore")
+            // SAFETY: The CLI transfers inherited FDs before the VMM opens new FDs.
+            .map(|restore| unsafe { RestoreConfig::parse(restore) })
+            .transpose()
+            .map_err(Error::ParsingRestore)?
+    } else {
+        None
+    };
+
+    if let Err(e) = expand_fdtable() {
+        warn!("Error expanding FD table: {e}");
+    }
+
     let log_level = match cmd_arguments.get_count("v") {
         0 => LevelFilter::Warn,
         1 => LevelFilter::Info,
@@ -715,12 +747,10 @@ fn start_vmm(
     let api_request_sender_clone = api_request_sender.clone();
 
     if seccomp_action == SeccompAction::Trap {
-        // SAFETY: handle_sigsys only performs async signal safe operations.
-        unsafe {
-            signal_hook_registry::register_sigaction(SIGSYS, handle_sigsys)
-                .map_err(|e| error!("Error adding SIGSYS signal handler: {e}"))
-                .ok();
-        }
+        // handle_sigsys only performs async signal safe operations.
+        register_signal_handler(SIGSYS, handle_sigsys)
+            .map_err(|e| error!("Error adding SIGSYS signal handler: {e}"))
+            .ok();
     }
 
     // SAFETY: Trivially safe.
@@ -876,18 +906,7 @@ fn start_vmm(
     event!("vmm", "started");
 
     let r: Result<(), Error> = (|| {
-        #[cfg(feature = "igvm")]
-        let payload_present = cmd_arguments.contains_id("kernel")
-            || cmd_arguments.contains_id("firmware")
-            || cmd_arguments.contains_id("igvm");
-        #[cfg(not(feature = "igvm"))]
-        let payload_present =
-            cmd_arguments.contains_id("kernel") || cmd_arguments.contains_id("firmware");
-
-        if payload_present {
-            let vm_params = VmParams::from_arg_matches(cmd_arguments);
-            let vm_config = VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
-
+        if let Some(vm_config) = vm_config {
             // Create and boot the VM based off the VM config we just built.
             let sender = api_request_sender.clone();
             api::VmCreate
@@ -900,12 +919,12 @@ fn start_vmm(
             api::VmBoot
                 .send(api_evt.try_clone().unwrap(), sender, ())
                 .map_err(Error::VmBoot)?;
-        } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
+        } else if let Some(restore_config) = restore_config {
             api::VmRestore
                 .send(
                     api_evt.try_clone().unwrap(),
                     api_request_sender,
-                    RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?,
+                    restore_config,
                 )
                 .map_err(Error::VmRestore)?;
         }
@@ -1048,10 +1067,6 @@ fn main() {
         }
 
         return;
-    }
-
-    if let Err(e) = expand_fdtable() {
-        warn!("Error expanding FD table: {e}");
     }
 
     let (api_socket_path, api_socket_fd) = match parse_api_socket(&cmd_arguments) {
@@ -1245,13 +1260,25 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn test_landlock_without_payload() {
+        // A VMM that receives its VM config later through vm.create can
+        // still confine its own threads.
+        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+        let cmd_arguments = create_app(default_vcpus, default_memory, default_rng)
+            .try_get_matches_from(["cloud-hypervisor", "--api-socket", "/tmp/api", "--landlock"])
+            .unwrap();
+        assert!(cmd_arguments.get_flag("landlock"));
+    }
+
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
         let (default_vcpus, default_memory, default_rng) = prepare_default_values();
         let cmd_arguments =
             create_app(default_vcpus, default_memory, default_rng).get_matches_from(args);
         let vm_params = VmParams::from_arg_matches(&cmd_arguments);
 
-        VmConfig::parse(vm_params).unwrap()
+        // SAFETY: These CLI test cases supply no inherited descriptors.
+        unsafe { VmConfig::parse(vm_params) }.unwrap()
     }
 
     fn compare_vm_config_cli_vs_json(
@@ -1391,7 +1418,6 @@ mod tests {
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]

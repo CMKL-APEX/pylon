@@ -6,7 +6,6 @@
 use std::sync::{Arc, Mutex};
 use std::{io, result};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -305,7 +304,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R TABLE offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u32(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             8 => {
                 let value = match modulo_offset {
@@ -324,7 +323,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R TABLE offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u64(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             _ => {
                 debug!("invalid data length");
@@ -354,7 +353,7 @@ impl MsixConfig {
 
         match data.len() {
             4 => {
-                let value = LittleEndian::read_u32(data);
+                let value = u32::from_le_bytes(data.try_into().expect("data should be 4 bytes"));
                 match modulo_offset {
                     0x0 => self.table_entries[index].msg_addr_lo = value,
                     0x4 => self.table_entries[index].msg_addr_hi = value,
@@ -368,7 +367,7 @@ impl MsixConfig {
                 debug!("MSI_W TABLE offset 0x{offset:x} data 0x{value:x}");
             }
             8 => {
-                let value = LittleEndian::read_u64(data);
+                let value = u64::from_le_bytes(data.try_into().expect("data should be 8 bytes"));
                 match modulo_offset {
                     0x0 => {
                         self.table_entries[index].msg_addr_lo = (value & 0xffff_ffffu64) as u32;
@@ -465,7 +464,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R PBA offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u32(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             8 => {
                 let value: u64 = match modulo_offset {
@@ -477,7 +476,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R PBA offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u64(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             _ => {
                 debug!("invalid data length");

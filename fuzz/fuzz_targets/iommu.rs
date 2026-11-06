@@ -8,20 +8,19 @@ use std::io;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use cloud_hypervisor_fuzz::FuzzCursor;
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
 use virtio_devices::{
     AccessPlatformMapping, DmaRemapping, VirtioDevice, VirtioInterrupt, VirtioInterruptType,
 };
 use virtio_queue::{Queue, QueueT};
+use vm_allocator::GuestMemory;
 use vm_device::dma_mapping::ExternalDmaMapping;
-use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
 use vm_migration::{Pausable, Snapshottable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
 macro_rules! align {
     ($n:expr, $align:expr) => {{
@@ -160,7 +159,7 @@ struct FuzzPlan {
 
 impl FuzzPlan {
     fn new(bytes: &[u8]) -> Self {
-        let mut stream = ByteStream::new(bytes);
+        let mut stream = FuzzCursor::new(bytes);
         let address_width_bits = if (stream.next_u8() & 1) == 0 {
             IOMMU_ADDR_WIDTH_BITS
         } else {
@@ -206,45 +205,6 @@ impl FuzzPlan {
             overflow_domain: 432 + (stream.next_u32() % 16),
             overflow_virt_start: u64::MAX - (overflow_pages * PAGE_SIZE) + 1,
         }
-    }
-}
-
-struct ByteStream<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl<'a> ByteStream<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, cursor: 0 }
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        let value = self.bytes[self.cursor % self.bytes.len()];
-        self.cursor = self.cursor.wrapping_add(1);
-        value
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        u32::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        u64::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
     }
 }
 
@@ -331,7 +291,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     // with exactly the same shape as the 'request_queue'.
     let event_queue = setup_virt_queue();
 
-    let mem = GuestMemoryMmap::from_ranges(&[
+    let mem = GuestMemory::from_ranges(&[
         (GuestAddress(0), MEM_SIZE),
         (GuestAddress(DESC_TABLE_ADDR), QUEUE_BYTES_SIZE),
     ])
@@ -664,7 +624,7 @@ fn baseline_chains() -> Vec<ChainSpec> {
 }
 
 fn append_fuzz_chains(chains: &mut Vec<ChainSpec>, bytes: &[u8], plan: &FuzzPlan) {
-    let mut stream = ByteStream::new(bytes);
+    let mut stream = FuzzCursor::new(bytes);
     append_guided_chains(chains, plan);
     let extra_chains = 1 + (stream.next_u8() as usize % 24);
     for _ in 0..extra_chains {
@@ -856,7 +816,7 @@ fn append_guided_chains(chains: &mut Vec<ChainSpec>, plan: &FuzzPlan) {
     ]);
 }
 
-fn next_fuzz_chain(stream: &mut ByteStream) -> ChainSpec {
+fn next_fuzz_chain(stream: &mut FuzzCursor) -> ChainSpec {
     let domain = stream.next_u32() % 64;
     let endpoint = stream.next_u32() % 128;
     let virt_start = pick_guest_page(stream.next_u64());
@@ -1006,7 +966,7 @@ fn append_u64(vec: &mut Vec<u8>, value: u64) {
     vec.extend_from_slice(&value.to_le_bytes());
 }
 
-fn write_request_queue(mem: &GuestMemoryMmap, chains: &[ChainSpec]) -> Result<(), ()> {
+fn write_request_queue(mem: &GuestMemory, chains: &[ChainSpec]) -> Result<(), ()> {
     let mut next_desc: u16 = 0;
     let mut next_payload_addr = PAYLOAD_ADDR_START;
     let mut avail_count: u16 = 0;
@@ -1110,7 +1070,7 @@ fn allocate_payload(next_payload_addr: &mut u64, len: u32) -> Option<u64> {
     Some(start)
 }
 
-fn write_desc(mem: &GuestMemoryMmap, desc_index: u16, desc: VirtqDesc) -> Result<(), ()> {
+fn write_desc(mem: &GuestMemory, desc_index: u16, desc: VirtqDesc) -> Result<(), ()> {
     let mut raw = [0u8; 16];
     raw[..8].copy_from_slice(&desc.addr.to_le_bytes());
     raw[8..12].copy_from_slice(&desc.len.to_le_bytes());
@@ -1123,7 +1083,7 @@ fn write_desc(mem: &GuestMemoryMmap, desc_index: u16, desc: VirtqDesc) -> Result
     .map_err(|_| ())
 }
 
-fn write_u16(mem: &GuestMemoryMmap, addr: u64, value: u16) -> Result<(), ()> {
+fn write_u16(mem: &GuestMemory, addr: u64, value: u16) -> Result<(), ()> {
     mem.write_slice(&value.to_le_bytes(), GuestAddress(addr))
         .map_err(|_| ())
 }

@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -45,7 +45,7 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::{GuestMemoryMmap, VirtioInterrupt};
+use crate::{GuestMemory, VirtioInterrupt};
 
 /// Control queue
 // Event available on the control queue.
@@ -59,7 +59,7 @@ const RETRY_ANNOUNCEMENTS_EVENT: u16 = START_ANNOUNCEMENTS_EVENT + 1;
 pub const MIN_MTU: u16 = 1280;
 
 pub struct NetCtrlEpollHandler {
-    pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    pub mem: GuestMemoryAtomic<GuestMemory>,
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
     pub ctrl_q: CtrlQueue,
@@ -230,7 +230,7 @@ pub type Result<T> = result::Result<T, Error>;
 
 struct NetEpollHandler {
     net: NetQueuePair,
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     kill_evt: EventFd,
     pause_evt: EventFd,
@@ -281,7 +281,7 @@ impl NetEpollHandler {
     fn process_tx(&mut self) -> result::Result<(), DeviceError> {
         let res = self
             .net
-            .process_tx(&self.mem.memory(), &mut self.queue_pair.1)
+            .process_tx(&*self.mem.memory(), &mut self.queue_pair.1)
             .map_err(DeviceError::NetQueuePair)?;
 
         if res {
@@ -310,7 +310,7 @@ impl NetEpollHandler {
     fn handle_rx_tap_event(&mut self) -> result::Result<(), DeviceError> {
         let res = self
             .net
-            .process_rx(&self.mem.memory(), &mut self.queue_pair.0)
+            .process_rx(&*self.mem.memory(), &mut self.queue_pair.0)
             .map_err(DeviceError::NetQueuePair)?;
 
         if res {
@@ -703,7 +703,7 @@ impl Net {
     #[expect(clippy::too_many_arguments)]
     pub fn from_tap_fds(
         id: String,
-        fds: &[RawFd],
+        fds: &[BorrowedFd<'_>],
         guest_mac: MacAddr,
         mtu: Option<u16>,
         access_platform_enabled: bool,
@@ -724,13 +724,9 @@ impl Net {
             .ok_or(Error::BadQueueNum)?;
 
         for fd in fds.iter() {
-            // Duplicate so that it can survive reboots
-            // SAFETY: FFI call to dup. Trivially safe.
-            let fd = unsafe { libc::dup(*fd) };
-            if fd < 0 {
-                return Err(Error::DuplicateTapFd(io::Error::last_os_error()));
-            }
-            let tap = Tap::from_tap_fd(fd, num_queue_pairs).map_err(Error::TapError)?;
+            // Keep the preserved original available across reboots.
+            let fd = fd.try_clone_to_owned().map_err(Error::DuplicateTapFd)?;
+            let tap = Tap::from_file(fd.into(), num_queue_pairs).map_err(Error::TapError)?;
             taps.push(tap);
         }
 
