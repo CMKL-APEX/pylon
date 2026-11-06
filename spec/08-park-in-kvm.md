@@ -473,16 +473,53 @@ pinned task shows the same cause every time. The `scx_pylon` live test
 | P2, VM 2 bursty (2 runs) | 0 | 0 |
 
 **The P2 idle run hit a gap in `scx_pylon`:**
-- *What happened:* a woken vCPU of VM 2 stayed runnable on the vCPU queue
-  for 30 s, during VM 2's boot. The watchdog ejected `scx_pylon`.
+- *What happened:* a vCPU of VM 2 stayed runnable on the vCPU queue for
+  30 s, during VM 2's boot. The watchdog ejected `scx_pylon`.
 - *Why no CPU ran it:*
-  - When a VM owns no CPU, `rescue_stranded_vcpus` moves its woken vCPUs
-    to the vCPU queue, but kicks no CPU.
-  - Idle CPUs don't look at that queue until something kicks them.
-  - VM 2 later owned a CPU again. That CPU took turns between its owner
-    and the woken vCPUs on the VM's own queue, and never reached the vCPU
-    queue.
-- *Status:* not fixed yet.
+  - `pylond` made that vCPU the owner of CPU 2 while it already waited
+    on the vCPU queue. `enqueue` doesn't run again for a queued thread,
+    so it never reached CPU 2's owner queue.
+  - CPU 2 gave its turns to VM 2's woken vCPUs instead, because its
+    owner wasn't queued there.
+  - Every other CPU skipped the vCPU, because it owned CPU 2.
+- *Fix:*
+  - `dispatch` also looks for a CPU's owner on the vCPU queue and on its
+    VM's queue.
+  - A CPU that skips a thread owning an idle CPU kicks that CPU.
+  - When `rescue_stranded_vcpus` moves vCPUs to the vCPU queue, it kicks
+    an idle CPU.
+- *Test:* the live test `test_owner_given_its_cpu_while_queued_runs`
+  gives a CPU to a thread while it is queued, ten times. Without the
+  fix, the owner didn't run at all in 2 of the 10 cycles. With it, the
+  test passed three times out of three.
+
+**With the `scx_pylon` fix too,** no run had a lockup or an RCU stall,
+and `scx_pylon` stayed loaded. P2 churned, though: 13,000 to 25,000
+forced preemptions per run, against a few hundred for P1. Sampling each
+vCPU's slot every 3 s showed two causes:
+- *P2 woke a VM with no core for any woken vCPU.* An idle guest's
+  vCPUs wake for ticks and IPIs and halt again within microseconds.
+  Each wake took a core from VM 1 by a forced preemption, and VM 1 took
+  it back once VM 2 halted: about 250 trades a second. P2 now waits for
+  a long wake, as for a VM that owns a core (§4.2 on the P2 branch).
+- *vCPUs stuck in `PARKING` (§3.7).* The trading stopped only once all
+  three parkable vCPUs of VM 2 sat in `PARKING` with no core, out of
+  `pylond`'s reach. A guest park thread had written `PARKING` over a
+  forced park.
+
+**With both fixes:**
+
+| Run | Guest soft lockups | Guest RCU stalls | VM 2 forced preemptions |
+|---|---|---|---|
+| P1, VM 2 idle | 0 | 0 | 562 |
+| P1, VM 2 bursty (2 runs) | 0 | 0 | 1,077 and 785 |
+| P2, VM 2 idle | 0 | 0 | 875 |
+| P2, VM 2 bursty (2 runs) | 0 | 0 | 2,106 and 3,186 |
+
+No sample found a vCPU in `PARKING`. VM 2's metered core time fell to
+5 to 11 s per run, about what its bursts need: 3 vCPUs spinning 100 ms
+every 7 s is 7.7 s over 180 s. Earlier runs metered 70 to 160 s, mostly
+cores it held while idle.
 
 ## 8. Alternatives Considered
 
