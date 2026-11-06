@@ -2049,6 +2049,111 @@ mod tests {
         );
     }
 
+    /// A core taken for a woken vCPU of a VM with no core stays with it until the guest agent
+    /// reports again (`agent_reports`), or for `WOKEN_GRANT_HOLD_US` without a report. Once it
+    /// has the core, the vCPU no longer counts as woken, and the guest reports no runnable
+    /// threads before that. Before, the donor took the core back as over the VM's demand in
+    /// the next sweep, and the two traded it every `WOKEN_DEMAND_US` (spec 08 §4.2). Returns
+    /// whether the donor starts taking the core back once the hold ends.
+    fn woken_grant_hold(agent_reports: bool) -> bool {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
+        let mut engine =
+            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
+                .with_vm_vcpus(Arc::clone(&vm_vcpus));
+
+        // A busy donor that always wants both cores.
+        let donor = build_test_vm(60, 2, 0, 2, 1);
+        let donor_page = donor.handle.shared_page();
+        donor_page
+            .telemetry
+            .runnable_threads
+            .store(2, Ordering::Release);
+        let mut rig = build_test_vm(80, 4, 0, 4, 1);
+        let handle = parks_in_kvm(&mut rig);
+        let page = handle.shared_page();
+        ControlPlane::publish_vm_handle(&snapshot, donor.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+        let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
+
+        engine.poll_once(1_000);
+        for slot in &donor_page.vcpus[..2] {
+            assert_ne!(slot.assigned_pcpu.load(Ordering::Acquire), PCPU_UNASSIGNED);
+            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+        }
+
+        // vCPU 2 of VM 80 stays woken for 4 ms (12,000,000 cycles at 3 GHz), so VM 80 takes
+        // a core, and the donor vCPU on it parks.
+        entry.woken.store(1 << 2, Ordering::Release);
+        engine.poll_once(2_000);
+        engine.poll_once(12_002_000);
+        let (pcpu, donor_vcpu) = [6, 7]
+            .into_iter()
+            .find_map(|pcpu| match engine.core_state(pcpu) {
+                CoreState::Revoking {
+                    donor_vcpu,
+                    recipient_vm_id: 80,
+                    recipient_vcpu: 2,
+                    ..
+                } => Some((pcpu, donor_vcpu)),
+                _ => None,
+            })
+            .expect("VM 80 takes a core");
+        let donor_slot = &donor_page.vcpus[donor_vcpu as usize];
+        donor_slot.revoke_requested.store(0, Ordering::Release);
+        donor_slot.yield_count.fetch_add(1, Ordering::Relaxed);
+        donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+        engine.poll_once(12_003_000);
+        assert_eq!(
+            engine.core_state(pcpu),
+            CoreState::Assigned { vm_id: 80, vcpu: 2 }
+        );
+
+        // vCPU 2 runs on its core, so it no longer counts as woken, and the guest reports no
+        // runnable threads. Until the agent reports again, the donor, which still wants both
+        // cores, doesn't take it back. 50 ms is 150,000,000 cycles.
+        page.vcpus[2]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        entry.woken.store(0, Ordering::Release);
+        engine.poll_once(12_004_000);
+        engine.poll_once(162_001_000);
+        assert_eq!(
+            engine.core_state(pcpu),
+            CoreState::Assigned { vm_id: 80, vcpu: 2 }
+        );
+        assert_eq!(donor.handle.forced_preempt_count(), 0);
+
+        let now = if agent_reports {
+            page.telemetry
+                .guest_heartbeat
+                .fetch_add(1, Ordering::Release);
+            162_001_500
+        } else {
+            162_002_000
+        };
+        engine.poll_once(now);
+        matches!(
+            engine.core_state(pcpu),
+            CoreState::Revoking {
+                donor_vm_id: 80,
+                recipient_vm_id: 60,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn test_plane2_core_for_a_woken_vcpu_stays_until_the_agent_reports() {
+        assert!(woken_grant_hold(true));
+    }
+
+    #[test]
+    fn test_plane2_core_for_a_woken_vcpu_stays_at_most_the_hold() {
+        assert!(woken_grant_hold(false));
+    }
+
     /// A woken vCPU of a VM that owns a core shares that core until it has been woken for
     /// `WOKEN_DEMAND_US`. Then it asks for a core of its own and gets the idle one. Its time is
     /// metered as shared (spec 08 §4.2).

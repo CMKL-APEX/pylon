@@ -229,6 +229,21 @@ assigned. It records when each bit was set, by VM slot and vCPU.
   tick, so a vCPU that wakes for an IPI or a timer and halts again stays
   shared. The longest wake sets the
   VM's urgency, as `head_wait_tsc` does, weighted by its priority.
+- **A core given to a woken vCPU stays wanted until the agent reports.**
+  Once it has the core, the vCPU no longer counts as woken, and
+  `runnable_threads` doesn't show its work until the guest agent's next
+  report. So its VM's desired cores don't drop below the cores it has or
+  is getting for vCPUs that were woken when picked, until
+  `guest_heartbeat` moves or `WOKEN_GRANT_HOLD_US` (50 ms, the agent's
+  default interval) passes. Then the usual demand applies. Without this,
+  a VM that a zero-core wakeup gave a core wanted none in the next
+  sweep, and the donor took it back as over its demand within 0.3 ms,
+  before the vCPU ran on it. A bursty VM traded a core with a busy one
+  every `WOKEN_DEMAND_US` while its burst lasted (§7.3). Holding the
+  core until the vCPU parked doesn't work: an idle vCPU with a core
+  halts inside KVM and parks only when its core is revoked, so an idle
+  VM kept a core for good. The other rules still apply: the donor can
+  take the core back for its fair share or its urgency.
 - **Which vCPU gets the core:** a vCPU in `stranded_work_bitmap` first,
   then the longest-woken vCPU, then one with a due timer, then the first
   parked vCPU. Stranded tasks can't run until their vCPU has a core,
@@ -578,6 +593,26 @@ Run time is the vCPU threads' time on a CPU, summed from the harness's
 samples. VM 2's bursts spin for a fixed 100 ms of wall time, so equal
 run time means they got as much done. No run had a lockup or an RCU
 stall. P2's figures include its own changes (§4.2 on its branch).
+
+**P2's extra preemptions were zero-core wakeups given back at once.**
+Logging every revocation in a P2 bursty run on `main` showed 207 of 590
+were VM 2 taking a core for a long wake, and most of the rest VM 1
+taking it back as over VM 2's demand, 0.1 to 0.3 ms later. VM 2's vCPU
+no longer counted as woken once it had the core, and the guest agent
+hadn't reported the burst yet. During each burst the two traded a core
+every `WOKEN_DEMAND_US`. A core given to a woken vCPU now stays wanted
+until the agent reports again, or for 50 ms (§4.2):
+
+| Run | Forced preemptions (VM 2), before → after | vCPU run time, VM 1 / VM 2 (s), before → after |
+|---|---|---|
+| P2, VM 2 idle | 97 → 57 | 695 / 16 → 696 / 15 |
+| P2, VM 2 bursty (2 runs) | 335 and 386 → 85 and 121 | 692 / 21 and 693 / 22 → 687 / 20 and 687 / 23 |
+
+P2 is now at P1's level. VM 2's metered core time was 3 to 11 s. A
+first version held the core until its vCPU parked. An idle vCPU with a
+core halts inside KVM and parks only when its core is revoked, so VM 2
+kept a core for the whole run (173 s of core time) and VM 1 lost a
+quarter of its run time.
 
 ## 8. Alternatives Considered
 
