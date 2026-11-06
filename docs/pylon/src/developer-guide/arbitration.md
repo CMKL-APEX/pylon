@@ -114,7 +114,13 @@ VMM measured for vCPU 0. Everything else is already host TSC.
 Each long wake then raises desired cores to at least committed cores
 plus one, up to `max_cores`. That catches demand `runnable_threads`
 misses, such as work in the guest kernel or since the agent's last
-report.
+report. Last, desired cores don't drop below the cores the VM has or is
+getting for vCPUs that were woken when phase 3 picked them, until the
+guest agent reports again (`guest_heartbeat` moves) or
+`WOKEN_GRANT_HOLD_US` (50 ms) passes. Such a vCPU no longer counts as
+woken once it has its core, and `runnable_threads` shows its work only
+from the agent's next report: its VM would otherwise give the core back
+in the next sweep, before the vCPU ran on it.
 
 **Urgency** orders VMs in phase 3. `head_wait` is `now_tsc -
 head_wait_tsc` (0 if the guest reports no waiting thread), or the
