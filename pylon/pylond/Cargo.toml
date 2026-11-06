@@ -17,7 +17,15 @@ path = "src/bin/pylon_bench.rs"
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = "1.7"
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = [
+  "color",
+  "derive",
+  "error-context",
+  "help",
+  "std",
+  "suggestions",
+  "usage",
+] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }

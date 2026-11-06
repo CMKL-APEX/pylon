@@ -10,7 +10,15 @@ name = "scx_pylon"
 path = "src/main.rs"
 
 [dependencies]
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = [
+  "color",
+  "derive",
+  "error-context",
+  "help",
+  "std",
+  "suggestions",
+  "usage",
+] }
 env_logger = { workspace = true }
 libbpf-rs = "0.24"
 libbpf-sys = { version = "1.4", features = ["vendored-libbpf"] }
