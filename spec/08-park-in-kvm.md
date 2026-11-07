@@ -515,7 +515,8 @@ pinned task shows the same cause every time. The `scx_pylon` live test
 - In the same trace, a timer interrupt reached a vCPU halted by a
   cooperative park, but KVM didn't enter the guest. That is unexplained.
   One suspect is an x86 interrupt shadow (just after `sti`), which the
-  `RFLAGS.IF` check of §3.4 doesn't see.
+  `RFLAGS.IF` check of §3.4 doesn't see. Later runs found no park in a
+  shadow (below).
 
 **With the bound of §3.6 and the backoff of §3.4:**
 
@@ -613,6 +614,40 @@ first version held the core until its vCPU parked. An idle vCPU with a
 core halts inside KVM and parks only when its core is revoked, so VM 2
 kept a core for the whole run (173 s of core time) and VM 1 lost a
 quarter of its run time.
+
+**The hold costs VM 1 no measurable run time.** In the runs above VM 1
+ran about 1% less with the hold. Four more bursty runs of each, on
+`main` with the hold and with `WOKEN_GRANT_HOLD_US` set to 0, alternated:
+
+| Hold | VM 1 vCPU run time (s) | VM 2 forced preemptions |
+|---|---|---|
+| 50 ms | 695.5, 687.4, 697.5, 688.2 (mean 692.2) | 113, 89, 115, 102 |
+| Off | 696.0, 699.9, 691.3, 691.9 (mean 694.8) | 302, 332, 384, 336 |
+
+The means differ by 0.4%, less than the spread within each set. No run
+had a lockup or an RCU stall.
+
+**The remaining trades follow VM 2's bursts.** Logging every revocation
+in a bursty run with the hold showed 174 revocations, against 590
+before:
+- 47 were VM 2 taking a core for a long wake. It went back about 60 ms
+  later (median), once the hold ended and the agent no longer reported
+  the burst.
+- 22 were VM 2 taking a core as under its fair share, after the agent
+  reported runnable threads. Each went back at the agent's next report,
+  50.3 ms later (median), once the burst was over. There were 57 before.
+- Most of the rest were VM 1 taking those cores back.
+
+So each core moves once per report period, and VM 2 keeps an idle core
+for at most one period after a burst: about 1 s of core time per run.
+Reporting more often would cut that, at a cost in guest CPU.
+
+**No park happened in an interrupt shadow.** A temporary build read the
+shadow state (`KVM_GET_VCPU_EVENTS`) at each park. Over 332 parks in a
+bursty and an idle P2 run, 184 of them forced, none was inside a shadow.
+That doesn't rule out a rare case, but nothing here needs a check for
+it. Of the 320 parks that weren't boot parks, 300 ended by the bound of
+§3.6 rather than by a wake.
 
 ## 8. Alternatives Considered
 
