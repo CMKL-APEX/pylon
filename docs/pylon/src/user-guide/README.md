@@ -8,7 +8,7 @@ It assumes a host where `pylond` already runs. To set one up, read the
 
 | Page | What it covers |
 |---|---|
-| [Running a Pylon VM](pylon-vms.md) | The `--pylon` option, choosing vCPU counts and policy, and what happens at boot and shutdown. |
+| [Running a Pylon VM](pylon-vms.md) | The `--pylon` option, choosing vCPU counts and policy, what happens at boot and shutdown, and parking inside KVM. |
 | [Inside the guest](guest.md) | What the guest sees, how it reports demand, and `pylon-guest-agent`. |
 
 If you use Glidex, you don't write `--pylon` yourself: Glidex builds it

@@ -12,7 +12,7 @@ pylond [--socket <path>] [--socket-group <group>] [--socket-mode <mode>]
 | `--socket <path>` | `/run/pylon/pylond.sock` | Control socket. Its parent directory is created if needed, and an existing file at the path is removed first. |
 | `--socket-group <group>` | `pylond`'s group | Group that owns the socket: a name or a numeric GID. |
 | `--socket-mode <mode>` | `pylond`'s umask | The socket's permission bits, in octal, such as `660` or `0o660`. VMMs need write permission to register. |
-| `--cores <list>` | `2-7` | Managed host CPUs: a comma-separated list of CPUs and ranges, such as `2-7` or `4-15,20-31`. Must not include 0 or 1, which `pylond` uses itself. |
+| `--cores <list>` | `2-7` | Managed host CPUs: a comma-separated list of CPUs and ranges, such as `2-7` or `4-15,20-31`. Must not include 0 or the engine CPU, which `pylond` uses itself. |
 | `--engine-cpu <cpu>` | `1` | Host CPU the Plane 2 polling engine pins itself to. It busy-polls, so it should not be in `--cores`; `pylond` warns if it is. |
 | `--enable-scx` | off | Attach `scx_pylon`, or exit with an error if it can't be attached. Conflicts with `--no-scx`. |
 | `--no-scx` | off | Never attach `scx_pylon`. |
@@ -42,12 +42,15 @@ assumes the architectural rate or, on x86_64, 3 GHz, and says so.
 |---|---|
 | `RUST_LOG` | Log level for `env_logger` (`error`, `warn`, `info`, `debug`, `trace`). Logs go to standard error. |
 
+`PYLON_PARK_IN_KVM` is read by the VMM, not by `pylond`
+([VMs that park inside KVM](../operator-guide/pylond.md#vms-that-park-inside-kvm)).
+
 ## Threads
 
 | Thread | CPU | Role |
 |---|---|---|
 | main (Tokio, single-threaded) | 0 | Control plane and metrics server |
-| `pylond-engine` | 1 | Arbitration engine |
+| `pylond-engine` | `--engine-cpu` (default 1) | Arbitration engine |
 
 ## Exit
 

@@ -19,7 +19,8 @@ going through the normal scheduler.
 > **Status.** Pylon is under active development. Core arbitration,
 > parking and waking, metering and the `sched_ext` dispatcher work.
 > Cooperative revocation, which is how a running VM is asked to give a
-> core back, doesn't work end to end yet. See [Status and
+> core back, doesn't work end to end yet. Parking vCPUs inside KVM is
+> a prototype behind an environment variable. See [Status and
 > roadmap](status.md) before relying on any behavior.
 
 ## Features

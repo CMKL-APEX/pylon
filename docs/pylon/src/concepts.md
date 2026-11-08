@@ -7,10 +7,10 @@ uses for them.
 
 | Part | What it is | Where it runs |
 |---|---|---|
-| **Pylon VMM** | Cloud Hypervisor with the `--pylon` option. It creates the VM's shared page, maps it into the guest, registers the VM with `pylond`, and parks and wakes vCPU threads. | One process per VM, on the host. |
+| **Pylon VMM** | Cloud Hypervisor with the `--pylon` option. It creates the VM's shared page, maps it into the guest, adds the `pylon-kick` PCI device, registers the VM with `pylond`, and parks and wakes vCPU threads. | One process per VM, on the host. |
 | **`pylond`** | The per-host *core arbiter*. It decides which vCPU runs on which managed host CPU. | One daemon per host, on host cores 0 and 1. |
 | **`scx_pylon`** | A Linux `sched_ext` BPF scheduler. It runs the vCPU thread that `pylond` assigned to each CPU. Optional. | In the host kernel. |
-| **Guest side** | Code in the guest that reports demand into the shared page. Today that's `pylon-guest-agent`, a userspace daemon. | Inside the VM. |
+| **Guest side** | Code in the guest that uses the shared page. `pylon-guest-agent`, a userspace daemon, reports demand. The optional `pv-pylon` kernel module parks a vCPU when `pylond` asks for its core back. | Inside the VM. |
 | **`pylon-abi`** | The `#![no_std]` Rust crate that defines the shared page's layout. Every other part uses it. | Compiled into all of the above. |
 
 ## The words
@@ -32,14 +32,22 @@ next timer fires.
 | State | Meaning |
 |---|---|
 | `RUNNING` | The vCPU thread runs guest code. |
-| `PARKED` | The vCPU thread is blocked in the VMM, waiting to be woken. It uses no CPU. |
+| `PARKED` | The vCPU thread is blocked in the VMM, waiting to be woken. It uses no CPU. A VM that parks inside KVM (below) keeps a parked vCPU halted in KVM instead. |
 | `WAKING` | Defined but no longer written: a vCPU that has just been given a core stays `PARKED` until its thread wakes and the VMM writes `RUNNING`. |
-| `PARKING` | The guest asks to park this vCPU. The VMM parks it at its next exit to userspace. No guest component writes it yet (see [Enhancements](developer-guide/enhancements.md)). |
+| `PARKING` | The guest asks to park this vCPU. The VMM parks it at its next exit to userspace. The `pv-pylon` module writes it when `pylond` revokes the vCPU (see [Inside the guest](user-guide/guest.md#parking-cooperatively-the-pv-pylon-module)). |
 
 **Park and wake.** *Parking* a vCPU blocks its host thread on an
 `eventfd` instead of running `KVM_RUN`. *Waking* it writes that
 `eventfd`. To the guest, a parked vCPU looks like a vCPU that isn't
 being scheduled.
+
+**Parking inside KVM.** A prototype, turned on with
+`PYLON_PARK_IN_KVM=1` in the VMM's environment. A parked vCPU stays
+inside `KVM_RUN`, halted, so an interrupt such as a timer or an IPI
+wakes it. A woken vCPU runs on its VM's CPUs without a core of its own,
+and stays `PARKED`. `pylond` gives it a core if it stays woken for 4 ms.
+It is meant to run with `scx_pylon`. See [Status and
+roadmap](status.md).
 
 **Assign.** `pylond` *assigns* a managed CPU to one vCPU of one VM. It
 records the assignment in the vCPU's slot (`assigned_pcpu`) and in the
@@ -54,13 +62,15 @@ as a **forced preemption**: `pylond` signals the donor's thread so the
 VMM parks it, and hands the core over once it has. If the donor still
 hasn't parked 50 µs after the first signal, `pylond` hands the core over
 anyway, which is counted as a **handoff without park**. It keeps
-signalling that donor until it parks. See [Status and roadmap](status.md)
+signalling that donor until it parks, waiting longer between signals
+each time, up to 1 ms. See [Status and roadmap](status.md)
 for how much of this path works today.
 
-**Critical section.** The guest sets a vCPU's `in_critical_section`
-while it holds a spinlock, handles an interrupt or has preemption
-disabled. `pylond` prefers donors that aren't in one, because
-preempting a lock holder stalls every other vCPU waiting for that lock.
+**Critical section.** A vCPU's `in_critical_section` is meant to be
+set while the guest holds a spinlock, handles an interrupt or has
+preemption disabled on it. `pylond` prefers donors that aren't in one,
+because preempting a lock holder stalls every other vCPU waiting for
+that lock. No guest component sets it yet.
 
 **Policy.** Each VM has `min_cores`, `max_cores` and a
 `priority_weight`. They are set with `--pylon` at boot and can be
@@ -73,7 +83,8 @@ a large boost, and a VM waking from zero cores gets the maximum.
 
 **Scale to zero.** A VM with no cores at all. `pylond` wakes it when a
 guest timer comes due: one that was armed on a vCPU when the VMM parked
-it, or the guest's `next_timer_tsc`.
+it, or the guest's `next_timer_tsc`. A VM that parks inside KVM is
+woken instead when one of its vCPUs stays woken for 4 ms.
 
 **Core-microseconds.** The metering unit: one managed CPU assigned to a
 VM for one microsecond.

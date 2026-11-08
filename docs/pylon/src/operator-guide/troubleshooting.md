@@ -20,8 +20,10 @@ doesn't see the rejection, so look in `pylond`'s log.
 `pylond` wakes a parked vCPU only when its VM reports demand above the
 cores it already has. Check `runnable_threads` in the stats:
 
-- **Always `0`:** nothing in the guest writes demand. Run
-  [`pylon-guest-agent`](../user-guide/guest.md) in the guest.
+- **Always `0`, even while the guest is busy:** nothing in the guest
+  writes demand. Run [`pylon-guest-agent`](../user-guide/guest.md) in
+  the guest. (The agent doesn't count itself, so an idle guest
+  reports `0`.)
 - **Above zero, but `current_cores` doesn't grow:** check that the VM's
   `max_cores` is above its current cores, and that a managed CPU is free
   or a donor VM is above its `min_cores`. On a host where every
@@ -34,9 +36,10 @@ cores it already has. Check `runnable_threads` in the stats:
 
 The guest sees parked vCPUs as online. Work queued on them, and
 interprocessor interrupts sent to them (for example TLB shootdowns),
-wait until `pylond` wakes the vCPU. Until the guest kernel module
-exists, keep `initial_active_vcpus` high enough for the guest's normal
-load. This is a known open question in the design (spec 06, Q2).
+wait until `pylond` wakes the vCPU. Keep `initial_active_vcpus` high
+enough for the guest's normal load. This is a known open question in
+the design (spec 06, Q2). [Parking inside KVM](pylond.md#vms-that-park-inside-kvm),
+a prototype, lets an interrupt wake a parked vCPU instead.
 
 One case to avoid in particular: a process that has to keep running,
 such as the guest agent, sitting on a parked vCPU. If it is the only
@@ -46,8 +49,9 @@ other must-run process a CPU among the initial vCPUs too.
 
 ## Forced preemptions are high
 
-That's expected for now: the guest isn't told about revocations, so
-donors don't park within the grace period
+That's expected for now. A guest without the `pv-pylon` module never
+parks cooperatively, and with it the cooperative park is still slower
+than the 8 µs grace period
 ([Status](../status.md#what-doesnt-work-yet)). `pylond` then signals the
 donor's vCPU thread and the VMM parks it.
 
@@ -55,7 +59,7 @@ donor's vCPU thread and the VMM parks it.
 
 `pylond` gave a core away because the donor hadn't parked 50 µs after
 it was first signalled. `pylond` keeps signalling that donor until it
-parks. Check:
+parks, at intervals that double up to 1 ms. Check:
 
 - **The VMM is a version from before `kick_signal`.** Such a VMM
   registers without one, so `pylond` can't signal it. Upgrade it.
@@ -63,6 +67,32 @@ parks. Check:
   or `CAP_KILL`.
 - **The vCPU thread is stuck outside `KVM_RUN`**, for example in a slow
   device exit. The donor parks at its next exit; look at the VMM's log.
+- **The VM parks inside KVM and the guest has interrupts disabled**
+  (x86_64). The VMM doesn't park such a vCPU until the guest enables
+  them again.
+
+## vCPUs beyond `initial_active_vcpus` never park
+
+The VMM starts every vCPU so the guest can bring it online. `pylond`
+asks it to park the extra ones only once `pylon-guest-agent` has
+written its first heartbeat, and then logs `VM <id>: asked <n> booted
+vCPU(s) to park`. If that line never appears, start the agent in the
+guest. `pylon-guest-agent --status` shows the heartbeat.
+
+## A VM that parks inside KVM
+
+Check the VMM's log for `Pylon: VM <id> parks vCPUs inside KVM`. If it
+is missing, `PYLON_PARK_IN_KVM=1` wasn't in the VMM's environment.
+
+- **`woken_shared_microseconds` and `woken_unowned_microseconds` stay at
+  `0` under load:** `scx_pylon` isn't attached, so woken vCPUs run on
+  any CPU and `pylond` doesn't see them ([below](#scx_pylon-isnt-attached)).
+- **`Pylon: failed to turn halt polling off`:** parked vCPUs may poll
+  in KVM and use host CPU.
+- **A parked vCPU runs while `pylond` shows no core for it:** expected.
+  KVM runs a parked vCPU when an interrupt arrives, and a vCPU parked by
+  the guest or a revocation runs again after 4 ms. Its state stays
+  parked until `pylond` gives it a core.
 
 ## The host feels sluggish after pylond starts
 

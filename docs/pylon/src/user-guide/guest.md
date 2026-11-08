@@ -1,8 +1,9 @@
 # Inside the guest
 
 Pylon needs no changes to the guest to boot it. Without a guest
-component, though, `pylond` has no demand signal. Its vCPUs below
-`initial_active_vcpus` run, and the parked ones stay parked. This page
+component, though, `pylond` has no demand signal, and no heartbeat
+tells it that the guest has booted. Every vCPU keeps running, and the
+VM behaves like an ordinary one. This page
 explains what the guest sees and how it reports demand.
 
 ## What the guest sees
@@ -10,7 +11,10 @@ explains what the guest sees and how it reports demand.
 - **All vCPUs are online.** A parked vCPU is still online in the guest.
   It just isn't scheduled on the host, the way a vCPU of an overcommitted
   host sometimes isn't. The guest's scheduler may put work on it; that
-  work waits until `pylond` wakes the vCPU.
+  work waits until `pylond` wakes the vCPU. A VM that [parks inside
+  KVM](pylon-vms.md#parking-inside-kvm) is different: an interrupt sent
+  to a parked vCPU wakes it, and it runs for a while without a core of
+  its own.
 - **The shared page**, 8 KiB at guest-physical address `0xFEDF_0000`
   (or the `gpa` you set). It starts with the header: magic
   `0x5059_4C4F_4E56_4D31` (`"PYLONVM1"`), ABI version `2`, the number of
@@ -47,8 +51,11 @@ cargo build --release -p pylon-guest-agent
 ./pylon-guest-agent --status              # print the page and exit
 ```
 
-It needs root, and a guest kernel that allows `/dev/mem` mappings of the
-page's address. All its options are in [Other
+It needs root. Without `pv-pylon`, it also needs a guest kernel that
+allows `/dev/mem` mappings of the page's address. It pins itself to
+guest CPU 0; pick another with `--cpu`, but only one of the
+`initial_active_vcpus`, since an agent on a parked vCPU can't report
+demand. All its options are in [Other
 tools](../reference/tools.md#pylon-guest-agent).
 
 The agent only writes telemetry. It leaves vCPU states and revocation

@@ -3,7 +3,8 @@
 This page collects Pylon's performance figures: what was run, where,
 when and how, and how to run it again. There are few so far. Pylon has
 **no measurement of a real core handoff between real VMs yet**: that is
-step S6 of [Enhancements](enhancements.md#implementation-steps).
+step S6 of [Enhancements](enhancements.md#implementation-steps)
+([#53](https://github.com/CMKL-APEX/pylon/issues/53)).
 
 ## How to read the numbers
 
@@ -54,7 +55,8 @@ computed the same checksum.
 **What it does and doesn't show.** The Pylon column is the time to wake
 and park threads through the real engine and `eventfd`s on a busy host.
 Pylon's latency budget is a few microseconds, and 138 µs is far above
-it. The reason hasn't been investigated: thread scheduling without
+it. The reason hasn't been investigated
+([#54](https://github.com/CMKL-APEX/pylon/issues/54)): thread scheduling without
 `scx_pylon` assignments for these worker threads, the engine sharing
 CPUs with the workload, and the benchmark's own polling are all
 candidates. The ACPI column is mostly the injected delays, so the ratio
@@ -160,11 +162,18 @@ be claimed:
 
 - The engine's sweep time, by number of VMs.
 - Kick to `PARKED`, and revocation to recipient running, between real
-  VMs, with and without `scx_pylon` (step S6). `pylond` now records
-  revocation-to-`PARKED` latency per VM
+  VMs, with and without `scx_pylon` (step S6,
+  [#53](https://github.com/CMKL-APEX/pylon/issues/53)). `pylond` now
+  records revocation-to-`PARKED` latency per VM
   (`pylon_vm_park_latency_microseconds`), but no run has been recorded
   yet.
 - Wake latency of a parked vCPU in a real VM.
+- For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
+  guest throughput against the `eventfd` park, and halt-polling
+  settings (spec 08 P3,
+  [#50](https://github.com/CMKL-APEX/pylon/issues/50)). Spec 08 §7
+  records stall and preemption counts from its prototype runs, not
+  latencies.
 - `scx_pylon`'s cost for non-VM tasks on the host, beyond the
   benchmark's threads above.
 - The same `pylon-bench` run on a CPU with `WAITPKG`.

@@ -70,12 +70,25 @@ which looks there by default.
    fails, the VMM logs a warning and boots anyway. **It doesn't retry**,
    so start `pylond` before the VMs.
 3. The VMM maps the page into guest memory at `gpa`.
-4. Each vCPU thread records its host thread ID in its slot. vCPUs below
-   `initial_active_vcpus` go straight to `RUNNING`. The others park on
-   their wake `eventfd` before entering the guest.
+4. Each vCPU thread records its host thread ID in its slot and enters
+   the guest as `RUNNING`. vCPUs from `initial_active_vcpus` on are also
+   tagged `park_on_boot`.
+5. When the guest agent's first heartbeat arrives, `pylond` asks the
+   VMM to park the tagged vCPUs. They park at once, and these parks
+   don't count as yields.
 
 From then on, `pylond` wakes parked vCPUs when the guest reports
 demand and a managed CPU is free.
+
+## Parking inside KVM
+
+Set `PYLON_PARK_IN_KVM=1` in the VMM's environment to park vCPUs inside
+KVM instead of in the VMM. There is no `--pylon` key for it. A parked
+vCPU then stays halted in KVM, so a timer or an IPI wakes it, and the
+VMM logs `parks vCPUs inside KVM` at info level when it starts. Run it on a host where
+`pylond` has attached `scx_pylon`: without it, a woken vCPU runs on any
+CPU. It is a prototype; see [Status and roadmap](../status.md) and
+[The scx_pylon dispatcher](../developer-guide/scx-pylon.md).
 
 ## What happens at shutdown
 
@@ -91,7 +104,8 @@ CPUs the VM held. The VM's `vm_id` is then free for its next start.
 ## Things to avoid
 
 - **Snapshot, restore and live migration.** Pylon state isn't saved or
-  moved, and the VMM doesn't refuse these operations.
+  moved, so the VMM refuses to snapshot or migrate a VM with `--pylon`:
+  its `pylon-kick` device fails the snapshot.
 - **vCPU hotplug** (`ch-remote resize`). It isn't coordinated with
   Pylon.
 - **Two VMs on one `shm` path.** Each would zero the other's page.

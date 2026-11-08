@@ -18,7 +18,9 @@ pub struct PylonVmmState {
     shm_file: File,
     shared_page: NonNull<PylonSharedPage>,   // mmap of shm_file, MAP_SHARED
     kick_eventfds: Vec<EventFd>,             // sent to pylond; pylon-kick's MSI-X notifiers
-    wake_eventfds: Vec<EventFd>,             // blocking, parked threads read them
+    wake_eventfds: Vec<EventFd>,             // sent to pylond; blocking, or non-blocking with park in KVM
+    parked_in_kvm: Vec<AtomicBool>,          // per vCPU: parked inside KVM
+    park_bounds: Vec<ParkBound>,             // per vCPU: timer and deadline that bound a park in KVM
     shutting_down: AtomicBool,
 }
 ```
@@ -40,7 +42,8 @@ breaks that argument.
 
 ### Configuration: `parse_and_configure`
 
-Called from `VmConfig` parsing in `vmm/src/config.rs`. It parses
+Called at the end of `VmConfig::parse` in `vmm/src/config.rs`, after
+validation. It parses
 `--pylon`, then builds and installs `PylonVmmState` (creating the page
 and registering with `pylond`). Building the state during option
 parsing is a side effect in an unusual place: it happens before the VM
@@ -49,24 +52,46 @@ exists, and spec 06 moves registration later for that reason.
 The registration message carries `kick_signal`: the VMM's own
 `SIGRTMIN()`, the signal its vCPU threads have a no-op handler for.
 `pylond` sends it to a donor vCPU whose revocation deadline has passed.
-`PylonVmmState::new` also sets every slot's `assigned_pcpu` to
+With park in KVM, the message also carries `wake_by_signal: true`
+([Control socket protocol](../reference/control-socket.md#registration)).
+The VMM registers only if the socket exists, and doesn't read the
+reply. `PylonVmmState::new` also sets every slot's `assigned_pcpu` to
 `PCPU_UNASSIGNED`, which `pylond` reads as "no core on its way".
 
 ### Memory: `setup_memory_region`
 
 Called from `MemoryManager::new` in `vmm/src/memory_manager.rs`. It
-wraps a clone of the `shm` file descriptor in a `GuestRegionMmap` at
-`gpa`, inserts it into `GuestMemoryMmap`, and registers it with the
-hypervisor as a new memory slot (`MemoryVisibility::Shared`). Errors
-surface as `memory_manager::Error::Pylon`.
+wraps a clone of the `shm` file descriptor in a guest region at `gpa`
+and registers it with the hypervisor as a new memory slot
+(`MemoryVisibility::Shared`). It doesn't add the region to the guest's
+memory map, like a device BAR
+([Shared-memory ABI](shared-memory-abi.md#the-page-in-guest-memory));
+`MemoryManager` keeps the region alive. With park in KVM it also turns
+halt polling off for the VM (`KVM_CAP_HALT_POLL` set to 0) and only logs
+a warning if that fails. Errors surface as
+`memory_manager::Error::Pylon`.
+
+### Backend check: `check_hypervisor`
+
+Called from `CpuManager::new`. It fails VM creation with `--pylon` on
+MSHV on aarch64, which can't read the guest's counter and timer.
+
+### Kick device
+
+`DeviceManager` adds the `pylon-kick` PCI device
+(`vmm/src/pylon_kick.rs`) when `--pylon` is given. Its MSI-X notifiers
+are the kick `eventfd`s, and its BAR0 holds the park doorbell
+([Enhancements](enhancements.md#kick-delivery-the-pylon-kick-pci-device)).
 
 ### vCPU start: `on_vcpu_thread_start`
 
 Called at the top of each vCPU thread in `vmm/src/cpu.rs`, after the
 thread barrier and before the first `KVM_RUN`. It stores `gettid()` in
-the slot's `host_tid`, sets `RUNNING`, and for
-`vcpu_id >= initial_active_vcpus` also sets the slot's `park_on_boot`
-tag. It doesn't park those vCPUs: a guest brings its secondary CPUs
+the slot's `host_tid`, measures the guest counter offset into
+`guest_tsc_offset` ([Time bases](shared-memory-abi.md#time-bases)), sets
+`RUNNING`, and for `vcpu_id >= initial_active_vcpus` also sets the
+slot's `park_on_boot` tag. With park in KVM it also creates the vCPU's
+park bound timer. It doesn't park those vCPUs: a guest brings its secondary CPUs
 online at boot (`PSCI CPU_ON` on aarch64, INIT/SIPI on x86_64), and a
 vCPU whose thread never enters `KVM_RUN` doesn't answer, so the guest
 waits for it, gives up, and boots without it. Once the guest has
@@ -88,12 +113,17 @@ exit to userspace. It applies the decision table from spec 06 §4.4
 | other | 1 | not passed | Keep running: the guest hasn't agreed and may hold a lock |
 | other | 0 | — | Keep running |
 
+A vCPU already parked inside KVM skips this table; see
+[Parking inside KVM](#parking-inside-kvm).
+
 `now` is the host counter (the TSC, or `CNTVCT_EL0` on aarch64), the clock `pylond` writes deadlines in. To park,
 it clears `revoke_requested`, increments `yield_count` (and
 `forced_preempt_count` for a forced park), records `last_yield_tsc`,
-publishes `PARKED` with `Release`, blocks on the wake `eventfd`, and
-sets `RUNNING` again on wakeup (unless shutting down). A boot park
-skips the counters and clears `park_on_boot` instead.
+records the guest's armed timer as `park_timer_deadline_tsc`, publishes
+`PARKED` with `Release`, blocks on the wake `eventfd`, and on wakeup
+clears `park_timer_deadline_tsc` and sets `RUNNING` again (unless
+shutting down). A boot park skips the counters and clears
+`park_on_boot` instead.
 
 Under KVM with an in-kernel LAPIC, a running vCPU exits to userspace
 only for MMIO, PIO, signals and similar, so on its own this check runs
@@ -104,13 +134,13 @@ passes (S2).
 Before S1, this hook parked on any exit while `revoke_requested` was
 set, and was also called from the `VmExit::Reset` arm, where KVM
 reports triple faults. Both are gone
-([Enhancements](enhancements.md#problems-in-the-current-revocation-path)).
+([Enhancements](enhancements.md#problems-in-the-original-revocation-path)).
 
 ### Shutdown: `shutdown_all`
 
-Called from `CpuManager::shutdown`. It sets `shutting_down` and writes
+Called from `CpuManager::shutdown`. It sets `shutting_down`, writes
 every wake `eventfd`, so parked threads return and see the VM is
-stopping.
+stopping, and stops the park bound timers.
 
 ## Parking
 
@@ -132,12 +162,78 @@ protocol (`SIGRTMIN`, `vcpu_paused`) doesn't know about it either.
 Pausing a VM with parked vCPUs hasn't been tested.
 <!-- TODO(verify): pause/resume with parked vCPUs. -->
 
+## Parking inside KVM
+
+With `PYLON_PARK_IN_KVM=1` in the VMM's environment
+([The --pylon option](../reference/pylon-option.md#environment)), a
+parked vCPU sleeps in `KVM_RUN` instead of in `park_vcpu`. The design
+and its measurements are in
+[spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md).
+The run loop passes `check_and_park_vcpu` a callback, `kvm_park_op`,
+that runs one `KvmParkOp` on the locked vCPU:
+
+| Op | x86_64 | aarch64 |
+|---|---|---|
+| `InterruptsEnabled` | `RFLAGS.IF` is set | Always true: `WFI` wakes on a masked interrupt |
+| `Halt` | `KVM_MP_STATE_HALTED` | `KVM_MP_STATE_SUSPENDED` |
+| `Run` | `KVM_MP_STATE_RUNNABLE` | `KVM_MP_STATE_RUNNABLE` |
+
+Built without the `kvm` feature, the callback always fails.
+
+**Park.** The decision table is the same. Before publishing anything,
+the VMM checks `InterruptsEnabled` and sets `Halt`. If either fails, the
+vCPU keeps running as if it hadn't been asked, and `pylond` signals it
+again (a halted x86 vCPU with interrupts off wouldn't wake for an IPI).
+Then it updates the slot as above, publishes `PARKED`, marks the vCPU
+parked in KVM, and returns. The run loop's next `KVM_RUN` sleeps until
+an interrupt or a signal.
+
+**Wake by interrupt.** KVM runs the guest again without an exit. The
+VMM doesn't see it, and `state` stays `PARKED`. `scx_pylon` decides
+where the thread runs ([scx_pylon](scx-pylon.md)).
+
+**Wake for a core.** The wake `eventfd` can't reach a thread in
+`KVM_RUN`, so `pylond` also signals the thread. After each exit of a
+vCPU parked in KVM, the VMM:
+
+1. turns `PARKING` back into `PARKED`: a guest park request that came
+   after a forced park is already done (spec 08 §3.7);
+2. reads the non-blocking wake `eventfd`. If it was written, it stops
+   the park bound, sets `Run`, clears `park_timer_deadline_tsc` and
+   publishes `RUNNING`;
+3. otherwise, if the park bound has passed, it sets `Run` and leaves
+   `state` at `PARKED`. The vCPU then runs without a core until it halts
+   again.
+
+**Bound.** A cooperative or forced park (not a boot park) arms a
+per-vCPU POSIX timer that sends `SIGRTMIN` to the vCPU thread after
+`PARK_IN_KVM_BOUND` (4 ms) and every 4 ms after that. It covers a vCPU
+that nothing would wake: no timer armed, or work queued without an IPI
+(spec 08 §3.6).
+
+**Halt polling** is off for the VM (`PARK_IN_KVM_HALT_POLL_NS` = 0),
+so a parked vCPU costs no host CPU. This also affects the guest's own
+`HLT`.
+
+## Seccomp
+
+Pylon adds these rules to `vmm/src/seccomp_filters.rs`:
+
+| Thread | Allowed | Why |
+|---|---|---|
+| vCPU | `KVM_GET_MSRS` (x86_64) | Read the guest TSC and TSC deadline |
+| vCPU | `KVM_GET_ONE_REG` (aarch64) | Read the guest counter and virtual timer |
+| vCPU | `KVM_SET_MP_STATE`, and `KVM_GET_REGS` on x86_64 | Park inside KVM |
+| vCPU and VMM | `timer_create`, `timer_settime`, `timer_delete` | Park bound timers |
+
 ## Tests
 
-`cargo test -p vmm --features kvm --lib pylon` runs eleven tests covering
-option parsing, page initialization, thread-ID registration, initial
-parking, every row of the park decision table, cooperative and forced
-parks, and daemon registration over a real socket. A second real-KVM
+`cargo test -p vmm --features kvm --lib pylon` runs the tests in
+`vmm/src/pylon.rs` and `vmm/src/pylon_kick.rs`. They cover option
+parsing, page initialization, thread-ID registration, boot parks, every
+row of the park decision table, cooperative and forced parks, the guest
+counter offset and timer conversion, parking inside KVM (with a fake
+`KvmParkOp` callback), and daemon registration over a real socket. A second real-KVM
 test runs a guest that never agrees to park, sends its vCPU thread
 `SIGRTMIN` with `tgkill` as `pylond` does, and checks that `KVM_RUN`
 returns and the VMM force-parks the vCPU. One test boots a minimal real-mode KVM guest that reads and writes

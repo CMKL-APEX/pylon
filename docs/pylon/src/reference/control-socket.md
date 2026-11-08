@@ -37,6 +37,12 @@ thread when a revocation's deadline passes. It must be a real-time
 signal. Without it, `pylond` never signals the VMM. `pylond` takes the
 VMM's PID from the socket's peer credentials, not from the message.
 
+`wake_by_signal` (optional, default `false`) is sent as `true` by a VMM
+that parks vCPUs inside KVM (`PYLON_PARK_IN_KVM=1`, spec 08). The wake
+`eventfd` can't reach a thread blocked in `KVM_RUN`, so `pylond` also
+sends `kick_signal` when it assigns a core, and again until the vCPU
+leaves `PARKED`. The VMM leaves the field out when it's `false`.
+
 Attached descriptors, in order: the shared page's file, then
 `num_vcpus` kick `eventfd`s, then `num_vcpus` wake `eventfd`s (1 + 2 ×
 `num_vcpus` in all).
@@ -46,7 +52,11 @@ Attached descriptors, in order: the shared page's file, then
 | `{"accepted": true, "message": "registered"}` | The page's header is valid and the `vm_id` is free. An earlier registration of the same `vm_id` is replaced only if its VMM has exited. |
 | `{"accepted": false, "message": "...a running VMM already registered this vm_id"}` | Another VM with this `vm_id` is registered, and its VMM is still running. |
 | `{"accepted": false, "message": "expected <n> FDs, got <m>"}` | Wrong number of descriptors. |
-| `{"accepted": false, "message": "<error>"}` | The page couldn't be mapped, its header is invalid, `kick_signal` isn't a real-time signal, or a pidfd for the peer couldn't be opened. |
+
+`pylond` logs every rejection as a warning, because the VMM doesn't read
+the response. A registration whose JSON doesn't parse gets no response.
+A registration's `priority_weight` of 0 is stored as 1.
+| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the page couldn't be mapped, is smaller than 8,192 bytes or its header is invalid; or a pidfd for the peer couldn't be opened. |
 
 ## Stats
 
@@ -86,11 +96,11 @@ Attached descriptors, in order: the shared page's file, then
 |---|---|---|
 | `current_cores` | `u32` | vCPUs with an assigned CPU whose state isn't `PARKED`. |
 | `allocated_core_microseconds` | `u64` | Core-microseconds metered to the VM since it registered. |
-| `cooperative_yields` | `u64` | Revocations completed by the donor parking. |
+| `cooperative_yields` | `u64` | Revocations completed by the donor parking before its deadline passed. |
 | `forced_preemptions` | `u64` | Revocations whose deadline passed before the donor parked. |
 | `runnable_threads` | `u32` | The guest's last report. |
 | `handoffs_without_park` | `u64` | Revocations where the core was handed over although the donor never parked. Should stay at 0. |
-| `woken_shared_microseconds` | `u64` | Time the VM's parked vCPUs spent woken by KVM while the VM owned a core (spec 08). |
+| `woken_shared_microseconds` | `u64` | Time the VM's parked vCPUs spent woken by KVM while the VM owned a core (spec 08). Always 0 for a VM registered without `wake_by_signal`. |
 | `woken_unowned_microseconds` | `u64` | The same, while the VM owned no core. |
 
 ## Policy update

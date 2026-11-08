@@ -31,11 +31,11 @@ see [The arbitration engine](arbitration.md).
 
 | Process | Owns | Shares |
 |---|---|---|
-| **VMM** (`vmm/src/pylon.rs`) | The shared-page file and its mapping; two `eventfd`s per vCPU; the vCPU threads. | The page (with the guest and `pylond`); the `eventfd`s (with `pylond`). |
-| **`pylond` Plane 1** | The Unix socket; the list of registered VMs, published as an immutable `Arc<Vec<VmHandle>>` through `ArcSwap`. | Each VM's page, mapped from the file descriptor the VMM sent. |
-| **`pylond` Plane 2** | All arbitration state: each managed CPU's `CoreState` (`Idle`, `Assigned`, `Revoking`), per-VM demand records, metering timestamps. None of it is shared or locked. | Writes the pCPU owner table and vCPU slots' host-side fields. |
-| **`scx_pylon`** | Nothing; it only reads. | The owner table, as a memory-mapped BPF array map. |
-| **Guest** | Its telemetry and its vCPU slots' guest-side fields. | The page. |
+| **VMM** (`vmm/src/pylon.rs`) | The shared-page file and its mapping; two `eventfd`s per vCPU; the vCPU threads; the `pylon-kick` PCI device (`vmm/src/pylon_kick.rs`), which turns each kick `eventfd` into an MSI-X interrupt for the guest. | The page (with the guest and `pylond`); the `eventfd`s (with `pylond`). |
+| **`pylond` Plane 1** | The Unix socket; the list of registered VMs, published as an immutable `Arc<Vec<VmHandle>>` through `ArcSwap`. | Each VM's page, mapped from the file descriptor the VMM sent. Writes `scx_pylon`'s `pylon_vcpu_dom` map. |
+| **`pylond` Plane 2** | All arbitration state: each managed CPU's `CoreState` (`Idle`, `Assigned`, `Revoking`), per-VM demand records, metering timestamps. None of it is shared or locked. | Writes the pCPU owner table, vCPU slots' host-side fields, and the `parked` masks in `pylon_vm_vcpus`; reads the `woken` masks. |
+| **`scx_pylon`** | Its run queues and per-CPU claims. | Reads the owner table, `pylon_vcpu_dom` and the `parked` masks; writes the `woken` masks in `pylon_vm_vcpus`. The owner table and `pylon_vm_vcpus` are memory-mapped BPF array maps. |
+| **Guest** | Its telemetry and its vCPU slots' guest-side fields, written by `pylon-guest-agent` and the `pv-pylon` module. | The page. |
 
 ### Why two planes
 
@@ -56,7 +56,8 @@ Policy changes are the one exception: Plane 1 writes them straight into
    vCPU slot.
 2. **VMM → Plane 1.** If `socket` exists, `register_with_daemon` sends
    one message: newline-terminated JSON (`vm_id`, `num_vcpus`, `kick_signal`,
-   `min_cores`, `max_cores`, `priority_weight`), with the file
+   `min_cores`, `max_cores`, `priority_weight`, and `wake_by_signal`
+   when vCPUs park inside KVM), with the file
    descriptors in `SCM_RIGHTS` in this order: the page, the kick
    `eventfd`s, the wake `eventfd`s.
 3. **Plane 1.** Maps the page from the descriptor, checks the header,
@@ -68,9 +69,15 @@ Policy changes are the one exception: Plane 1 writes them straight into
 4. **VMM, memory setup.** `setup_memory_region` maps the same file into
    guest-physical memory at `gpa` as a shared memory slot.
 5. **VMM, vCPU threads.** Each thread stores its `gettid()` in its slot's
-   `host_tid`. Threads at or above `initial_active_vcpus` park on their
-   wake `eventfd` before their first `KVM_RUN`.
+   `host_tid`. The VMM tags vCPUs at or above `initial_active_vcpus`
+   `park_on_boot`, and leaves them running so the guest can bring them
+   online.
 6. **Plane 2.** Sees the VM in its next sweep.
+7. **Plane 1, once a second.** Lists the VM's vCPU threads in
+   `pylon_vcpu_dom`. Once the guest agent has reported
+   (`guest_heartbeat` is non-zero), it sets `revoke_requested` on each
+   tagged vCPU that isn't `PARKED` yet and signals its thread, and the
+   VMM parks it at its next exit.
 
 ## Flow: handing a core to a VM
 
@@ -86,7 +93,10 @@ When a managed CPU is idle (the fast path):
    `assigned_pcpu`, and writes the vCPU's wake
    `eventfd`.
 4. **VMM.** The parked thread's blocking read returns. It sets
-   `state = RUNNING` and enters `KVM_RUN`.
+   `state = RUNNING` and enters `KVM_RUN`. A vCPU parked inside KVM
+   (below) can't see the `eventfd` while it sleeps there, so for such a
+   VM the engine also sends `kick_signal`; at the exit, the VMM finds
+   the `eventfd` written and sets `state = RUNNING`.
 5. **Kernel.** With `scx_pylon` attached, `select_cpu` finds the thread
    in the owner table and `enqueue` queues it on the owned CPU with a
    20 ms slice, renewed unless a task pinned to that CPU is waiting. That CPU's SMT siblings then run only vCPUs of the
@@ -106,13 +116,17 @@ When no managed CPU is idle, the engine takes one from a donor:
    first, it signals the donor's thread with the VMM's `kick_signal`
    until the VMM force-parks it, and gives up waiting 50 µs after the
    first signal ([phase 2](arbitration.md#phase-2-revocations-in-flight)).
-4. **Kernel.** With `scx_pylon`, `dispatch` on that CPU sees a new owner
-   and preempts the donor thread if it's still there.
+4. **Kernel.** With `scx_pylon`, the recipient's `enqueue` finds it
+   owns the CPU, queues it there and kicks the CPU with
+   `SCX_KICK_PREEMPT`. The kick preempts the donor thread if it still
+   runs there, and `dispatch` runs the recipient.
 
-> **Today, step 2 doesn't happen.** Nothing turns the kick into a guest
-> interrupt, and no guest component writes `PARKING`, so every
+> Step 2 needs the `pv-pylon` module in the guest. The kick `eventfd`
+> raises the vCPU's MSI-X vector on the `pylon-kick` device; the
+> module's per-CPU park thread writes `PARKING` and rings the park
+> doorbell, which exits to the VMM. Without the module, every
 > revocation ends with step 3's forced park. See
-> [Enhancements](enhancements.md#problems-in-the-current-revocation-path).
+> [Inside the guest](../user-guide/guest.md#parking-cooperatively-the-pv-pylon-module).
 
 ## Flow: giving a core back
 
@@ -122,8 +136,28 @@ phase sees, on an assigned CPU, `state = PARKED` with
 It meters the time so far, clears the owner entry, sets the slot's
 `assigned_pcpu` to unassigned, and marks the CPU `Idle`.
 
+## Parking inside KVM
+
+With `PYLON_PARK_IN_KVM=1` in the VMM's environment, a vCPU parks inside
+KVM instead
+([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
+The VMM halts it and returns to `KVM_RUN`, which sleeps until an
+interrupt or a signal. An interrupt, such as the guest's timer, runs the
+guest again without an exit and without a core: the vCPU stays
+`PARKED`. `scx_pylon` marks such a vCPU *woken* and runs it on a CPU its
+VM owns, in turns with that CPU's owner. `pylond` reads the woken
+vCPUs, and counts one woken for 4 ms or longer as demand for a core of
+its own. After a
+park the guest or a revocation asked for, the VMM also makes the vCPU
+runnable, still `PARKED`, once it has been parked for 4 ms
+(`PARK_IN_KVM_BOUND`). The engine's side is in
+[The arbitration engine](arbitration.md#vms-that-park-inside-kvm), and
+`scx_pylon`'s in [The scx_pylon dispatcher](scx-pylon.md#callbacks).
+
 ## Threads in a Pylon VMM
 
 Pylon adds no threads to the VMM. It uses the existing vCPU threads:
 they park and wake themselves. A parked vCPU thread is blocked in
 `read(2)` on its wake `eventfd`, outside `KVM_RUN`, holding no locks.
+Inside KVM, it is instead halted in `KVM_RUN`, with a per-thread POSIX
+timer that sends `SIGRTMIN` when the 4 ms bound passes.

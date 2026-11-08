@@ -24,6 +24,9 @@ cargo build -p cloud-hypervisor --features kvm
 BPF target, `libelf` and `zlib`. If a VMM build fails in a way that
 looks feature-related, retry with `--features kvm`.
 
+The `pv-pylon` guest module builds against kernel headers, with `KDIR`
+selecting them: `make -C pylon/guest/linux`.
+
 ## Tests
 
 | Command | Covers | Needs |
@@ -36,6 +39,8 @@ looks feature-related, retry with `--features kvm`.
 | `cargo test -p pylon-guest-agent` | `/proc` parsing, telemetry | — |
 | `cargo test -p vmm --features kvm --lib pylon` | VMM side, including a real KVM guest | `/dev/kvm` |
 | `cargo test -p vmm --features kvm --lib config` and `cargo test -p cloud-hypervisor --features kvm --bin cloud-hypervisor` | `--pylon` parsing in context | — |
+| `cargo test -p arch --features kvm` | The shared page's place in the guest layout | — |
+| `make -C pylon/guest/linux KCFLAGS=-Werror W=1` | `pv-pylon` builds without warnings | Kernel headers |
 
 Add a unit test with every bug fix, and with any non-trivial logic in
 the engine. The engine takes time as an argument (`poll_once(now_tsc)`),
@@ -57,7 +62,7 @@ so tests don't need real time.
 ## Changing a design
 
 1. Change the spec in `spec/` first. For a new design, add a numbered
-   spec (`spec/07-….md`). Keep existing spec paths, because code and
+   spec (`spec/09-….md`). Keep existing spec paths, because code and
    other specs cite them.
 2. Update the status tracker,
    [`spec/05-implementation-status.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md),
@@ -71,8 +76,8 @@ so tests don't need real time.
 
 Commit messages follow `CONTRIBUTING.md`: a component prefix, a subject
 and body within 72 columns, and a `Signed-off-by` trailer. Pylon's
-prefixes include `pylon`, `pylond`, `scx-pylon`, `pylon-abi`, `spec`,
-`docs` and `ci`; the full list is in
+prefixes include `pylon`, `pylond`, `scx-pylon`, `pylon-abi`,
+`pylon-guest-agent`, `spec`, `docs` and `ci`; the full list is in
 [`scripts/gitlint/rules/TitleStartsWithComponent.py`](https://github.com/CMKL-APEX/pylon/blob/main/scripts/gitlint/rules/TitleStartsWithComponent.py).
 
 If an LLM contributed meaningfully to a change, say so in the pull
@@ -83,12 +88,13 @@ LLMs").
 
 | Workflow | Runs |
 |---|---|
-| `pylon-ci.yaml` | Pylon's crates: tests, clippy, the VMM's Pylon tests, release builds and `pylon-bench --quick`. |
+| `pylon-ci.yaml` | Pylon's crates: commit and DCO checks on pull requests, formatting and clippy, tests, the VMM's Pylon tests, release builds and `pylon-bench --quick`; the `pv-pylon` module build and `checkpatch` on x86_64 and aarch64 runners; and clippy and unit tests on a native aarch64 runner (`pylon-aarch64`). |
 | `ci.yaml` | Upstream's workspace checks: formatting, clippy for every hypervisor and feature combination, builds across targets, unit tests. Cross and musl jobs exclude `scx-pylon` and `pylond`. |
 | `pylon-docs.yaml` | Builds this book on pull requests and publishes it on `main`. |
 
 Jobs that need upstream's self-hosted runners are disabled in this
-repository. The current coverage is in the status tracker's
+repository ([#66](https://github.com/CMKL-APEX/pylon/issues/66) tracks
+gating them on the upstream repository instead). The current coverage is in the status tracker's
 [CI coverage](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md#ci-coverage)
 section.
 

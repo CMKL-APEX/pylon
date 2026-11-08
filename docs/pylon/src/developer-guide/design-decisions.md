@@ -4,7 +4,7 @@ This page explains why Pylon is built the way it is. For each choice a
 contributor is likely to question, it gives the decision, the reason,
 what it costs, and when to look at it again. The reasons come from the
 specs ([`spec/00-architecture.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/00-architecture.md)
-to [`06`](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md))
+to [`08`](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md))
 and from pull requests. Where the project hasn't written a reason down,
 this page says so.
 
@@ -40,11 +40,15 @@ waking a thread takes microseconds and needs nothing from the guest.
 
 **Cost.** The guest doesn't know a vCPU is parked. Work it queues there,
 and interrupts it sends there (TLB shootdowns, reschedule IPIs), wait
-until `pylond` wakes the vCPU. Solving that needs guest cooperation:
-spec 06 open question Q2.
+until `pylond` wakes the vCPU (spec 06 open question Q2). Spec 08
+answers this for unmodified guests: with `PYLON_PARK_IN_KVM=1`, the VMM
+parks the vCPU halted inside KVM instead of on the `eventfd`, so an
+interrupt wakes it, and `scx_pylon` runs it on its own VM's CPUs. That
+mode is still a prototype behind an environment variable
+([Enhancements](enhancements.md#parking-inside-kvm-spec-08)).
 
-**Revisit** if the guest side can't be made to treat parked vCPUs as
-preempted.
+**Revisit** once spec 08's measurements (P3) show whether parking
+inside KVM should replace the `eventfd` park.
 
 ## Shared memory on the hot path
 
@@ -102,8 +106,10 @@ bounds how long a recipient can wait for an uncooperative or broken
 guest. The project hasn't recorded why 8 µs specifically. It matches
 the "~3–6 µs" handoff target plus margin.
 
-**Cost.** It needs a working guest-side path to be cooperative at all,
-and that path isn't built yet ([Enhancements](enhancements.md)).
+**Cost.** It needs a guest-side path to be cooperative at all. The
+`pv-pylon` module provides one, but a kick takes about 20 µs to reach
+`PARKED`, longer than the 8 µs grace, so many revocations still end in
+a forced park ([Enhancements](enhancements.md)).
 
 ## `sched_ext` for the kernel side
 
@@ -118,6 +124,8 @@ decision a memory store.
 it's attached, not only for vCPU threads. It needs Linux 6.12 or later.
 `pylond` therefore treats it as optional: it attaches it when it can
 and runs without it otherwise ([#9](https://github.com/CMKL-APEX/pylon/pull/9)).
+Parking inside KVM (spec 08) is the exception: it needs `scx_pylon` to
+keep woken vCPUs on their VM's CPUs.
 
 ## A fixed guest-physical address
 
@@ -126,24 +134,29 @@ and runs without it otherwise ([#9](https://github.com/CMKL-APEX/pylon/pull/9)).
 **Why.** It needs no device model, and a guest can find it with no
 discovery protocol. The reason isn't recorded beyond simplicity.
 
-**Cost.** The address isn't reserved in Cloud Hypervisor's layout. The
-page has its own memory slot but isn't guest RAM, so it stays out of the
-guest's E820 table (it used to be listed as RAM). Spec 06 adds a PCI
-device that reports the address, and §9 plans to move the page into its
-BAR.
+**Cost.** The address is fixed. Pylon declares it in both `arch`
+layouts (`PYLON_SHARED_START`, in the 32-bit reserved hole), but a
+future upstream device could still want it. The page has its own
+memory slot but isn't guest RAM, so it stays out of the guest's E820
+table (it used to be listed as RAM). The `pylon-kick` device reports
+the address in BAR0, and spec 06 §9 plans to move the page into a BAR
+([#59](https://github.com/CMKL-APEX/pylon/issues/59)).
 
 ## Isolate from upstream
 
-**Decision.** New crates under `pylon/`, VMM logic in one new file, and
-one-line hooks in upstream files (spec 00 §2, spec 04 §1).
+**Decision.** New crates under `pylon/`, VMM logic in new files
+(`vmm/src/pylon.rs` and `vmm/src/pylon_kick.rs`), and short hooks in
+upstream files (spec 00 §2, spec 04 §1).
 
 **Why.** Upstream Cloud Hypervisor changes quickly. Every line Pylon
 changes in an upstream file is a possible conflict at each merge.
 
 **Cost.** The VMM side reaches its state through a process-global
 instead of passing it explicitly, and VMM features that need more than a
-hook (the `pylon-kick` device in spec 06) still need a small upstream
-touch.
+hook still need a small upstream touch: the `pylon-kick` device is
+created from `device_manager.rs`, and park inside KVM added
+`Vm::set_halt_poll_ns` to the `hypervisor` crate
+([Organization](organization.md#vmm-hook-points)).
 
 ## JSON over a Unix socket, with SCM_RIGHTS
 
@@ -168,6 +181,10 @@ is no authentication beyond socket permissions.
 Rust guest kernel (spec 00 names Asterinas `ostd`), not only into
 userspace.
 
+**Cost.** The Linux module `pv-pylon` is C, so it can't use the crate.
+It repeats the layout in `pv_pylon_abi.h`, with static assertions on the
+same offsets.
+
 ## A userspace guest agent first
 
 **Decision.** The first guest component is a userspace daemon that
@@ -177,6 +194,6 @@ reads `/proc`.
 build.
 
 **Cost.** It reports demand milliseconds late, can't see critical
-sections and can't act on revocations, and its attempt to act on them
-is wrong (spec 06 P4). Spec 06 makes it telemetry-only and moves
-cooperation into a kernel module.
+sections and can't act on revocations. Its early attempt to act on them
+was wrong (spec 06 P4). Since spec 06 S3 it is telemetry-only, and
+cooperation moved into the `pv-pylon` kernel module (S5).

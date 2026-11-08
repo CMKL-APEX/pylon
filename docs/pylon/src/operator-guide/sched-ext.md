@@ -17,12 +17,19 @@ memory-mapped BPF map, with no system calls. The scheduler reads it:
   at once.
 - **When a CPU needs its next task**, `scx_pylon` dispatches the
   CPU's owner, and preempts the task on that CPU if it isn't the owner.
+- **When KVM wakes a parked vCPU** of a VM that
+  [parks inside KVM](pylond.md#vms-that-park-inside-kvm), `scx_pylon`
+  runs it only on a CPU its VM owns, taking turns with the owner in
+  100 µs slices, and marks it woken for `pylond`. If the VM owns no
+  CPU, the vCPU runs like any other managed vCPU thread.
 - **Every other task** is placed by `sched_ext`'s default CPU selection.
 
 Without `scx_pylon`, the same table exists in `pylond`'s memory but
 nothing reads it. Parked vCPU threads are still woken and blocked
 through `eventfd`s, and the host's fair scheduler decides where and
-when they run.
+when they run. A VM that parks inside KVM needs `scx_pylon`: without
+it, its woken vCPUs run on any CPU and `pylond` doesn't know they
+run.
 
 ## When pylond attaches it
 

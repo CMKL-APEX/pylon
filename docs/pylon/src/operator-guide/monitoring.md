@@ -54,7 +54,8 @@ echo '{"action":"stats","vm_id":17}' | socat - UNIX-CONNECT:/run/pylon/pylond.so
       "allocated_core_microseconds": 81234567,
       "cooperative_yields": 12, "forced_preemptions": 4,
       "runnable_threads": 5,
-      "handoffs_without_park": 0
+      "handoffs_without_park": 0,
+      "woken_shared_microseconds": 0, "woken_unowned_microseconds": 0
     }
   ]
 }
@@ -67,7 +68,9 @@ echo '{"action":"stats","vm_id":17}' | socat - UNIX-CONNECT:/run/pylon/pylond.so
 | `cooperative_yields` | Revocations where the donor vCPU parked within the grace period. |
 | `forced_preemptions` | Revocations where the grace period ran out. `pylond` then signals the donor's vCPU thread so the VMM parks it. |
 | `handoffs_without_park` | Revocations where the donor still hadn't parked 50 µs after it was first signalled, so the core moved anyway. Should stay at 0. |
-| `runnable_threads` | What the guest last reported. `0` if nothing in the guest reports it. |
+| `runnable_threads` | What the guest last reported. `0` if nothing in the guest reports it. The guest agent doesn't count itself. |
+| `woken_shared_microseconds` | Time the VM's parked vCPUs spent woken by KVM while the VM owned a managed CPU, sharing it. Only for VMs that [park inside KVM](pylond.md#vms-that-park-inside-kvm) with `scx_pylon` attached; `0` otherwise. |
+| `woken_unowned_microseconds` | The same, while the VM owned no managed CPU, so its woken vCPUs ran on other CPUs. |
 
 Counters start at zero when the VM registers and are lost when `pylond`
 restarts.
@@ -102,6 +105,7 @@ Useful queries:
 | Average cores per VM over 5 minutes | `rate(pylon_vm_core_microseconds_total[5m]) / 1e6` |
 | p99 revocation-to-park latency per VM | `histogram_quantile(0.99, sum by (vm_id, le) (rate(pylon_vm_park_latency_microseconds_bucket[5m])))` |
 | Cores handed over without a park | `increase(pylon_vm_handoffs_without_park_total[1h])` |
+| Woken parked vCPUs per VM, by whether it owned a core | `rate(pylon_vm_woken_vcpu_microseconds_total[5m]) / 1e6` |
 | Share of revocations that were forced | `rate(pylon_vm_forced_preemptions_total[5m]) / (rate(pylon_vm_forced_preemptions_total[5m]) + rate(pylon_vm_cooperative_yields_total[5m]))` |
 
 While cooperative revocation is incomplete
