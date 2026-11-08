@@ -442,3 +442,4 @@ module_pci_driver(pv_pylon_driver);
 MODULE_DESCRIPTION("Pylon guest kick and cooperative park");
 MODULE_AUTHOR("CMKL-APEX");
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_VERSION("0.0.8-dev");
