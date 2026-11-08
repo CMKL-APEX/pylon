@@ -1,7 +1,9 @@
 # Specification 08: Parking vCPUs Inside KVM
 
-> **Status:** `DRAFT`. Prototype first (§7). P0 is done (§7.1); P1 is done
-> (§7.2); P2–P3 aren't.
+> **Status:** `DRAFT`. Prototype first (§7). P0 (§7.1), P1 (§7.2) and P2
+> (§4.2, results in §7.3) are done; P3, the measurements, isn't (#50). The
+> VMM parks inside KVM only when `PYLON_PARK_IN_KVM` is set; ABI v3 and a
+> real option wait for P3 (#51).
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 

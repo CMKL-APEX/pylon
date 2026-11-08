@@ -1,6 +1,8 @@
 # Specification 07: aarch64 Host & Guest Support
 
-> **Status:** `DRAFT` — design for review. Nothing here is implemented yet.
+> **Status:** `DRAFT`. Tasks A-T0 to A-T7 are done: the aarch64 host side
+> builds, runs and has CI. A-T8 (end to end with a real guest, #62) is in
+> progress and A-T9 (kick path on GICv3 ITS, #63) isn't started.
 > Tracked as **Track 6** in `spec/05-implementation-status.md`. The task board
 > in §9 is the place to claim, track and hand off work.
 
