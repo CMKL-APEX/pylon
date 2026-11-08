@@ -18,8 +18,10 @@ the host on the hot path. Its layout is defined once, in
   that changes is an `AtomicU8`, `AtomicU32` or `AtomicU64`. No reader
   takes a lock.
 - **Fixed size.** The page is exactly two 4 KiB pages. Compile-time
-  assertions check every structure's size and `revoke_requested`'s
-  offset.
+  assertions check every structure's size and alignment, where the
+  header, telemetry and slots start, and the offsets of
+  `park_timer_deadline_tsc`, `revoke_requested`, `park_on_boot`,
+  `host_tid` and `guest_tsc_offset`.
 
 ## Layout
 
@@ -51,7 +53,7 @@ the host on the hot path. Its layout is defined once, in
 |---|---|---|---|---|
 | 0 | `runnable_threads` | `u32` | Runnable threads in the guest, running or queued. | `pylon-guest-agent` |
 | 4 | `rx_ring_cons_idx` | `u32` | Guest network receive ring's consumer index, compared with the host's doorbell to wake a zero-core VM. | Nothing |
-| 8 | `stranded_work_bitmap` | `u64` | Bit *n* set: parked vCPU *n* has queued work. `pylond` wakes those first. | Nothing |
+| 8 | `stranded_work_bitmap` | `u64` | Bit *n* set: parked vCPU *n* has queued work. `pylond` wakes those first. | `pv-pylon`, when it parks a CPU with other runnable tasks |
 | 16 | `head_wait_tsc` | `u64` | Guest TSC since which runnable threads have waited for a vCPU; `0` if none. | `pylon-guest-agent` |
 | 24 | `next_timer_tsc` | `u64` | Guest TSC of the guest's next timer, to wake a zero-core VM. | Nothing (the VMM's `park_timer_deadline_tsc` covers armed timers) |
 | 32 | `guest_heartbeat` | `u64` | Incremented on every guest update. | `pylon-guest-agent` |
@@ -61,11 +63,11 @@ the host on the hot path. Its layout is defined once, in
 
 | Offset | Field | Type | Meaning |
 |---|---|---|---|
-| 0 | `state` | `u8` | `PARKED` = 0, `RUNNING` = 1, `PARKING` = 2, `WAKING` = 3 |
+| 0 | `state` | `u8` | `PARKED` = 0, `RUNNING` = 1, `PARKING` = 2, `WAKING` = 3 (reserved: nothing writes it any more) |
 | 1 | `in_critical_section` | `u8` | Non-zero while the vCPU holds a spinlock, handles an interrupt or has preemption disabled |
 | 8 | `last_yield_tsc` | `u64` | Host TSC of the vCPU's last yield |
 | 16 | `yield_count` | `u64` | Number of yields |
-| 24 | `park_timer_deadline_tsc` | `u64` | Host TSC at which the guest's TSC-deadline timer was due when the VMM parked the vCPU; `0` if none. Cleared when the vCPU runs. |
+| 24 | `park_timer_deadline_tsc` | `u64` | Host TSC at which the guest's TSC-deadline timer was due when the VMM parked the vCPU; `0` if none. Cleared when the vCPU's park ends (inside KVM: when it's woken for a core, not when an interrupt lets it run). |
 | **32** | `revoke_requested` | `u8` | `1`: `pylond` wants this vCPU to give up its core |
 | 33 | `assigned_pcpu` | `u8` | Host CPU assigned by `pylond`; `255` (`PCPU_UNASSIGNED`) if none |
 | 34 | `park_on_boot` | `u8` | `1` while the VMM wants the vCPU parked once the guest has booted: set when the vCPU thread starts, for vCPUs beyond `initial_active_vcpus`; cleared by the VMM when it parks the vCPU. Reserved (`0`) before; no version bump. |
@@ -77,6 +79,12 @@ the host on the hot path. Its layout is defined once, in
 Two limits follow from the types: at most 64 vCPUs per VM, and
 `assigned_pcpu` can only name host CPUs 0–254.
 
+`PARKED` means the VMM has parked the vCPU. With park inside KVM
+(`PYLON_PARK_IN_KVM=1`, spec 08), the thread sleeps in `KVM_RUN` instead
+of in the VMM, and an interrupt can run a `PARKED` vCPU without the VMM
+seeing it. `state` stays `PARKED` until `pylond` gives the vCPU a core
+([VMM integration](vmm-integration.md#parking-inside-kvm)).
+
 ## Who writes what, today
 
 ABI version 2 gives each field one writer (spec 06 §3), and the field
@@ -84,20 +92,22 @@ docs in `pylon-abi` say which:
 
 | Field | Writer |
 |---|---|
-| `state` | The guest, only `RUNNING → PARKING` for its own vCPU; the VMM, every other transition. Never `pylond`. |
+| `state` | The guest (`pv-pylon`), only `RUNNING → PARKING` for its own vCPU; the VMM, every other transition. Never `pylond`. |
 | `revoke_requested` | `pylond` sets it; the VMM clears it when it parks the vCPU. |
 | `yield_count`, `last_yield_tsc`, `forced_preempt_count` | The VMM, when it parks the vCPU. |
 | `assigned_pcpu`, `revoke_deadline_tsc` | `pylond`. The VMM initializes `assigned_pcpu` to `PCPU_UNASSIGNED`. |
 | `park_on_boot` | The VMM sets and clears it. `pylond` reads it: it asks the VMM to park a tagged vCPU (it sets `revoke_requested`) once `guest_heartbeat` is non-zero. |
 | `host_tid`, `guest_tsc_offset`, `park_timer_deadline_tsc` | The VMM. |
-| Telemetry | The guest (today `pylon-guest-agent`, which writes nothing else). |
+| Telemetry | The guest: `pylon-guest-agent` writes `runnable_threads`, `head_wait_tsc` and `guest_heartbeat`, and nothing else; `pv-pylon` writes `stranded_work_bitmap`. |
 
 Version 2 has the same layout as version 1. The version changed because
 version-1 guest components broke these rules; a version-1 agent refuses
 a version-2 page, and the other way round. `park_timer_deadline_tsc` and
 `guest_tsc_offset` were added later in version 2, in bytes that were
 reserved and zero, and readers treat `0` as "not provided", so they
-didn't need a new version.
+didn't need a new version. `park_on_boot` took a reserved byte the same
+way. Spec 08 §4.4 proposes a version 3 for park inside KVM; the code is
+still at version 2.
 
 ## Time bases
 
@@ -137,7 +147,10 @@ device BAR, the page is not part of the VMM's guest RAM
 (`GuestMemoryMmap`), so the guest's E820 table, the PVH memory map and
 ACPI don't list it. `MemoryManager` keeps the mapping alive for the
 VM's lifetime. A guest maps it through `/dev/mem`, which
-`CONFIG_STRICT_DEVMEM` allows for addresses that aren't RAM.
+`CONFIG_STRICT_DEVMEM` allows for addresses that aren't RAM, or through
+`/dev/pylon` when the `pv-pylon` module is loaded. On x86_64 the
+`/dev/mem` mapping then fails, so `pylon-guest-agent` uses `/dev/pylon`
+when it exists.
 
 ## Changing the ABI
 
@@ -150,6 +163,7 @@ VM's lifetime. A guest maps it through `/dev/mem`, which
    `PYLON_ABI_VERSION`. `pylond` refuses pages with another version, so
    update the VMM, `pylond` and guest components together.
 4. Update every reader and writer: `vmm/src/pylon.rs`,
-   `pylond/src/engine.rs` and `lib.rs`, `pylon-guest-agent`, and the
+   `pylond/src/engine.rs` and `lib.rs`, `pylon-guest-agent`, the C copy
+   of the layout in `pylon/guest/linux/pv_pylon_abi.h`, and the
    tests that build pages by hand (`pylond/tests/e2e_pylon.rs`,
    `pylon_bench.rs`).

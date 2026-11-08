@@ -17,7 +17,7 @@ happens.
 
 ```text
 host CPU 0      pylond control plane (socket, registrations, metrics)
-host CPU 1      pylond arbitration engine (polls every ~1 µs)
+--engine-cpu    pylond arbitration engine (polls every ~1 µs; default CPU 1)
 --cores CPUs    given to Pylon VMs' vCPUs by pylond
 other CPUs      everything else: VMM threads, devices, host services
 ```

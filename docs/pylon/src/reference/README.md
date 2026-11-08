@@ -2,7 +2,7 @@
 
 | Page | What it lists |
 |---|---|
-| [The --pylon option](pylon-option.md) | Every key of Cloud Hypervisor's `--pylon` option. |
+| [The --pylon option](pylon-option.md) | Every key of Cloud Hypervisor's `--pylon` option, and the `PYLON_PARK_IN_KVM` environment variable. |
 | [pylond](pylond.md) | `pylond`'s command-line options. |
 | [Control socket protocol](control-socket.md) | The messages `pylond` accepts on its Unix socket. |
 | [Metrics](metrics.md) | The Prometheus metrics `pylond` exports. |

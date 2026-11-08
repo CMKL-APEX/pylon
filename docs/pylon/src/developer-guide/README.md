@@ -12,14 +12,17 @@ instead. To use it, read the [User guide](../user-guide/README.md).
 
 Pylon lives in a fork of Cloud Hypervisor and is built to stay
 mergeable with upstream. Almost all of it is in standalone crates
-under `pylon/`. The VMM side is one file, `vmm/src/pylon.rs`, plus a
-handful of one-line hooks in upstream files. Four Rust crates and one
-BPF program make it up:
+under `pylon/`. The VMM side is two files, `vmm/src/pylon.rs` and
+`vmm/src/pylon_kick.rs`, plus a handful of short hooks in upstream
+files. Four Rust crates, one BPF program and one guest kernel module
+make it up:
 
 - **`pylon-abi`**: the `#![no_std]` layout of the 8 KiB shared page
   that every other part reads and writes.
 - **`vmm/src/pylon.rs`**: creates the page, maps it into the guest,
   registers the VM with `pylond`, and parks and wakes vCPU threads.
+  **`vmm/src/pylon_kick.rs`** is the `pylon-kick` PCI device, which turns
+  `pylond`'s kicks into guest interrupts.
 - **`pylond`**: a two-thread daemon. A Tokio control plane on host core 0
   takes registrations and requests. An allocation-free polling engine
   on core 1 decides, every microsecond, which vCPU owns each managed
@@ -28,7 +31,9 @@ BPF program make it up:
   loader. It makes the kernel run each CPU's owner, read from a
   memory-mapped BPF map that `pylond` writes.
 - **`pylon-guest-agent`**: a userspace guest daemon that reports demand.
-  It stands in until the planned guest kernel module exists.
+  It only writes telemetry.
+- **`pv-pylon`** (`pylon/guest/linux/`): a Linux guest kernel module in
+  C. It drives `pylon-kick` and parks a revoked vCPU at a safe point.
 
 ## Pages
 
@@ -41,7 +46,7 @@ BPF program make it up:
 | [VMM integration](vmm-integration.md) | `vmm/src/pylon.rs` and its hooks into Cloud Hypervisor. |
 | [The scx_pylon dispatcher](scx-pylon.md) | The BPF scheduler, its map, and how `pylond` loads it. |
 | [Design decisions and trade-offs](design-decisions.md) | Why Pylon is shaped the way it is, and what each choice costs. |
-| [Enhancements](enhancements.md) | Known problems in the revocation path and the designed fix (spec 06), plus other planned work. |
+| [Enhancements](enhancements.md) | The revocation path fix (spec 06), parking inside KVM (spec 08), and other planned work. |
 | [Performance and benchmarks](benchmarks.md) | Figures, with their source, date and hardware, and how to reproduce them. |
 | [Contributing](contributing.md) | Building, tests, CI, conventions and the pull request flow. |
 
@@ -64,6 +69,8 @@ The specs:
 | [04-implementation-plan.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/04-implementation-plan.md) | The original track plan and upstream touch points. |
 | [05-implementation-status.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md) | Status tracker, known issues and CI coverage. |
 | [06-guest-kick-path.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md) | The guest kick and cooperative park design (draft). |
+| [07-aarch64-support.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md) | aarch64 host and guest support (draft). |
+| [08-park-in-kvm.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md) | Parking vCPUs inside KVM so interrupts wake them (draft). |
 
 Specs 00–03 describe the design as first planned. Where the code
 differs, this guide describes the code and says so.
@@ -84,4 +91,6 @@ differs, this guide describes the code and says so.
    real KVM VM against the shared page:
    `cargo test -p vmm --features kvm --lib pylon`.
 7. Read [Enhancements](enhancements.md) for what is broken and what is
-   planned before you pick up work.
+   planned before you pick up work. Open work is tracked as GitHub
+   issues on the
+   [`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestones).

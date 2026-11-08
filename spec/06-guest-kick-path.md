@@ -1,9 +1,12 @@
 # Specification 06: Guest Kick & Cooperative Park Path
 
-> **Status:** `DRAFT` — design for review. Steps S1 (§4.4, the VMM's park decision),
-> S2 (§4.4–§4.5, `pylond`'s forced park) and S3 (§3, §4.6: telemetry-only guest agent,
-> ABI version 2) are implemented; the rest isn't. Where the implementation refined the
-> design, the affected sections say so.
+> **Status:** `DRAFT` — design for review. Steps S1 to S5 are implemented: S1 (§4.4,
+> the VMM's park decision), S2 (§4.4–§4.5, `pylond`'s forced park), S3 (§3, §4.6:
+> telemetry-only guest agent, ABI version 2), S4 (the `pylon-kick` device, with the
+> provisional PCI ID of Q1) and S5 (`pv-pylon`, §4.6 items 1–4). S6, the latency
+> measurement, isn't done (#53). Q2 is answered for unmodified guests by
+> `spec/08-park-in-kvm.md`. Where the implementation refined the design, the
+> affected sections say so. Open work is tracked on the `v0.0.8` milestone.
 > Tracked as **Track 4** (VMM/pylond) and **Track 5** (guest kernel) in
 > `spec/05-implementation-status.md`.
 
@@ -465,9 +468,11 @@ forced park, which is honest about the current state, and the metrics show it.
 
 - Move the shared page into a `pylon-kick` BAR and drop the fixed GPA
   `0xFEDF_0000`. That address lies between the IOAPIC (`0xFEC0_0000`) and the
-  LAPIC (`0xFEE0_0000`), but `arch/src/x86_64/layout.rs` doesn't declare it, so
-  a future upstream device could land on it. Since K4 the page is no longer
-  guest RAM: it is absent from the E820 map, like the IOAPIC and LAPIC.
+  LAPIC (`0xFEE0_0000`). `arch/src/x86_64/layout.rs` and
+  `arch/src/aarch64/layout.rs` now declare it as `PYLON_SHARED_START`, with
+  overlap asserts, but it is still a fixed address in the guest's layout.
+  Since K4 the page is no longer guest RAM: it is absent from the E820 map,
+  like the IOAPIC and LAPIC. Tracked as #59.
 - aarch64 `pylond` (counter abstraction). Now specified in
   `spec/07-aarch64-support.md`.
 
@@ -479,7 +484,11 @@ forced park, which is honest about the current state, and the metrics show it.
   **Provisional (2026-10-31):** `0x1AF4:0x10F0` from QEMU's experimental range
   (§4.2), which unblocks S4. **Open:** request a PCI-SIG vendor ID for CMKL,
   and give `pylon-kick` a device ID under it before Pylon ships.
-- **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. *Seen
+- **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. **Answered for
+  unmodified guests (2026-11-06)** by `spec/08-park-in-kvm.md`, enabled with
+  `PYLON_PARK_IN_KVM`: a vCPU parks halted inside KVM, so an interrupt wakes
+  it, and `scx_pylon` runs it on its VM's CPUs. The text below is the
+  original question. *Seen
   2026-10-31:* two 4-vCPU VMs on 4 managed CPUs settled at 2 cores each.
   Each VM's third managed vCPU then stayed parked, while guest tasks were
   pinned to it, and both guests reported soft lockups and RCU stalls

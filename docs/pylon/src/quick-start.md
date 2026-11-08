@@ -86,4 +86,6 @@ counters. To export them as Prometheus metrics, start `pylond` with
 - What `--pylon` options mean: [Running a Pylon VM](user-guide/pylon-vms.md)
   and [the option reference](reference/pylon-option.md).
 - What the guest needs to report demand: [Inside the guest](user-guide/guest.md).
+- Parking vCPUs inside KVM, a prototype: [Running a Pylon
+  VM](user-guide/pylon-vms.md#parking-inside-kvm).
 - What doesn't work yet: [Status and roadmap](status.md).

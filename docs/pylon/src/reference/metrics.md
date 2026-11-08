@@ -1,7 +1,7 @@
 # Metrics
 
 With `--metrics-port`, `pylond` serves Prometheus text-format metrics at
-`http://<metrics-addr>:<port>/metrics` (and at `/`). Every metric has one
+`http://<metrics-addr>:<port>/metrics` (and at `/`); any other path gets a 404. Every metric has one
 label, `vm_id`, and one series per registered VM, except where noted.
 
 | Metric | Type | Meaning |
@@ -11,8 +11,8 @@ label, `vm_id`, and one series per registered VM, except where noted.
 | `pylon_vm_cooperative_yields_total` | counter | Revocations completed because the donor parked within the grace period. |
 | `pylon_vm_forced_preemptions_total` | counter | Revocations whose grace period ran out before the donor parked. |
 | `pylon_vm_handoffs_without_park_total` | counter | Revocations where the core was handed over although the donor never parked, 50 µs after it was first signalled. Should stay at 0. |
-| `pylon_vm_park_latency_microseconds` | histogram | Time from a revocation request to the donor parking. Buckets (`le`): 1, 2, 4, …, 1024 µs, `+Inf`. |
-| `pylon_vm_woken_vcpu_microseconds_total` | counter | Time the VM's parked vCPUs spent woken by KVM and runnable, for VMs that park inside KVM (spec 08). Label `cores`: `owned` while the VM owned a managed CPU, where they share it; `none` while it owned none, where they run on other CPUs. |
+| `pylon_vm_park_latency_microseconds` | histogram | Time from a revocation request to the donor parking. Buckets (`le`): 1, 2, 4, …, 1024 µs, `+Inf`, plus `_sum` and `_count`. |
+| `pylon_vm_woken_vcpu_microseconds_total` | counter | Time the VM's parked vCPUs spent woken by KVM and runnable, for VMs that park inside KVM (spec 08); 0 for other VMs. Label `cores`: `owned` while the VM owned a managed CPU, where they share it; `none` while it owned none, where they run on other CPUs. |
 | `pylon_vm_runnable_threads` | gauge | Runnable threads the guest last reported. |
 | `pylon_vm_min_cores` | gauge | Current `min_cores`. |
 | `pylon_vm_max_cores` | gauge | Current `max_cores`. |

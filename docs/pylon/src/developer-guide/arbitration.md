@@ -36,10 +36,24 @@ microsecond. That figure hasn't been measured; see
   At most 64 VMs are considered per sweep, in list order.
 - **No locks and no blocking calls.** The VM list is loaded with one
   `ArcSwap::load`. The only system calls are `eventfd` writes to wake or
-  kick a vCPU.
+  kick a vCPU, and `tgkill` to signal a vCPU thread (after a
+  `pidfd_send_signal` check that the VMM still exists).
 - **State is local.** `core_states` (`Idle`, `Assigned { vm_id, vcpu }`,
   `Revoking { donor…, recipient…, deadline_tsc }`) is owned by the
   engine thread alone.
+
+### VMs that park inside KVM
+
+A VMM started with `PYLON_PARK_IN_KVM=1` registers with
+`wake_by_signal` set, and parks a vCPU inside KVM instead of on its wake
+`eventfd`: the vCPU halts in `KVM_RUN`
+([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)
+§3). An interrupt then runs the guest again without a core and without
+an exit; the vCPU stays `PARKED`. The engine treats such a VM
+differently in four places: a due timer is no zero-core wakeup (phase 1), vCPUs
+that KVM woke count as demand (phase 1), waking a vCPU for a core also
+takes a signal (phase 2), and it tells `scx_pylon` which vCPUs are
+parked (after phase 3).
 
 ## Phase 0: reclaim and meter
 
@@ -91,7 +105,8 @@ the shared vCPU queue: a core for it would cost another VM a forced
 preemption, and come back as soon as it halts.
 
 **Woken vCPUs** (VMs that park inside KVM, spec 08 §4.2). The engine
-reads the VM's `woken` mask from `scx_pylon`, keeps the vCPUs still
+reads the VM's `woken` mask from `scx_pylon`'s `pylon_vm_vcpus` map
+(by the VM's slot; without `scx_pylon`, nothing writes it), keeps the vCPUs still
 `PARKED` with no core assigned, and records when it first saw each one.
 A vCPU woken for `WOKEN_DEMAND_US` (4 ms) or longer is a *long wake*.
 The longest wake counts as waiting time, like `head_wait`.
@@ -111,8 +126,8 @@ VMM measured for vCPU 0. Everything else is already host TSC.
 | `runnable_threads > 0` | `runnable_threads` clamped to `[min_cores, max_cores]` |
 | Otherwise | 0 |
 
-Each long wake then raises desired cores to at least committed cores
-plus one, up to `max_cores`. That catches demand `runnable_threads`
+Long wakes then raise desired cores to at least committed cores plus
+the number of long wakes, up to `max_cores`. That catches demand `runnable_threads`
 misses, such as work in the guest kernel or since the agent's last
 report. Last, desired cores don't drop below the cores the VM has or is
 getting for vCPUs that were woken when phase 3 picked them, until the
@@ -166,7 +181,8 @@ After a handoff without park, the donor still has `revoke_requested`
 set and is no longer on any `Revoking` CPU. Each sweep therefore also
 looks for such vCPUs and keeps signalling them until the VMM parks them,
 at an interval that grows from the deadline on, up to 1 ms. These are vCPUs with `revoke_requested = 1`, no
-`assigned_pcpu`, not `PARKED`, and a deadline that has passed. Without
+`assigned_pcpu`, not `PARKED`, not tagged `park_on_boot` (Plane 1
+signals boot parks), and a deadline that has passed. Without
 this, a guest that never exits to userspace on its own kept running
 without a core.
 `pylond` signals only a VMM that registered a `kick_signal`, and checks
@@ -174,9 +190,15 @@ through a pidfd that the VMM process still exists before each
 `tgkill`.
 
 Handing the CPU over unassigns the donor (`assigned_pcpu`), writes the
-recipient's thread ID to the CPU's owner entry, sets the recipient
-slot's `assigned_pcpu`, writes its wake `eventfd`, and marks the CPU
-`Assigned` to the recipient. When the donor parked, the time from the
+recipient's thread ID (and its VM's slot, in the flags) to the CPU's
+owner entry, sets the recipient slot's `assigned_pcpu`, writes its wake
+`eventfd`, and marks the CPU `Assigned` to the recipient. For a VM that
+parks inside KVM, the wake `eventfd` alone doesn't reach the thread
+asleep in `KVM_RUN`, so the engine also sends `kick_signal`. Each sweep
+sends it again, at most every `REVOKE_RESIGNAL_US` (10 µs), while the
+vCPU is still `PARKED` with the `yield_count` it had at assignment: a
+signal that lands just before the thread re-enters `KVM_RUN` interrupts
+nothing. When the donor parked, the time from the
 revocation request to `PARKED` goes into the VM's park latency
 histogram. The engine doesn't touch the donor's `state` or
 `revoke_requested`; the VMM clears `revoke_requested` when it parks.
@@ -199,8 +221,9 @@ that order, while it needs more cores (desired minus committed):
    `PARKED` and its `assigned_pcpu` is unassigned; a vCPU with a CPU on
    its way is still `PARKED` but already assigned or reserved. If the VM
    has no free vCPU, move on to the next VM.
-2. **Fast path.** If a managed CPU is `Idle`, assign it (as in phase 2's
-   hand-over) and continue.
+2. **Fast path.** If a managed CPU is `Idle` and none of its SMT
+   siblings is another VM's, assign it (as in phase 2's hand-over) and
+   continue. A CPU whose sibling the VM already holds comes first.
 3. **Preemption path.** Otherwise choose a donor with
    `select_donor_pcpu`, or stop matching for this VM if there's none.
 
@@ -209,7 +232,9 @@ that order, while it needs more cores (desired minus committed):
 A CPU `Assigned` to another VM is an eligible donor if:
 
 ```text
-donor's vCPU isn't PARKED
+none of the CPU's SMT siblings is assigned to, or being handed to or
+    from, a VM other than the recipient
+and donor's vCPU isn't PARKED
 and ((donor above its min_cores
         and (donor holds more than it desires
              or donor holds more than recipient's committed cores + 1
@@ -246,10 +271,22 @@ marks the CPU `Revoking`. It reserves the recipient vCPU by setting its
 incoming count goes up, and the donor's assigned count goes down, so
 later decisions in the same sweep see the change.
 
+## After phase 3: parked vCPUs for `scx_pylon`
+
+Last, for each VM that parks inside KVM, the engine writes the mask of
+its vCPUs that are `PARKED` with no CPU assigned to the `parked` field
+of its `pylon_vm_vcpus` entry, and clears the entries of VMs that have
+gone. This runs after matching, so the vCPUs given a CPU in this sweep
+are already out of the mask. `scx_pylon` uses it to tell a parked vCPU
+that KVM woke from one that runs on its own CPU
+([The scx_pylon dispatcher](scx-pylon.md#callbacks)).
+
 ## The owner table
 
 `PcpuOwnerTable` is an array of `{ target_tid: u32, flags: u32 }`
-indexed by host CPU. It lives in one of three places:
+indexed by host CPU. Bits 16–31 of `flags` hold the owner's VM slot
+plus one (0 if the VM has no slot); `scx_pylon` finds the CPUs a VM
+owns by it. It lives in one of three places:
 
 | Backing | When |
 |---|---|

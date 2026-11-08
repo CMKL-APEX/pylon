@@ -15,7 +15,7 @@ runqueue locks. `scx_pylon` makes the kernel act on `pylond`'s decision
 directly, and `pylond` communicates that decision with memory stores,
 not system calls.
 
-## The map
+## The maps
 
 ```c
 struct pcpu_owner_entry { __u32 target_tid; __u32 flags; };
@@ -31,9 +31,24 @@ struct {
 
 `BPF_F_MMAPABLE` lets userspace `mmap` the array. `pylond` maps it and
 uses it as its `PcpuOwnerTable`, so an owner change is two atomic
-stores: `flags`, then `target_tid` with `Release`. `flags` is defined
-(`ACTIVE`, `PREEMPT`) but `pylond` writes `0`, and the BPF program
-doesn't read it.
+stores: `flags`, then `target_tid` with `Release`. Bits 16–31 of
+`flags` hold the owner's VM slot plus one (0 if unknown), so the BPF
+program can find the CPUs a VM owns. The `ACTIVE` and `PREEMPT` bits are
+defined but not used.
+
+Four more maps:
+
+- `pylon_vcpu_dom` (hash, by thread ID): the vCPU threads of registered
+  VMs, with their VMM's tgid, their VM's slot and their vCPU index.
+  `pylond`'s Plane 1 writes it.
+- `pylon_vm_vcpus` (array of 64 VM slots, `BPF_F_MMAPABLE`): two vCPU
+  bitmasks per VM, `parked` and `woken`
+  ([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)
+  §4.3). `pylond`'s engine writes `parked`, the vCPUs that are `PARKED`
+  with no CPU assigned. `scx_pylon` writes `woken`, the parked vCPUs
+  that KVM woke and that are runnable. `pylond` maps it.
+- `pylon_smt_next` (array): the SMT sibling ring, described below.
+- `pylon_guard`: state of the core scheduling guard, described below.
 
 ## Callbacks
 
@@ -47,7 +62,7 @@ doesn't read it.
 A task found as an owner is marked in task-local storage with its VMM
 process's tgid: its *domain*. A vCPU thread gets its domain earlier, at
 its first `enqueue`, when `pylond` has listed it in `pylon_vcpu_dom`.
-`pylond`'s control plane keeps that map, thread ID to VMM tgid, in line
+`pylond`'s control plane keeps that map in line
 with the registered VMs' shared pages every second. `enqueue` checks the
 tgid too, so a thread ID reused by another process isn't tagged. A vCPU
 is therefore isolated whether or not it ever owns a CPU, which matters
@@ -55,22 +70,24 @@ because `pylond` only gives CPUs to vCPUs that are parked
 (`initial_active_vcpus`: the vCPUs beyond it are parked once the guest
 has booted).
 
-**`enqueue(p, enq_flags)`** puts each task on one of three kinds of
-queue:
+**`enqueue(p, enq_flags)`** puts each task on one of these queues:
 
 - The owner of its CPU goes on that CPU's owner queue (DSQ id = CPU)
-  with a 20 ms slice, and the CPU is kicked with `SCX_KICK_PREEMPT`.
-  This is what preempts a donor whose CPU was given to a recipient.
-- A parked vCPU that KVM woke goes on its VM's queue, if its VM owns a
-  CPU, and that CPU is kicked. This applies to VMs that park inside KVM
+  with a 20 ms slice, and the CPU is kicked with `SCX_KICK_PREEMPT`
+  (not when that CPU is just putting `p` back after running it). This
+  is what preempts a donor whose CPU was given to a recipient.
+- A parked vCPU that KVM woke goes on its VM's queue
+  (`PYLON_VM_DSQ` + slot) with a 100 µs slice, if its VM owns a CPU it
+  may run on, and that CPU is kicked. If its VM owns none, it goes on
+  the vCPU queue instead. This applies to VMs that park inside KVM
   (`PYLON_PARK_IN_KVM`, [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
-  `pylond`'s engine marks such vCPUs in `pylon_vm_vcpus` while they are
-  `PARKED` with no CPU assigned. `enqueue` sets the vCPU's *woken* bit
-  there, and `quiescent` clears it when the vCPU stops being runnable.
+  `enqueue` recognises such a vCPU by its bit in `parked`, and sets its
+  bit in `woken`. The bit is cleared when the vCPU is enqueued as an
+  owner, and by `quiescent` when it stops being runnable.
 - Another vCPU thread with a domain goes on the vCPU queue. If it owns
   a CPU elsewhere, that CPU is kicked.
 - A host task allowed on only one CPU, such as a per-CPU kworker, goes
-  on that CPU's local queue, and an idle CPU is kicked.
+  on that CPU's local queue, and that CPU is kicked if it is idle.
 - Everything else goes on the host queue.
 
 A task with migration disabled stays on its CPU's local queue too. The
@@ -83,13 +100,15 @@ so `enqueue` kicks it to schedule again.
 **`dispatch(cpu, prev)`**, when a CPU needs work, tries in order:
 
 1. The CPU's owner queue. Tasks that no longer own the CPU are moved to
-   the vCPU or host queue.
+   the vCPU or host queue. An owner whose slice just ended is still
+   `prev`, not on the queue; it keeps the CPU for another slice.
    - `pylond` can give the CPU to a vCPU thread that already waits on the
      vCPU queue or on its VM's queue. `enqueue` doesn't run again for a
      queued thread, so `dispatch` also looks for the owner on those two
      queues.
    - While woken vCPUs wait on the queue of the owner's VM, the owner and
-     they take 100 µs turns. The owner entry's flags carry the VM's slot.
+     they take 100 µs turns (the owner's slice is 100 µs instead of
+     20 ms while they wait). The owner entry's flags carry the VM's slot.
      `running` records, per CPU, whether the owner or a woken vCPU ran
      last; host tasks that run between turns, such as per-CPU kworkers,
      don't change it.
@@ -98,7 +117,8 @@ so `enqueue` kicks it to schedule again.
    waited here.
 3. The host queue.
 
-Each `dispatch` also checks one VM queue in turn. If that VM no longer
+Each `dispatch` also checks one VM queue in turn
+(`rescue_stranded_vcpus`). If that VM no longer
 owns a CPU, its vCPUs move to the vCPU queue, so they don't wait until
 the stall watchdog fires. An idle CPU is kicked for each, because idle
 CPUs only look at the vCPU queue when kicked.
@@ -229,9 +249,11 @@ SPDX header.
 `ScxPylonUserspace` in `src/lib.rs` wraps `libbpf-rs`:
 
 - `open_embedded()` opens the embedded object.
-- `load_and_attach(guard)` loads it, fills `pylon_smt_next`, sets up
-  the core scheduling guard if asked, attaches the `struct_ops` link,
-  and maps `pylon_pcpu_owners`.
+- `load_and_attach(guard)` loads it, maps `pylon_pcpu_owners`, fills
+  `pylon_smt_next`, sets up the core scheduling guard if asked, and
+  attaches the `struct_ops` link.
+- `vcpu_domain_map()` gives Plane 1 a handle on `pylon_vcpu_dom`, and
+  `vm_vcpus_mmap()` maps `pylon_vm_vcpus` for the engine.
 - `into_parts()` hands `pylond` the mapping (as its owner table), the
   link, the guard's links and the object. `pylond` keeps the link alive for its lifetime.
   The kernel detaches the scheduler when the link's descriptor closes,
