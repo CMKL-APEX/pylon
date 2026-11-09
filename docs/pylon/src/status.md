@@ -30,8 +30,11 @@ The detailed tracker is
 **Parking inside KVM is a prototype.** It is behind an environment
 variable, not a `--pylon` option, and the shared-page ABI hasn't been
 bumped for it ([#51](https://github.com/CMKL-APEX/pylon/issues/51)). It is meant to run with `scx_pylon`: without it, a
-woken vCPU runs on any CPU. The measurements that decide whether it
-replaces the default park are still to do ([#50](https://github.com/CMKL-APEX/pylon/issues/50)).
+woken vCPU runs on any CPU. Measured against the default park, it
+stops the stalls in unmodified guests and costs no throughput, so it
+will replace the default park on KVM
+([spec 08 §7.4](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md#74-p3-result-2026-11-09)).
+Wake latency still has a tail of about 2 ms ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
 
 **Cooperative revocation, within the grace period.** The parts exist
 (`pylon-kick` and `pv-pylon`), but:
@@ -78,7 +81,6 @@ issues:
 
 | Work | Issue |
 |---|---|
-| Measure parking inside KVM and decide whether it replaces the default park. | [#50](https://github.com/CMKL-APEX/pylon/issues/50) |
 | Check `pv-pylon` under the real `pylond`. | [#55](https://github.com/CMKL-APEX/pylon/issues/55) |
 | Run the self-hosted CI jobs only in the upstream repository instead of disabling them. | [#66](https://github.com/CMKL-APEX/pylon/issues/66) |
 

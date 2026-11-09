@@ -1,9 +1,10 @@
 # Specification 08: Parking vCPUs Inside KVM
 
-> **Status:** `DRAFT`. Prototype first (§7). P0 (§7.1), P1 (§7.2) and P2
-> (§4.2, results in §7.3) are done; P3, the measurements, isn't (#50). The
-> VMM parks inside KVM only when `PYLON_PARK_IN_KVM` is set; ABI v3 and a
-> real option wait for P3 (#51).
+> **Status:** `DRAFT`. Prototype first (§7). P0 (§7.1), P1 (§7.2), P2
+> (§4.2, results in §7.3) and P3 (§7.4) are done. P3 decided that
+> parking inside KVM replaces the park of spec 06 on KVM. The VMM still
+> parks inside KVM only when `PYLON_PARK_IN_KVM` is set; ABI v3 and a
+> real option are #51.
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 
@@ -650,6 +651,65 @@ bursty and an idle P2 run, 184 of them forced, none was inside a shadow.
 That doesn't rule out a rare case, but nothing here needs a check for
 it. Of the 320 parks that weren't boot parks, 300 ended by the bound of
 §3.6 rather than by a wake.
+
+### 7.4 P3 result (2026-11-09)
+
+**Setup:**
+- *Host:* the 16-vCPU nested host of §7.3.
+- *VMs:* two 4-vCPU Ubuntu guests. VM 2 is either busy (a busy loop on
+  every CPU) or idle.
+- *Load on VM 1:*
+  - *ping-pong:* two tasks, on vCPUs 1 and 2, pass a byte back and forth
+    over a pipe, sleeping 1 ms between rounds. Each 10 s the guest
+    prints the round trip's p50 and p99.
+  - *work:* vCPUs 1 to 3 each run a fixed unit of work, then sleep 2 ms.
+    Each 10 s the guest prints the units done.
+- *`pylond`:* 3 managed CPUs, `min_cores=0`, with `scx_pylon`.
+- *Baseline:* VM 1 alone, without `--pylon`, pinned to the same 3 host
+  CPUs.
+- *Runs:* 150 s each. The first 40 s (boot) are dropped; the tables give
+  the median of the remaining 10 s samples.
+
+**The park of spec 06 stalls unmodified guests at boot.** In all 8 runs
+with the default park, the guests logged soft lockups (2 to 12 per run,
+in 6 runs) or RCU stalls (all 8), and never started their load. Parking
+inside KVM had no lockup and no RCU stall in any of its 28 runs.
+
+**Throughput is at least the baseline's.** Work units per 10 s, VM 1,
+three runs each, alternated:
+
+| Setup | Units per 10 s | VM 1's VMM CPU |
+|---|---|---|
+| Baseline | 7,430, 8,023, 8,149 | 142–157% |
+| Park in KVM, VM 2 busy | 8,492, 8,374, 8,303 | 96% |
+| Park in KVM, VM 2 idle | 8,414, 8,366, 8,087 | 131–141% |
+
+**Wake latency has a tail of about 1.9 ms.** Ping-pong round trip in µs,
+two runs each:
+
+| Setup | p50 | p99 |
+|---|---|---|
+| Baseline | 203, 209 | 407, 454 |
+| Park in KVM, VM 2 busy | 155, 122 | 1,903, 1,981 |
+| Park in KVM, VM 2 idle | 273, 1,826 | 630, 2,074 |
+
+The median is at or below the baseline's, which is mostly the guest's
+own Python overhead. But the p99 is about 1.9 ms in most runs, and in
+some runs the median sits there too for most of the run. That fits a
+parked vCPU that doesn't wake on the IPI and runs only later. It isn't
+traced yet; it is followed up with the parks that end by the bound
+(#52).
+
+**Halt polling doesn't help.** With `KVM_CAP_HALT_POLL` at 50 µs
+instead of 0, ping-pong had the same p99 (1.9 ms) and throughput was
+lower and more spread out (7,452 to 8,360 units) for the same VMM CPU.
+Halt polling stays off (§3.5).
+
+**Decision:** on KVM, a parked vCPU waits inside KVM (§3.1) instead of
+in the VMM, for forced and cooperative parks alike. `pv-pylon` still
+decides when a guest gives a core back (§2). MSHV keeps today's park.
+Making this a real option, with ABI v3, is #51. The wake latency tail
+is #52.
 
 ## 8. Alternatives Considered
 
