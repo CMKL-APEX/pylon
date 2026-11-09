@@ -1,9 +1,9 @@
 # Status and roadmap
 
 This page says what works in Pylon today, what doesn't, and what is
-planned. It reflects `main` as of 2026-11-08. Open work is tracked as
-GitHub issues on the
-[`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestone/1).
+planned. It reflects `main` as of 2026-11-09. Open work is tracked as
+GitHub issues: the [`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestone/1) holds what the next
+release needs, and the [`v0.0.9` milestone](https://github.com/CMKL-APEX/pylon/milestone/2) the rest.
 The detailed tracker is
 [`spec/05-implementation-status.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md).
 
@@ -75,18 +75,28 @@ replaces the default park are still to do ([#50](https://github.com/CMKL-APEX/py
 
 ## Roadmap
 
-The [`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestone/1)
-lists the open work. The main threads:
+The next release, `v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)), is scoped to four
+issues:
+
+| Work | Issue |
+|---|---|
+| Measure parking inside KVM and decide whether it replaces the default park. | [#50](https://github.com/CMKL-APEX/pylon/issues/50) |
+| Check `pv-pylon` under the real `pylond`. | [#55](https://github.com/CMKL-APEX/pylon/issues/55) |
+| Keep `min_cores` while a VM is idle. | [#58](https://github.com/CMKL-APEX/pylon/issues/58) |
+| Run the self-hosted CI jobs only in the upstream repository instead of disabling them. | [#66](https://github.com/CMKL-APEX/pylon/issues/66) |
+
+The rest is on `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
 
 | Work | Issues |
 |---|---|
-| Measure parking inside KVM, decide whether it replaces the default park, then make it a real option with ABI v3. | [#50](https://github.com/CMKL-APEX/pylon/issues/50), [#51](https://github.com/CMKL-APEX/pylon/issues/51), [#52](https://github.com/CMKL-APEX/pylon/issues/52) |
+| Make parking inside KVM a real option with ABI v3; end more parks by a wake than by the bound. | [#51](https://github.com/CMKL-APEX/pylon/issues/51), [#52](https://github.com/CMKL-APEX/pylon/issues/52) |
 | Measure and cut handoff latency. | [#53](https://github.com/CMKL-APEX/pylon/issues/53), [#54](https://github.com/CMKL-APEX/pylon/issues/54) |
-| Finish the cooperative path: check `pv-pylon` under the real `pylond`; report critical sections. | [#55](https://github.com/CMKL-APEX/pylon/issues/55), [#56](https://github.com/CMKL-APEX/pylon/issues/56) |
-| Scale to zero on network traffic; keep `min_cores` while idle. | [#57](https://github.com/CMKL-APEX/pylon/issues/57), [#58](https://github.com/CMKL-APEX/pylon/issues/58) |
+| Report critical sections from the guest. | [#56](https://github.com/CMKL-APEX/pylon/issues/56) |
+| Scale to zero on network traffic. | [#57](https://github.com/CMKL-APEX/pylon/issues/57) |
 | Move the shared page into a PCI BAR; get a PCI ID. | [#59](https://github.com/CMKL-APEX/pylon/issues/59), [#64](https://github.com/CMKL-APEX/pylon/issues/64) |
 | Lifecycle: `pylond` restart, vCPU hotplug, snapshot and migration. | [#60](https://github.com/CMKL-APEX/pylon/issues/60), [#61](https://github.com/CMKL-APEX/pylon/issues/61) |
 | aarch64: a real guest end to end, and the kick path on the GICv3 ITS. | [#62](https://github.com/CMKL-APEX/pylon/issues/62), [#63](https://github.com/CMKL-APEX/pylon/issues/63) |
+| MSHV: check that a signal-interrupted run returns cleanly. | [#65](https://github.com/CMKL-APEX/pylon/issues/65) |
 
 [Enhancements](developer-guide/enhancements.md) explains the design of
 the cooperative path.
