@@ -39,15 +39,15 @@ Wake latency still has a tail of about 2 ms ([#52](https://github.com/CMKL-APEX/
 **Cooperative revocation, within the grace period.** The parts exist
 (`pylon-kick` and `pv-pylon`), but:
 
-- **Too slow for the grace period.** Kick to park takes about 20 µs on
-  the hosts tested so far (measured coarsely), more than `pylond`'s
-  8 µs grace period, so many revocations still end in a forced park.
+- **Too slow for the grace period.** Under the real `pylond`, a guest
+  takes 80–140 µs on average to park after a revocation, far more than
+  `pylond`'s 8 µs grace period, so revocations end in a forced park.
+  A longer grace makes them cooperative but gains no throughput, so the
+  guest's yield has to get faster ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
   The end-to-end latency hasn't been measured properly ([#53](https://github.com/CMKL-APEX/pylon/issues/53)), and the
   138 µs scale-out seen in `pylon-bench` isn't explained ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
 - **No module, no cooperation.** A guest without `pv-pylon` never
   cooperates: every revocation ends in a forced park.
-- **Not checked end to end.** `pv-pylon` was tested against a stand-in
-  `pylond`, not the real one ([#55](https://github.com/CMKL-APEX/pylon/issues/55)).
 
 **Other gaps** (tracked as K1–K7 in the status tracker's
 [known issues](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md#known-issues-other)):
@@ -81,7 +81,6 @@ issues:
 
 | Work | Issue |
 |---|---|
-| Check `pv-pylon` under the real `pylond`. | [#55](https://github.com/CMKL-APEX/pylon/issues/55) |
 | Run the self-hosted CI jobs only in the upstream repository instead of disabling them. | [#66](https://github.com/CMKL-APEX/pylon/issues/66) |
 
 The rest is on `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
@@ -89,7 +88,7 @@ The rest is on `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/mileston
 | Work | Issues |
 |---|---|
 | Make parking inside KVM a real option with ABI v3; end more parks by a wake than by the bound. | [#51](https://github.com/CMKL-APEX/pylon/issues/51), [#52](https://github.com/CMKL-APEX/pylon/issues/52) |
-| Measure and cut handoff latency. | [#53](https://github.com/CMKL-APEX/pylon/issues/53), [#54](https://github.com/CMKL-APEX/pylon/issues/54) |
+| Measure and cut handoff latency; make the guest yield within the grace period. | [#53](https://github.com/CMKL-APEX/pylon/issues/53), [#54](https://github.com/CMKL-APEX/pylon/issues/54), [#74](https://github.com/CMKL-APEX/pylon/issues/74) |
 | Report critical sections from the guest. | [#56](https://github.com/CMKL-APEX/pylon/issues/56) |
 | Scale to zero on network traffic. | [#57](https://github.com/CMKL-APEX/pylon/issues/57) |
 | Move the shared page into a PCI BAR; get a PCI ID. | [#59](https://github.com/CMKL-APEX/pylon/issues/59), [#64](https://github.com/CMKL-APEX/pylon/issues/64) |
