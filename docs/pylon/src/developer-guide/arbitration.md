@@ -124,7 +124,7 @@ VMM measured for vCPU 0. Everything else is already host TSC.
 |---|---|
 | Zero-core wakeup | `max(runnable, 1)` clamped to `[max(min_cores, 1), max_cores]` |
 | `runnable_threads > 0` | `runnable_threads` clamped to `[min_cores, max_cores]` |
-| Otherwise | 0 |
+| Otherwise | 0, whatever `min_cores`: it is a floor under demand, not a reservation |
 
 Long wakes then raise desired cores to at least committed cores plus
 the number of long wakes, up to `max_cores`. That catches demand `runnable_threads`

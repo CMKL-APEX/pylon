@@ -13,7 +13,7 @@ device options. An unknown key is an error.
 | `socket` | path | none | `pylond`'s control socket, such as `/run/pylon/pylond.sock`. Without it, the VM never registers, and parked vCPUs are never woken. The VMM registers once, at start, and doesn't retry: if the socket doesn't exist yet, it logs that and runs unregistered. |
 | `gpa` | integer, `0x` hex or decimal | `0xfedf0000` | Guest-physical address of the page. Must be a multiple of 4,096. |
 | `initial_active_vcpus` | integer | `--cpus boot` | vCPUs `0 … n-1` always run; the others run during boot and are parked once the guest reports it is up (first `guest_heartbeat`). Capped at the number of slots. |
-| `min_cores` | integer | `1` | Cores `pylond` tries to give the VM before any VM above its minimum, whenever it reports demand. |
+| `min_cores` | integer | `1` | Cores `pylond` tries to give the VM before any VM above its minimum, whenever it reports demand. It isn't a reservation: an idle VM holds no cores. |
 | `max_cores` | integer | number of slots | Most cores `pylond` gives the VM. `pylond` rejects the registration if `max_cores` is 0, `min_cores` is above it, or it's above the number of slots. |
 | `priority_weight` | integer | `100` | Multiplies the VM's urgency. Only ratios between VMs matter. `pylond` stores 0 as 1. |
 | `vm_id` | integer | `1` | The VM's id in the page's header and in `pylond`. Must be unique among VMs registered with one `pylond`. |

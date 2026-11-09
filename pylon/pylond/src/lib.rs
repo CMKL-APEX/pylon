@@ -1302,6 +1302,45 @@ mod tests {
     }
 
     #[test]
+    fn test_plane2_min_cores_is_a_floor_under_demand_only() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(
+            Arc::clone(&snapshot),
+            Arc::clone(&pcpu_owners),
+            &[2, 3, 4, 5],
+        );
+
+        let vm = build_test_vm(1, 4, 2, 4, 1);
+        let page = vm.handle.shared_page();
+        page.telemetry
+            .stranded_work_bitmap
+            .store(0b1111, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, vm.handle.clone());
+
+        // Idle: no runnable threads, no timer due, no packets. `min_cores` doesn't hold a core
+        // for an idle VM, so it can scale to zero.
+        engine.poll_once(6_000);
+        let held = |engine: &MatrixEngine| {
+            [2, 3, 4, 5]
+                .iter()
+                .filter(|&&pcpu| {
+                    matches!(
+                        engine.core_state(pcpu),
+                        CoreState::Assigned { vm_id: 1, .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(held(&engine), 0);
+
+        // One runnable thread: the VM gets `min_cores` cores, not one.
+        page.telemetry.runnable_threads.store(1, Ordering::Release);
+        engine.poll_once(7_000);
+        assert_eq!(held(&engine), 2);
+    }
+
+    #[test]
     fn test_plane2_park_timer_wakes_zero_core_vm_on_due_vcpu() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
