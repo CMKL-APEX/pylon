@@ -38,8 +38,10 @@ guest boots on vCPU 0.
 the VM. `max_cores` defaults to the number of vCPUs. `min_cores`
 defaults to `1`. When the VM has runnable work, `pylond` raises it to
 `min_cores` first, before giving cores to VMs above their minimum.
-Today a VM that reports no runnable threads gets no cores, whatever its
-`min_cores` ([Status](../status.md#what-doesnt-work-yet)).
+`min_cores` is a floor under demand, not a reservation: a VM that
+reports no runnable threads gets no cores, whatever its `min_cores`, so
+an idle VM leaves its cores to others. Its first runnable thread brings
+it back to `min_cores`.
 
 **`priority_weight`** (default `100`) multiplies the VM's urgency.
 Between two VMs whose oldest runnable thread has waited equally long,

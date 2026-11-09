@@ -752,6 +752,8 @@ impl MatrixEngine {
             } else if runnable > 0 {
                 runnable.clamp(vm.min_cores(), vm.max_cores())
             } else {
+                // `min_cores` is a floor under demand, not a reservation: an idle VM wants no
+                // core, so it can scale to zero.
                 0
             };
             // Each long wake asks for one more core: `runnable_threads` may not show its work.

@@ -19,7 +19,7 @@ The detailed tracker is
 | Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. Repeated signals back off up to 1 ms. |
 | Parking inside KVM | With `PYLON_PARK_IN_KVM=1` in the VMM's environment, a parked vCPU halts inside KVM, so an interrupt (an IPI, a timer) wakes it. `scx_pylon` runs a woken vCPU only on its own VM's CPUs, and `pylond` gives a core to a VM whose vCPU stays woken. This removes the soft lockups of VMs that hold fewer cores than they have vCPUs. See [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
 | Arbitration | Demand evaluation, urgency ordering and donor selection run every tick (see [The arbitration engine](developer-guide/arbitration.md)). |
-| Runtime policy | `min_cores`, `max_cores` and `priority_weight` can be changed over the control socket. |
+| Runtime policy | `min_cores`, `max_cores` and `priority_weight` can be changed over the control socket. `min_cores` is a floor under demand: an idle VM holds no cores. |
 | Metering | Core-microseconds, cooperative yields, forced preemptions, handoffs without park, revocation-to-park latency and woken-vCPU time per VM, over the socket and as Prometheus metrics. |
 | `scx_pylon` | Attaches to a `sched_ext` kernel and runs each managed CPU's assigned vCPU thread, keeps vCPU threads' SMT siblings apart, and shares a VM's CPUs with its woken vCPUs. `pylond` attaches it automatically when the kernel supports it. |
 | Kick device and guest module | The `pylon-kick` PCI device delivers revocations to the guest as interrupts, and the `pv-pylon` guest module parks a revoked vCPU at a safe point and reports stranded work. |
@@ -58,8 +58,6 @@ replaces the default park are still to do ([#50](https://github.com/CMKL-APEX/py
 - **Critical sections.** Nothing writes `in_critical_section`, so donor
   selection can't avoid lock holders. It needs guest kernel hooks, not
   just the module ([#56](https://github.com/CMKL-APEX/pylon/issues/56)).
-- **`min_cores` while idle.** A VM that reports no runnable threads
-  wants zero cores, whatever its `min_cores` ([#58](https://github.com/CMKL-APEX/pylon/issues/58)).
 - **Counter scaling.** `pylond` converts the guest's counter values
   with the offset the VMM measures, assuming the guest counter runs at
   the host's rate. A VM restored with a different TSC rate would break
@@ -75,14 +73,13 @@ replaces the default park are still to do ([#50](https://github.com/CMKL-APEX/py
 
 ## Roadmap
 
-The next release, `v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)), is scoped to four
+The next release, `v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)), is scoped to these
 issues:
 
 | Work | Issue |
 |---|---|
 | Measure parking inside KVM and decide whether it replaces the default park. | [#50](https://github.com/CMKL-APEX/pylon/issues/50) |
 | Check `pv-pylon` under the real `pylond`. | [#55](https://github.com/CMKL-APEX/pylon/issues/55) |
-| Keep `min_cores` while a VM is idle. | [#58](https://github.com/CMKL-APEX/pylon/issues/58) |
 | Run the self-hosted CI jobs only in the upstream repository instead of disabling them. | [#66](https://github.com/CMKL-APEX/pylon/issues/66) |
 
 The rest is on `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
