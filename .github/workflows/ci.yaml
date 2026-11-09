@@ -657,9 +657,9 @@ jobs:
   integration-x86-64-pr:
     name: integration-x86-64-pr
     needs: [preflight, dco, quality, build]
-    # if: >-
-    #   github.event_name == 'pull_request' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
-    if: false
+    # Self-hosted runners exist only upstream; forks would queue forever.
+    if: >-
+      github.repository == 'cloud-hypervisor/cloud-hypervisor' && github.event_name == 'pull_request' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
     timeout-minutes: 80
     env:
       # Our runner has 16 cores (nproc).
@@ -700,8 +700,9 @@ jobs:
   integration-x86-64-mq:
     name: integration-x86-64-mq
     needs: [preflight]
+    # Self-hosted runners exist only upstream; forks would queue forever.
     if: &mq-if >-
-      (github.event_name == 'merge_group' || github.event_name == 'push') && needs.preflight.outputs.full == 'true'
+      github.repository == 'cloud-hypervisor/cloud-hypervisor' && (github.event_name == 'merge_group' || github.event_name == 'push') && needs.preflight.outputs.full == 'true'
     timeout-minutes: 80
     env:
       # Our runner has 16 cores (nproc).

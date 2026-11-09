@@ -92,9 +92,9 @@ LLMs").
 | `ci.yaml` | Upstream's workspace checks: formatting, clippy for every hypervisor and feature combination, builds across targets, unit tests. Cross and musl jobs exclude `scx-pylon` and `pylond`. |
 | `pylon-docs.yaml` | Builds this book on pull requests and publishes it on `main`. |
 
-Jobs that need upstream's self-hosted runners are disabled in this
-repository ([#66](https://github.com/CMKL-APEX/pylon/issues/66) tracks
-gating them on the upstream repository instead). The current coverage is in the status tracker's
+Jobs that need upstream's self-hosted runners (the integration tests)
+run only in the upstream repository and are skipped here. The current
+coverage is in the status tracker's
 [CI coverage](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md#ci-coverage)
 section.
 
