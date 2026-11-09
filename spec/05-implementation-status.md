@@ -3,8 +3,8 @@
 > **Instructions for Subagents & Coding Agents:**
 > Update your assigned track section in this file as you start, progress through, and complete your tasks (including test results and any interface notes for other tracks). Avoid modifying sections belonging to other tracks while they are `IN_PROGRESS`.
 
-Open work is tracked as GitHub issues on the `v0.0.8` milestone (#50–#67).
-The rows below point to them.
+Open work is tracked as GitHub issues (#50–#66): #50, #55, #58 and #66 on
+the `v0.0.8` milestone, the rest on `v0.0.9`. The rows below point to them.
 
 ---
 

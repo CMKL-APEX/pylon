@@ -93,4 +93,4 @@ differs, this guide describes the code and says so.
 7. Read [Enhancements](enhancements.md) for what is broken and what is
    planned before you pick up work. Open work is tracked as GitHub
    issues on the
-   [`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestones).
+   [`v0.0.8` and `v0.0.9` milestones](https://github.com/CMKL-APEX/pylon/milestones).

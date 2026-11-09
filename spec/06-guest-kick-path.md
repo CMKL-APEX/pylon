@@ -6,7 +6,8 @@
 > provisional PCI ID of Q1) and S5 (`pv-pylon`, §4.6 items 1–4). S6, the latency
 > measurement, isn't done (#53). Q2 is answered for unmodified guests by
 > `spec/08-park-in-kvm.md`. Where the implementation refined the design, the
-> affected sections say so. Open work is tracked on the `v0.0.8` milestone.
+> affected sections say so. Open work is tracked on the `v0.0.8` and `v0.0.9`
+> milestones.
 > Tracked as **Track 4** (VMM/pylond) and **Track 5** (guest kernel) in
 > `spec/05-implementation-status.md`.
 
