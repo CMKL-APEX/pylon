@@ -10,7 +10,7 @@ use std::io::{self, Error, ErrorKind};
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 use libc::size_t;
-use log::warn;
+use log::{debug, warn};
 use vm_allocator::page_size::get_page_size;
 
 const ONE_GIB: usize = 1024 * 1024 * 1024;
@@ -161,6 +161,20 @@ fn allocate_aligned_mapping(
         return Err(err);
     }
 
+    // vfio-pci installs huge page-table entries for a BAR only where
+    // transparent hugepages are allowed; on a host where they are
+    // `madvise`, it otherwise faults the BAR in 4K at a time when it is
+    // mapped for DMA (about 27 s for a 64 GiB BAR on Linux 6.17).
+    // SAFETY: FFI call on the range just mapped above.
+    if unsafe { libc::madvise(addr, len, libc::MADV_HUGEPAGE) } != 0 {
+        debug!(
+            "Failed to madvise MADV_HUGEPAGE on region {:p} length 0x{:x}: {}",
+            addr,
+            len,
+            Error::last_os_error()
+        );
+    }
+
     Ok(addr)
 }
 
@@ -244,6 +258,9 @@ in both isize and libc::size_t";
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File};
+    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+
     use super::*;
 
     fn tail_trim_range_from_len(base_addr: usize, len: size_t) -> (usize, size_t) {
@@ -303,6 +320,39 @@ mod tests {
         // A page-aligned end needs no rounding.
         assert_eq!(tail_addr, base_addr + len);
         assert_eq!(tail_addr + tail_len, base_addr + len + alignment);
+    }
+
+    #[test]
+    fn aligned_mapping_is_marked_for_hugepages() {
+        let page_size = get_page_size() as usize;
+        let len = page_size * 512;
+        // SAFETY: FFI call with a valid NUL-terminated name.
+        let fd = unsafe { libc::memfd_create(c"mmap-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: fd was just created and is owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        File::from(fd.try_clone().unwrap())
+            .set_len(len as u64)
+            .unwrap();
+
+        let region = MmapRegion::mmap(
+            len as u64,
+            libc::PROT_READ | libc::PROT_WRITE,
+            fd.as_fd(),
+            0,
+            0,
+        )
+        .unwrap();
+
+        let start = format!("{:x}-", region.addr() as usize);
+        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
+        let flags = smaps
+            .split_inclusive('\n')
+            .skip_while(|l| !l.starts_with(&start))
+            .find_map(|l| l.strip_prefix("VmFlags:"))
+            .unwrap();
+        // `hg`: MADV_HUGEPAGE is set on the mapping.
+        assert!(flags.split_whitespace().any(|f| f == "hg"), "{flags}");
     }
 
     #[test]
