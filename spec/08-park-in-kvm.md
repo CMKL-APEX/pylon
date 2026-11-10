@@ -4,7 +4,8 @@
 > (§4.2, results in §7.3) and P3 (§7.4) are done. P3 decided that
 > parking inside KVM replaces the park of spec 06 on KVM. It is the
 > `--pylon park=kvm` option, the default on x86_64 KVM hosts, with ABI
-> version 3 (§4.4, §4.5, #51).
+> version 3 (§4.4, §4.5, #51). A bare-metal run confirms the P3
+> result (§7.5).
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 
@@ -733,6 +734,51 @@ in the VMM, for forced and cooperative parks alike. `pv-pylon` still
 decides when a guest gives a core back (§2). MSHV keeps today's park.
 Making this a real option, with ABI v3, is #51 (done, §4.4 and §4.5).
 The wake latency tail is #52.
+
+### 7.5 Bare-metal result (2026-11-10)
+
+The P3 method of §7.4, repeated on bare metal with the #51 build
+(`--pylon park=kvm|vmm`, ABI v3).
+
+**Setup:** as §7.4, except:
+- *Host:* AMD EPYC 7282, 16 cores with SMT, one NUMA node, the stock
+  Ubuntu 7.0.0-43 kernel. It lacks the `sched_ext` core-scheduling
+  fixes, so `pylond`'s guard refuses core scheduling (#15) and the VMs
+  run without it, as the VMM does for `--pylon` VMs since #51.
+- *VM 2:* busy, idle, or bursty (§7.3).
+
+**No stalls with parking inside KVM; stalls with parking in the VMM.**
+All 12 runs that parked inside KVM had no soft lockup and no RCU stall.
+All 3 runs with `park=vmm` (VM 2 bursty) had both (10/3, 6/2 and 6/1
+lockups/stalls), and VM 1 never started its load.
+
+**Throughput is above the baseline.** Work units per 10 s, VM 1, three
+runs each:
+
+| Setup | Units per 10 s |
+|---|---|
+| Baseline | 6,970, 6,974, 7,010 |
+| Park in KVM, VM 2 bursty | 9,462, 9,466, 8,586 |
+| Park in KVM, VM 2 idle | 8,610, 9,568, 9,578 |
+| Park in KVM, VM 2 busy | 7,835, 7,816, 7,884 |
+
+The baseline time-slices 4 vCPUs on 3 pinned CPUs, so it isn't an
+upper bound. Runs vary by about 10%.
+
+**The 1.9 ms tail is the same as nested.** Ping-pong round trip in µs,
+two runs each:
+
+| Setup | p50 | p99 |
+|---|---|---|
+| Baseline | 58, 56 | 116, 118 |
+| Park in KVM, VM 2 busy | 40, 41 | 1,927, 1,928 |
+| Park in KVM, VM 2 idle | 37, 37 | 65, 69 |
+
+The median is about 4 times lower than nested, and below the
+baseline's. The p99 tail appears only when VM 2 is busy, and at the
+same ~1.9 ms as in §7.4. A tail that doesn't scale with the host
+points to a fixed bound or timeout in the wake path rather than a cost
+of the platform (#52).
 
 ## 8. Alternatives Considered
 

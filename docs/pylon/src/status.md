@@ -29,13 +29,15 @@ The detailed tracker is
 
 **Parking inside KVM has limits.** It is the default on x86_64 KVM
 hosts (`--pylon park=kvm`), because it stops the stalls in unmodified
-guests and costs no throughput
-([spec 08 §7.4](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md#74-p3-result-2026-11-09)).
+guests and costs no throughput, nested and on bare metal
+([spec 08 §7.4](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md#74-p3-result-2026-11-09),
+[§7.5](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md#75-bare-metal-result-2026-11-10)).
 But:
 
 - **It needs `scx_pylon`.** `pylond` without it rejects such a VM; use
   `park=vmm` there.
-- **Wake latency has a tail of about 2 ms**
+- **Wake latency has a tail of about 2 ms** when another VM is busy,
+  on bare metal as nested
   ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
 - **aarch64 parks in the VMM by default** until parking inside KVM is
   verified there.
