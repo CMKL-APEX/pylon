@@ -254,7 +254,8 @@ const PR_SCHED_CORE_SHARE_FROM: libc::c_int = 3;
 const PR_SCHED_CORE_SCOPE_THREAD: libc::c_int = 0;
 
 /// Create a new unique core scheduling cookie for the current thread.
-/// Silently succeeds on kernels that don't support PR_SCHED_CORE.
+/// Silently succeeds on kernels that don't support PR_SCHED_CORE, and with
+/// `--pylon` when `pylond`'s guard refuses it (`pylon::core_scheduling_refused`).
 fn core_scheduling_create() -> Result<()> {
     // SAFETY: prctl with PR_SCHED_CORE_CREATE on the current thread (pid=0).
     // All arguments are valid constants. We check the return value.
@@ -278,6 +279,7 @@ fn core_scheduling_create() -> Result<()> {
                 warn!("Kernel lacks CONFIG_SCHED_CORE support - no SMT isolation");
             }
             Some(libc::ENODEV) => {}
+            _ if pylon::core_scheduling_refused(&err) => {}
             _ => return Err(Error::CoreScheduling(err)),
         }
     }
@@ -286,7 +288,8 @@ fn core_scheduling_create() -> Result<()> {
 
 /// Copy the core scheduling cookie from the thread identified by `tid`
 /// to the current thread, placing both in the same scheduling group.
-/// Silently succeeds on kernels that don't support PR_SCHED_CORE.
+/// Silently succeeds on kernels that don't support PR_SCHED_CORE, and with
+/// `--pylon` when `pylond`'s guard refuses it (`pylon::core_scheduling_refused`).
 fn core_scheduling_share_from(tid: i32) -> Result<()> {
     // SAFETY: prctl with PR_SCHED_CORE_SHARE_FROM targeting tid.
     // All arguments are valid. We check the return value.
@@ -303,6 +306,7 @@ fn core_scheduling_share_from(tid: i32) -> Result<()> {
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(libc::EINVAL) | Some(libc::ENODEV) => {}
+            _ if pylon::core_scheduling_refused(&err) => {}
             _ => return Err(Error::CoreScheduling(err)),
         }
     }

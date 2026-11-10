@@ -125,7 +125,9 @@ with `--core-sched-deny off`), and `scx_pylon` disabled itself.
 ## A VM fails to start with `Error enabling core scheduling`
 
 `scx_pylon` is attached with the core scheduling guard, which refuses
-core scheduling. Start the VM with `--cpus ...,core_scheduling=off`
+core scheduling. A VM with `--pylon` runs without it and only logs a
+warning, so this is a VM without `--pylon`, or a Cloud Hypervisor older
+than Pylon 0.0.8. Start it with `--cpus ...,core_scheduling=off`
 ([Core scheduling](sched-ext.md#core-scheduling)). Upstream Cloud
 Hypervisor doesn't fail in this case: it hangs before booting the
 guest and stops answering its API.

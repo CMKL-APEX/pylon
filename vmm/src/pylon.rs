@@ -1152,6 +1152,35 @@ pub fn read_guest_tsc_deadline(_vcpu: &dyn Vcpu) -> Option<u64> {
     None
 }
 
+/// Whether `PR_SCHED_CORE` failing with `err` means the vCPU should run without core
+/// scheduling, for `vmm/src/cpu.rs`. Only with `--pylon`, and only for `EPERM`: that is what
+/// `pylond`'s guard answers while `scx_pylon` is attached to a kernel without the `sched_ext`
+/// core-scheduling fixes (issue #15). `scx_pylon` then keeps the VM's vCPU threads apart from
+/// their SMT siblings instead. Warns once per process.
+pub fn core_scheduling_refused(err: &io::Error) -> bool {
+    let Some(state) = global_state() else {
+        return false;
+    };
+    if !refused_by_guard(err) {
+        return false;
+    }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "Pylon: core scheduling refused (EPERM), as pylond's guard does on kernels without \
+             the sched_ext core-scheduling fixes (pylon#15); VM {} runs without it, and \
+             scx_pylon keeps its vCPU threads apart from their SMT siblings",
+            state.config.vm_id
+        );
+    }
+    true
+}
+
+/// The part of `core_scheduling_refused` that doesn't depend on `--pylon`.
+fn refused_by_guard(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EPERM)
+}
+
 /// Hook for `CpuManager::new` (`vmm/src/cpu.rs`): rejects `--pylon` on a hypervisor backend that
 /// can't support it, so it fails at start-up instead of silently never forcing a park. MSHV on
 /// aarch64 can't read the guest's counter or timer (`spec/07-aarch64-support.md` §4.2).
@@ -1889,6 +1918,17 @@ mod tests {
             (&stream).write_all(reply).unwrap();
             (msg, fds_read, listener)
         })
+    }
+
+    #[test]
+    fn test_core_scheduling_refused_only_for_eperm() {
+        assert!(refused_by_guard(&io::Error::from_raw_os_error(libc::EPERM)));
+        assert!(!refused_by_guard(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!refused_by_guard(&io::Error::from_raw_os_error(
+            libc::ENOMEM
+        )));
     }
 
     #[test]
