@@ -47,6 +47,26 @@ beyond the table above:
 The aarch64 numbers so far are in [Benchmarks](../developer-guide/benchmarks.md).
 A booted aarch64 guest hasn't been run with Pylon yet.
 
+## Download a release
+
+Each [release](https://github.com/CMKL-APEX/pylon/releases) has these
+files:
+
+| File | What it is |
+|---|---|
+| `cloud-hypervisor`, `ch-remote` | The VMM and its client for x86_64, linked to glibc. |
+| `cloud-hypervisor-static`, `ch-remote-static` | The same, static (musl), for x86_64. |
+| `cloud-hypervisor-static-aarch64`, `ch-remote-static-aarch64` | The same, static, for aarch64. |
+| `pylond`, `scx_pylon` | The host daemon and the BPF scheduler tool for x86_64. |
+| `pylond-aarch64`, `scx_pylon-aarch64` | The same for aarch64. |
+| `pylon-guest-agent-static`, `pylon-guest-agent-static-aarch64` | The guest agent, static, to copy into Linux guests. |
+| `pv-pylon-<version>.tar.gz` | The `pv-pylon` guest module's source. Build it against the guest's kernel headers. |
+| `pylon-<version>.tar.xz` | The source, with its Rust dependencies vendored. |
+
+`pylond` and `scx_pylon` are built on Ubuntu 24.04. They need glibc 2.39
+or later, `libelf`, `zlib` and `zstd` (on Ubuntu, `libelf1t64`,
+`zlib1g` and `libzstd1`). On other hosts, build from source.
+
 ## Build
 
 ```bash
