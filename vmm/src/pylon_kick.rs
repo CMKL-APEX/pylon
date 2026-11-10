@@ -611,8 +611,11 @@ mod tests {
         let manager = MsiInterruptManager::new(allocator, Arc::clone(&vm));
 
         let dir = TempDir::new().unwrap();
-        let cfg = PylonConfig::parse(&format!("shm={}", dir.path().join("kick-pylon").display()))
-            .unwrap();
+        let cfg = PylonConfig::parse(&format!(
+            "shm={},park=vmm",
+            dir.path().join("kick-pylon").display()
+        ))
+        .unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         let mut device = PylonKickDevice::create(
             "kick".to_string(),

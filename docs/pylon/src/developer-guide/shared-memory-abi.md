@@ -37,7 +37,7 @@ the host on the hot path. Its layout is defined once, in
 | Offset | Field | Type | Value |
 |---|---|---|---|
 | 0 | `magic` | `u64` | `PYLON_MAGIC` = `0x5059_4C4F_4E56_4D31` (`"PYLONVM1"`) |
-| 8 | `version` | `u32` | `PYLON_ABI_VERSION` = 2 (same layout as 1; stricter writer rules) |
+| 8 | `version` | `u32` | `PYLON_ABI_VERSION` = 3 (same layout as 1 and 2) |
 | 12 | `num_vcpus` | `u32` | Number of slots in use: `max(boot, max)` vCPUs |
 | 16 | `vm_id` | `u64` | From `--pylon vm_id=` |
 | 24 | `tsc_khz` | `u64` | Counter rate used to convert ticks to time, or `0` if unknown. The VMM writes `0`; `pylond` then uses the host counter rate it finds at start. |
@@ -80,19 +80,19 @@ Two limits follow from the types: at most 64 vCPUs per VM, and
 `assigned_pcpu` can only name host CPUs 0–254.
 
 `PARKED` means the VMM has parked the vCPU. With park inside KVM
-(`PYLON_PARK_IN_KVM=1`, spec 08), the thread sleeps in `KVM_RUN` instead
+(`--pylon park=kvm`, spec 08), the thread sleeps in `KVM_RUN` instead
 of in the VMM, and an interrupt can run a `PARKED` vCPU without the VMM
 seeing it. `state` stays `PARKED` until `pylond` gives the vCPU a core
 ([VMM integration](vmm-integration.md#parking-inside-kvm)).
 
 ## Who writes what, today
 
-ABI version 2 gives each field one writer (spec 06 §3), and the field
-docs in `pylon-abi` say which:
+ABI version 2 gave each field one writer (spec 06 §3), and version 3
+keeps that. The field docs in `pylon-abi` say which:
 
 | Field | Writer |
 |---|---|
-| `state` | The guest (`pv-pylon`), only `RUNNING → PARKING` for its own vCPU; the VMM, every other transition. Never `pylond`. |
+| `state` | The guest (`pv-pylon`), only `PARKING` for its own vCPU, over `RUNNING`, or over `PARKED` while parked inside KVM; the VMM, every other transition. Never `pylond`. |
 | `revoke_requested` | `pylond` sets it; the VMM clears it when it parks the vCPU. |
 | `yield_count`, `last_yield_tsc`, `forced_preempt_count` | The VMM, when it parks the vCPU. |
 | `assigned_pcpu`, `revoke_deadline_tsc` | `pylond`. The VMM initializes `assigned_pcpu` to `PCPU_UNASSIGNED`. |
@@ -106,8 +106,25 @@ a version-2 page, and the other way round. `park_timer_deadline_tsc` and
 `guest_tsc_offset` were added later in version 2, in bytes that were
 reserved and zero, and readers treat `0` as "not provided", so they
 didn't need a new version. `park_on_boot` took a reserved byte the same
-way. Spec 08 §4.4 proposes a version 3 for park inside KVM; the code is
-still at version 2.
+way.
+
+Version 3 (spec 08 §4.4) keeps the layout too, and changes what the
+fields mean for a VM that parks inside KVM:
+
+- **A `PARKED` vCPU may be running.** An interrupt runs it without a
+  core and without an exit, so the VMM can't write `RUNNING`. Whether it
+  runs comes from `scx_pylon`'s woken map.
+- **The guest may write `PARKING` over `PARKED`**, when its park thread
+  saw a revocation that the VMM then forced. The VMM turns it back into
+  `PARKED`.
+- **`park_timer_deadline_tsc` only orders vCPUs.** KVM fires the
+  guest's timer itself, so `pylond` uses it only to pick which vCPU of a
+  VM gets a core first.
+
+The wake `eventfd`s stay: a vCPU parked inside KVM reads its own,
+without blocking, after each exit, to learn that `pylond` assigned it a
+core. A version-2 guest component or `pylond` refuses a version-3
+page.
 
 ## Time bases
 

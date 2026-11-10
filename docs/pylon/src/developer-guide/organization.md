@@ -108,7 +108,7 @@ symbols.
 | A control socket message | `pylond/src/lib.rs` (types) and `handle_client_connection` in `control.rs` |
 | A metric | `run_prometheus_server` in `control.rs` |
 | What the VMM does on a vCPU exit | `check_and_park_vcpu` in `vmm/src/pylon.rs` |
-| How a vCPU parks inside KVM (`PYLON_PARK_IN_KVM`) | `check_and_park_vcpu` and `kvm_park_op` in `vmm/src/pylon.rs` |
+| How a vCPU parks inside KVM (`park=kvm`) | `check_and_park_vcpu` and `kvm_park_op` in `vmm/src/pylon.rs` |
 | The `pylon-kick` device's registers and MSI-X | `vmm/src/pylon_kick.rs` |
 | When `scx_pylon` attaches | `scx_attach` in `pylond/src/main.rs` |
 | The BPF scheduling policy | `scx_pylon.bpf.c` |

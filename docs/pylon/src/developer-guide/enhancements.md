@@ -166,9 +166,9 @@ and the guest can't tell it isn't running. In a two-VM run on
 (spec 08 §1). Spec 08 parks the vCPU inside KVM instead, so KVM wakes
 it like a vCPU the guest halted itself. It needs no guest changes.
 
-It is a prototype. The VMM uses it only when its environment has
-`PYLON_PARK_IN_KVM=1`, and only on KVM. It relies on `scx_pylon`:
-`pylond --no-scx` is a non-goal (spec 08 §2). How it works:
+The VMM uses it with `--pylon park=kvm`, the default on x86_64 KVM
+hosts, and only on KVM. It relies on `scx_pylon`: `pylond` without it
+rejects such a VM (spec 08 §2). How it works:
 
 - **Park.** The VMM takes the usual steps up to `PARKED`, then sets the
   vCPU halted (`KVM_MP_STATE_HALTED` on x86_64, `KVM_MP_STATE_SUSPENDED`
@@ -202,14 +202,12 @@ It is a prototype. The VMM uses it only when its environment has
 | P0 | VMM only: park inside KVM, wake by signal, halt polling off. | **Done.** No soft lockups in the two-VM run (spec 08 §7.1). |
 | P1 | `scx_pylon`: per-VM queues and the woken map. | **Done.** Woken vCPUs run only on their VM's CPUs (§7.2). |
 | P2 | `pylond`: read the woken map, meter shared time, treat long wakes as demand. | **Done.** No stalls in the two-VM runs (§7.3). |
-| P3 | Measurements: wake-to-run latency for IPIs to parked vCPUs, guest throughput against the `eventfd` park, halt-polling settings. | **Not started** ([#50](https://github.com/CMKL-APEX/pylon/issues/50)). |
+| P3 | Measurements: wake-to-run latency for IPIs to parked vCPUs, guest throughput against the `eventfd` park, halt-polling settings. | **Done.** No stalls, throughput at the baseline's, halt polling stays off (§7.4). |
 
 Still open:
 
-- **Replace the environment variable** with a real option, and write
-  the ABI version 3 rules (spec 08 §4.4): `state` loses a writer, and a
-  due timer no longer wakes a VM with no core
-  ([#51](https://github.com/CMKL-APEX/pylon/issues/51)). Both wait for P3.
+- **aarch64** defaults to `park=vmm` until parking inside KVM is
+  verified there (spec 08 §6, V1).
 - **Most parks end by the 4 ms bound**, not by a wake
   ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
 - **Snapshot and migration** stay refused.
@@ -229,8 +227,8 @@ These are from spec 06 §10:
   guest flag the target in `stranded_work_bitmap`, or have the VMM
   watch for pending interrupts on parked vCPUs. This also affects vCPUs
   parked at boot. **Answered for unmodified guests** by parking inside
-  KVM ([above](#parking-inside-kvm-spec-08)), while it stays behind
-  `PYLON_PARK_IN_KVM`.
+  KVM ([above](#parking-inside-kvm-spec-08)), the default on x86_64
+  KVM hosts.
 - **Q3.** The minimum guest kernel version, and where to hook
   `in_critical_section`. `pv-pylon` builds against Linux 6.3 and later;
   the hook points are open

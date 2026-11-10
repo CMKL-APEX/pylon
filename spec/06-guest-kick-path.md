@@ -411,6 +411,11 @@ are the VMM's own, and the device installs them later (§4.2). Until the guest
 driver enables MSI-X, a kick waits in its `EventFd`. That is harmless: the
 forced path (§4.4) still applies.
 
+*Since #51:* registration moved to `setup_memory_region`, still before
+any device exists, because nothing logged during config parsing shows:
+the VMM installs its logger afterwards. The VMM now also reads
+`pylond`'s reply and logs a rejection.
+
 ---
 
 ## 6. Architecture & Backend Considerations
@@ -486,8 +491,8 @@ forced park, which is honest about the current state, and the metrics show it.
   (§4.2), which unblocks S4. **Open:** request a PCI-SIG vendor ID for CMKL,
   and give `pylon-kick` a device ID under it before Pylon ships.
 - **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. **Answered for
-  unmodified guests (2026-11-06)** by `spec/08-park-in-kvm.md`, enabled with
-  `PYLON_PARK_IN_KVM`: a vCPU parks halted inside KVM, so an interrupt wakes
+  unmodified guests (2026-11-06)** by `spec/08-park-in-kvm.md`, the default on
+  x86_64 KVM hosts (`--pylon park=kvm`): a vCPU parks halted inside KVM, so an interrupt wakes
   it, and `scx_pylon` runs it on its VM's CPUs. The text below is the
   original question. *Seen
   2026-10-31:* two 4-vCPU VMs on 4 managed CPUs settled at 2 cores each.

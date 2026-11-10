@@ -41,10 +41,10 @@ waking a thread takes microseconds and needs nothing from the guest.
 **Cost.** The guest doesn't know a vCPU is parked. Work it queues there,
 and interrupts it sends there (TLB shootdowns, reschedule IPIs), wait
 until `pylond` wakes the vCPU (spec 06 open question Q2). Spec 08
-answers this for unmodified guests: with `PYLON_PARK_IN_KVM=1`, the VMM
+answers this for unmodified guests: with `--pylon park=kvm`, the VMM
 parks the vCPU halted inside KVM instead of on the `eventfd`, so an
-interrupt wakes it, and `scx_pylon` runs it on its own VM's CPUs. That
-mode is still a prototype behind an environment variable
+interrupt wakes it, and `scx_pylon` runs it on its own VM's CPUs. Its
+measurements (spec 08 §7.4) made it the default on x86_64 KVM hosts
 ([Enhancements](enhancements.md#parking-inside-kvm-spec-08)).
 
 **Revisit** once spec 08's measurements (P3) show whether parking

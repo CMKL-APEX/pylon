@@ -16,7 +16,7 @@
 #include <linux/types.h>
 
 #define PYLON_MAGIC			0x50594C4F4E564D31ULL /* "PYLONVM1" */
-#define PYLON_ABI_VERSION		2
+#define PYLON_ABI_VERSION		3
 #define PYLON_MAX_VCPUS			64
 #define PYLON_SHARED_PAGE_SIZE		8192
 

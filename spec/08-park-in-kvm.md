@@ -2,9 +2,9 @@
 
 > **Status:** `DRAFT`. Prototype first (§7). P0 (§7.1), P1 (§7.2), P2
 > (§4.2, results in §7.3) and P3 (§7.4) are done. P3 decided that
-> parking inside KVM replaces the park of spec 06 on KVM. The VMM still
-> parks inside KVM only when `PYLON_PARK_IN_KVM` is set; ABI v3 and a
-> real option are #51.
+> parking inside KVM replaces the park of spec 06 on KVM. It is the
+> `--pylon park=kvm` option, the default on x86_64 KVM hosts, with ABI
+> version 3 (§4.4, §4.5, #51).
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
 > spec 06 Q2 for unmodified guests.
 
@@ -102,8 +102,10 @@ The wake `EventFd` can't reach a thread blocked in `KVM_RUN`. Calling
   It does this today for forced parks.
 - **KVM** wakes the blocked thread on the pending signal, and `KVM_RUN`
   returns `EINTR`.
-- **The VMM** sees `assigned_pcpu` set. It sets the vCPU runnable
-  (`KVM_MP_STATE_RUNNABLE`), writes `RUNNING`, and re-enters.
+- **The VMM** reads the vCPU's wake `EventFd` (non-blocking). If
+  `pylond` wrote it, the VMM sets the vCPU runnable
+  (`KVM_MP_STATE_RUNNABLE`), writes `RUNNING`, and re-enters. (The draft
+  read `assigned_pcpu` here; §4.4 says why it doesn't.)
 
 An `EINTR` with no assignment is spurious. The VMM then goes back to
 §3.1 step 2.
@@ -196,7 +198,7 @@ vCPU was parked already, so the request is done and no park is counted.
 - The park bound of §3.6.
 - Restoring `PARKED` over a late guest park request (§3.7).
 - `KVM_CAP_HALT_POLL` at VM creation when `--pylon` is set.
-- Drop the wake `EventFd`s, or keep them only for MSHV.
+- Keep the wake `EventFd`s, non-blocking, as the assignment token (§4.4).
 - Snapshot and migration stay refused (spec 06 §7).
 
 ### 4.2 `pylond`
@@ -315,7 +317,28 @@ So:
   gets a core, while the guest re-arms its timer unseen. So once it
   passed, a VM with no core looked due again as soon as it lost a core,
   and traded one with a busy VM about ten times a second (§7.3).
-- **The wake `EventFd`s drop out of registration** for KVM VMs.
+- **The guest may write `PARKING` over `PARKED`**, for the late park
+  request of §3.7. The VMM turns it back into `PARKED`.
+
+*As implemented (#51):* the layout is unchanged, and `PYLON_ABI_VERSION`
+is 3. The wake `EventFd`s stay. §3.3 had the VMM read `assigned_pcpu`
+after an `EINTR` instead, but a donor that has just parked still has its
+old `assigned_pcpu` until `pylond`'s next sweep hands the core over, so
+the VMM would take it for a new assignment and run without a core. The
+`EventFd`, non-blocking for these VMs, is written once per assignment, so
+the VMM reads it after each exit instead (§3.3).
+
+### 4.5 Option
+
+`--pylon park=kvm|vmm` picks where a vCPU without a core waits:
+
+- **Default:** `kvm` on x86_64 when `/dev/kvm` exists, the backend the
+  VMM picks first; `vmm` elsewhere. aarch64 stays on `vmm` until V1 is
+  answered there.
+- **`park=kvm` on MSHV** is refused at start-up (§2).
+- **`pylond` without `scx_pylon`** rejects the registration of a VM that
+  parks inside KVM (`wake_by_signal`), whose woken vCPUs would otherwise
+  run on any CPU.
 
 ## 5. Guest Impact (Unmodified Linux)
 
@@ -708,8 +731,8 @@ Halt polling stays off (§3.5).
 **Decision:** on KVM, a parked vCPU waits inside KVM (§3.1) instead of
 in the VMM, for forced and cooperative parks alike. `pv-pylon` still
 decides when a guest gives a core back (§2). MSHV keeps today's park.
-Making this a real option, with ABI v3, is #51. The wake latency tail
-is #52.
+Making this a real option, with ABI v3, is #51 (done, §4.4 and §4.5).
+The wake latency tail is #52.
 
 ## 8. Alternatives Considered
 

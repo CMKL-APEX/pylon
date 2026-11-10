@@ -38,10 +38,12 @@ signal. Without it, `pylond` never signals the VMM. `pylond` takes the
 VMM's PID from the socket's peer credentials, not from the message.
 
 `wake_by_signal` (optional, default `false`) is sent as `true` by a VMM
-that parks vCPUs inside KVM (`PYLON_PARK_IN_KVM=1`, spec 08). The wake
+that parks vCPUs inside KVM (`--pylon park=kvm`, spec 08). The wake
 `eventfd` can't reach a thread blocked in `KVM_RUN`, so `pylond` also
 sends `kick_signal` when it assigns a core, and again until the vCPU
 leaves `PARKED`. The VMM leaves the field out when it's `false`.
+`pylond` rejects such a registration when `scx_pylon` isn't attached:
+without it, a woken vCPU would run on any CPU.
 
 Attached descriptors, in order: the shared page's file, then
 `num_vcpus` kick `eventfd`s, then `num_vcpus` wake `eventfd`s (1 + 2 ×
@@ -53,8 +55,8 @@ Attached descriptors, in order: the shared page's file, then
 | `{"accepted": false, "message": "...a running VMM already registered this vm_id"}` | Another VM with this `vm_id` is registered, and its VMM is still running. |
 | `{"accepted": false, "message": "expected <n> FDs, got <m>"}` | Wrong number of descriptors. |
 
-`pylond` logs every rejection as a warning, because the VMM doesn't read
-the response. A registration whose JSON doesn't parse gets no response.
+`pylond` closes the connection after the response. Both sides log a
+rejection as a warning; the VM then runs without `pylond`. A registration whose JSON doesn't parse gets no response.
 A registration's `priority_weight` of 0 is stored as 1.
 | `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the page couldn't be mapped, is smaller than 8,192 bytes or its header is invalid; or a pidfd for the peer couldn't be opened. |
 

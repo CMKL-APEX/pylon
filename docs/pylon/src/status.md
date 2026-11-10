@@ -1,7 +1,7 @@
 # Status and roadmap
 
 This page says what works in Pylon today, what doesn't, and what is
-planned. It reflects `main` as of 2026-11-09. Open work is tracked as
+planned. It reflects `main` as of 2026-11-10. Open work is tracked as
 GitHub issues: the [`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestone/1) holds what the next
 release needs, and the [`v0.0.9` milestone](https://github.com/CMKL-APEX/pylon/milestone/2) the rest.
 The detailed tracker is
@@ -17,7 +17,7 @@ The detailed tracker is
 | Waking parked vCPUs | `pylond` wakes a parked vCPU when its VM has demand and a managed CPU is idle, or takes a core from another VM. |
 | Taking back idle cores | When a vCPU parks on its own, `pylond` reclaims its core. |
 | Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. Repeated signals back off up to 1 ms. |
-| Parking inside KVM | With `PYLON_PARK_IN_KVM=1` in the VMM's environment, a parked vCPU halts inside KVM, so an interrupt (an IPI, a timer) wakes it. `scx_pylon` runs a woken vCPU only on its own VM's CPUs, and `pylond` gives a core to a VM whose vCPU stays woken. This removes the soft lockups of VMs that hold fewer cores than they have vCPUs. See [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
+| Parking inside KVM | With `--pylon park=kvm`, the default on x86_64 KVM hosts, a parked vCPU halts inside KVM, so an interrupt (an IPI, a timer) wakes it. `scx_pylon` runs a woken vCPU only on its own VM's CPUs, and `pylond` gives a core to a VM whose vCPU stays woken. This removes the soft lockups of VMs that hold fewer cores than they have vCPUs. See [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
 | Arbitration | Demand evaluation, urgency ordering and donor selection run every tick (see [The arbitration engine](developer-guide/arbitration.md)). |
 | Runtime policy | `min_cores`, `max_cores` and `priority_weight` can be changed over the control socket. `min_cores` is a floor under demand: an idle VM holds no cores. |
 | Metering | Core-microseconds, cooperative yields, forced preemptions, handoffs without park, revocation-to-park latency and woken-vCPU time per VM, over the socket and as Prometheus metrics. |
@@ -27,14 +27,18 @@ The detailed tracker is
 
 ## What doesn't work yet
 
-**Parking inside KVM is a prototype.** It is behind an environment
-variable, not a `--pylon` option, and the shared-page ABI hasn't been
-bumped for it ([#51](https://github.com/CMKL-APEX/pylon/issues/51)). It is meant to run with `scx_pylon`: without it, a
-woken vCPU runs on any CPU. Measured against the default park, it
-stops the stalls in unmodified guests and costs no throughput, so it
-will replace the default park on KVM
+**Parking inside KVM has limits.** It is the default on x86_64 KVM
+hosts (`--pylon park=kvm`), because it stops the stalls in unmodified
+guests and costs no throughput
 ([spec 08 §7.4](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md#74-p3-result-2026-11-09)).
-Wake latency still has a tail of about 2 ms ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
+But:
+
+- **It needs `scx_pylon`.** `pylond` without it rejects such a VM; use
+  `park=vmm` there.
+- **Wake latency has a tail of about 2 ms**
+  ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
+- **aarch64 parks in the VMM by default** until parking inside KVM is
+  verified there.
 
 **Cooperative revocation, within the grace period.** The parts exist
 (`pylon-kick` and `pv-pylon`), but:
@@ -81,13 +85,13 @@ issues:
 
 | Work | Issue |
 |---|---|
-| Run the self-hosted CI jobs only in the upstream repository instead of disabling them. | [#66](https://github.com/CMKL-APEX/pylon/issues/66) |
+| Make parking inside KVM a `--pylon` option, the default on x86_64 KVM hosts, with ABI version 3. | [#51](https://github.com/CMKL-APEX/pylon/issues/51) |
 
 The rest is on `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
 
 | Work | Issues |
 |---|---|
-| Make parking inside KVM a real option with ABI v3; end more parks by a wake than by the bound. | [#51](https://github.com/CMKL-APEX/pylon/issues/51), [#52](https://github.com/CMKL-APEX/pylon/issues/52) |
+| End more parks by a wake than by the bound. | [#52](https://github.com/CMKL-APEX/pylon/issues/52) |
 | Measure and cut handoff latency; make the guest yield within the grace period. | [#53](https://github.com/CMKL-APEX/pylon/issues/53), [#54](https://github.com/CMKL-APEX/pylon/issues/54), [#74](https://github.com/CMKL-APEX/pylon/issues/74) |
 | Report critical sections from the guest. | [#56](https://github.com/CMKL-APEX/pylon/issues/56) |
 | Scale to zero on network traffic. | [#57](https://github.com/CMKL-APEX/pylon/issues/57) |

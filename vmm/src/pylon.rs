@@ -4,17 +4,21 @@
 //
 
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::{env, fs, io, mem, ptr, result};
+use std::{fmt, fs, io, mem, ptr, result};
 
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{MsrEntry, msr_index};
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+use hypervisor::kvm::KvmHypervisor;
 use hypervisor::{HypervisorType, HypervisorVmError, MemoryVisibility, Vcpu, Vm};
 use log::{info, warn};
 use option_parser::{OptionParser, OptionParserError};
@@ -50,12 +54,9 @@ pub const UNKNOWN_TSC_KHZ: u64 = 0;
 /// Default VM priority weight for Pylon core arbitration.
 pub const DEFAULT_PRIORITY_WEIGHT: u32 = 100;
 
-/// Environment variable that parks vCPUs inside KVM instead of in the VMM
-/// (`spec/08-park-in-kvm.md`, prototype step P0) when set to `1`.
-pub const PARK_IN_KVM_ENV: &str = "PYLON_PARK_IN_KVM";
-
-/// Halt polling limit, in nanoseconds, for a VM that parks vCPUs inside KVM. P0 turns halt
-/// polling off, so a parked vCPU costs no host CPU (`spec/08-park-in-kvm.md` §3.5).
+/// Halt polling limit, in nanoseconds, for a VM that parks vCPUs inside KVM. Halt polling is
+/// off, so a parked vCPU costs no host CPU; polling for 50 µs made no measurable difference to
+/// wake latency (`spec/08-park-in-kvm.md` §3.5, §7.4).
 const PARK_IN_KVM_HALT_POLL_NS: u32 = 0;
 
 /// Longest a vCPU stays parked inside KVM with nothing waking it, before the VMM lets it run
@@ -71,6 +72,10 @@ pub enum Error {
     /// Failed to parse `--pylon` options.
     #[error("Error parsing --pylon options")]
     OptionParse(#[source] OptionParserError),
+
+    /// `park=kvm` on a hypervisor other than KVM.
+    #[error("--pylon park=kvm needs KVM; use park=vmm")]
+    ParkInKvmNeedsKvm,
 
     /// Missing required `shm` parameter in `--pylon`.
     #[error("Error parsing --pylon: shm path missing")]
@@ -127,6 +132,66 @@ pub enum Error {
     /// Failed to register the VM with the `pylond` Unix domain socket.
     #[error("Failed to register VM with pylond daemon")]
     DaemonRegister(#[source] io::Error),
+
+    /// `pylond` refused the VM's registration.
+    #[error("pylond rejected the registration: {0}")]
+    DaemonRejected(String),
+}
+
+/// How long the VMM waits for `pylond`'s reply to its registration.
+const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `pylond`'s reply to a registration (`VmRegistrationResponse` in `pylond`), sent before it
+/// closes the connection.
+#[derive(Debug, Deserialize)]
+struct DaemonRegistrationReply {
+    accepted: bool,
+    message: String,
+}
+
+/// Where a vCPU without a core waits (`--pylon park=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PylonPark {
+    /// Halted inside KVM, so that interrupts wake it, gated by `scx_pylon`
+    /// (`spec/08-park-in-kvm.md`).
+    Kvm,
+    /// Blocked in the VMM until `pylond` assigns a core (`spec/06-guest-kick-path.md`).
+    Vmm,
+}
+
+impl PylonPark {
+    /// `Kvm` on x86_64 when KVM is available, which is the backend the VMM picks first;
+    /// `Vmm` elsewhere. Parking inside KVM hasn't been verified on aarch64 yet
+    /// (`spec/08-park-in-kvm.md` §6, V1).
+    pub fn host_default() -> Self {
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        if KvmHypervisor::is_available().unwrap_or(false) {
+            return PylonPark::Kvm;
+        }
+        PylonPark::Vmm
+    }
+}
+
+impl FromStr for PylonPark {
+    type Err = String;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s {
+            "kvm" => Ok(PylonPark::Kvm),
+            "vmm" => Ok(PylonPark::Vmm),
+            _ => Err(format!("invalid park mode {s:?} (expected kvm or vmm)")),
+        }
+    }
+}
+
+impl fmt::Display for PylonPark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PylonPark::Kvm => "kvm",
+            PylonPark::Vmm => "vmm",
+        })
+    }
 }
 
 /// Configuration for the Pylon microsecond core arbitration subsystem (`--pylon`).
@@ -148,14 +213,15 @@ pub struct PylonConfig {
     pub priority_weight: u32,
     /// Identifier for this VM in `PylonHeader` and `pylond`.
     pub vm_id: u64,
-    /// Park vCPUs inside KVM (`spec/08-park-in-kvm.md`), from `PYLON_PARK_IN_KVM`.
-    pub park_in_kvm: bool,
+    /// Where a vCPU without a core waits (defaults to `PylonPark::host_default`).
+    pub park: PylonPark,
 }
 
 impl PylonConfig {
     pub const SYNTAX: &'static str = "Pylon elastic core arbitration parameters \
         \"shm=<shm_path>[,socket=<pylond_sock_path>,gpa=<hex_or_dec_gpa>,\
-        initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>]\"";
+        initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>,\
+        park=kvm|vmm]\"";
 
     /// Parses a `--pylon` CLI configuration string.
     pub fn parse(pylon: &str) -> result::Result<Self, Error> {
@@ -168,7 +234,8 @@ impl PylonConfig {
             .add("min_cores")
             .add("max_cores")
             .add("priority_weight")
-            .add("vm_id");
+            .add("vm_id")
+            .add("park");
         parser.parse(pylon).map_err(Error::OptionParse)?;
 
         let shm_str = parser.get("shm").ok_or(Error::MissingShmPath)?;
@@ -220,6 +287,10 @@ impl PylonConfig {
             .convert::<u64>("vm_id")
             .map_err(Error::OptionParse)?
             .unwrap_or(1);
+        let park = parser
+            .convert::<PylonPark>("park")
+            .map_err(Error::OptionParse)?
+            .unwrap_or_else(PylonPark::host_default);
 
         Ok(PylonConfig {
             shm,
@@ -230,7 +301,7 @@ impl PylonConfig {
             max_cores,
             priority_weight,
             vm_id,
-            park_in_kvm: env::var(PARK_IN_KVM_ENV).is_ok_and(|v| v == "1"),
+            park,
         })
     }
 }
@@ -273,6 +344,8 @@ pub struct PylonVmmState {
     /// One per vCPU: the bound on how long it stays parked inside KVM (§3.6).
     park_bounds: Vec<ParkBound>,
     shutting_down: AtomicBool,
+    /// Set once `register` has run, so that a VM rebooted in the same process registers once.
+    registered: AtomicBool,
 }
 
 /// Ends a park inside KVM that nothing else ends (`spec/08-park-in-kvm.md` §3.6).
@@ -445,8 +518,7 @@ impl PylonVmmState {
             slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
         }
 
-        let wake_flags = if config.park_in_kvm {
-            info!("Pylon: VM {} parks vCPUs inside KVM", config.vm_id);
+        let wake_flags = if config.park == PylonPark::Kvm {
             libc::EFD_NONBLOCK
         } else {
             0
@@ -475,24 +547,44 @@ impl PylonVmmState {
             parked_in_kvm: (0..num_vcpus).map(|_| AtomicBool::new(false)).collect(),
             park_bounds: (0..num_vcpus).map(|_| ParkBound::default()).collect(),
             shutting_down: AtomicBool::new(false),
+            registered: AtomicBool::new(false),
         });
 
-        if let Some(socket_path) = &config.socket {
-            if socket_path.exists() {
-                if let Err(e) = state.register_with_daemon(socket_path) {
-                    warn!(
-                        "Pylon: failed to register VM {} with pylond at {:?}: {e}",
-                        config.vm_id, socket_path
-                    );
-                }
-            } else {
-                info!(
-                    "Pylon: daemon socket {socket_path:?} does not exist yet; continuing with shared memory initialized"
-                );
-            }
-        }
-
         Ok(state)
+    }
+
+    /// Registers the VM with `pylond` if `socket=` is set, once per process.
+    ///
+    /// Not part of `new`, which runs while the command line is parsed, before the logger is
+    /// installed: a failed registration has to show in the VMM's log.
+    pub fn register(&self) {
+        let Some(socket_path) = &self.config.socket else {
+            return;
+        };
+        if self.registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !socket_path.exists() {
+            warn!(
+                "Pylon: pylond socket {socket_path:?} doesn't exist; VM {} runs unmanaged",
+                self.config.vm_id
+            );
+            return;
+        }
+        match self.register_with_daemon(socket_path) {
+            Ok(()) => info!(
+                "Pylon: registered VM {} with pylond, parking vCPUs {}",
+                self.config.vm_id,
+                match self.config.park {
+                    PylonPark::Kvm => "inside KVM",
+                    PylonPark::Vmm => "in the VMM",
+                }
+            ),
+            Err(e) => warn!(
+                "Pylon: failed to register VM {} with pylond at {socket_path:?}: {e}",
+                self.config.vm_id
+            ),
+        }
     }
 
     /// Connects to `pylond` over Unix domain socket and transmits VM registration metadata
@@ -506,7 +598,7 @@ impl PylonVmmState {
             max_cores: self.config.max_cores.unwrap_or(self.max_vcpus),
             priority_weight: self.config.priority_weight,
             kick_signal: SIGRTMIN(),
-            wake_by_signal: self.config.park_in_kvm,
+            wake_by_signal: self.config.park == PylonPark::Kvm,
         };
         let mut json_bytes =
             serde_json::to_vec(&payload).map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
@@ -524,6 +616,19 @@ impl PylonVmmState {
         stream
             .send_with_fds(&[json_bytes.as_slice()], &fds)
             .map_err(|e| Error::DaemonRegister(e.into()))?;
+
+        stream
+            .set_read_timeout(Some(DAEMON_REPLY_TIMEOUT))
+            .map_err(Error::DaemonRegister)?;
+        let mut reply = Vec::new();
+        (&stream)
+            .read_to_end(&mut reply)
+            .map_err(Error::DaemonRegister)?;
+        let reply: DaemonRegistrationReply = serde_json::from_slice(&reply)
+            .map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
+        if !reply.accepted {
+            return Err(Error::DaemonRejected(reply.message));
+        }
         Ok(())
     }
 
@@ -660,7 +765,7 @@ impl PylonVmmState {
         if vcpu_id >= self.initial_active_vcpus {
             slot.park_on_boot.store(1, Ordering::Release);
         }
-        if self.config.park_in_kvm {
+        if self.config.park == PylonPark::Kvm {
             match ThreadTimer::new() {
                 Ok(timer) => {
                     let _ = self.park_bounds[vcpu_id as usize].timer.set(timer);
@@ -689,7 +794,7 @@ impl PylonVmmState {
     /// guest TSC) as `park_timer_deadline_tsc` in host TSC, so `pylond` can give the vCPU a
     /// core back when the timer is due: a parked vCPU's timer interrupt can't fire.
     ///
-    /// With `park_in_kvm`, the vCPU parks inside KVM instead (`spec/08-park-in-kvm.md`):
+    /// With `park=kvm`, the vCPU parks inside KVM instead (`spec/08-park-in-kvm.md`):
     /// `vcpu_op` sets it halted and this returns at once, so the run loop's next `KVM_RUN`
     /// sleeps in KVM until an interrupt or a signal. An interrupt runs the guest again without
     /// an exit; `state` stays `PARKED`. After each later exit, the vCPU becomes runnable and
@@ -756,7 +861,7 @@ impl PylonVmmState {
         // park yet; `pylond` signals again (`spec/08-park-in-kvm.md` §3.4). Halting happens
         // before anything is published, so a failure leaves the vCPU running as if it hadn't
         // been asked.
-        if self.config.park_in_kvm
+        if self.config.park == PylonPark::Kvm
             && !(vcpu_op(KvmParkOp::InterruptsEnabled) && vcpu_op(KvmParkOp::Halt))
         {
             return false;
@@ -780,7 +885,7 @@ impl PylonVmmState {
         slot.park_timer_deadline_tsc.store(timer, Ordering::Relaxed);
         slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
 
-        if self.config.park_in_kvm {
+        if self.config.park == PylonPark::Kvm {
             parked_in_kvm.store(true, Ordering::Relaxed);
             if decision != ParkDecision::Boot {
                 self.start_park_bound(vcpu_id);
@@ -1047,18 +1152,61 @@ pub fn read_guest_tsc_deadline(_vcpu: &dyn Vcpu) -> Option<u64> {
     None
 }
 
+/// Whether `PR_SCHED_CORE` failing with `err` means the vCPU should run without core
+/// scheduling, for `vmm/src/cpu.rs`. Only with `--pylon`, and only for `EPERM`: that is what
+/// `pylond`'s guard answers while `scx_pylon` is attached to a kernel without the `sched_ext`
+/// core-scheduling fixes (issue #15). `scx_pylon` then keeps the VM's vCPU threads apart from
+/// their SMT siblings instead. Warns once per process.
+pub fn core_scheduling_refused(err: &io::Error) -> bool {
+    let Some(state) = global_state() else {
+        return false;
+    };
+    if !refused_by_guard(err) {
+        return false;
+    }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "Pylon: core scheduling refused (EPERM), as pylond's guard does on kernels without \
+             the sched_ext core-scheduling fixes (pylon#15); VM {} runs without it, and \
+             scx_pylon keeps its vCPU threads apart from their SMT siblings",
+            state.config.vm_id
+        );
+    }
+    true
+}
+
+/// The part of `core_scheduling_refused` that doesn't depend on `--pylon`.
+fn refused_by_guard(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EPERM)
+}
+
 /// Hook for `CpuManager::new` (`vmm/src/cpu.rs`): rejects `--pylon` on a hypervisor backend that
 /// can't support it, so it fails at start-up instead of silently never forcing a park. MSHV on
 /// aarch64 can't read the guest's counter or timer (`spec/07-aarch64-support.md` §4.2).
+///
+/// Also rejects `park=kvm` on a backend other than KVM, which has no halted state to park in.
 pub fn check_hypervisor(hypervisor_type: HypervisorType) -> result::Result<(), Error> {
+    let Some(state) = global_state() else {
+        return Ok(());
+    };
     #[cfg(feature = "mshv")]
-    if cfg!(target_arch = "aarch64")
-        && hypervisor_type == HypervisorType::Mshv
-        && global_state().is_some()
-    {
+    if cfg!(target_arch = "aarch64") && hypervisor_type == HypervisorType::Mshv {
         return Err(Error::UnsupportedHypervisor);
     }
+    check_park(state.config.park, hypervisor_type)
+}
+
+/// Whether `park` works on `hypervisor_type`.
+fn check_park(park: PylonPark, hypervisor_type: HypervisorType) -> result::Result<(), Error> {
+    #[cfg(feature = "kvm")]
+    if hypervisor_type == HypervisorType::Kvm {
+        return Ok(());
+    }
     let _ = hypervisor_type;
+    if park == PylonPark::Kvm {
+        return Err(Error::ParkInKvmNeedsKvm);
+    }
     Ok(())
 }
 
@@ -1105,15 +1253,16 @@ pub fn clear_global_state() {
 }
 
 /// Hook for `MemoryManager::new` (`vmm/src/memory_manager.rs`): maps the Pylon shared page
-/// into guest physical memory if `--pylon` is active. The returned region must live as long
-/// as the VM.
+/// into guest physical memory if `--pylon` is active, then registers the VM with `pylond`. The
+/// returned region must live as long as the VM.
 pub fn setup_memory_region(
     vm: &Arc<dyn Vm>,
     next_memory_slot: &mut u32,
 ) -> result::Result<Option<Arc<GuestRegion>>, Error> {
     if let Some(state) = global_state() {
         let region = state.setup_gpa_mapping(vm, next_memory_slot)?;
-        if state.config.park_in_kvm
+        state.register();
+        if state.config.park == PylonPark::Kvm
             && let Err(e) = vm.set_halt_poll_ns(PARK_IN_KVM_HALT_POLL_NS)
         {
             warn!("Pylon: failed to turn halt polling off: {e}");
@@ -1156,6 +1305,7 @@ pub fn shutdown_all() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -1176,10 +1326,11 @@ mod tests {
         assert_eq!(cfg.max_cores, None);
         assert_eq!(cfg.priority_weight, DEFAULT_PRIORITY_WEIGHT);
         assert_eq!(cfg.vm_id, 1);
+        assert_eq!(cfg.park, PylonPark::host_default());
 
         let full = PylonConfig::parse(
             "shm=/dev/shm/vm42-pylon,socket=/run/pylon/pylond.sock,gpa=0xfedf0000,\
-             initial_active_vcpus=2,min_cores=1,max_cores=8,priority_weight=250,vm_id=42",
+             initial_active_vcpus=2,min_cores=1,max_cores=8,priority_weight=250,vm_id=42,park=vmm",
         )
         .unwrap();
         assert_eq!(full.shm, PathBuf::from("/dev/shm/vm42-pylon"));
@@ -1190,6 +1341,34 @@ mod tests {
         assert_eq!(full.max_cores, Some(8));
         assert_eq!(full.priority_weight, 250);
         assert_eq!(full.vm_id, 42);
+        assert_eq!(full.park, PylonPark::Vmm);
+        let kvm = PylonConfig::parse("shm=/dev/shm/vm1-pylon,park=kvm").unwrap();
+        assert_eq!(kvm.park, PylonPark::Kvm);
+    }
+
+    #[test]
+    fn test_pylon_park_default_and_hypervisor_check() {
+        #[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+        assert_eq!(PylonPark::host_default(), PylonPark::Vmm);
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        assert_eq!(
+            PylonPark::host_default() == PylonPark::Kvm,
+            Path::new("/dev/kvm").exists()
+        );
+
+        #[cfg(feature = "kvm")]
+        {
+            check_park(PylonPark::Kvm, HypervisorType::Kvm).unwrap();
+            check_park(PylonPark::Vmm, HypervisorType::Kvm).unwrap();
+        }
+        #[cfg(feature = "mshv")]
+        {
+            assert!(matches!(
+                check_park(PylonPark::Kvm, HypervisorType::Mshv),
+                Err(Error::ParkInKvmNeedsKvm)
+            ));
+            check_park(PylonPark::Vmm, HypervisorType::Mshv).unwrap();
+        }
     }
 
     #[test]
@@ -1219,6 +1398,11 @@ mod tests {
             PylonConfig::parse("shm=/dev/shm/test-pylon,unknown_key=1"),
             Err(Error::OptionParse(_))
         ));
+        // Unknown park mode
+        assert!(matches!(
+            PylonConfig::parse("shm=/dev/shm/test-pylon,park=host"),
+            Err(Error::OptionParse(_))
+        ));
     }
 
     #[test]
@@ -1226,7 +1410,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-init-pylon");
         let cfg = PylonConfig::parse(&format!(
-            "shm={},vm_id=77,initial_active_vcpus=2",
+            "shm={},park=vmm,vm_id=77,initial_active_vcpus=2",
             shm_path.display()
         ))
         .unwrap();
@@ -1258,7 +1442,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-tid-pylon");
         let cfg = PylonConfig::parse(&format!(
-            "shm={},initial_active_vcpus=1",
+            "shm={},park=vmm,initial_active_vcpus=1",
             shm_path.display()
         ))
         .unwrap();
@@ -1297,7 +1481,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-boot-park-pylon");
         let cfg = PylonConfig::parse(&format!(
-            "shm={},initial_active_vcpus=1",
+            "shm={},park=vmm,initial_active_vcpus=1",
             shm_path.display()
         ))
         .unwrap();
@@ -1401,7 +1585,7 @@ mod tests {
 
     fn running_vcpu0_state(dir: &TempDir) -> Arc<PylonVmmState> {
         let shm_path = dir.path().join("vm-park-pylon");
-        let cfg = PylonConfig::parse(&format!("shm={}", shm_path.display())).unwrap();
+        let cfg = PylonConfig::parse(&format!("shm={},park=vmm", shm_path.display())).unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         state.on_vcpu_thread_start(0, || None);
         assert_eq!(
@@ -1417,8 +1601,8 @@ mod tests {
         extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
         register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
         let shm_path = dir.path().join("vm-park-kvm-pylon");
-        let mut cfg = PylonConfig::parse(&format!("shm={}", shm_path.display())).unwrap();
-        cfg.park_in_kvm = true;
+        let mut cfg = PylonConfig::parse(&format!("shm={},park=vmm", shm_path.display())).unwrap();
+        cfg.park = PylonPark::Kvm;
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         state.on_vcpu_thread_start(0, || None);
         state
@@ -1706,14 +1890,13 @@ mod tests {
         assert_eq!(vtimer_deadline(0b001, 0), 0);
     }
 
-    #[test]
-    fn test_daemon_socket_registration_scm_rights() {
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-sock-pylon");
-        let sock_path = dir.path().join("pylond.sock");
-
-        let listener = UnixListener::bind(&sock_path).unwrap();
-        let server_thread = thread::spawn(move || {
+    /// Accepts one registration on `listener`, answers it with `reply`, and returns the request,
+    /// the number of FDs that came with it, and the listener.
+    fn serve_one_registration(
+        listener: UnixListener,
+        reply: &'static [u8],
+    ) -> thread::JoinHandle<(DaemonRegistrationPayload, usize, UnixListener)> {
+        thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 512];
             let mut iov = [libc::iovec {
@@ -1732,26 +1915,81 @@ mod tests {
             }
             let msg: DaemonRegistrationPayload =
                 serde_json::from_slice(&buf[..bytes_read]).unwrap();
-            (msg, fds_read)
-        });
+            (&stream).write_all(reply).unwrap();
+            (msg, fds_read, listener)
+        })
+    }
+
+    #[test]
+    fn test_core_scheduling_refused_only_for_eperm() {
+        assert!(refused_by_guard(&io::Error::from_raw_os_error(libc::EPERM)));
+        assert!(!refused_by_guard(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!refused_by_guard(&io::Error::from_raw_os_error(
+            libc::ENOMEM
+        )));
+    }
+
+    #[test]
+    fn test_daemon_socket_registration_scm_rights() {
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-sock-pylon");
+        let sock_path = dir.path().join("pylond.sock");
+
+        let server = serve_one_registration(
+            UnixListener::bind(&sock_path).unwrap(),
+            br#"{"accepted":true,"message":"ok"}"#,
+        );
 
         let cfg = PylonConfig::parse(&format!(
-            "shm={},socket={},vm_id=99,min_cores=1,max_cores=2,priority_weight=150",
+            "shm={},park=vmm,socket={},vm_id=99,min_cores=1,max_cores=2,priority_weight=150",
             shm_path.display(),
             sock_path.display()
         ))
         .unwrap();
 
-        let _state = PylonVmmState::new(&cfg, 2, 2).unwrap();
-        let (msg, fds_read) = server_thread.join().unwrap();
+        // Creating the state doesn't register; `register` does.
+        let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.register();
+        let (msg, fds_read, listener) = server.join().unwrap();
         assert_eq!(msg.vm_id, 99);
         assert_eq!(msg.num_vcpus, 2);
         assert_eq!(msg.min_cores, 1);
         assert_eq!(msg.max_cores, 2);
         assert_eq!(msg.priority_weight, 150);
         assert_eq!(msg.kick_signal, SIGRTMIN());
+        assert!(!msg.wake_by_signal);
         // 1 shm_fd + 2 kick_eventfds + 2 wake_eventfds = 5 FDs
         assert_eq!(fds_read, 5);
+
+        // A second call, as after a reboot in the same process, doesn't connect again.
+        state.register();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn test_daemon_rejection_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-reject-pylon");
+        let sock_path = dir.path().join("pylond.sock");
+
+        let server = serve_one_registration(
+            UnixListener::bind(&sock_path).unwrap(),
+            br#"{"accepted":false,"message":"needs scx_pylon"}"#,
+        );
+        let cfg =
+            PylonConfig::parse(&format!("shm={},park=kvm,vm_id=98", shm_path.display())).unwrap();
+        let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+
+        let err = state.register_with_daemon(&sock_path).unwrap_err();
+        let (msg, _, _) = server.join().unwrap();
+        assert!(msg.wake_by_signal);
+        assert!(matches!(err, Error::DaemonRejected(m) if m == "needs scx_pylon"));
     }
 
     /// The guest counter read from a real vCPU converts to the host counter within a small
@@ -1764,7 +2002,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-kvm-counter-pylon");
         let cfg = PylonConfig::parse(&format!(
-            "shm={},gpa=0x8000,vm_id=44,initial_active_vcpus=1",
+            "shm={},park=vmm,gpa=0x8000,vm_id=44,initial_active_vcpus=1",
             shm_path.display()
         ))
         .unwrap();
@@ -1813,7 +2051,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shm_path = dir.path().join("vm-kvm-forced-pylon");
         let cfg = PylonConfig::parse(&format!(
-            "shm={},gpa=0x8000,vm_id=43,initial_active_vcpus=1",
+            "shm={},park=vmm,gpa=0x8000,vm_id=43,initial_active_vcpus=1",
             shm_path.display()
         ))
         .unwrap();
@@ -1971,7 +2209,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let shm_path = dir.path().join(format!("vm-kvm-spin-{vm_id}-pylon"));
             let cfg = PylonConfig::parse(&format!(
-                "shm={},gpa=0x8000,vm_id={vm_id},initial_active_vcpus=1",
+                "shm={},park=vmm,gpa=0x8000,vm_id={vm_id},initial_active_vcpus=1",
                 shm_path.display()
             ))
             .unwrap();
@@ -2223,7 +2461,7 @@ mod tests {
         let shm_path = dir.path().join("vm-kvm-e2e-pylon");
         // Map Pylon shared page at GPA 0x8000 so 16-bit real-mode guest code can address it directly.
         let cfg = PylonConfig::parse(&format!(
-            "shm={},gpa=0x8000,vm_id=42,initial_active_vcpus=1",
+            "shm={},park=vmm,gpa=0x8000,vm_id=42,initial_active_vcpus=1",
             shm_path.display()
         ))
         .unwrap();

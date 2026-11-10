@@ -81,8 +81,16 @@ guest. `pylon-guest-agent --status` shows the heartbeat.
 
 ## A VM that parks inside KVM
 
-Check the VMM's log for `Pylon: VM <id> parks vCPUs inside KVM`. If it
-is missing, `PYLON_PARK_IN_KVM=1` wasn't in the VMM's environment.
+Check the VMM's log for `Pylon: registered VM <id> with pylond, parking
+vCPUs inside KVM`. If it says `in the VMM` instead, the VM was started
+with `park=vmm`, or on a host where that is the default (aarch64, or no
+`/dev/kvm`). If the line is missing, the VM didn't register.
+
+- **`Rejected registration of VM <id>: ... needs scx_pylon` in
+  `pylond`'s log:** `pylond` runs without `scx_pylon`. Attach it, or
+  start the VM with `--pylon park=vmm`.
+- **`--pylon park=kvm needs KVM; use park=vmm`:** the VMM runs on MSHV,
+  which has no halted state to park in.
 
 - **`woken_shared_microseconds` and `woken_unowned_microseconds` stay at
   `0` under load:** `scx_pylon` isn't attached, so woken vCPUs run on
@@ -117,7 +125,9 @@ with `--core-sched-deny off`), and `scx_pylon` disabled itself.
 ## A VM fails to start with `Error enabling core scheduling`
 
 `scx_pylon` is attached with the core scheduling guard, which refuses
-core scheduling. Start the VM with `--cpus ...,core_scheduling=off`
+core scheduling. A VM with `--pylon` runs without it and only logs a
+warning, so this is a VM without `--pylon`, or a Cloud Hypervisor older
+than Pylon 0.0.8. Start it with `--cpus ...,core_scheduling=off`
 ([Core scheduling](sched-ext.md#core-scheduling)). Upstream Cloud
 Hypervisor doesn't fail in this case: it hangs before booting the
 guest and stops answering its API.

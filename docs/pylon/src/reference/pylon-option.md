@@ -1,7 +1,7 @@
 # The --pylon option
 
 ```text
-cloud-hypervisor ... --pylon shm=<path>[,socket=<path>,gpa=<addr>,initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>]
+cloud-hypervisor ... --pylon shm=<path>[,socket=<path>,gpa=<addr>,initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>,park=kvm|vmm]
 ```
 
 Comma-separated `key=value` pairs, parsed like Cloud Hypervisor's other
@@ -17,6 +17,7 @@ device options. An unknown key is an error.
 | `max_cores` | integer | number of slots | Most cores `pylond` gives the VM. `pylond` rejects the registration if `max_cores` is 0, `min_cores` is above it, or it's above the number of slots. |
 | `priority_weight` | integer | `100` | Multiplies the VM's urgency. Only ratios between VMs matter. `pylond` stores 0 as 1. |
 | `vm_id` | integer | `1` | The VM's id in the page's header and in `pylond`. Must be unique among VMs registered with one `pylond`. |
+| `park` | `kvm` or `vmm` | `kvm` on x86_64 when `/dev/kvm` exists, else `vmm` | Where a vCPU without a core waits. `kvm` halts it inside `KVM_RUN`, so an interrupt wakes it; the VMM also turns KVM's halt polling off for the VM and tells `pylond` to wake vCPUs with a signal. It needs `pylond` with `scx_pylon`. `vmm` blocks the vCPU thread in the VMM until `pylond` assigns a core; use it with a guest that runs `pv-pylon` on a host without `scx_pylon`. See [VMM integration](../developer-guide/vmm-integration.md#parking-inside-kvm) and [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
 
 The number of vCPU slots is `max(--cpus boot, --cpus max)`, at most 64.
 More vCPUs than that is an error.
@@ -27,21 +28,14 @@ More vCPUs than that is an error.
 |---|---|
 | `Error parsing --pylon: shm path missing` | No `shm`, or it's empty. |
 | `Error parsing --pylon: invalid GPA <value>` | `gpa` isn't a number, or isn't 4 KiB-aligned. |
-| `Error parsing --pylon options` | An unknown key, or a value that isn't a number. |
+| `Error parsing --pylon options` | An unknown key, a value that isn't a number, or a `park` other than `kvm` or `vmm`. |
+| `--pylon park=kvm needs KVM; use park=vmm` | `park=kvm` on MSHV. |
 | `Invalid Pylon vCPU count <n> (must be between 1 and 64)` | Too many vCPUs. |
 | `--pylon is not supported on MSHV on aarch64` | The MSHV backend on aarch64 can't read the guest's counter and timer. |
 | `Failed to open Pylon shared memory file` (and others about the file) | The `shm` path can't be created, opened, resized or mapped. |
 
 Registration failures aren't errors: the VM boots and the VMM logs a
 warning ([Troubleshooting](../operator-guide/troubleshooting.md)).
-
-## Environment
-
-One setting is an environment variable of the VMM, not a key:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `PYLON_PARK_IN_KVM` | unset | `1` (exactly) parks vCPUs inside KVM instead of in the VMM: a parked vCPU halts in `KVM_RUN`, so an interrupt wakes it. The VMM also turns KVM's halt polling off for the VM and tells `pylond` to wake vCPUs with a signal. Any other value, or none, parks in the VMM. See [VMM integration](../developer-guide/vmm-integration.md#parking-inside-kvm) and [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
 
 ## Example
 
