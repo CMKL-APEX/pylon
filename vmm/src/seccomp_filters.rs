@@ -907,7 +907,7 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         // Pylon reads the guest TSC and TSC deadline from the vCPU thread.
         #[cfg(target_arch = "x86_64")]
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSRS)?],
-        // With PYLON_PARK_IN_KVM, a vCPU thread halts and resumes its own vCPU, and on x86_64
+        // With park=kvm, a vCPU thread halts and resumes its own vCPU, and on x86_64
         // first checks that the guest can take interrupts (spec 08).
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MP_STATE)?],
         #[cfg(target_arch = "x86_64")]
@@ -1075,7 +1075,7 @@ fn vcpu_thread_rules(
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_stat, vec![]),
         (libc::SYS_statx, vec![]),
-        // With PYLON_PARK_IN_KVM, each vCPU thread has a timer that bounds its park
+        // With park=kvm, each vCPU thread has a timer that bounds its park
         // (spec 08 §3.6).
         (libc::SYS_timer_create, vec![]),
         (libc::SYS_timer_delete, vec![]),
