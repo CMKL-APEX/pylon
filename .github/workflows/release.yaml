@@ -1,4 +1,4 @@
-name: Cloud Hypervisor Release
+name: Pylon Release
 on: [create, merge_group]
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
@@ -10,22 +10,26 @@ jobs:
   release:
     if: (github.event_name == 'create' && github.event.ref_type == 'tag') || github.event_name == 'merge_group'
     name: Release ${{ matrix.platform.target }}
+    # The VMM and ch-remote for every target, and the guest agent as a static binary. pylond
+    # and scx-pylon need the target's libelf, so the `pylon-host` job builds them natively.
     strategy:
       fail-fast: false
       matrix:
         platform:
         - target: x86_64-unknown-linux-gnu
-          args: --all --release --features mshv
+          args: --release -p cloud-hypervisor --features cloud-hypervisor/mshv
           name_ch: cloud-hypervisor
           name_ch_remote: ch-remote
         - target: x86_64-unknown-linux-musl
-          args: --all --release --features mshv
+          args: --release -p cloud-hypervisor -p pylon-guest-agent --features cloud-hypervisor/mshv
           name_ch: cloud-hypervisor-static
           name_ch_remote: ch-remote-static
+          name_agent: pylon-guest-agent-static
         - target: aarch64-unknown-linux-musl
-          args:  --all --release
+          args: --release -p cloud-hypervisor -p pylon-guest-agent
           name_ch: cloud-hypervisor-static-aarch64
           name_ch_remote: ch-remote-static-aarch64
+          name_agent: pylon-guest-agent-static-aarch64
     runs-on: ubuntu-latest
     steps:
       - name: Code checkout
@@ -37,7 +41,7 @@ jobs:
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        run: rsync -rv --exclude=.git . ../cloud-hypervisor-${{ github.event.ref }}
+        run: rsync -rv --exclude=.git . ../pylon-${{ github.event.ref }}
       - name: Build ${{ matrix.platform.target }}
         uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
@@ -50,21 +54,23 @@ jobs:
         if: github.event_name == 'create' && github.event.ref_type == 'tag'
         shell: bash
         run: |
-          cp target/${{ matrix.platform.target }}/release/cloud-hypervisor ./${{ matrix.platform.name_ch }}
-          cp target/${{ matrix.platform.target }}/release/ch-remote ./${{ matrix.platform.name_ch_remote }}
+          mkdir -p dist
+          cp target/${{ matrix.platform.target }}/release/cloud-hypervisor dist/${{ matrix.platform.name_ch }}
+          cp target/${{ matrix.platform.target }}/release/ch-remote dist/${{ matrix.platform.name_ch_remote }}
+          if [ -n "${{ matrix.platform.name_agent }}" ]; then
+            cp target/${{ matrix.platform.target }}/release/pylon-guest-agent dist/${{ matrix.platform.name_agent }}
+          fi
       - name: Upload Release Artifacts
         if: github.event_name == 'create' && github.event.ref_type == 'tag'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Artifacts for ${{ matrix.platform.target }}
-          path: |
-            ./${{ matrix.platform.name_ch }}
-            ./${{ matrix.platform.name_ch_remote }}
+          path: dist/
       - name: Vendor
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        working-directory: ../cloud-hypervisor-${{ github.event.ref }}
+        working-directory: ../pylon-${{ github.event.ref }}
         run: |
           mkdir ../vendor-cargo-home
           export CARGO_HOME=$(realpath ../vendor-cargo-home)
@@ -74,22 +80,73 @@ jobs:
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        run: tar cJf cloud-hypervisor-${{ github.event.ref }}.tar.xz ../cloud-hypervisor-${{ github.event.ref }}
-      - name: Upload cloud-hypervisor vendored source archive
+        run: tar cJf dist/pylon-${{ github.event.ref }}.tar.xz ../pylon-${{ github.event.ref }}
+      - name: Upload vendored source archive
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        id: upload-release-cloud-hypervisor-vendored-sources
+        id: upload-release-vendored-sources
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          path: cloud-hypervisor-${{ github.event.ref }}.tar.xz
-          name: cloud-hypervisor-${{ github.event.ref }}.tar.xz
+          path: dist/pylon-${{ github.event.ref }}.tar.xz
+          name: pylon-${{ github.event.ref }}.tar.xz
       - name: Create GitHub Release
         if: github.event_name == 'create' && github.event.ref_type == 'tag'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
-          files: |
-            ./${{ matrix.platform.name_ch }}
-            ./${{ matrix.platform.name_ch_remote }}
-            ./cloud-hypervisor-${{ github.event.ref }}.tar.xz
+          files: dist/*
+
+  # pylond and scx_pylon, built natively because libbpf links the target's libelf. They link
+  # glibc, libelf, zlib and zstd dynamically, so they are built on Ubuntu 24.04 to run on hosts
+  # with glibc 2.39 or later. The x86_64 job also ships the pv-pylon guest module's source.
+  pylon-host:
+    if: (github.event_name == 'create' && github.event.ref_type == 'tag') || github.event_name == 'merge_group'
+    name: Release Pylon host tools ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x86_64
+          runner: ubuntu-24.04
+          suffix: ""
+        - arch: aarch64
+          runner: ubuntu-24.04-arm
+          suffix: -aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq build-essential clang llvm libelf-dev zlib1g-dev pkg-config
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89.0"
+      - name: Build pylond and scx_pylon
+        run: cargo build --locked --release -p pylond -p scx-pylon
+      - name: Copy Release Binaries
+        if: github.event_name == 'create' && github.event.ref_type == 'tag'
+        run: |
+          mkdir -p dist
+          strip -o dist/pylond${{ matrix.suffix }} target/release/pylond
+          strip -o dist/scx_pylon${{ matrix.suffix }} target/release/scx_pylon
+      - name: Create pv-pylon source archive
+        if: |
+          github.event_name == 'create' && github.event.ref_type == 'tag' &&
+          matrix.arch == 'x86_64'
+        run: tar czf dist/pv-pylon-${{ github.event.ref }}.tar.gz -C pylon/guest linux
+      - name: Upload Release Artifacts
+        if: github.event_name == 'create' && github.event.ref_type == 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Pylon host tools for ${{ matrix.arch }}
+          path: dist/
+      - name: Create GitHub Release
+        if: github.event_name == 'create' && github.event.ref_type == 'tag'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          files: dist/*
