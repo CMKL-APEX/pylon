@@ -26,11 +26,20 @@ pub const PYLON_MAGIC: u64 = 0x5059_4C4F_4E56_4D31; // "PYLONVM1"
 /// (`spec/06-guest-kick-path.md` §3): see the field docs of [`PylonVcpuSlot`].
 /// `PylonVcpuSlot::park_timer_deadline_tsc` and `PylonVcpuSlot::guest_tsc_offset` use space
 /// that was reserved (zero) before; a reader treats 0 in either as "not provided".
-pub const PYLON_ABI_VERSION: u32 = 2;
+///
+/// Version 3 keeps the layout and adds parking inside KVM (`spec/08-park-in-kvm.md` §4.4):
+/// - A vCPU parked inside KVM stays `VCPU_STATE_PARKED` while an interrupt runs it without a
+///   core; whether it runs comes from `scx_pylon`'s woken map, not from `state`.
+/// - So the guest may find its running vCPU `PARKED`, and may write `PARKING` over it; the
+///   VMM turns that back into `PARKED`.
+/// - `park_timer_deadline_tsc` only orders vCPUs for a core: KVM fires the guest's timer.
+pub const PYLON_ABI_VERSION: u32 = 3;
 
 /// vCPU execution states in `PylonVcpuSlot::state`.
 ///
-/// The vCPU's thread is blocked in the VMM, outside `KVM_RUN`. Written by the VMM.
+/// The vCPU has no core. Its thread is blocked in the VMM outside `KVM_RUN`, or, with
+/// `park=kvm`, halted inside KVM, where an interrupt may run it without a core. Written by
+/// the VMM.
 pub const VCPU_STATE_PARKED: u8 = 0;
 /// The vCPU runs guest code. Written by the VMM.
 pub const VCPU_STATE_RUNNING: u8 = 1;
@@ -174,8 +183,9 @@ impl Default for PylonTelemetry {
 #[derive(Debug)]
 pub struct PylonVcpuSlot {
     // --- Lower 32B: Written by Guest / VMM vCPU thread ---
-    /// Current vCPU state (`VCPU_STATE_*`). The guest writes only `RUNNING -> PARKING`, for
-    /// its own vCPU; the VMM writes every other transition. `pylond` never writes it.
+    /// Current vCPU state (`VCPU_STATE_*`). The guest writes only `PARKING`, for its own
+    /// vCPU, over `RUNNING` (or over `PARKED` while parked inside KVM); the VMM writes every
+    /// other transition. `pylond` never writes it.
     pub state: AtomicU8,
     /// Non-zero when the guest vCPU holds a spinlock, is in an IRQ handler, or has preemption disabled.
     pub in_critical_section: AtomicU8,
@@ -187,7 +197,9 @@ pub struct PylonVcpuSlot {
     pub yield_count: AtomicU64,
     /// Host counter value at which the guest's timer on this vCPU (the TSC deadline on x86_64,
     /// the virtual timer's compare value on aarch64) was due when the VMM parked it, or 0 if no timer was armed or the VMM couldn't read it. Written by the VMM
-    /// before it publishes `VCPU_STATE_PARKED`, and cleared when the vCPU runs again.
+    /// before it publishes `VCPU_STATE_PARKED`, and cleared when the vCPU runs again. For a
+    /// vCPU parked inside KVM, KVM fires the timer itself, and `pylond` only uses this to pick
+    /// which vCPU of a VM gets a core first.
     pub park_timer_deadline_tsc: AtomicU64,
 
     // --- Upper 32B: Written by Host (pylond & VMM init) ---
