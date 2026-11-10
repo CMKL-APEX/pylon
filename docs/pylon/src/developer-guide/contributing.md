@@ -91,6 +91,7 @@ LLMs").
 | `pylon-ci.yaml` | Pylon's crates: commit and DCO checks on pull requests, formatting and clippy, tests, the VMM's Pylon tests, release builds and `pylon-bench --quick`; the `pv-pylon` module build and `checkpatch` on x86_64 and aarch64 runners; and clippy and unit tests on a native aarch64 runner (`pylon-aarch64`). |
 | `ci.yaml` | Upstream's workspace checks: formatting, clippy for every hypervisor and feature combination, builds across targets, unit tests. Cross and musl jobs exclude `scx-pylon` and `pylond`. |
 | `pylon-docs.yaml` | Builds this book on pull requests and publishes it on `main`. |
+| `release.yaml` | On a tag, builds the release files and attaches them to a draft GitHub release: the VMM and `ch-remote` for each target, the static guest agent, `pylond` and `scx_pylon` built natively on Ubuntu 24.04 for x86_64 and aarch64, the `pv-pylon` source and the vendored source archive. |
 
 Jobs that need upstream's self-hosted runners (the integration tests)
 run only in the upstream repository and are skipped here. The current

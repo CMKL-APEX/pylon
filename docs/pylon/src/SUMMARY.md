@@ -4,6 +4,7 @@
 [Quick start](quick-start.md)
 [Concepts](concepts.md)
 [Status and roadmap](status.md)
+[Release notes](release-notes.md)
 
 # User guide
 

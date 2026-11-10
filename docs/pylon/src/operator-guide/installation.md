@@ -8,7 +8,7 @@
 | Hypervisor | KVM. Pylon hasn't been run on MSHV. |
 | Rust | The workspace's MSRV, 1.89.0, or newer. |
 | Build packages | Cloud Hypervisor's usual ones, plus `clang` (with the BPF target), `llvm`, `libelf-dev`, `zlib1g-dev` and `pkg-config`, for `scx_pylon`. |
-| Kernel (optional) | Linux built with `CONFIG_SCHED_CLASS_EXT` (6.12 or later) to use `scx_pylon`. Without it, Pylon still works, using the host's normal scheduler. |
+| Kernel | Linux built with `CONFIG_SCHED_CLASS_EXT` (6.12 or later) to use `scx_pylon`. The default `--pylon park=kvm` needs it: without `scx_pylon`, `pylond` refuses such VMs. On other kernels, Pylon works with `park=vmm`, using the host's normal scheduler. |
 
 On Debian or Ubuntu:
 

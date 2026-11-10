@@ -3,8 +3,9 @@
 > **Instructions for Subagents & Coding Agents:**
 > Update your assigned track section in this file as you start, progress through, and complete your tasks (including test results and any interface notes for other tracks). Avoid modifying sections belonging to other tracks while they are `IN_PROGRESS`.
 
-Open work is tracked as GitHub issues (#50–#66): #50, #55, #58 and #66 on
-the `v0.0.8` milestone, the rest on `v0.0.9`. The rows below point to them.
+Open work is tracked as GitHub issues (#50–#66). #50, #51, #55, #58 and
+#66 were the `v0.0.8` milestone, the first release; the rest are on
+`v0.0.9`. The rows below point to them.
 
 ---
 
@@ -126,12 +127,13 @@ Measured context: `pylon-bench` (2026-10-29, AMD EPYC 9124, no `WAITPKG`) shows 
 | `quality` aarch64-gnu / aarch64-musl | Re-enabled (Pylon host crates excluded) | ✅ aarch64-musl passes on GitHub (stable and beta, PR #69, [run](https://github.com/CMKL-APEX/pylon/actions/runs/42509554500)). aarch64-gnu was dropped from the matrix (`eaf7608dd`). The Pylon crates are built, linted and tested natively on aarch64 by `pylon-aarch64` (see below). |
 | `pylon-aarch64` (`pylon-ci.yaml`) | Added by spec 07 A-T7; runs on `ubuntu-24.04-arm` | ✅ Its commands pass on the aarch64 dev host (2026-10-30): clippy `-D warnings` for `pylon-abi`, `pylon-guest-agent`, `pylond`, `scx-pylon`, `arch`, `hypervisor`, `vmm`, `cloud-hypervisor`; tests of the Pylon crates, `arch`, and `vmm --lib pylon`/`config`. Hosted arm64 runners have no `/dev/kvm`: the `vmm` KVM test skips itself (checked by hiding `/dev/kvm`), `hypervisor` tests are left out, and the benchmark isn't run. The job's first run on GitHub is the open check. |
 | `formatting` aarch64-musl | Re-enabled | n/a (`rustfmt` only) |
-| `build` x86_64-musl + `mshv`/`sev_snp`/`igvm` build steps | Re-enabled (Pylon host crates excluded from release `--all`) | ✅ x86_64-gnu feature builds covered by the clippy runs above |
+| `build` x86_64-musl + `mshv`/`sev_snp`/`igvm` build steps | Re-enabled (Pylon host crates excluded) | ✅ x86_64-gnu feature builds covered by the clippy runs above |
 | `build-riscv64` | Re-enabled | ✅ Passes on GitHub (PR #69); builds only `cloud-hypervisor` |
 | `unit-tests-x86-64` musl | Re-enabled | ✅ Passes on GitHub (PR #69; runs in the `dev_cli.sh` container) |
 | `virtio-villain` | Re-enabled (GitHub-hosted runner with KVM) | ✅ Passes on GitHub (PR #69): the suite runs against a `kvm` build |
 | `integration-x86-64-pr` | Gated on `github.repository == 'cloud-hypervisor/cloud-hypervisor'` (`garm-noble-16` self-hosted runner); skipped here | — |
 | `integration-x86-64-mq`, `-graviton`, `-vfio`, `-windows`, `-mshv-x86-64`, `-sev-snp` | Merge queue and `dev/*/*` pushes only, now also gated on the upstream repository (self-hosted runners); skipped here | — |
+| `release.yaml` | Adapted for Pylon (#81): the cross jobs build only `cloud-hypervisor` (and `pylon-guest-agent` on musl); a native `pylon-host` job builds `pylond` and `scx_pylon` on Ubuntu 24.04, x86_64 and aarch64 | Builds checked locally with Rust 1.89.0; the first tagged run is the open check |
 | `pylon-docs.yaml` | New: builds the book on PRs that touch `docs/pylon/`; publishes `gh-pages` from `main` | ✅ `mdbook build docs/pylon` (mdBook 0.5.4), all internal links and anchors resolve |
 | `integration-metrics.yaml` | Gated on `github.repository == 'cloud-hypervisor/cloud-hypervisor'`; it used to queue forever on fork `main` pushes (`garm-jammy-16` runner absent) | — |
 
