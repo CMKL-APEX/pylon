@@ -82,7 +82,14 @@ guest. `pylon-guest-agent --status` shows the heartbeat.
 ## A VM that parks inside KVM
 
 Check the VMM's log for `Pylon: VM <id> parks vCPUs inside KVM`. If it
-is missing, `PYLON_PARK_IN_KVM=1` wasn't in the VMM's environment.
+is missing, the VM parks in the VMM: it was started with `park=vmm`,
+or on a host where that is the default (aarch64, or no `/dev/kvm`).
+
+- **`Rejected registration of VM <id>: ... needs scx_pylon` in
+  `pylond`'s log:** `pylond` runs without `scx_pylon`. Attach it, or
+  start the VM with `--pylon park=vmm`.
+- **`--pylon park=kvm needs KVM; use park=vmm`:** the VMM runs on MSHV,
+  which has no halted state to park in.
 
 - **`woken_shared_microseconds` and `woken_unowned_microseconds` stay at
   `0` under load:** `scx_pylon` isn't attached, so woken vCPUs run on

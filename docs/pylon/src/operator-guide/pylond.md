@@ -74,17 +74,18 @@ parked. The socket file is left behind and removed at the next start.
 
 ## VMs that park inside KVM
 
-A VMM started with `PYLON_PARK_IN_KVM=1` in its environment parks
-vCPUs halted inside KVM instead of blocked in the VMM, so an interrupt
-wakes a parked vCPU. It logs `Pylon: VM <id> parks vCPUs inside KVM`.
-This is a prototype ([Status](../status.md#what-doesnt-work-yet),
-[spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
+A VMM started with `--pylon park=kvm`, the default on x86_64 KVM
+hosts, parks vCPUs halted inside KVM instead of blocked in the VMM, so
+an interrupt wakes a parked vCPU. It logs `Pylon: VM <id> parks vCPUs
+inside KVM`
+([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
 `pylond` needs no option for it. What changes on the host:
 
 - **It needs `scx_pylon`.** `scx_pylon` runs a woken vCPU only on CPUs
   its VM owns and reports it to `pylond`, which then gives a core to a
-  VM whose vCPU stays woken for 4 ms. Without `scx_pylon`, a woken vCPU
-  runs on any CPU and `pylond` doesn't see it
+  VM whose vCPU stays woken for 4 ms. `pylond` without `scx_pylon`
+  rejects such a VM's registration, and logs `Rejected registration`;
+  start the VM with `park=vmm` on such a host
   ([Kernel scheduling with scx_pylon](sched-ext.md)).
 - **Halt polling is off for that VM.** The VMM sets the VM's halt
   polling limit to 0, so a parked vCPU costs no host CPU. It logs

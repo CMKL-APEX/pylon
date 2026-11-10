@@ -164,8 +164,9 @@ Pausing a VM with parked vCPUs hasn't been tested.
 
 ## Parking inside KVM
 
-With `PYLON_PARK_IN_KVM=1` in the VMM's environment
-([The --pylon option](../reference/pylon-option.md#environment)), a
+With `--pylon park=kvm`
+([The --pylon option](../reference/pylon-option.md)), the default on
+x86_64 KVM hosts, a
 parked vCPU sleeps in `KVM_RUN` instead of in `park_vcpu`. The design
 and its measurements are in
 [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md).

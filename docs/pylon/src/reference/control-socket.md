@@ -38,10 +38,12 @@ signal. Without it, `pylond` never signals the VMM. `pylond` takes the
 VMM's PID from the socket's peer credentials, not from the message.
 
 `wake_by_signal` (optional, default `false`) is sent as `true` by a VMM
-that parks vCPUs inside KVM (`PYLON_PARK_IN_KVM=1`, spec 08). The wake
+that parks vCPUs inside KVM (`--pylon park=kvm`, spec 08). The wake
 `eventfd` can't reach a thread blocked in `KVM_RUN`, so `pylond` also
 sends `kick_signal` when it assigns a core, and again until the vCPU
 leaves `PARKED`. The VMM leaves the field out when it's `false`.
+`pylond` rejects such a registration when `scx_pylon` isn't attached:
+without it, a woken vCPU would run on any CPU.
 
 Attached descriptors, in order: the shared page's file, then
 `num_vcpus` kick `eventfd`s, then `num_vcpus` wake `eventfd`s (1 + 2 ×

@@ -80,7 +80,7 @@ has booted).
   (`PYLON_VM_DSQ` + slot) with a 100 µs slice, if its VM owns a CPU it
   may run on, and that CPU is kicked. If its VM owns none, it goes on
   the vCPU queue instead. This applies to VMs that park inside KVM
-  (`PYLON_PARK_IN_KVM`, [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
+  (`--pylon park=kvm`, [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
   `enqueue` recognises such a vCPU by its bit in `parked`, and sets its
   bit in `woken`. The bit is cleared when the vCPU is enqueued as an
   owner, and by `quiescent` when it stops being runnable.

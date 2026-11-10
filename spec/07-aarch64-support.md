@@ -41,8 +41,8 @@ features `wfxt`, `ecv`, `atomics` (LSE).
    wakeups.
 2. One counter abstraction ("host counter ticks") shared by every component,
    with no behaviour change on x86_64.
-3. No shared-memory layout change. ABI v2 guests and `pylond` stay compatible
-   on x86_64.
+3. No shared-memory layout change. Guests and `pylond` of the same ABI version
+   stay compatible on x86_64.
 4. aarch64 builds, unit tests and the KVM end-to-end test run in CI.
 
 **Non-Goals (this spec)**

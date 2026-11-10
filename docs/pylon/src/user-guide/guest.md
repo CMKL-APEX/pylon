@@ -17,7 +17,7 @@ explains what the guest sees and how it reports demand.
   its own.
 - **The shared page**, 8 KiB at guest-physical address `0xFEDF_0000`
   (or the `gpa` you set). It starts with the header: magic
-  `0x5059_4C4F_4E56_4D31` (`"PYLONVM1"`), ABI version `2`, the number of
+  `0x5059_4C4F_4E56_4D31` (`"PYLONVM1"`), ABI version `3`, the number of
   vCPU slots and the VM's id. See [Shared-memory
   ABI](../developer-guide/shared-memory-abi.md) for the layout.
 

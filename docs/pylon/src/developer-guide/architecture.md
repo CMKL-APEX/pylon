@@ -138,8 +138,8 @@ It meters the time so far, clears the owner entry, sets the slot's
 
 ## Parking inside KVM
 
-With `PYLON_PARK_IN_KVM=1` in the VMM's environment, a vCPU parks inside
-KVM instead
+With `--pylon park=kvm`, the default on x86_64 KVM hosts, a vCPU parks
+inside KVM instead of in the VMM
 ([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
 The VMM halts it and returns to `KVM_RUN`, which sleeps until an
 interrupt or a signal. An interrupt, such as the guest's timer, runs the

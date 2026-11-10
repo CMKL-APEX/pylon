@@ -42,8 +42,8 @@ assumes the architectural rate or, on x86_64, 3 GHz, and says so.
 |---|---|
 | `RUST_LOG` | Log level for `env_logger` (`error`, `warn`, `info`, `debug`, `trace`). Logs go to standard error. |
 
-`PYLON_PARK_IN_KVM` is read by the VMM, not by `pylond`
-([VMs that park inside KVM](../operator-guide/pylond.md#vms-that-park-inside-kvm)).
+Where a VM's vCPUs park is the VMM's `--pylon park=` key, not a `pylond`
+option ([VMs that park inside KVM](../operator-guide/pylond.md#vms-that-park-inside-kvm)).
 
 ## Threads
 

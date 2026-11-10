@@ -44,7 +44,7 @@ microsecond. That figure hasn't been measured; see
 
 ### VMs that park inside KVM
 
-A VMM started with `PYLON_PARK_IN_KVM=1` registers with
+A VMM started with `--pylon park=kvm` registers with
 `wake_by_signal` set, and parks a vCPU inside KVM instead of on its wake
 `eventfd`: the vCPU halts in `KVM_RUN`
 ([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)
