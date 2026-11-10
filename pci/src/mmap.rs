@@ -258,7 +258,8 @@ in both isize and libc::size_t";
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::{AsFd as _, FromRawFd as _};
+    use std::fs::{self, File};
+    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
 
     use super::*;
 
@@ -329,8 +330,8 @@ mod tests {
         let fd = unsafe { libc::memfd_create(c"mmap-test".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0);
         // SAFETY: fd was just created and is owned here.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-        std::fs::File::from(fd.try_clone().unwrap())
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        File::from(fd.try_clone().unwrap())
             .set_len(len as u64)
             .unwrap();
 
@@ -344,7 +345,7 @@ mod tests {
         .unwrap();
 
         let start = format!("{:x}-", region.addr() as usize);
-        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
         let flags = smaps
             .split_inclusive('\n')
             .skip_while(|l| !l.starts_with(&start))
