@@ -1033,10 +1033,10 @@ mod tests {
     };
 
     pub(crate) struct TestVmRig {
-        req: VmRegistrationRequest,
-        shm_fd: OwnedFd,
-        kick_fds: Vec<OwnedFd>,
-        wake_fds: Vec<OwnedFd>,
+        pub(crate) req: VmRegistrationRequest,
+        pub(crate) shm_fd: OwnedFd,
+        pub(crate) kick_fds: Vec<OwnedFd>,
+        pub(crate) wake_fds: Vec<OwnedFd>,
         pub(crate) handle: VmHandle,
     }
 

@@ -197,8 +197,13 @@ impl ControlPlane {
                 accept_res = listener.accept() => {
                     let (stream, _) = accept_res.map_err(Error::Io)?;
                     let snapshot = Arc::clone(&self.vm_snapshot);
+                    // The vCPU domain table is `scx_pylon`'s, so it is set exactly when
+                    // `scx_pylon` is attached.
+                    let scx_attached = self.vcpu_domains.is_some();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_client_connection(stream, snapshot).await {
+                        if let Err(err) =
+                            handle_client_connection(stream, snapshot, scx_attached).await
+                        {
                             warn!("Failed to handle VM registration client: {err}");
                         }
                     });
@@ -245,9 +250,13 @@ impl ControlPlane {
     }
 }
 
+/// Handles one client of the control socket. A VM that parks vCPUs inside KVM
+/// (`wake_by_signal`) registers only while `scx_attached`: without `scx_pylon`, its woken vCPUs
+/// would run on any CPU, including cores other VMs own (`spec/08-park-in-kvm.md` §4.3).
 async fn handle_client_connection(
     stream: UnixStream,
     vm_snapshot: Arc<VmSnapshot>,
+    scx_attached: bool,
 ) -> Result<(), Error> {
     let (payload, mut fds) = recv_msg_with_fds_async(&stream).await?;
 
@@ -377,6 +386,13 @@ async fn handle_client_connection(
                 Err(Error::InvalidRegistration {
                     vm_id: req.vm_id,
                     reason: "a running VMM already registered this vm_id".to_owned(),
+                })
+            } else if req.wake_by_signal && !scx_attached {
+                Err(Error::InvalidRegistration {
+                    vm_id: req.vm_id,
+                    reason: "it parks vCPUs inside KVM, which needs scx_pylon; \
+                             start the VM with --pylon park=vmm or pylond with scx_pylon"
+                        .to_owned(),
                 })
             } else {
                 handle
@@ -776,7 +792,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::tests::build_test_vm;
+    use crate::tests::{TestVmRig, build_test_vm};
 
     /// A `VcpuDomainTable` that records its contents and can refuse inserts.
     #[derive(Default)]
@@ -821,7 +837,54 @@ mod tests {
         daemon.set_nonblocking(true).unwrap();
         let daemon = UnixStream::from_std(daemon).unwrap();
         let snapshot = Arc::new(VmSnapshot::from_pointee(Vec::new()));
-        handle_client_connection(daemon, snapshot).await.unwrap();
+        handle_client_connection(daemon, snapshot, false)
+            .await
+            .unwrap();
+    }
+
+    /// Registers `rig`'s VM over a socket pair, with `scx_pylon` attached or not, and returns
+    /// the reply and the VMs registered afterwards.
+    async fn register(rig: &TestVmRig, scx_attached: bool) -> (VmRegistrationResponse, usize) {
+        let (mut vmm, daemon) = StdUnixStream::pair().unwrap();
+        let mut fds = vec![rig.shm_fd.as_raw_fd()];
+        fds.extend(rig.kick_fds.iter().map(AsRawFd::as_raw_fd));
+        fds.extend(rig.wake_fds.iter().map(AsRawFd::as_raw_fd));
+        let payload = serde_json::to_vec(&rig.req).unwrap();
+        send_msg_with_fds(vmm.as_raw_fd(), &payload, &fds).unwrap();
+
+        daemon.set_nonblocking(true).unwrap();
+        let daemon = UnixStream::from_std(daemon).unwrap();
+        let snapshot = Arc::new(VmSnapshot::from_pointee(Vec::new()));
+        handle_client_connection(daemon, Arc::clone(&snapshot), scx_attached)
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        vmm.read_to_end(&mut reply).unwrap();
+        (
+            serde_json::from_slice(&reply).unwrap(),
+            snapshot.load().len(),
+        )
+    }
+
+    /// A VM that parks vCPUs inside KVM needs `scx_pylon` to keep its woken vCPUs on its own
+    /// cores, so it isn't registered without it. A VM that parks in the VMM is.
+    #[tokio::test]
+    async fn registration_of_a_vm_parking_inside_kvm_needs_scx() {
+        let mut rig = build_test_vm(1, 1, 0, 1, 1);
+        rig.req.wake_by_signal = true;
+        let (resp, registered) = register(&rig, false).await;
+        assert!(!resp.accepted);
+        assert!(resp.message.contains("park=vmm"), "{}", resp.message);
+        assert_eq!(registered, 0);
+
+        let (resp, registered) = register(&rig, true).await;
+        assert!(resp.accepted, "{}", resp.message);
+        assert_eq!(registered, 1);
+
+        rig.req.wake_by_signal = false;
+        let (resp, registered) = register(&rig, false).await;
+        assert!(resp.accepted, "{}", resp.message);
+        assert_eq!(registered, 1);
     }
 
     /// vCPU `vcpu` of the VM in slot `vm_slot`, whose VMM is `pid`.
