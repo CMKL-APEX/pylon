@@ -4,6 +4,7 @@
 //
 
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -131,6 +132,21 @@ pub enum Error {
     /// Failed to register the VM with the `pylond` Unix domain socket.
     #[error("Failed to register VM with pylond daemon")]
     DaemonRegister(#[source] io::Error),
+
+    /// `pylond` refused the VM's registration.
+    #[error("pylond rejected the registration: {0}")]
+    DaemonRejected(String),
+}
+
+/// How long the VMM waits for `pylond`'s reply to its registration.
+const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `pylond`'s reply to a registration (`VmRegistrationResponse` in `pylond`), sent before it
+/// closes the connection.
+#[derive(Debug, Deserialize)]
+struct DaemonRegistrationReply {
+    accepted: bool,
+    message: String,
 }
 
 /// Where a vCPU without a core waits (`--pylon park=`).
@@ -328,6 +344,8 @@ pub struct PylonVmmState {
     /// One per vCPU: the bound on how long it stays parked inside KVM (§3.6).
     park_bounds: Vec<ParkBound>,
     shutting_down: AtomicBool,
+    /// Set once `register` has run, so that a VM rebooted in the same process registers once.
+    registered: AtomicBool,
 }
 
 /// Ends a park inside KVM that nothing else ends (`spec/08-park-in-kvm.md` §3.6).
@@ -501,7 +519,6 @@ impl PylonVmmState {
         }
 
         let wake_flags = if config.park == PylonPark::Kvm {
-            info!("Pylon: VM {} parks vCPUs inside KVM", config.vm_id);
             libc::EFD_NONBLOCK
         } else {
             0
@@ -530,24 +547,44 @@ impl PylonVmmState {
             parked_in_kvm: (0..num_vcpus).map(|_| AtomicBool::new(false)).collect(),
             park_bounds: (0..num_vcpus).map(|_| ParkBound::default()).collect(),
             shutting_down: AtomicBool::new(false),
+            registered: AtomicBool::new(false),
         });
 
-        if let Some(socket_path) = &config.socket {
-            if socket_path.exists() {
-                if let Err(e) = state.register_with_daemon(socket_path) {
-                    warn!(
-                        "Pylon: failed to register VM {} with pylond at {:?}: {e}",
-                        config.vm_id, socket_path
-                    );
-                }
-            } else {
-                info!(
-                    "Pylon: daemon socket {socket_path:?} does not exist yet; continuing with shared memory initialized"
-                );
-            }
-        }
-
         Ok(state)
+    }
+
+    /// Registers the VM with `pylond` if `socket=` is set, once per process.
+    ///
+    /// Not part of `new`, which runs while the command line is parsed, before the logger is
+    /// installed: a failed registration has to show in the VMM's log.
+    pub fn register(&self) {
+        let Some(socket_path) = &self.config.socket else {
+            return;
+        };
+        if self.registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !socket_path.exists() {
+            warn!(
+                "Pylon: pylond socket {socket_path:?} doesn't exist; VM {} runs unmanaged",
+                self.config.vm_id
+            );
+            return;
+        }
+        match self.register_with_daemon(socket_path) {
+            Ok(()) => info!(
+                "Pylon: registered VM {} with pylond, parking vCPUs {}",
+                self.config.vm_id,
+                match self.config.park {
+                    PylonPark::Kvm => "inside KVM",
+                    PylonPark::Vmm => "in the VMM",
+                }
+            ),
+            Err(e) => warn!(
+                "Pylon: failed to register VM {} with pylond at {socket_path:?}: {e}",
+                self.config.vm_id
+            ),
+        }
     }
 
     /// Connects to `pylond` over Unix domain socket and transmits VM registration metadata
@@ -579,6 +616,19 @@ impl PylonVmmState {
         stream
             .send_with_fds(&[json_bytes.as_slice()], &fds)
             .map_err(|e| Error::DaemonRegister(e.into()))?;
+
+        stream
+            .set_read_timeout(Some(DAEMON_REPLY_TIMEOUT))
+            .map_err(Error::DaemonRegister)?;
+        let mut reply = Vec::new();
+        (&stream)
+            .read_to_end(&mut reply)
+            .map_err(Error::DaemonRegister)?;
+        let reply: DaemonRegistrationReply = serde_json::from_slice(&reply)
+            .map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
+        if !reply.accepted {
+            return Err(Error::DaemonRejected(reply.message));
+        }
         Ok(())
     }
 
@@ -1174,14 +1224,15 @@ pub fn clear_global_state() {
 }
 
 /// Hook for `MemoryManager::new` (`vmm/src/memory_manager.rs`): maps the Pylon shared page
-/// into guest physical memory if `--pylon` is active. The returned region must live as long
-/// as the VM.
+/// into guest physical memory if `--pylon` is active, then registers the VM with `pylond`. The
+/// returned region must live as long as the VM.
 pub fn setup_memory_region(
     vm: &Arc<dyn Vm>,
     next_memory_slot: &mut u32,
 ) -> result::Result<Option<Arc<GuestRegion>>, Error> {
     if let Some(state) = global_state() {
         let region = state.setup_gpa_mapping(vm, next_memory_slot)?;
+        state.register();
         if state.config.park == PylonPark::Kvm
             && let Err(e) = vm.set_halt_poll_ns(PARK_IN_KVM_HALT_POLL_NS)
         {
@@ -1225,6 +1276,7 @@ pub fn shutdown_all() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -1809,14 +1861,13 @@ mod tests {
         assert_eq!(vtimer_deadline(0b001, 0), 0);
     }
 
-    #[test]
-    fn test_daemon_socket_registration_scm_rights() {
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-sock-pylon");
-        let sock_path = dir.path().join("pylond.sock");
-
-        let listener = UnixListener::bind(&sock_path).unwrap();
-        let server_thread = thread::spawn(move || {
+    /// Accepts one registration on `listener`, answers it with `reply`, and returns the request,
+    /// the number of FDs that came with it, and the listener.
+    fn serve_one_registration(
+        listener: UnixListener,
+        reply: &'static [u8],
+    ) -> thread::JoinHandle<(DaemonRegistrationPayload, usize, UnixListener)> {
+        thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 512];
             let mut iov = [libc::iovec {
@@ -1835,8 +1886,21 @@ mod tests {
             }
             let msg: DaemonRegistrationPayload =
                 serde_json::from_slice(&buf[..bytes_read]).unwrap();
-            (msg, fds_read)
-        });
+            (&stream).write_all(reply).unwrap();
+            (msg, fds_read, listener)
+        })
+    }
+
+    #[test]
+    fn test_daemon_socket_registration_scm_rights() {
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-sock-pylon");
+        let sock_path = dir.path().join("pylond.sock");
+
+        let server = serve_one_registration(
+            UnixListener::bind(&sock_path).unwrap(),
+            br#"{"accepted":true,"message":"ok"}"#,
+        );
 
         let cfg = PylonConfig::parse(&format!(
             "shm={},park=vmm,socket={},vm_id=99,min_cores=1,max_cores=2,priority_weight=150",
@@ -1845,16 +1909,47 @@ mod tests {
         ))
         .unwrap();
 
-        let _state = PylonVmmState::new(&cfg, 2, 2).unwrap();
-        let (msg, fds_read) = server_thread.join().unwrap();
+        // Creating the state doesn't register; `register` does.
+        let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.register();
+        let (msg, fds_read, listener) = server.join().unwrap();
         assert_eq!(msg.vm_id, 99);
         assert_eq!(msg.num_vcpus, 2);
         assert_eq!(msg.min_cores, 1);
         assert_eq!(msg.max_cores, 2);
         assert_eq!(msg.priority_weight, 150);
         assert_eq!(msg.kick_signal, SIGRTMIN());
+        assert!(!msg.wake_by_signal);
         // 1 shm_fd + 2 kick_eventfds + 2 wake_eventfds = 5 FDs
         assert_eq!(fds_read, 5);
+
+        // A second call, as after a reboot in the same process, doesn't connect again.
+        state.register();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn test_daemon_rejection_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let shm_path = dir.path().join("vm-reject-pylon");
+        let sock_path = dir.path().join("pylond.sock");
+
+        let server = serve_one_registration(
+            UnixListener::bind(&sock_path).unwrap(),
+            br#"{"accepted":false,"message":"needs scx_pylon"}"#,
+        );
+        let cfg =
+            PylonConfig::parse(&format!("shm={},park=kvm,vm_id=98", shm_path.display())).unwrap();
+        let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+
+        let err = state.register_with_daemon(&sock_path).unwrap_err();
+        let (msg, _, _) = server.join().unwrap();
+        assert!(msg.wake_by_signal);
+        assert!(matches!(err, Error::DaemonRejected(m) if m == "needs scx_pylon"));
     }
 
     /// The guest counter read from a real vCPU converts to the host counter within a small

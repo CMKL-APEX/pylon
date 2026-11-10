@@ -410,7 +410,7 @@ async fn handle_client_connection(
                     }
                 }
                 Err(err) => {
-                    // The VMM doesn't wait for the reply, so say it here.
+                    // Logged here too, for operators who read only pylond's log.
                     warn!("Rejected registration of VM {}: {err}", req.vm_id);
                     VmRegistrationResponse {
                         accepted: false,
@@ -428,7 +428,7 @@ async fn handle_client_connection(
         };
 
         match send_json_response_async(&stream, &response).await {
-            // The VMM closes the socket without reading the reply.
+            // A VMM that gave up waiting has closed the socket.
             Err(Error::Io(err))
                 if matches!(
                     err.kind(),

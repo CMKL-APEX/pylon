@@ -411,6 +411,11 @@ are the VMM's own, and the device installs them later (§4.2). Until the guest
 driver enables MSI-X, a kick waits in its `EventFd`. That is harmless: the
 forced path (§4.4) still applies.
 
+*Since #51:* registration moved to `setup_memory_region`, still before
+any device exists, because nothing logged during config parsing shows:
+the VMM installs its logger afterwards. The VMM now also reads
+`pylond`'s reply and logs a rejection.
+
 ---
 
 ## 6. Architecture & Backend Considerations

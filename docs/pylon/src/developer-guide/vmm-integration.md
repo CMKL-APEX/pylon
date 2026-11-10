@@ -44,18 +44,21 @@ breaks that argument.
 
 Called at the end of `VmConfig::parse` in `vmm/src/config.rs`, after
 validation. It parses
-`--pylon`, then builds and installs `PylonVmmState` (creating the page
-and registering with `pylond`). Building the state during option
-parsing is a side effect in an unusual place: it happens before the VM
-exists, and spec 06 moves registration later for that reason.
+`--pylon`, then builds and installs `PylonVmmState`, creating the page.
+Building the state during option parsing is a side effect in an unusual
+place: it happens before the VM exists, and before the VMM installs its
+logger, so nothing logged there shows. Registration with `pylond`
+therefore waits for `setup_memory_region`.
 
 The registration message carries `kick_signal`: the VMM's own
 `SIGRTMIN()`, the signal its vCPU threads have a no-op handler for.
 `pylond` sends it to a donor vCPU whose revocation deadline has passed.
 With park in KVM, the message also carries `wake_by_signal: true`
 ([Control socket protocol](../reference/control-socket.md#registration)).
-The VMM registers only if the socket exists, and doesn't read the
-reply. `PylonVmmState::new` also sets every slot's `assigned_pcpu` to
+The VMM registers only if the socket exists, once per process, and
+waits up to 1 second for the reply. It logs where its vCPUs park when
+`pylond` accepts it, and a warning with `pylond`'s reason when it
+doesn't; the VM then runs unmanaged. `PylonVmmState::new` also sets every slot's `assigned_pcpu` to
 `PCPU_UNASSIGNED`, which `pylond` reads as "no core on its way".
 
 ### Memory: `setup_memory_region`
@@ -66,7 +69,8 @@ and registers it with the hypervisor as a new memory slot
 (`MemoryVisibility::Shared`). It doesn't add the region to the guest's
 memory map, like a device BAR
 ([Shared-memory ABI](shared-memory-abi.md#the-page-in-guest-memory));
-`MemoryManager` keeps the region alive. With park in KVM it also turns
+`MemoryManager` keeps the region alive. It then registers the VM with
+`pylond` (`PylonVmmState::register`). With park in KVM it also turns
 halt polling off for the VM (`KVM_CAP_HALT_POLL` set to 0) and only logs
 a warning if that fails. Errors surface as
 `memory_manager::Error::Pylon`.

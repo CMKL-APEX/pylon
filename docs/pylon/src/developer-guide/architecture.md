@@ -54,7 +54,9 @@ Policy changes are the one exception: Plane 1 writes them straight into
    opens) the `shm` file, sets it to 8,192 bytes, maps it, zeroes it,
    writes the header, and creates a kick and a wake `eventfd` for each
    vCPU slot.
-2. **VMM → Plane 1.** If `socket` exists, `register_with_daemon` sends
+2. **VMM → Plane 1, at memory setup.** `setup_memory_region` maps the
+   same file into guest-physical memory at `gpa` as a shared memory
+   slot. Then, if `socket` exists, `register_with_daemon` sends
    one message: newline-terminated JSON (`vm_id`, `num_vcpus`, `kick_signal`,
    `min_cores`, `max_cores`, `priority_weight`, and `wake_by_signal`
    when vCPUs park inside KVM), with the file
@@ -65,15 +67,14 @@ Policy changes are the one exception: Plane 1 writes them straight into
    it later),
    builds a `VmHandle`, and publishes a new VM list without any old
    entry that has the same `vm_id`. It replies with
-   `{"accepted":true,...}`. The VMM doesn't wait for the reply.
-4. **VMM, memory setup.** `setup_memory_region` maps the same file into
-   guest-physical memory at `gpa` as a shared memory slot.
-5. **VMM, vCPU threads.** Each thread stores its `gettid()` in its slot's
+   `{"accepted":true,...}` and closes the connection. The VMM waits up to
+   1 second for the reply and logs a rejection as a warning.
+4. **VMM, vCPU threads.** Each thread stores its `gettid()` in its slot's
    `host_tid`. The VMM tags vCPUs at or above `initial_active_vcpus`
    `park_on_boot`, and leaves them running so the guest can bring them
    online.
-6. **Plane 2.** Sees the VM in its next sweep.
-7. **Plane 1, once a second.** Lists the VM's vCPU threads in
+5. **Plane 2.** Sees the VM in its next sweep.
+6. **Plane 1, once a second.** Lists the VM's vCPU threads in
    `pylon_vcpu_dom`. Once the guest agent has reported
    (`guest_heartbeat` is non-zero), it sets `revoke_requested` on each
    tagged vCPU that isn't `PARKED` yet and signals its thread, and the
