@@ -35,7 +35,7 @@ For each managed tenant physical core (`pCPU`) in `CoreState::Revoking { donor_v
 1. Check `donor_slot.state.load(Acquire) == VCPU_STATE_PARKED` OR `now_tsc >= deadline_tsc`.
 2. If true:
    - If `now_tsc >= deadline_tsc` and not parked, increment `donor_slot.forced_preempt_count`.
-   - Write `recipient_slot.host_tid` into the `scx_pylon` memory-mapped BPF array for `pCPU`.
+   - Write the recipient's `host_tid` from its host page slot (spec 01 §2.1) into the `scx_pylon` memory-mapped BPF array for `pCPU`.
    - Set `recipient_slot.assigned_pcpu.store(pcpu_id, Release)` and `recipient_slot.state.store(VCPU_STATE_WAKING, Release)`.
    - Trigger `recipient_vm.wake_vcpu(recipient_vcpu)` (writes `1` to the vCPU's wake `eventfd`/futex).
    - Transition `pCPU` to `CoreState::Assigned { vm: recipient_vm, vcpu: recipient_vcpu }`.

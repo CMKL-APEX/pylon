@@ -552,8 +552,8 @@ impl MatrixEngine {
     /// Gives `pcpu` to `vcpu` of `vm`: publishes the owner, records the assignment, and wakes
     /// the vCPU thread. The VMM moves the vCPU from `PARKED` to `RUNNING` when it wakes.
     fn assign_pcpu(&mut self, pcpu: usize, vm: &VmHandle, vcpu: u8, now_tsc: u64) {
-        let slot = &vm.shared_page().vcpus[vcpu as usize];
-        let tid = slot.host_tid.load(Ordering::Acquire);
+        let host = &vm.host_page().vcpus[vcpu as usize];
+        let tid = host.host_tid.load(Ordering::Acquire);
         // `scx_pylon` finds the CPUs a VM owns by the slot in the flags (spec 08 §4.3).
         let vm_slot = vm.vm_slot();
         let flags = if vm_slot == VM_SLOT_NONE {
@@ -562,9 +562,7 @@ impl MatrixEngine {
             (u32::from(vm_slot) + 1) << scx_pylon::PCPU_OWNER_SLOT_SHIFT
         };
         self.pcpu_owners.write_owner(pcpu, tid, flags);
-        self.assigned_yield_count[pcpu] = vm.host_page().vcpus[vcpu as usize]
-            .yield_count
-            .load(Ordering::Acquire);
+        self.assigned_yield_count[pcpu] = host.yield_count.load(Ordering::Acquire);
         vm.set_assigned_pcpu(vcpu as usize, pcpu as u8);
         let _ = vm.wake_vcpu(vcpu as usize);
         // A vCPU parked inside KVM only sees the wake `eventfd` after an exit

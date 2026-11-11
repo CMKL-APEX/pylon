@@ -163,6 +163,7 @@ impl SimulatedVmm {
                     // SAFETY: `libc::gettid()` is always safe to call.
                     let tid = unsafe { libc::gettid() as u32 };
                     set_state(VCPU_STATE_PARKED);
+                    host.host_tid.store(tid, Ordering::Release);
                     slot.host_tid.store(tid, Ordering::Release);
 
                     let mut parked = true;
@@ -224,9 +225,8 @@ impl SimulatedVmm {
 
         // Wait until all vCPU threads have registered their non-zero `host_tid`.
         let deadline = Instant::now() + Duration::from_secs(3);
-        // SAFETY: `shm_mmap` is valid and page-aligned.
-        let shared = unsafe { &*(shm_mmap.as_ptr().cast::<PylonSharedPage>()) };
-        for (vcpu_idx, slot) in shared.vcpus.iter().enumerate().take(num_vcpus as usize) {
+        let host = host_page_of(&shm_mmap);
+        for (vcpu_idx, slot) in host.vcpus.iter().enumerate().take(num_vcpus as usize) {
             while slot.host_tid.load(Ordering::Acquire) == 0 {
                 assert!(
                     Instant::now() < deadline,
@@ -434,7 +434,9 @@ fn test_e2e_full_stack_multi_vm_scale_out_and_cooperative_revocation() {
 
     // Verify via `scx_pylon::PcpuOwnerMap` that every vCPU's real Linux TID owns its assigned pCPU!
     for vcpu_idx in 0..4 {
-        let tid = page1.vcpus[vcpu_idx].host_tid.load(Ordering::Acquire);
+        let tid = vm1.host_page().vcpus[vcpu_idx]
+            .host_tid
+            .load(Ordering::Acquire);
         let pcpu = page1.vcpus[vcpu_idx].assigned_pcpu.load(Ordering::Acquire) as usize;
         assert!(
             tenant_pcpus.contains(&pcpu),
@@ -523,7 +525,9 @@ fn test_e2e_full_stack_multi_vm_scale_out_and_cooperative_revocation() {
 
     // Verify `scx_pylon::PcpuOwnerMap` now maps the 2 handed-off pCPUs to VM 102's vCPU 0 and vCPU 2 TIDs.
     for &vcpu_idx in &[0usize, 2usize] {
-        let tid2 = page2.vcpus[vcpu_idx].host_tid.load(Ordering::Acquire);
+        let tid2 = vm2.host_page().vcpus[vcpu_idx]
+            .host_tid
+            .load(Ordering::Acquire);
         let pcpu2 = page2.vcpus[vcpu_idx].assigned_pcpu.load(Ordering::Acquire) as usize;
         assert_eq!(scx_owner_map.find_pcpu_for_tid(tid2), Some(pcpu2));
     }
@@ -751,7 +755,7 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_guest: DonorGuest
     // 3. Advance TSC past the 8 us deadline while donor remains in `VCPU_STATE_RUNNING`. The
     //    revocation counts as forced, but pylond keeps waiting for the VMM to park the donor and
     //    never writes the donor's `state` itself.
-    let donor_tid = donor_page.vcpus[0].host_tid.load(Ordering::Acquire);
+    let donor_tid = donor_host.host_tid.load(Ordering::Acquire);
     engine.poll_once(deadline + 1);
     assert_eq!(pcpu_owners.read_owner(4).0, donor_tid);
     assert_eq!(donor_host.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
@@ -774,7 +778,9 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_guest: DonorGuest
     engine.poll_once(handoff - 1);
     assert_eq!(pcpu_owners.read_owner(4).0, donor_tid);
     engine.poll_once(handoff);
-    let recip_tid = recip_page.vcpus[0].host_tid.load(Ordering::Acquire);
+    let recip_tid = recipient.host_page().vcpus[0]
+        .host_tid
+        .load(Ordering::Acquire);
     assert_eq!(pcpu_owners.read_owner(4).0, recip_tid);
     let stats = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
     assert_eq!(stats.vms[0].handoffs_without_park, 1);

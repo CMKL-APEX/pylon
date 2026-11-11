@@ -93,7 +93,7 @@ ABI version 2 gave each field one writer (spec 06 §3), and version 3
 keeps that. The field docs in `pylon-abi` say which. These are the
 rules for well-behaved guests: the guest can write the whole page, so
 the VMM and `pylond` act only on the guest's `PARKING` request and
-telemetry from it. The park state they act on is in the
+telemetry from it. The park state and thread IDs they act on are in the
 [host page](#the-host-page), and the fields of the same name here are
 copies for the guest.
 
@@ -144,12 +144,12 @@ or whose host header is invalid.
 
 | Offset | Size | Structure | Contents |
 |---|---|---|---|
-| `0x0000` | 64 | `PylonHostHeader` | `magic` = `PYLON_HOST_MAGIC` (`"PYLONHP1"`), `version` = `PYLON_HOST_VERSION` = 1. Written once by the VMM. |
+| `0x0000` | 64 | `PylonHostHeader` | `magic` = `PYLON_HOST_MAGIC` (`"PYLONHP1"`), `version` = `PYLON_HOST_VERSION` = 2. Written once by the VMM. |
 | `0x0040` | 64 × 64 | `[PylonHostVcpuSlot; 64]` | One slot per vCPU. |
 | `0x1040` | 4,032 | `_tail_pad` | Zero padding to 8,192 bytes. |
 
 `PylonHostVcpuSlot` holds the host's copy of each field that decides
-who gets a core:
+who gets a core, and of the vCPU's thread ID:
 
 | Field | Type | Writer |
 |---|---|---|
@@ -157,6 +157,7 @@ who gets a core:
 | `revoke_requested` | `u8` | `pylond` sets it; the VMM clears it when it parks the vCPU. |
 | `assigned_pcpu` | `u8` | `pylond`. The VMM initializes it to `PCPU_UNASSIGNED`. |
 | `park_on_boot` | `u8` | The VMM. |
+| `host_tid` | `u32` | The VMM, when the vCPU thread starts. `pylond` signals this thread and makes it the owner of the CPUs it gives the vCPU in `scx_pylon`. |
 | `yield_count` | `u64` | The VMM, before it publishes `PARKED`. |
 | `revoke_deadline_tsc` | `u64` | `pylond`, before it sets `revoke_requested`. |
 
@@ -165,11 +166,12 @@ Each writer updates the host slot first and then the guest's copy in
 `revoke_requested` and can watch its own state. Whether a vCPU parked,
 and whether a revocation is still pending, are read only from the host
 slot: a guest that writes `PARKED`, a new `yield_count`, or clears
-`revoke_requested` in its own slot changes nothing.
+`revoke_requested` in its own slot changes nothing. Neither does a
+guest that writes another thread's ID into its `host_tid`.
 
 The host page has its own version, which changes without
 `PYLON_ABI_VERSION`, since guests never see it. The VMM and `pylond`
-have to be upgraded together.
+have to be upgraded together. Version 2 added `host_tid`.
 
 ## Time bases
 

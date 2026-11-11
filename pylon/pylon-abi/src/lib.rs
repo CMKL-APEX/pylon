@@ -182,9 +182,9 @@ impl Default for PylonTelemetry {
 /// Lower 32 bytes are Guest-written; Upper 32 bytes are Host-written.
 ///
 /// The guest can write all of it. `state`, `revoke_requested`, `assigned_pcpu`,
-/// `park_on_boot`, `yield_count` and `revoke_deadline_tsc` are copies, for the guest, of the
-/// fields of the same name in [`PylonHostVcpuSlot`], which the VMM and `pylond` act on; the
-/// one exception is `state`, where the guest asks to park by writing `PARKING`.
+/// `park_on_boot`, `host_tid`, `yield_count` and `revoke_deadline_tsc` are copies, for the
+/// guest, of the fields of the same name in [`PylonHostVcpuSlot`], which the VMM and `pylond`
+/// act on; the one exception is `state`, where the guest asks to park by writing `PARKING`.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct PylonVcpuSlot {
@@ -223,6 +223,7 @@ pub struct PylonVcpuSlot {
     pub park_on_boot: AtomicU8,
     pub _pad_host: [u8; 1],
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
+    /// A copy for the guest: `pylond` uses `PylonHostVcpuSlot::host_tid`.
     pub host_tid: AtomicU32,
     /// Host counter deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
     /// Written by `pylond` before it sets `revoke_requested`.
@@ -337,7 +338,7 @@ impl PylonSharedPage {
 pub const PYLON_HOST_MAGIC: u64 = 0x5059_4C4F_4E48_5031;
 /// Version of the host page in `PylonHostHeader::version`. It changes on its own, without
 /// [`PYLON_ABI_VERSION`]: the guest never sees the host page.
-pub const PYLON_HOST_VERSION: u32 = 1;
+pub const PYLON_HOST_VERSION: u32 = 2;
 /// Offset of the [`PylonHostPage`] in the shared memory file, right after the shared page.
 pub const PYLON_HOST_PAGE_OFFSET: usize = PYLON_SHARED_PAGE_SIZE;
 /// Size in bytes of the [`PylonHostPage`].
@@ -379,7 +380,7 @@ impl Default for PylonHostHeader {
     }
 }
 
-/// The host's copy of a vCPU's park state, which only the VMM and `pylond` can write.
+/// The host's copy of a vCPU's park state and thread, which only the VMM and `pylond` can write.
 ///
 /// The guest can write the whole shared page, whatever the field docs of [`PylonVcpuSlot`]
 /// say, so neither the VMM nor `pylond` acts on what it reads there, except the guest's own
@@ -399,7 +400,9 @@ pub struct PylonHostVcpuSlot {
     /// Non-zero while the VMM wants this vCPU parked once the guest has booted. Written by the
     /// VMM (see `PylonVcpuSlot::park_on_boot`).
     pub park_on_boot: AtomicU8,
-    pub _pad: [u8; 4],
+    /// The vCPU thread's Linux thread ID, or 0 until its thread starts. Written by the VMM.
+    /// `pylond` signals this thread and gives it the pCPUs it assigns to the vCPU.
+    pub host_tid: AtomicU32,
     /// Number of times the VMM parked this vCPU, cooperatively or forced. Written by the VMM,
     /// before it publishes `VCPU_STATE_PARKED`.
     pub yield_count: AtomicU64,
@@ -418,7 +421,7 @@ impl PylonHostVcpuSlot {
             revoke_requested: AtomicU8::new(0),
             assigned_pcpu: AtomicU8::new(PCPU_UNASSIGNED),
             park_on_boot: AtomicU8::new(0),
-            _pad: [0u8; 4],
+            host_tid: AtomicU32::new(0),
             yield_count: AtomicU64::new(0),
             revoke_deadline_tsc: AtomicU64::new(0),
             _reserved: [0u8; 40],
@@ -432,6 +435,7 @@ impl PylonHostVcpuSlot {
         self.revoke_requested.store(0, Ordering::Release);
         self.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
         self.park_on_boot.store(0, Ordering::Release);
+        self.host_tid.store(0, Ordering::Release);
         self.yield_count.store(0, Ordering::Release);
         self.revoke_deadline_tsc.store(0, Ordering::Release);
     }
@@ -487,6 +491,7 @@ const _: () = {
     assert!(size_of::<PylonHostHeader>() == 64);
     assert!(size_of::<PylonHostVcpuSlot>() == 64);
     assert!(align_of::<PylonHostVcpuSlot>() == 64);
+    assert!(offset_of!(PylonHostVcpuSlot, host_tid) == 4);
     assert!(size_of::<PylonHostPage>() == PYLON_HOST_PAGE_SIZE);
     assert!(align_of::<PylonHostPage>() == 4096);
     assert!(offset_of!(PylonHostPage, vcpus) == 64);
@@ -551,6 +556,7 @@ mod tests {
             page.vcpus[0].assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
         );
+        assert_eq!(page.vcpus[0].host_tid.load(Ordering::Acquire), 0);
     }
 
     #[test]

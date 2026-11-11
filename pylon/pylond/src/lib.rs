@@ -684,7 +684,7 @@ impl VmHandle {
             (self.inner.num_vcpus as usize).min(MAX_VCPUS)
         };
         let vm_slot = self.vm_slot();
-        self.shared_page().vcpus[..num_vcpus]
+        self.host_page().vcpus[..num_vcpus]
             .iter()
             .enumerate()
             .filter_map(move |(vcpu, slot)| {
@@ -723,7 +723,7 @@ impl VmHandle {
     /// no signal, its PID is unknown, the vCPU's thread ID isn't known yet, or the VMM has exited.
     pub fn signal_vcpu(&self, vcpu_idx: usize) -> Result<bool, Error> {
         let slot = self
-            .shared_page()
+            .host_page()
             .vcpus
             .get(vcpu_idx)
             .filter(|_| vcpu_idx < self.inner.num_vcpus as usize)
@@ -1129,8 +1129,15 @@ mod tests {
         };
         page.init(vm_id, num_vcpus, tsc_khz);
         host_page.init();
-        for (vcpu_idx, slot) in page.vcpus.iter().enumerate().take(num_vcpus as usize) {
+        for (vcpu_idx, (slot, host)) in page
+            .vcpus
+            .iter()
+            .zip(&host_page.vcpus)
+            .enumerate()
+            .take(num_vcpus as usize)
+        {
             let tid = (vm_id as u32) * 1000 + (vcpu_idx as u32) + 1;
+            host.host_tid.store(tid, Ordering::Release);
             slot.host_tid.store(tid, Ordering::Release);
         }
         owned
@@ -1243,7 +1250,7 @@ mod tests {
         assert_eq!(vm.priority_weight(), 10);
         assert!(vm.shared_page().header.is_valid());
         assert_eq!(
-            vm.shared_page().vcpus[2].host_tid.load(Ordering::Acquire),
+            vm.host_page().vcpus[2].host_tid.load(Ordering::Acquire),
             101_003
         );
 
@@ -1324,6 +1331,11 @@ mod tests {
             .telemetry
             .stranded_work_bitmap
             .store(1 << 1, Ordering::Release);
+        // vm_timer's guest names vm_rx's vCPU 1 thread in its own page; the pCPU still goes to
+        // the thread the VMM recorded in the host page.
+        vm_timer.handle.shared_page().vcpus[2]
+            .host_tid
+            .store(2002, Ordering::Release);
 
         ControlPlane::publish_vm_handle(&snapshot, vm_timer.handle.clone());
         ControlPlane::publish_vm_handle(&snapshot, vm_rx.handle.clone());
@@ -1883,10 +1895,14 @@ mod tests {
     fn test_vcpu_threads_lists_started_vcpus_with_the_vmm_pid_and_slot() {
         let rig = build_test_vm(50, 3, 0, 1, 1);
         // Only vCPU 1's thread has started.
-        for (idx, slot) in rig.handle.shared_page().vcpus[..3].iter().enumerate() {
+        for (idx, slot) in rig.handle.host_page().vcpus[..3].iter().enumerate() {
             let tid = if idx == 1 { 4242 } else { 0 };
             slot.host_tid.store(tid, Ordering::Release);
         }
+        // A thread ID the guest writes into its own page isn't listed.
+        rig.handle.shared_page().vcpus[0]
+            .host_tid
+            .store(1, Ordering::Release);
         // Without a PID, the threads can't be tied to a process.
         assert_eq!(rig.handle.vcpu_threads().count(), 0);
 
@@ -1991,8 +2007,9 @@ mod tests {
         let page = handle.shared_page();
         let host = handle.host_page();
         for (i, (slot, host_slot)) in page.vcpus[..3].iter().zip(&host.vcpus).enumerate() {
-            slot.host_tid
-                .store(tids[i].load(Ordering::SeqCst) as u32, Ordering::Release);
+            let tid = tids[i].load(Ordering::SeqCst) as u32;
+            host_slot.host_tid.store(tid, Ordering::Release);
+            slot.host_tid.store(tid, Ordering::Release);
             host_slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
         }
         // vCPU 0 is an initial vCPU (no tag); 1 is tagged and running; 2 is tagged, already parked.
@@ -2387,7 +2404,7 @@ mod tests {
         }
         let page = handle.shared_page();
         let host = handle.host_page();
-        page.vcpus[0]
+        host.vcpus[0]
             .host_tid
             .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
         page.telemetry.runnable_threads.store(1, Ordering::Release);
@@ -2472,7 +2489,7 @@ mod tests {
             thread::yield_now();
         }
         let donor_slot = &donor_handle.host_page().vcpus[0];
-        donor_handle.shared_page().vcpus[0]
+        donor_slot
             .host_tid
             .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
         donor_slot
@@ -2634,7 +2651,7 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(exited.vmm_exited(), Some(true));
         // It is never signalled.
-        exited.shared_page().vcpus[0]
+        exited.host_page().vcpus[0]
             .host_tid
             .store(child.id(), Ordering::Release);
         assert!(!exited.signal_vcpu(0).unwrap());

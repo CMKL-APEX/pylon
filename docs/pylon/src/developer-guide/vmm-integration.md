@@ -93,7 +93,7 @@ are the kick `eventfd`s, and its BAR0 holds the park doorbell
 
 Called at the top of each vCPU thread in `vmm/src/cpu.rs`, after the
 thread barrier and before the first `KVM_RUN`. It stores `gettid()` in
-the slot's `host_tid`, measures the guest counter offset into
+`host_tid`, in the host page and then in the guest's copy, measures the guest counter offset into
 `guest_tsc_offset` ([Time bases](shared-memory-abi.md#time-bases)), sets
 `RUNNING`, and for `vcpu_id >= initial_active_vcpus` also sets the
 slot's `park_on_boot` tag. With park in KVM it also creates the vCPU's

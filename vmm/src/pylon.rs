@@ -760,8 +760,12 @@ impl PylonVmmState {
         self.kick_eventfds.get(vcpu_id as usize)
     }
 
-    /// Stores the Linux kernel thread ID (`gettid()`) into `PylonSharedPage.vcpus[vcpu_id].host_tid`.
+    /// Stores the Linux kernel thread ID (`gettid()`) into the vCPU's host slot, then into its
+    /// shared page slot for the guest.
     pub fn register_vcpu_tid(&self, vcpu_id: u32, tid: u32) {
+        if let Some(host) = self.host_slot(vcpu_id) {
+            host.host_tid.store(tid, Ordering::Release);
+        }
         if let Some(slot) = self.vcpu_slot(vcpu_id) {
             slot.host_tid.store(tid, Ordering::Release);
         }
@@ -1504,6 +1508,7 @@ mod tests {
             let host = state.host_slot(i).unwrap();
             assert_eq!(host.state.load(Ordering::Relaxed), VCPU_STATE_PARKED);
             assert_eq!(host.assigned_pcpu.load(Ordering::Relaxed), PCPU_UNASSIGNED);
+            assert_eq!(host.host_tid.load(Ordering::Relaxed), 0);
         }
         assert!(state.vcpu_slot(4).is_none());
         assert!(state.host_slot(4).is_none());
@@ -1529,7 +1534,9 @@ mod tests {
         handle0.join().unwrap();
 
         let slot0 = state.vcpu_slot(0).unwrap();
-        assert_ne!(slot0.host_tid.load(Ordering::Acquire), 0);
+        let tid0 = state.host_slot(0).unwrap().host_tid.load(Ordering::Acquire);
+        assert_ne!(tid0, 0);
+        assert_eq!(slot0.host_tid.load(Ordering::Acquire), tid0);
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
 
         // vCPU 1 is >= initial_active_vcpus (1): it registers its thread and is tagged

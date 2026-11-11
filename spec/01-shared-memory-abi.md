@@ -120,7 +120,7 @@ only the shared page into the guest; the VMM and `pylond` map the whole file.
 #[repr(C, align(64))]
 pub struct PylonHostHeader {
     pub magic: u64,   // PYLON_HOST_MAGIC, "PYLONHP1"
-    pub version: u32, // PYLON_HOST_VERSION, 1
+    pub version: u32, // PYLON_HOST_VERSION, 2
     pub _reserved: [u8; 52],
 }
 
@@ -130,7 +130,7 @@ pub struct PylonHostVcpuSlot {
     pub revoke_requested: AtomicU8, // pylond sets, VMM clears
     pub assigned_pcpu: AtomicU8,    // pylond
     pub park_on_boot: AtomicU8,     // VMM
-    pub _pad: [u8; 4],
+    pub host_tid: AtomicU32,        // VMM, at vCPU thread start
     pub yield_count: AtomicU64,         // VMM, before publishing PARKED
     pub revoke_deadline_tsc: AtomicU64, // pylond, before setting revoke_requested
     pub _reserved: [u8; 40],
@@ -146,7 +146,8 @@ pub struct PylonHostPage {
 
 The VMM and `pylond` act on these fields, not on the fields of the same name in `PylonVcpuSlot`,
 which each writer updates after the host slot as copies for the guest. Whether a vCPU parked, and
-whether a revocation is pending, come only from the host page.
+whether a revocation is pending, come only from the host page, and so do the thread IDs `pylond`
+signals and writes to `scx_pylon`'s owner map.
 `pylond` rejects a file smaller than `PYLON_SHM_FILE_SIZE` or with an invalid host header. The host
 page's version changes without `PYLON_ABI_VERSION`.
 
@@ -162,6 +163,7 @@ page's version changes without `PYLON_ABI_VERSION`.
 - `offset_of!(PylonVcpuSlot, park_timer_deadline_tsc) == 24`
 - `offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56`
 - `size_of::<PylonHostVcpuSlot>() == 64`
+- `offset_of!(PylonHostVcpuSlot, host_tid) == 4`
 - `size_of::<PylonHostPage>() == 8192`
 
 ### Time bases

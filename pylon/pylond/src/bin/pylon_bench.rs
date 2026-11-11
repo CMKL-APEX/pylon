@@ -290,6 +290,7 @@ fn run_pylon_elastic_benchmark(
                     VCPU_STATE_RUNNING
                 };
                 slot.state.store(initial_state, Ordering::Release);
+                slot.host_tid.store(tid, Ordering::Release);
                 shared.vcpus[vcpu_idx]
                     .host_tid
                     .store(tid, Ordering::Release);
@@ -334,7 +335,7 @@ fn run_pylon_elastic_benchmark(
     // SAFETY: `shm_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned.
     let shared = unsafe { &*(shm_mmap.as_ptr().cast::<PylonSharedPage>()) };
     let host = host_page(&shm_mmap);
-    for slot in shared.vcpus.iter().take(max_vcpus as usize) {
+    for slot in host.vcpus.iter().take(max_vcpus as usize) {
         while slot.host_tid.load(Ordering::Acquire) == 0 {
             thread::yield_now();
         }
