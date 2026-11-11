@@ -20,6 +20,11 @@ The `pylon-abi` crate (`pylon/pylon-abi`) defines the `#![no_std]` binary contra
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
 
 pub const MAX_VCPUS: usize = 64;
+
+/// The guest can write every byte of the shared page while the host holds a reference to it,
+/// so even unused bytes are atomics: a plain integer there would be undefined behaviour.
+pub type GuestBytes<const N: usize> = [AtomicU8; N];
+
 pub const PYLON_MAGIC: u64 = 0x5059_4C4F_4E56_4D31; // "PYLONVM1"
 pub const PYLON_ABI_VERSION: u32 = 3; // 1 until spec 06 S3, 2 until spec 08 (#51): same layout
 
@@ -36,12 +41,12 @@ pub const PYLON_DEFAULT_GPA: u64 = 0xFEDF_0000;
 /// Cache Line 0: Header metadata written once by VMM at VM creation.
 #[repr(C, align(64))]
 pub struct PylonHeader {
-    pub magic: u64,
-    pub version: u32,
-    pub num_vcpus: u32,
-    pub vm_id: u64,
-    pub tsc_khz: u64,
-    pub _reserved: [u8; 32],
+    pub magic: AtomicU64,
+    pub version: AtomicU32,
+    pub num_vcpus: AtomicU32,
+    pub vm_id: AtomicU64,
+    pub tsc_khz: AtomicU64,
+    pub _reserved: GuestBytes<32>,
 }
 
 /// Cache Line 1: Guest -> Host Telemetry (Strictly written by Guest, Read-Only for Host).
@@ -59,7 +64,7 @@ pub struct PylonTelemetry {
     pub next_timer_tsc: AtomicU64,
     /// Monotonically increasing guest heartbeat counter.
     pub guest_heartbeat: AtomicU64,
-    pub _pad: [u8; 16],
+    pub _pad: GuestBytes<16>,
 }
 
 /// Cache Lines 2..65: One 64-byte slot per vCPU.
@@ -71,7 +76,7 @@ pub struct PylonVcpuSlot {
     pub state: AtomicU8,
     /// Non-zero when the guest vCPU holds a spinlock, is in an IRQ handler, or has preemption disabled.
     pub in_critical_section: AtomicU8,
-    pub _pad_guest: [u8; 6],
+    pub _pad_guest: GuestBytes<6>,
     /// TSC when the guest last yielded this vCPU.
     pub last_yield_tsc: AtomicU64,
     /// Number of cooperative yields performed by this vCPU.
@@ -88,7 +93,7 @@ pub struct PylonVcpuSlot {
     /// Non-zero while the VMM wants this vCPU parked once the guest has booted (spec 07 A-F2).
     /// Set and cleared by the VMM; pylond asks for the park once `guest_heartbeat` is non-zero.
     pub park_on_boot: AtomicU8,
-    pub _pad_host: [u8; 1],
+    pub _pad_host: GuestBytes<1>,
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
     pub host_tid: AtomicU32,
     /// Hard TSC deadline after which pylond will forcibly preempt the vCPU if it hasn't parked.
@@ -106,7 +111,7 @@ pub struct PylonSharedPage {
     pub header: PylonHeader,
     pub telemetry: PylonTelemetry,
     pub vcpus: [PylonVcpuSlot; MAX_VCPUS],
-    pub _tail_pad: [u8; 3968], // Pad to exact 8192 bytes (2 * 4096B pages)
+    pub _tail_pad: GuestBytes<3968>, // Pad to exact 8192 bytes (2 * 4096B pages)
 }
 ```
 

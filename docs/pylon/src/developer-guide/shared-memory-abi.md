@@ -16,9 +16,11 @@ the host on the hot path. The file that backs it also holds an
   the host don't keep stealing the same line from each other. Each vCPU
   slot is split in half: the lower 32 bytes for the guest side, the upper
   32 for the host side.
-- **Atomics only.** After the VMM initializes the page, every field
-  that changes is an `AtomicU8`, `AtomicU32` or `AtomicU64`. No reader
-  takes a lock.
+- **Atomics only.** Every byte of the shared page, header and padding
+  included, is an `AtomicU8`, `AtomicU32` or `AtomicU64`: the guest can
+  write any of them at any time, so the host may hold a Rust reference
+  to the page only if nothing in it is a plain integer. No reader takes
+  a lock.
 - **Fixed size.** The page is exactly two 4 KiB pages. Compile-time
   assertions check every structure's size and alignment, where the
   header, telemetry and slots start, and the offsets of

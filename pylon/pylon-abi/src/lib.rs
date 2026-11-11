@@ -84,19 +84,40 @@ pub const PYLON_KICK_REG_SHM_GPA_HI: u64 = 0x10;
 /// parks it if its slot is `VCPU_STATE_PARKING`. The value is the vCPU index, for tracing.
 pub const PYLON_KICK_REG_PARK_DOORBELL: u64 = 0x40;
 
+/// Bytes of the shared page that nothing reads. They are atomics because the guest can write
+/// every byte of the page while the host holds a reference to it.
+pub type GuestBytes<const N: usize> = [AtomicU8; N];
+
+/// Returns zeroed [`GuestBytes`].
+#[inline]
+pub const fn guest_bytes<const N: usize>() -> GuestBytes<N> {
+    [const { AtomicU8::new(0) }; N]
+}
+
+/// Zeroes `bytes`.
+#[inline]
+pub fn clear_guest_bytes(bytes: &[AtomicU8]) {
+    for byte in bytes {
+        byte.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Cache Line 0: Header metadata written once by VMM at VM creation.
+///
+/// The fields are atomics because the guest can overwrite them at any time; a reader must not
+/// assume they keep the values the VMM wrote.
 #[repr(C, align(64))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct PylonHeader {
-    pub magic: u64,
-    pub version: u32,
-    pub num_vcpus: u32,
-    pub vm_id: u64,
+    pub magic: AtomicU64,
+    pub version: AtomicU32,
+    pub num_vcpus: AtomicU32,
+    pub vm_id: AtomicU64,
     /// Counter rate in kHz, or 0 if the writer doesn't know it. Informational only: the guest
     /// can write the page, so `pylond` ignores it and always uses the host counter rate it
     /// finds itself (measured on x86_64, `CNTFRQ_EL0` on aarch64).
-    pub tsc_khz: u64,
-    pub _reserved: [u8; 32],
+    pub tsc_khz: AtomicU64,
+    pub _reserved: GuestBytes<32>,
 }
 
 impl PylonHeader {
@@ -104,22 +125,23 @@ impl PylonHeader {
     #[inline]
     pub const fn new(vm_id: u64, num_vcpus: u32, tsc_khz: u64) -> Self {
         Self {
-            magic: PYLON_MAGIC,
-            version: PYLON_ABI_VERSION,
-            num_vcpus,
-            vm_id,
-            tsc_khz,
-            _reserved: [0u8; 32],
+            magic: AtomicU64::new(PYLON_MAGIC),
+            version: AtomicU32::new(PYLON_ABI_VERSION),
+            num_vcpus: AtomicU32::new(num_vcpus),
+            vm_id: AtomicU64::new(vm_id),
+            tsc_khz: AtomicU64::new(tsc_khz),
+            _reserved: guest_bytes(),
         }
     }
 
     /// Returns `true` if the magic value, ABI version, and vCPU count are valid.
     #[inline]
-    pub const fn is_valid(&self) -> bool {
-        self.magic == PYLON_MAGIC
-            && self.version == PYLON_ABI_VERSION
-            && self.num_vcpus > 0
-            && (self.num_vcpus as usize) <= MAX_VCPUS
+    pub fn is_valid(&self) -> bool {
+        let num_vcpus = self.num_vcpus.load(Ordering::Acquire);
+        self.magic.load(Ordering::Acquire) == PYLON_MAGIC
+            && self.version.load(Ordering::Acquire) == PYLON_ABI_VERSION
+            && num_vcpus > 0
+            && (num_vcpus as usize) <= MAX_VCPUS
     }
 }
 
@@ -141,7 +163,7 @@ pub struct PylonTelemetry {
     pub next_timer_tsc: AtomicU64,
     /// Monotonically increasing guest heartbeat counter.
     pub guest_heartbeat: AtomicU64,
-    pub _pad: [u8; 16],
+    pub _pad: GuestBytes<16>,
 }
 
 impl PylonTelemetry {
@@ -155,7 +177,7 @@ impl PylonTelemetry {
             head_wait_tsc: AtomicU64::new(0),
             next_timer_tsc: AtomicU64::new(0),
             guest_heartbeat: AtomicU64::new(0),
-            _pad: [0u8; 16],
+            _pad: guest_bytes(),
         }
     }
 
@@ -195,7 +217,7 @@ pub struct PylonVcpuSlot {
     pub state: AtomicU8,
     /// Non-zero when the guest vCPU holds a spinlock, is in an IRQ handler, or has preemption disabled.
     pub in_critical_section: AtomicU8,
-    pub _pad_guest: [u8; 6],
+    pub _pad_guest: GuestBytes<6>,
     /// Host counter when the VMM last parked this vCPU. Written by the VMM.
     pub last_yield_tsc: AtomicU64,
     /// Number of times the VMM parked this vCPU, cooperatively or forced. Written by the VMM,
@@ -221,7 +243,7 @@ pub struct PylonVcpuSlot {
     /// non-zero `guest_heartbeat`), `pylond` sets `revoke_requested` and signals the thread; the
     /// VMM then parks the vCPU at once and clears this byte. 0 before ABI v2 used these bytes.
     pub park_on_boot: AtomicU8,
-    pub _pad_host: [u8; 1],
+    pub _pad_host: GuestBytes<1>,
     /// Host Linux Thread ID (pid_t from gettid()) for this vCPU thread. Written by VMM at boot.
     /// A copy for the guest: `pylond` uses `PylonHostVcpuSlot::host_tid`.
     pub host_tid: AtomicU32,
@@ -242,14 +264,14 @@ impl PylonVcpuSlot {
         Self {
             state: AtomicU8::new(VCPU_STATE_PARKED),
             in_critical_section: AtomicU8::new(0),
-            _pad_guest: [0u8; 6],
+            _pad_guest: guest_bytes(),
             last_yield_tsc: AtomicU64::new(0),
             yield_count: AtomicU64::new(0),
             park_timer_deadline_tsc: AtomicU64::new(0),
             revoke_requested: AtomicU8::new(0),
             assigned_pcpu: AtomicU8::new(PCPU_UNASSIGNED),
             park_on_boot: AtomicU8::new(0),
-            _pad_host: [0u8; 1],
+            _pad_host: guest_bytes(),
             host_tid: AtomicU32::new(0),
             revoke_deadline_tsc: AtomicU64::new(0),
             forced_preempt_count: AtomicU64::new(0),
@@ -289,7 +311,7 @@ pub struct PylonSharedPage {
     pub header: PylonHeader,
     pub telemetry: PylonTelemetry,
     pub vcpus: [PylonVcpuSlot; MAX_VCPUS],
-    pub _tail_pad: [u8; 3968], // Pad to exact 8192 bytes (2 * 4096B pages)
+    pub _tail_pad: GuestBytes<3968>, // Pad to exact 8192 bytes (2 * 4096B pages)
 }
 
 impl PylonSharedPage {
@@ -301,13 +323,13 @@ impl PylonSharedPage {
         for slot in &self.vcpus {
             slot.reset();
         }
-        self._tail_pad.fill(0);
+        clear_guest_bytes(&self._tail_pad);
     }
 
     /// Counts how many vCPUs are currently in `VCPU_STATE_RUNNING` or `VCPU_STATE_WAKING`.
     #[inline]
     pub fn active_vcpu_count(&self) -> u32 {
-        let limit = (self.header.num_vcpus as usize).min(MAX_VCPUS);
+        let limit = (self.header.num_vcpus.load(Ordering::Acquire) as usize).min(MAX_VCPUS);
         let mut count = 0u32;
         let mut idx = 0;
         while idx < limit {
@@ -529,11 +551,14 @@ mod tests {
         let mut page: PylonSharedPage = unsafe { zeroed() };
         page.init(42, 8, 3_000_000);
         assert!(page.header.is_valid());
-        assert_eq!(page.header.magic, PYLON_MAGIC);
-        assert_eq!(page.header.version, PYLON_ABI_VERSION);
-        assert_eq!(page.header.vm_id, 42);
-        assert_eq!(page.header.num_vcpus, 8);
-        assert_eq!(page.header.tsc_khz, 3_000_000);
+        assert_eq!(page.header.magic.load(Ordering::Relaxed), PYLON_MAGIC);
+        assert_eq!(
+            page.header.version.load(Ordering::Relaxed),
+            PYLON_ABI_VERSION
+        );
+        assert_eq!(page.header.vm_id.load(Ordering::Relaxed), 42);
+        assert_eq!(page.header.num_vcpus.load(Ordering::Relaxed), 8);
+        assert_eq!(page.header.tsc_khz.load(Ordering::Relaxed), 3_000_000);
         assert_eq!(page.active_vcpu_count(), 0);
         assert_eq!(
             page.vcpus[0].assigned_pcpu.load(Ordering::Acquire),

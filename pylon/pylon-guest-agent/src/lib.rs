@@ -218,21 +218,24 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
     pub fn new(backend: PylonMemoryBackend, reader: R) -> Result<Self, PylonGuestError> {
         let page = backend.as_shared_page();
         let header = &page.header;
+        let magic = header.magic.load(Ordering::Acquire);
+        let version = header.version.load(Ordering::Acquire);
+        let num_vcpus = header.num_vcpus.load(Ordering::Acquire);
 
-        if header.magic != PYLON_MAGIC {
+        if magic != PYLON_MAGIC {
             return Err(PylonGuestError::InvalidMagic {
                 expected: PYLON_MAGIC,
-                actual: header.magic,
+                actual: magic,
             });
         }
-        if header.version != PYLON_ABI_VERSION {
+        if version != PYLON_ABI_VERSION {
             return Err(PylonGuestError::InvalidVersion {
                 expected: PYLON_ABI_VERSION,
-                actual: header.version,
+                actual: version,
             });
         }
-        if header.num_vcpus == 0 || (header.num_vcpus as usize) > MAX_VCPUS {
-            return Err(PylonGuestError::InvalidNumVcpus(header.num_vcpus));
+        if num_vcpus == 0 || (num_vcpus as usize) > MAX_VCPUS {
+            return Err(PylonGuestError::InvalidNumVcpus(num_vcpus));
         }
 
         Ok(Self { backend, reader })
@@ -288,7 +291,8 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
     /// Take a full status snapshot.
     pub fn status(&self) -> GuestAgentStatus {
         let page = self.shared_page();
-        let num_vcpus = (page.header.num_vcpus as usize).min(MAX_VCPUS);
+        let header_vcpus = page.header.num_vcpus.load(Ordering::Acquire);
+        let num_vcpus = (header_vcpus as usize).min(MAX_VCPUS);
         let mut vcpus = Vec::with_capacity(num_vcpus);
 
         for (i, slot) in page.vcpus.iter().enumerate().take(num_vcpus) {
@@ -319,9 +323,9 @@ impl<R: TelemetryReader> PylonGuestAgent<R> {
         }
 
         GuestAgentStatus {
-            vm_id: page.header.vm_id,
-            num_vcpus: page.header.num_vcpus,
-            tsc_khz: page.header.tsc_khz,
+            vm_id: page.header.vm_id.load(Ordering::Relaxed),
+            num_vcpus: header_vcpus,
+            tsc_khz: page.header.tsc_khz.load(Ordering::Relaxed),
             runnable_threads: page.telemetry.runnable_threads.load(Ordering::Acquire),
             guest_heartbeat: page.telemetry.guest_heartbeat.load(Ordering::Relaxed),
             vcpus,

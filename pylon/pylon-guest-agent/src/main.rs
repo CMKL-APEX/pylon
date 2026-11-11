@@ -139,8 +139,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     info!(
         "Pylon guest agent started for VM {} ({} vCPUs), interval = {} us",
-        agent.header().vm_id,
-        agent.header().num_vcpus,
+        agent.header().vm_id.load(Ordering::Relaxed),
+        agent.header().num_vcpus.load(Ordering::Relaxed),
         args.interval_us
     );
 

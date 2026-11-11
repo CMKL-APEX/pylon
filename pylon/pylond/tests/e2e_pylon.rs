@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use std::{io, process, ptr};
+use std::{io, process};
 
 use arc_swap::ArcSwap;
 use memmap2::MmapMut;
@@ -285,10 +285,10 @@ impl SimulatedVmm {
     /// Overwrites the counter rate in the header, as a guest can: the whole page is mapped
     /// writable into the guest.
     fn write_header_tsc_khz(&mut self, tsc_khz: u64) {
-        let page = self.shm_mmap.as_mut_ptr().cast::<PylonSharedPage>();
-        // SAFETY: `shm_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned, so `page` points to a whole
-        // `PylonSharedPage`, and no reference to the header is alive.
-        unsafe { ptr::write_volatile(ptr::addr_of_mut!((*page).header.tsc_khz), tsc_khz) };
+        self.shared_page()
+            .header
+            .tsc_khz
+            .store(tsc_khz, Ordering::Release);
     }
 
     fn shutdown(mut self) {

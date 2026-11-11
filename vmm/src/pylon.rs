@@ -24,10 +24,9 @@ use log::{info, warn};
 use option_parser::{OptionParser, OptionParserError};
 use pylon_abi::clock::read_counter;
 use pylon_abi::{
-    MAX_VCPUS, PCPU_UNASSIGNED, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_HOST_PAGE_OFFSET,
-    PYLON_MAGIC, PYLON_SHARED_PAGE_SIZE, PYLON_SHM_FILE_SIZE, PylonHeader, PylonHostHeader,
-    PylonHostPage, PylonHostVcpuSlot, PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED,
-    VCPU_STATE_PARKING, VCPU_STATE_RUNNING,
+    MAX_VCPUS, PCPU_UNASSIGNED, PYLON_DEFAULT_GPA, PYLON_HOST_PAGE_OFFSET, PYLON_SHARED_PAGE_SIZE,
+    PYLON_SHM_FILE_SIZE, PylonHeader, PylonHostHeader, PylonHostPage, PylonHostVcpuSlot,
+    PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED, VCPU_STATE_PARKING, VCPU_STATE_RUNNING,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -508,14 +507,7 @@ impl PylonVmmState {
             );
             ptr::write(
                 &raw mut (*shared_page.as_ptr()).header,
-                PylonHeader {
-                    magic: PYLON_MAGIC,
-                    version: PYLON_ABI_VERSION,
-                    num_vcpus,
-                    vm_id: config.vm_id,
-                    tsc_khz: UNKNOWN_TSC_KHZ,
-                    _reserved: [0u8; 32],
-                },
+                PylonHeader::new(config.vm_id, num_vcpus, UNKNOWN_TSC_KHZ),
             );
         }
         // `pylond` treats a parked vCPU as free for a core only while its `assigned_pcpu` is
@@ -1492,11 +1484,10 @@ mod tests {
         assert!(state.host_page().header.is_valid());
 
         let page = state.shared_page();
-        assert_eq!(page.header.magic, PYLON_MAGIC);
-        assert_eq!(page.header.version, PYLON_ABI_VERSION);
-        assert_eq!(page.header.num_vcpus, 4);
-        assert_eq!(page.header.vm_id, 77);
-        assert_eq!(page.header.tsc_khz, UNKNOWN_TSC_KHZ);
+        assert!(page.header.is_valid());
+        assert_eq!(page.header.num_vcpus.load(Ordering::Relaxed), 4);
+        assert_eq!(page.header.vm_id.load(Ordering::Relaxed), 77);
+        assert_eq!(page.header.tsc_khz.load(Ordering::Relaxed), UNKNOWN_TSC_KHZ);
         assert_eq!(page.telemetry.runnable_threads.load(Ordering::Relaxed), 0);
 
         for i in 0..4 {
