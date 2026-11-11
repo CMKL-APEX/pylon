@@ -25,7 +25,8 @@ use arc_swap::ArcSwap;
 use clap::Parser;
 use memmap2::MmapMut;
 use pylon_abi::{
-    PCPU_UNASSIGNED, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
+    PCPU_UNASSIGNED, PYLON_HOST_PAGE_OFFSET, PYLON_SHM_FILE_SIZE, PylonHostPage, PylonSharedPage,
+    VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
 };
 use pylond::engine::{MatrixEngine, default_counter_khz, read_tsc};
 use pylond::{
@@ -203,6 +204,18 @@ impl WaveWorkQueue {
     }
 }
 
+/// The `PylonHostPage` in `mmap`, a mapping of the whole shared memory file.
+fn host_page(mmap: &MmapMut) -> &PylonHostPage {
+    // SAFETY: `mmap` is page-aligned and `PYLON_SHM_FILE_SIZE` bytes, and the host page lies at a
+    // page-aligned offset in it.
+    unsafe {
+        &*(mmap
+            .as_ptr()
+            .add(PYLON_HOST_PAGE_OFFSET)
+            .cast::<PylonHostPage>())
+    }
+}
+
 /// Runs the workload using Pylon microsecond core elasticity (`PylonSharedPage` + `MatrixEngine` + `EventFd` fast-park/wake).
 fn run_pylon_elastic_benchmark(
     waves: usize,
@@ -219,14 +232,25 @@ fn run_pylon_elastic_benchmark(
         .open(&shm_path)
         .expect("failed to create benchmark shm file");
     shm_file
-        .set_len(PYLON_SHARED_PAGE_SIZE as u64)
+        .set_len(PYLON_SHM_FILE_SIZE as u64)
         .expect("failed to size benchmark shm file");
 
-    // SAFETY: `shm_file` is 8,192 bytes and accessed atomically via `PylonSharedPage`.
+    // SAFETY: `shm_file` is `PYLON_SHM_FILE_SIZE` bytes and accessed atomically via
+    // `PylonSharedPage` and `PylonHostPage`.
     let mut shm_mmap = unsafe { MmapMut::map_mut(&shm_file).expect("mmap failed") };
-    // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned.
-    let page = unsafe { &mut *(shm_mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
+    // SAFETY: `shm_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned, and the host page lies at
+    // a page-aligned offset in it.
+    let (page, host) = unsafe {
+        (
+            &mut *(shm_mmap.as_mut_ptr().cast::<PylonSharedPage>()),
+            &mut *(shm_mmap
+                .as_mut_ptr()
+                .add(PYLON_HOST_PAGE_OFFSET)
+                .cast::<PylonHostPage>()),
+        )
+    };
     page.init(1, max_vcpus, default_counter_khz());
+    host.init();
 
     let stop = Arc::new(AtomicBool::new(false));
     let work_queue = Arc::new(WaveWorkQueue::new(iters_per_task));
@@ -245,7 +269,7 @@ fn run_pylon_elastic_benchmark(
         local_wake_fds.push(wake_fd);
 
         let thread_file = shm_file.try_clone().expect("clone shm_file");
-        // SAFETY: Mapping the 8,192-byte shared memory page into the vCPU worker thread.
+        // SAFETY: Mapping the shared memory file into the vCPU worker thread.
         let thread_mmap = unsafe { MmapMut::map_mut(&thread_file).expect("thread mmap") };
         let thread_stop = Arc::clone(&stop);
         let thread_queue = Arc::clone(&work_queue);
@@ -253,9 +277,10 @@ fn run_pylon_elastic_benchmark(
         let th = thread::Builder::new()
             .name(format!("pylon-bench-vcpu{vcpu_idx}"))
             .spawn(move || {
-                // SAFETY: `thread_mmap` is 8,192 bytes and page-aligned.
+                // SAFETY: `thread_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned.
                 let shared = unsafe { &*(thread_mmap.as_ptr().cast::<PylonSharedPage>()) };
-                let slot = &shared.vcpus[vcpu_idx];
+                // The simulated VMM keeps the park state in the host page, as the VMM does.
+                let slot = &host_page(&thread_mmap).vcpus[vcpu_idx];
                 // SAFETY: `libc::gettid()` is always safe to call.
                 let tid = unsafe { libc::gettid() as u32 };
                 let mut parked = vcpu_idx != 0;
@@ -265,7 +290,9 @@ fn run_pylon_elastic_benchmark(
                     VCPU_STATE_RUNNING
                 };
                 slot.state.store(initial_state, Ordering::Release);
-                slot.host_tid.store(tid, Ordering::Release);
+                shared.vcpus[vcpu_idx]
+                    .host_tid
+                    .store(tid, Ordering::Release);
 
                 while !thread_stop.load(Ordering::Acquire) {
                     if parked {
@@ -304,8 +331,9 @@ fn run_pylon_elastic_benchmark(
     }
 
     // Wait for all vCPU threads to register their `host_tid`.
-    // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned.
+    // SAFETY: `shm_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned.
     let shared = unsafe { &*(shm_mmap.as_ptr().cast::<PylonSharedPage>()) };
+    let host = host_page(&shm_mmap);
     for slot in shared.vcpus.iter().take(max_vcpus as usize) {
         while slot.host_tid.load(Ordering::Acquire) == 0 {
             thread::yield_now();
@@ -339,7 +367,7 @@ fn run_pylon_elastic_benchmark(
     );
 
     // Initialize baseline: vCPU 0 owns pCPU 0 (`runnable_threads = 1`).
-    shared.vcpus[0].assigned_pcpu.store(0, Ordering::Release);
+    host.vcpus[0].assigned_pcpu.store(0, Ordering::Release);
     engine.set_core_state(0, CoreState::Assigned { vm_id: 1, vcpu: 0 });
 
     let mut scale_out_samples_ns = Vec::with_capacity(waves);
@@ -367,7 +395,7 @@ fn run_pylon_elastic_benchmark(
         engine.poll_once(read_tsc());
 
         while (0..(max_vcpus as usize))
-            .any(|i| shared.vcpus[i].state.load(Ordering::Acquire) != VCPU_STATE_RUNNING)
+            .any(|i| host.vcpus[i].state.load(Ordering::Acquire) != VCPU_STATE_RUNNING)
         {
             thread::yield_now();
         }
@@ -386,11 +414,11 @@ fn run_pylon_elastic_benchmark(
             .telemetry
             .runnable_threads
             .store(1, Ordering::Release);
-        for slot in shared.vcpus.iter().take(max_vcpus as usize).skip(1) {
+        for slot in host.vcpus.iter().take(max_vcpus as usize).skip(1) {
             slot.revoke_requested.store(1, Ordering::Release);
         }
         while (1..(max_vcpus as usize))
-            .any(|i| shared.vcpus[i].state.load(Ordering::Acquire) != VCPU_STATE_PARKED)
+            .any(|i| host.vcpus[i].state.load(Ordering::Acquire) != VCPU_STATE_PARKED)
         {
             thread::yield_now();
         }

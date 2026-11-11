@@ -59,7 +59,9 @@ The VMM registers only if the socket exists, once per process, and
 waits up to 1 second for the reply. It logs where its vCPUs park when
 `pylond` accepts it, and a warning with `pylond`'s reason when it
 doesn't; the VM then runs unmanaged. `PylonVmmState::new` also sets every slot's `assigned_pcpu` to
-`PCPU_UNASSIGNED`, which `pylond` reads as "no core on its way".
+`PCPU_UNASSIGNED`, in the shared page and in the
+[host page](shared-memory-abi.md#the-host-page), which `pylond` reads
+as "no core on its way".
 
 ### Memory: `setup_memory_region`
 
@@ -116,6 +118,14 @@ exit to userspace. It applies the decision table from spec 06 §4.4
 | other | 1 | `now >= revoke_deadline_tsc` | Forced park |
 | other | 1 | not passed | Keep running: the guest hasn't agreed and may hold a lock |
 | other | 0 | — | Keep running |
+
+`state` is the guest's, from the shared page: the guest asks to park by
+writing `PARKING` there. `revoke_requested`, the deadline and
+`park_on_boot` come from the
+[host page](shared-memory-abi.md#the-host-page), so a guest can't clear
+or postpone a revocation. What the VMM publishes (`state`,
+`yield_count`, clearing `revoke_requested` and `park_on_boot`) goes to
+the host page first and then to the guest's copy.
 
 A vCPU already parked inside KVM skips this table; see
 [Parking inside KVM](#parking-inside-kvm).

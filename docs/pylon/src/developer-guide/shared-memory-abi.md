@@ -2,7 +2,9 @@
 
 Every Pylon VM has one 8,192-byte shared page. The VMM, `pylond` and
 the guest all map it, and it's the only channel between the guest and
-the host on the hot path. Its layout is defined once, in
+the host on the hot path. The file that backs it also holds an
+8,192-byte [host page](#the-host-page) after it, which only the VMM and
+`pylond` map. Its layout is defined once, in
 [`pylon/pylon-abi/src/lib.rs`](https://github.com/CMKL-APEX/pylon/blob/main/pylon/pylon-abi/src/lib.rs)
 (`#![no_std]`, so a guest kernel can use it too). The design is in
 [`spec/01-shared-memory-abi.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/01-shared-memory-abi.md).
@@ -88,7 +90,12 @@ seeing it. `state` stays `PARKED` until `pylond` gives the vCPU a core
 ## Who writes what, today
 
 ABI version 2 gave each field one writer (spec 06 §3), and version 3
-keeps that. The field docs in `pylon-abi` say which:
+keeps that. The field docs in `pylon-abi` say which. These are the
+rules for well-behaved guests: the guest can write the whole page, so
+the VMM and `pylond` act only on the guest's `PARKING` request and
+telemetry from it. The park state they act on is in the
+[host page](#the-host-page), and the fields of the same name here are
+copies for the guest.
 
 | Field | Writer |
 |---|---|
@@ -125,6 +132,44 @@ The wake `eventfd`s stay: a vCPU parked inside KVM reads its own,
 without blocking, after each exit, to learn that `pylond` assigned it a
 core. A version-2 guest component or `pylond` refuses a version-3
 page.
+
+## The host page
+
+`PylonHostPage` follows the shared page in the same file, at
+`PYLON_HOST_PAGE_OFFSET` (8,192), so the file is `PYLON_SHM_FILE_SIZE`
+(16,384) bytes. The VMM maps only the shared page into the guest, so
+the guest can neither read nor write the host page. `pylond` maps the
+whole file it receives at registration and refuses one that is smaller
+or whose host header is invalid.
+
+| Offset | Size | Structure | Contents |
+|---|---|---|---|
+| `0x0000` | 64 | `PylonHostHeader` | `magic` = `PYLON_HOST_MAGIC` (`"PYLONHP1"`), `version` = `PYLON_HOST_VERSION` = 1. Written once by the VMM. |
+| `0x0040` | 64 × 64 | `[PylonHostVcpuSlot; 64]` | One slot per vCPU. |
+| `0x1040` | 4,032 | `_tail_pad` | Zero padding to 8,192 bytes. |
+
+`PylonHostVcpuSlot` holds the host's copy of each field that decides
+who gets a core:
+
+| Field | Type | Writer |
+|---|---|---|
+| `state` | `u8` | The VMM: `PARKED` or `RUNNING`, never `PARKING`. |
+| `revoke_requested` | `u8` | `pylond` sets it; the VMM clears it when it parks the vCPU. |
+| `assigned_pcpu` | `u8` | `pylond`. The VMM initializes it to `PCPU_UNASSIGNED`. |
+| `park_on_boot` | `u8` | The VMM. |
+| `yield_count` | `u64` | The VMM, before it publishes `PARKED`. |
+| `revoke_deadline_tsc` | `u64` | `pylond`, before it sets `revoke_requested`. |
+
+Each writer updates the host slot first and then the guest's copy in
+`PylonVcpuSlot`, so a guest still learns of a revocation from
+`revoke_requested` and can watch its own state. Whether a vCPU parked,
+and whether a revocation is still pending, are read only from the host
+slot: a guest that writes `PARKED`, a new `yield_count`, or clears
+`revoke_requested` in its own slot changes nothing.
+
+The host page has its own version, which changes without
+`PYLON_ABI_VERSION`, since guests never see it. The VMM and `pylond`
+have to be upgraded together.
 
 ## Time bases
 
@@ -179,7 +224,9 @@ when it exists.
 3. If the change alters a field's meaning or its writer, bump
    `PYLON_ABI_VERSION`. `pylond` refuses pages with another version, so
    update the VMM, `pylond` and guest components together.
-4. Update every reader and writer: `vmm/src/pylon.rs`,
+4. A change to the host page needs `PYLON_HOST_VERSION` bumped, not
+   `PYLON_ABI_VERSION`, and no guest component changes.
+5. Update every reader and writer: `vmm/src/pylon.rs`,
    `pylond/src/engine.rs` and `lib.rs`, `pylon-guest-agent`, the C copy
    of the layout in `pylon/guest/linux/pv_pylon_abi.h`, and the
    tests that build pages by hand (`pylond/tests/e2e_pylon.rs`,

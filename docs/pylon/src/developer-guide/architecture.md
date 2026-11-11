@@ -51,8 +51,8 @@ Policy changes are the one exception: Plane 1 writes them straight into
 ## Flow: registering a VM
 
 1. **VMM, while parsing options.** `PylonVmmState::new` creates (or
-   opens) the `shm` file, sets it to 8,192 bytes, maps it, zeroes it,
-   writes the header, and creates a kick and a wake `eventfd` for each
+   opens) the `shm` file, sets it to 16,384 bytes (the shared page, then
+   the host page), maps it, zeroes it, writes both headers, and creates a kick and a wake `eventfd` for each
    vCPU slot.
 2. **VMM → Plane 1, at memory setup.** `setup_memory_region` maps the
    same file into guest-physical memory at `gpa` as a shared memory

@@ -9,7 +9,7 @@ device options. An unknown key is an error.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `shm` | path | **required** | File backing the 8 KiB shared page, for example `/dev/shm/vm17-pylon`. Created if missing (with its parent directories), resized to 8,192 bytes and zeroed at start. Not removed at exit. One file per VM. |
+| `shm` | path | **required** | File backing the 8 KiB shared page and the 8 KiB host page after it, for example `/dev/shm/vm17-pylon`. Created if missing (with its parent directories), resized to 16,384 bytes and zeroed at start. Only the shared page is mapped into the guest. Not removed at exit. One file per VM. |
 | `socket` | path | none | `pylond`'s control socket, such as `/run/pylon/pylond.sock`. Without it, the VM never registers, and parked vCPUs are never woken. The VMM registers once, at start, and doesn't retry: if the socket doesn't exist yet, it logs that and runs unregistered. |
 | `gpa` | integer, `0x` hex or decimal | `0xfedf0000` | Guest-physical address of the page. Must be a multiple of 4,096. |
 | `initial_active_vcpus` | integer | `--cpus boot` | vCPUs `0 … n-1` always run; the others run during boot and are parked once the guest reports it is up (first `guest_heartbeat`). Capped at the number of slots. |

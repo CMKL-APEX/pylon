@@ -21,7 +21,9 @@ are given to VMs. `pylond` itself runs on host cores 0 and 1.
 **Shared page.** An 8 KiB memory region per VM, backed by a file such as
 `/dev/shm/vm1-pylon`. It's mapped into the VMM, into `pylond`, and into
 the guest at a fixed guest-physical address (`0xFEDF_0000` by default).
-It holds a header, guest telemetry, and one 64-byte slot per vCPU.
+It holds a header, guest telemetry, and one 64-byte slot per vCPU. The
+same file holds a host page after it, which the guest doesn't see: the
+VMM and `pylond` keep the park state they act on there.
 
 **Telemetry** is what the guest writes about its own demand: how many
 threads are runnable, how long the oldest one has waited, and when its

@@ -58,7 +58,7 @@ Attached descriptors, in order: the shared page's file, then
 `pylond` closes the connection after the response. Both sides log a
 rejection as a warning; the VM then runs without `pylond`. A registration whose JSON doesn't parse gets no response.
 A registration's `priority_weight` of 0 is stored as 1.
-| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the page couldn't be mapped, is smaller than 8,192 bytes or its header is invalid; or a pidfd for the peer couldn't be opened. |
+| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the file couldn't be mapped, is smaller than 16,384 bytes, or the header of its shared page or host page is invalid; or a pidfd for the peer couldn't be opened. |
 
 ## Stats
 

@@ -110,6 +110,46 @@ pub struct PylonSharedPage {
 }
 ```
 
+### 2.1 Host page
+The guest can write the whole `PylonSharedPage`: the per-field writers above hold only for
+well-behaved guests. The shared memory file therefore holds a `PylonHostPage` after it, at
+`PYLON_HOST_PAGE_OFFSET` (8,192), making the file `PYLON_SHM_FILE_SIZE` (16,384) bytes. The VMM maps
+only the shared page into the guest; the VMM and `pylond` map the whole file.
+
+```rust
+#[repr(C, align(64))]
+pub struct PylonHostHeader {
+    pub magic: u64,   // PYLON_HOST_MAGIC, "PYLONHP1"
+    pub version: u32, // PYLON_HOST_VERSION, 1
+    pub _reserved: [u8; 52],
+}
+
+#[repr(C, align(64))]
+pub struct PylonHostVcpuSlot {
+    pub state: AtomicU8,            // VMM: PARKED or RUNNING
+    pub revoke_requested: AtomicU8, // pylond sets, VMM clears
+    pub assigned_pcpu: AtomicU8,    // pylond
+    pub park_on_boot: AtomicU8,     // VMM
+    pub _pad: [u8; 4],
+    pub yield_count: AtomicU64,         // VMM, before publishing PARKED
+    pub revoke_deadline_tsc: AtomicU64, // pylond, before setting revoke_requested
+    pub _reserved: [u8; 40],
+}
+
+#[repr(C, align(4096))]
+pub struct PylonHostPage {
+    pub header: PylonHostHeader,
+    pub vcpus: [PylonHostVcpuSlot; MAX_VCPUS],
+    pub _tail_pad: [u8; 4032], // Pad to exact 8192 bytes
+}
+```
+
+The VMM and `pylond` act on these fields, not on the fields of the same name in `PylonVcpuSlot`,
+which each writer updates after the host slot as copies for the guest. Whether a vCPU parked, and
+whether a revocation is pending, come only from the host page.
+`pylond` rejects a file smaller than `PYLON_SHM_FILE_SIZE` or with an invalid host header. The host
+page's version changes without `PYLON_ABI_VERSION`.
+
 ---
 
 ## 3. Required Compile-Time Verification Tests
@@ -121,6 +161,8 @@ pub struct PylonSharedPage {
 - `offset_of!(PylonVcpuSlot, revoke_requested) == 32`
 - `offset_of!(PylonVcpuSlot, park_timer_deadline_tsc) == 24`
 - `offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56`
+- `size_of::<PylonHostVcpuSlot>() == 64`
+- `size_of::<PylonHostPage>() == 8192`
 
 ### Time bases
 Every `*_tsc` field and `tsc_khz` count **host counter ticks** (`spec/07-aarch64-support.md` §3):

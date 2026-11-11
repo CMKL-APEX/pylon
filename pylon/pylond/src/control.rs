@@ -274,7 +274,7 @@ async fn handle_client_connection(
                 {
                     continue;
                 }
-                let page = vm.shared_page();
+                let page = vm.host_page();
                 let mut current_cores = 0u32;
                 let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
                 for vcpu_slot in page.vcpus.iter().take(num_vcpus) {
@@ -294,7 +294,11 @@ async fn handle_client_connection(
                     allocated_core_microseconds: vm.allocated_core_usec(),
                     cooperative_yields: vm.cooperative_yield_count(),
                     forced_preemptions: vm.forced_preempt_count(),
-                    runnable_threads: page.telemetry.runnable_threads.load(Ordering::Acquire),
+                    runnable_threads: vm
+                        .shared_page()
+                        .telemetry
+                        .runnable_threads
+                        .load(Ordering::Acquire),
                     handoffs_without_park: vm.handoff_without_park_count(),
                     woken_shared_microseconds: vm.woken_shared_usec(),
                     woken_unowned_microseconds: vm.woken_unowned_usec(),
@@ -704,7 +708,7 @@ pub async fn run_prometheus_server(
                         let vms = snapshot.load();
                         for vm in vms.iter() {
                             let vid = vm.vm_id();
-                            let page = vm.shared_page();
+                            let page = vm.host_page();
                             let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
                             let mut current_cores = 0u32;
                             for vcpu_slot in page.vcpus.iter().take(num_vcpus) {
@@ -714,7 +718,7 @@ pub async fn run_prometheus_server(
                                     current_cores += 1;
                                 }
                             }
-                            let runnable = page.telemetry.runnable_threads.load(Ordering::Acquire);
+                            let runnable = vm.shared_page().telemetry.runnable_threads.load(Ordering::Acquire);
                             body.push_str(&format!("pylon_vm_allocated_cores{{vm_id=\"{vid}\"}} {current_cores}\n"));
                             body.push_str(&format!("pylon_vm_core_microseconds_total{{vm_id=\"{vid}\"}} {}\n", vm.allocated_core_usec()));
                             body.push_str(&format!("pylon_vm_cooperative_yields_total{{vm_id=\"{vid}\"}} {}\n", vm.cooperative_yield_count()));

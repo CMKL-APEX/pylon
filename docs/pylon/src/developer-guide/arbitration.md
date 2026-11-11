@@ -55,6 +55,12 @@ that KVM woke count as demand (phase 1), waking a vCPU for a core also
 takes a signal (phase 2), and it tells `scx_pylon` which vCPUs are
 parked (after phase 3).
 
+The engine reads a vCPU's `state`, `yield_count`, `revoke_requested`,
+`revoke_deadline_tsc`, `assigned_pcpu` and `park_on_boot` from the VM's
+[host page](shared-memory-abi.md#the-host-page), which the guest can't
+write, and writes `assigned_pcpu` and revocations there and to the
+guest's copies. Below, those fields mean the host page's.
+
 ## Phase 0: reclaim and meter
 
 **Reclaim.** For each `Assigned` CPU whose vCPU is `PARKED` with no

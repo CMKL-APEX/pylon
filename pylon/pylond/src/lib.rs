@@ -17,7 +17,10 @@ use std::{io, ptr};
 use arc_swap::ArcSwap;
 use log::warn;
 use memmap2::MmapMut;
-use pylon_abi::{MAX_VCPUS, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED};
+use pylon_abi::{
+    MAX_VCPUS, PYLON_HOST_PAGE_OFFSET, PYLON_SHM_FILE_SIZE, PylonHostPage, PylonSharedPage,
+    VCPU_STATE_PARKED,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -41,6 +44,9 @@ pub enum Error {
 
     #[error("Invalid Pylon shared page header for VM {vm_id}")]
     InvalidSharedHeader { vm_id: u64 },
+
+    #[error("Invalid Pylon host page header for VM {vm_id}")]
+    InvalidHostHeader { vm_id: u64 },
 
     #[error("Invalid registration request for VM {vm_id}: {reason}")]
     InvalidRegistration { vm_id: u64, reason: String },
@@ -462,13 +468,13 @@ impl VmHandle {
         }
 
         let shm_file = File::from(shm_fd);
-        // SAFETY: `shm_file` refers to the 8,192-byte Pylon shared memory page whose contents
-        // are accessed solely via atomic operations defined in `pylon-abi`.
+        // SAFETY: `shm_file` refers to the Pylon shared memory file, whose contents are
+        // accessed solely via atomic operations defined in `pylon-abi`.
         let shm_mmap = unsafe { MmapMut::map_mut(&shm_file).map_err(Error::Io)? };
-        if shm_mmap.len() < PYLON_SHARED_PAGE_SIZE {
+        if shm_mmap.len() < PYLON_SHM_FILE_SIZE {
             return Err(Error::SharedMemoryTooSmall {
                 actual: shm_mmap.len(),
-                expected: PYLON_SHARED_PAGE_SIZE,
+                expected: PYLON_SHM_FILE_SIZE,
             });
         }
 
@@ -500,6 +506,9 @@ impl VmHandle {
 
         if !handle.shared_page().header.is_valid() {
             return Err(Error::InvalidSharedHeader { vm_id: req.vm_id });
+        }
+        if !handle.host_page().header.is_valid() {
+            return Err(Error::InvalidHostHeader { vm_id: req.vm_id });
         }
 
         Ok(handle)
@@ -756,7 +765,7 @@ impl VmHandle {
         }
         let num_vcpus = (self.inner.num_vcpus as usize).min(MAX_VCPUS);
         let mut asked = 0;
-        for (vcpu_idx, slot) in page.vcpus[..num_vcpus].iter().enumerate() {
+        for (vcpu_idx, slot) in self.host_page().vcpus[..num_vcpus].iter().enumerate() {
             if slot.park_on_boot.load(Ordering::Acquire) == 0
                 || slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
             {
@@ -764,8 +773,7 @@ impl VmHandle {
             }
             // The deadline doesn't matter to a boot park, and 0 keeps it from ever looking like
             // a revocation that is still inside its grace period.
-            slot.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-            slot.revoke_requested.store(1, Ordering::Release);
+            self.request_park(vcpu_idx, 0);
             match self.signal_vcpu(vcpu_idx) {
                 Ok(_) => asked += 1,
                 Err(err) => warn!(
@@ -818,11 +826,59 @@ impl VmHandle {
             clippy::cast_ptr_alignment,
             reason = "mmap(2) returns page-aligned memory"
         )]
-        // SAFETY: `shm_mmap` length was verified to be >= `PYLON_SHARED_PAGE_SIZE` (8192)
+        // SAFETY: `shm_mmap` length was verified to be >= `PYLON_SHM_FILE_SIZE`
         // and `mmap` guarantees page alignment (4096 bytes), matching `PylonSharedPage`.
         unsafe {
             &*(self.inner.shm_mmap.as_ptr().cast::<PylonSharedPage>())
         }
+    }
+
+    /// Returns a reference to the memory-mapped `PylonHostPage`. The guest can write the shared
+    /// page, so whether a vCPU parked, and the revocations and cores `pylond` gives it, are read
+    /// from here.
+    #[inline]
+    pub fn host_page(&self) -> &PylonHostPage {
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "mmap(2) returns page-aligned memory"
+        )]
+        // SAFETY: `shm_mmap` length was verified to be >= `PYLON_SHM_FILE_SIZE`, and the host page
+        // lies at `PYLON_HOST_PAGE_OFFSET`, a multiple of its 4096-byte alignment.
+        unsafe {
+            &*(self
+                .inner
+                .shm_mmap
+                .as_ptr()
+                .add(PYLON_HOST_PAGE_OFFSET)
+                .cast::<PylonHostPage>())
+        }
+    }
+
+    /// Sets the core assigned to, or reserved for, `vcpu_idx`, and the guest's copy.
+    #[inline]
+    pub fn set_assigned_pcpu(&self, vcpu_idx: usize, pcpu: u8) {
+        self.host_page().vcpus[vcpu_idx]
+            .assigned_pcpu
+            .store(pcpu, Ordering::Release);
+        self.shared_page().vcpus[vcpu_idx]
+            .assigned_pcpu
+            .store(pcpu, Ordering::Release);
+    }
+
+    /// Asks the VMM to park `vcpu_idx`, forcibly from `deadline_tsc` on: sets the deadline, then
+    /// `revoke_requested`, in the host page and in the guest's copy, from which the guest
+    /// learns of the request.
+    #[inline]
+    pub fn request_park(&self, vcpu_idx: usize, deadline_tsc: u64) {
+        let host = &self.host_page().vcpus[vcpu_idx];
+        host.revoke_deadline_tsc
+            .store(deadline_tsc, Ordering::Relaxed);
+        host.revoke_requested.store(1, Ordering::Release);
+        let guest = &self.shared_page().vcpus[vcpu_idx];
+        guest
+            .revoke_deadline_tsc
+            .store(deadline_tsc, Ordering::Relaxed);
+        guest.revoke_requested.store(1, Ordering::Release);
     }
 
     /// Reads the host-side vDPA/virtio RX doorbell index for 0-core wakeups.
@@ -1050,19 +1106,29 @@ mod tests {
 
         // SAFETY: `owned` is a valid memfd file descriptor.
         let trunc_rc =
-            unsafe { libc::ftruncate(owned.as_raw_fd(), PYLON_SHARED_PAGE_SIZE as libc::off_t) };
+            unsafe { libc::ftruncate(owned.as_raw_fd(), PYLON_SHM_FILE_SIZE as libc::off_t) };
         assert_eq!(trunc_rc, 0, "ftruncate failed");
 
         let file = File::from(owned.try_clone().unwrap());
-        // SAFETY: `file` is truncated to `PYLON_SHARED_PAGE_SIZE` (8192 bytes).
+        // SAFETY: `file` is truncated to `PYLON_SHM_FILE_SIZE`.
         let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         #[expect(
             clippy::cast_ptr_alignment,
             reason = "mmap(2) returns page-aligned memory"
         )]
-        // SAFETY: `mmap` is page-aligned and 8192 bytes, matching `PylonSharedPage`.
-        let page = unsafe { &mut *(mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
+        // SAFETY: `mmap` is page-aligned and `PYLON_SHM_FILE_SIZE` bytes, and the host page lies
+        // at a page-aligned offset in it.
+        let (page, host_page) = unsafe {
+            (
+                &mut *(mmap.as_mut_ptr().cast::<PylonSharedPage>()),
+                &mut *(mmap
+                    .as_mut_ptr()
+                    .add(PYLON_HOST_PAGE_OFFSET)
+                    .cast::<PylonHostPage>()),
+            )
+        };
         page.init(vm_id, num_vcpus, tsc_khz);
+        host_page.init();
         for (vcpu_idx, slot) in page.vcpus.iter().enumerate().take(num_vcpus as usize) {
             let tid = (vm_id as u32) * 1000 + (vcpu_idx as u32) + 1;
             slot.host_tid.store(tid, Ordering::Release);
@@ -1272,13 +1338,13 @@ mod tests {
         );
         // `pylond` doesn't write `state`; the vCPU stays PARKED until its thread wakes.
         assert_eq!(
-            vm_timer.handle.shared_page().vcpus[2]
+            vm_timer.handle.host_page().vcpus[2]
                 .state
                 .load(Ordering::Acquire),
             VCPU_STATE_PARKED
         );
         assert_eq!(
-            vm_timer.handle.shared_page().vcpus[2]
+            vm_timer.handle.host_page().vcpus[2]
                 .assigned_pcpu
                 .load(Ordering::Acquire),
             2
@@ -1292,7 +1358,7 @@ mod tests {
             CoreState::Assigned { vm_id: 2, vcpu: 1 }
         );
         assert_eq!(
-            vm_rx.handle.shared_page().vcpus[1]
+            vm_rx.handle.host_page().vcpus[1]
                 .state
                 .load(Ordering::Acquire),
             VCPU_STATE_PARKED
@@ -1492,13 +1558,14 @@ mod tests {
         // Simulate Donor vCPU 0 and vCPU 1 entering VCPU_STATE_RUNNING.
         // Mark Donor vCPU 0 in a critical section (`in_critical_section = 1`) and vCPU 1 not in critical section (`0`).
         let donor_page = donor.handle.shared_page();
-        donor_page.vcpus[0]
+        let donor_host = donor.handle.host_page();
+        donor_host.vcpus[0]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         donor_page.vcpus[0]
             .in_critical_section
             .store(1, Ordering::Release);
-        donor_page.vcpus[1]
+        donor_host.vcpus[1]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         donor_page.vcpus[1]
@@ -1512,6 +1579,7 @@ mod tests {
 
         // Step 2: Recipient becomes hungry for 1 core with high urgency.
         let recipient_page = recipient.handle.shared_page();
+        let recipient_host = recipient.handle.host_page();
         recipient_page
             .telemetry
             .runnable_threads
@@ -1539,11 +1607,11 @@ mod tests {
             }
         );
         assert_eq!(
-            donor_page.vcpus[1].revoke_requested.load(Ordering::Acquire),
+            donor_host.vcpus[1].revoke_requested.load(Ordering::Acquire),
             1
         );
         assert_eq!(
-            donor_page.vcpus[1]
+            donor_host.vcpus[1]
                 .revoke_deadline_tsc
                 .load(Ordering::Acquire),
             26_000
@@ -1552,10 +1620,10 @@ mod tests {
 
         // Step 3: Cooperative handoff before deadline (now_tsc = 5,000 < 26,000).
         // Donor vCPU 1 parks cooperatively; the VMM bumps `yield_count` before `PARKED`.
-        donor_page.vcpus[1]
+        donor_host.vcpus[1]
             .yield_count
             .fetch_add(1, Ordering::Relaxed);
-        donor_page.vcpus[1]
+        donor_host.vcpus[1]
             .state
             .store(VCPU_STATE_PARKED, Ordering::Release);
         engine.poll_once(5_000);
@@ -1570,18 +1638,18 @@ mod tests {
         assert_eq!(donor.handle.park_latency().count(), 1);
         assert_eq!(donor.handle.park_latency().sum_us(), 1);
         assert_eq!(
-            donor_page.vcpus[1].assigned_pcpu.load(Ordering::Acquire),
+            donor_host.vcpus[1].assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
         );
         assert_eq!(pcpu_owners.read_owner(5).0, 20_001);
         assert_eq!(
-            recipient_page.vcpus[0]
+            recipient_host.vcpus[0]
                 .assigned_pcpu
                 .load(Ordering::Acquire),
             5
         );
         assert_eq!(
-            recipient_page.vcpus[0].state.load(Ordering::Acquire),
+            recipient_host.vcpus[0].state.load(Ordering::Acquire),
             VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[0].as_raw_fd()).unwrap(), 1);
@@ -1593,7 +1661,7 @@ mod tests {
             .telemetry
             .runnable_threads
             .store(0, Ordering::Release);
-        recipient_page.vcpus[0]
+        recipient_host.vcpus[0]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         recipient_page
@@ -1616,7 +1684,7 @@ mod tests {
                 deadline_tsc: 30_000,
             },
         );
-        donor_page.vcpus[0]
+        donor_host.vcpus[0]
             .revoke_requested
             .store(1, Ordering::Release);
 
@@ -1639,11 +1707,11 @@ mod tests {
         assert!(matches!(engine.core_state(4), CoreState::Revoking { .. }));
         assert_eq!(donor.handle.forced_preempt_count(), 1);
         assert_eq!(
-            donor_page.vcpus[0].state.load(Ordering::Acquire),
+            donor_host.vcpus[0].state.load(Ordering::Acquire),
             VCPU_STATE_RUNNING
         );
         assert_eq!(
-            donor_page.vcpus[0].revoke_requested.load(Ordering::Acquire),
+            donor_host.vcpus[0].revoke_requested.load(Ordering::Acquire),
             1
         );
         assert_eq!(
@@ -1654,13 +1722,13 @@ mod tests {
         );
 
         // The VMM force-parks the donor at its next exit; the core then moves.
-        donor_page.vcpus[0]
+        donor_host.vcpus[0]
             .revoke_requested
             .store(0, Ordering::Release);
-        donor_page.vcpus[0]
+        donor_host.vcpus[0]
             .yield_count
             .fetch_add(1, Ordering::Relaxed);
-        donor_page.vcpus[0]
+        donor_host.vcpus[0]
             .state
             .store(VCPU_STATE_PARKED, Ordering::Release);
         engine.poll_once(40_000);
@@ -1673,13 +1741,13 @@ mod tests {
         assert_eq!(donor.handle.handoff_without_park_count(), 0);
         assert_eq!(pcpu_owners.read_owner(4).0, 20_002);
         assert_eq!(
-            recipient_page.vcpus[1]
+            recipient_host.vcpus[1]
                 .assigned_pcpu
                 .load(Ordering::Acquire),
             4
         );
         assert_eq!(
-            recipient_page.vcpus[1].state.load(Ordering::Acquire),
+            recipient_host.vcpus[1].state.load(Ordering::Acquire),
             VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[1].as_raw_fd()).unwrap(), 1);
@@ -1696,7 +1764,7 @@ mod tests {
 
         let donor = build_test_vm(60, 1, 0, 1, 1);
         let recipient = build_test_vm(70, 1, 0, 1, 100);
-        let donor_slot = &donor.handle.shared_page().vcpus[0];
+        let donor_slot = &donor.handle.host_page().vcpus[0];
         let recipient_page = recipient.handle.shared_page();
         donor
             .handle
@@ -1772,16 +1840,17 @@ mod tests {
 
         for (rig, now) in [(&a, 1_000), (&b, 2_000)] {
             let page = rig.handle.shared_page();
+            let host = rig.handle.host_page();
             page.telemetry.runnable_threads.store(2, Ordering::Release);
             engine.poll_once(now);
-            for slot in &page.vcpus[..2] {
+            for slot in &host.vcpus[..2] {
                 slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
             }
             page.telemetry.runnable_threads.store(0, Ordering::Release);
         }
         for rig in [&a, &b] {
             assert_eq!(
-                rig.handle.shared_page().vcpus[..2]
+                rig.handle.host_page().vcpus[..2]
                     .iter()
                     .filter(|slot| slot.assigned_pcpu.load(Ordering::Acquire) != PCPU_UNASSIGNED)
                     .count(),
@@ -1920,32 +1989,33 @@ mod tests {
             thread::yield_now();
         }
         let page = handle.shared_page();
-        for (i, slot) in page.vcpus[..3].iter().enumerate() {
+        let host = handle.host_page();
+        for (i, (slot, host_slot)) in page.vcpus[..3].iter().zip(&host.vcpus).enumerate() {
             slot.host_tid
                 .store(tids[i].load(Ordering::SeqCst) as u32, Ordering::Release);
-            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            host_slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
         }
         // vCPU 0 is an initial vCPU (no tag); 1 is tagged and running; 2 is tagged, already parked.
-        page.vcpus[1].park_on_boot.store(1, Ordering::Release);
-        page.vcpus[2].park_on_boot.store(1, Ordering::Release);
-        page.vcpus[2]
+        host.vcpus[1].park_on_boot.store(1, Ordering::Release);
+        host.vcpus[2].park_on_boot.store(1, Ordering::Release);
+        host.vcpus[2]
             .state
             .store(VCPU_STATE_PARKED, Ordering::Release);
 
         // The guest hasn't reported yet: leave everything alone.
         assert_eq!(handle.park_booted_vcpus(), 0);
-        assert_eq!(page.vcpus[1].revoke_requested.load(Ordering::Acquire), 0);
+        assert_eq!(host.vcpus[1].revoke_requested.load(Ordering::Acquire), 0);
 
         page.telemetry.guest_heartbeat.store(1, Ordering::Release);
         assert_eq!(handle.park_booted_vcpus(), 1);
         for (i, expected) in [(0, 0), (1, 1), (2, 0)] {
             assert_eq!(
-                page.vcpus[i].revoke_requested.load(Ordering::Acquire),
+                host.vcpus[i].revoke_requested.load(Ordering::Acquire),
                 expected,
                 "vCPU {i}"
             );
         }
-        assert_eq!(page.vcpus[1].revoke_deadline_tsc.load(Ordering::Acquire), 0);
+        assert_eq!(host.vcpus[1].revoke_deadline_tsc.load(Ordering::Acquire), 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while BOOT_KICK_SIGNALS_SEEN.load(Ordering::SeqCst) < 1 {
             assert!(Instant::now() < deadline, "vCPU thread wasn't signalled");
@@ -1955,8 +2025,8 @@ mod tests {
         // A signal can be lost: while the VMM hasn't parked it, the next call asks again.
         assert_eq!(handle.park_booted_vcpus(), 1);
         // The VMM parked it and cleared the tag: nothing left to ask.
-        page.vcpus[1].park_on_boot.store(0, Ordering::Release);
-        page.vcpus[1].revoke_requested.store(0, Ordering::Release);
+        host.vcpus[1].park_on_boot.store(0, Ordering::Release);
+        host.vcpus[1].revoke_requested.store(0, Ordering::Release);
         assert_eq!(handle.park_booted_vcpus(), 0);
 
         stop.store(true, Ordering::SeqCst);
@@ -1996,7 +2066,7 @@ mod tests {
         ControlPlane::publish_vm_handle(&snapshot, vmm.handle.clone());
         let (kvm_slot, vmm_slot) = (kvm_handle.vm_slot(), vmm.handle.vm_slot());
         let parked = |slot: u16| vm_vcpus.entry(slot).unwrap().parked.load(Ordering::Acquire);
-        kvm_handle.shared_page().vcpus[1]
+        kvm_handle.host_page().vcpus[1]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
 
@@ -2062,6 +2132,7 @@ mod tests {
         ControlPlane::publish_vm_handle(&snapshot, handle.clone());
         let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
         let page = handle.shared_page();
+        let host = handle.host_page();
         page.telemetry
             .stranded_work_bitmap
             .store(1 << 1, Ordering::Release);
@@ -2081,7 +2152,7 @@ mod tests {
             engine.core_state(6),
             CoreState::Assigned { vm_id: 80, vcpu: 1 }
         );
-        assert_eq!(page.vcpus[1].assigned_pcpu.load(Ordering::Acquire), 6);
+        assert_eq!(host.vcpus[1].assigned_pcpu.load(Ordering::Acquire), 6);
         assert_eq!(
             page.telemetry.stranded_work_bitmap.load(Ordering::Acquire),
             0
@@ -2105,6 +2176,7 @@ mod tests {
         // A busy donor that always wants both cores.
         let donor = build_test_vm(60, 2, 0, 2, 1);
         let donor_page = donor.handle.shared_page();
+        let donor_host = donor.handle.host_page();
         donor_page
             .telemetry
             .runnable_threads
@@ -2112,12 +2184,13 @@ mod tests {
         let mut rig = build_test_vm(80, 4, 0, 4, 1);
         let handle = parks_in_kvm(&mut rig);
         let page = handle.shared_page();
+        let host = handle.host_page();
         ControlPlane::publish_vm_handle(&snapshot, donor.handle.clone());
         ControlPlane::publish_vm_handle(&snapshot, handle.clone());
         let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
 
         engine.poll_once(1_000);
-        for slot in &donor_page.vcpus[..2] {
+        for slot in &donor_host.vcpus[..2] {
             assert_ne!(slot.assigned_pcpu.load(Ordering::Acquire), PCPU_UNASSIGNED);
             slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
         }
@@ -2139,7 +2212,7 @@ mod tests {
                 _ => None,
             })
             .expect("VM 80 takes a core");
-        let donor_slot = &donor_page.vcpus[donor_vcpu as usize];
+        let donor_slot = &donor_host.vcpus[donor_vcpu as usize];
         donor_slot.revoke_requested.store(0, Ordering::Release);
         donor_slot.yield_count.fetch_add(1, Ordering::Relaxed);
         donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
@@ -2152,7 +2225,7 @@ mod tests {
         // vCPU 2 runs on its core, so it no longer counts as woken, and the guest reports no
         // runnable threads. Until the agent reports again, the donor, which still wants both
         // cores, doesn't take it back. 50 ms is 150,000,000 cycles.
-        page.vcpus[2]
+        host.vcpus[2]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         entry.woken.store(0, Ordering::Release);
@@ -2212,6 +2285,7 @@ mod tests {
         ControlPlane::publish_vm_handle(&snapshot, handle.clone());
         let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
         let page = handle.shared_page();
+        let host = handle.host_page();
 
         // vCPU 0 gets a core for one runnable thread, and runs.
         page.telemetry.runnable_threads.store(1, Ordering::Release);
@@ -2220,7 +2294,7 @@ mod tests {
             engine.core_state(6),
             CoreState::Assigned { vm_id: 81, vcpu: 0 }
         );
-        page.vcpus[0]
+        host.vcpus[0]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         page.telemetry.runnable_threads.store(0, Ordering::Release);
@@ -2312,6 +2386,7 @@ mod tests {
             thread::yield_now();
         }
         let page = handle.shared_page();
+        let host = handle.host_page();
         page.vcpus[0]
             .host_tid
             .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
@@ -2332,7 +2407,7 @@ mod tests {
         wait_for_wake_signals(before + 2);
 
         // Running again: no more signals.
-        page.vcpus[0]
+        host.vcpus[0]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         engine.poll_once(1_100_000);
@@ -2396,8 +2471,8 @@ mod tests {
         while tid.load(Ordering::SeqCst) == 0 {
             thread::yield_now();
         }
-        let donor_slot = &donor_handle.shared_page().vcpus[0];
-        donor_slot
+        let donor_slot = &donor_handle.host_page().vcpus[0];
+        donor_handle.shared_page().vcpus[0]
             .host_tid
             .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
         donor_slot

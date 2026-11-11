@@ -24,8 +24,9 @@ use log::{info, warn};
 use option_parser::{OptionParser, OptionParserError};
 use pylon_abi::clock::read_counter;
 use pylon_abi::{
-    MAX_VCPUS, PCPU_UNASSIGNED, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_MAGIC,
-    PYLON_SHARED_PAGE_SIZE, PylonHeader, PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED,
+    MAX_VCPUS, PCPU_UNASSIGNED, PYLON_ABI_VERSION, PYLON_DEFAULT_GPA, PYLON_HOST_PAGE_OFFSET,
+    PYLON_MAGIC, PYLON_SHARED_PAGE_SIZE, PYLON_SHM_FILE_SIZE, PylonHeader, PylonHostHeader,
+    PylonHostPage, PylonHostVcpuSlot, PylonSharedPage, PylonVcpuSlot, VCPU_STATE_PARKED,
     VCPU_STATE_PARKING, VCPU_STATE_RUNNING,
 };
 use serde::{Deserialize, Serialize};
@@ -324,13 +325,15 @@ struct DaemonRegistrationPayload {
     wake_by_signal: bool,
 }
 
-/// VMM-side Pylon runtime state managing the 8,192-byte `PylonSharedPage` and per-vCPU park/wake primitives.
+/// VMM-side Pylon runtime state managing the shared memory file (the 8,192-byte `PylonSharedPage`
+/// the guest sees, then the `PylonHostPage` it doesn't) and per-vCPU park/wake primitives.
 pub struct PylonVmmState {
     config: PylonConfig,
     boot_vcpus: u32,
     max_vcpus: u32,
     initial_active_vcpus: u32,
     shm_file: File,
+    /// The whole shared memory file, `PYLON_SHM_FILE_SIZE` bytes, starting with the shared page.
     shared_page: NonNull<PylonSharedPage>,
     /// One per vCPU. `pylond` writes one to deliver a revocation; the `pylon-kick` device
     /// installs them as its MSI-X notifiers (`vmm/src/pylon_kick.rs`).
@@ -436,10 +439,10 @@ unsafe impl Sync for PylonVmmState {}
 
 impl Drop for PylonVmmState {
     fn drop(&mut self) {
-        // SAFETY: `self.shared_page` was created via `libc::mmap` with length `PYLON_SHARED_PAGE_SIZE`
+        // SAFETY: `self.shared_page` was created via `libc::mmap` with length `PYLON_SHM_FILE_SIZE`
         // in `PylonVmmState::new` and remains valid until `Drop`.
         unsafe {
-            libc::munmap(self.shared_page.as_ptr().cast(), PYLON_SHARED_PAGE_SIZE);
+            libc::munmap(self.shared_page.as_ptr().cast(), PYLON_SHM_FILE_SIZE);
         }
     }
 }
@@ -472,14 +475,15 @@ impl PylonVmmState {
             .map_err(Error::ShmOpen)?;
 
         shm_file
-            .set_len(PYLON_SHARED_PAGE_SIZE as u64)
+            .set_len(PYLON_SHM_FILE_SIZE as u64)
             .map_err(Error::ShmSetLen)?;
 
-        // SAFETY: Mapping a valid, 8192-byte file descriptor with `MAP_SHARED` into process memory.
+        // SAFETY: Mapping a valid file descriptor of `PYLON_SHM_FILE_SIZE` bytes with `MAP_SHARED`
+        // into process memory.
         let mapped_ptr = unsafe {
             libc::mmap(
                 null_mut(),
-                PYLON_SHARED_PAGE_SIZE,
+                PYLON_SHM_FILE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 shm_file.as_raw_fd(),
@@ -493,10 +497,15 @@ impl PylonVmmState {
         let shared_page = NonNull::new(mapped_ptr.cast::<PylonSharedPage>())
             .ok_or_else(|| Error::ShmMmap(io::Error::other("mmap returned null pointer")))?;
 
-        // Zero-initialize the entire 8,192-byte page and write the header.
-        // SAFETY: `shared_page` points to a valid 8,192-byte writable `MAP_SHARED` region.
+        // Zero-initialize the whole file and write the headers.
+        // SAFETY: `shared_page` points to a valid writable `MAP_SHARED` region of
+        // `PYLON_SHM_FILE_SIZE` bytes, and the host page lies inside it, page-aligned.
         unsafe {
-            ptr::write_bytes(shared_page.as_ptr().cast::<u8>(), 0, PYLON_SHARED_PAGE_SIZE);
+            ptr::write_bytes(shared_page.as_ptr().cast::<u8>(), 0, PYLON_SHM_FILE_SIZE);
+            ptr::write(
+                &raw mut (*host_page_ptr(shared_page)).header,
+                PylonHostHeader::new(),
+            );
             ptr::write(
                 &raw mut (*shared_page.as_ptr()).header,
                 PylonHeader {
@@ -511,10 +520,13 @@ impl PylonVmmState {
         }
         // `pylond` treats a parked vCPU as free for a core only while its `assigned_pcpu` is
         // unassigned, which zeroing doesn't produce.
-        // SAFETY: `shared_page` points to the 8,192-byte mapping initialized above, and its vCPU
-        // slots are only accessed through atomics.
-        let page = unsafe { shared_page.as_ref() };
+        // SAFETY: `shared_page` points to the mapping initialized above, and its vCPU slots are
+        // only accessed through atomics.
+        let (page, host_page) = unsafe { (shared_page.as_ref(), &*host_page_ptr(shared_page)) };
         for slot in &page.vcpus {
+            slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+        }
+        for slot in &host_page.vcpus {
             slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
         }
 
@@ -722,6 +734,22 @@ impl PylonVmmState {
         }
     }
 
+    /// Returns a shared reference to the `PylonHostPage`, which the guest doesn't see.
+    pub fn host_page(&self) -> &PylonHostPage {
+        // SAFETY: the host page lies inside the mapping, which is valid for the lifetime of
+        // `self`, and all its mutable fields use interior atomic mutability.
+        unsafe { &*host_page_ptr(self.shared_page) }
+    }
+
+    /// Returns a reference to the `PylonHostVcpuSlot` for `vcpu_id`.
+    pub fn host_slot(&self, vcpu_id: u32) -> Option<&PylonHostVcpuSlot> {
+        if vcpu_id < self.max_vcpus && (vcpu_id as usize) < MAX_VCPUS {
+            Some(&self.host_page().vcpus[vcpu_id as usize])
+        } else {
+            None
+        }
+    }
+
     /// Returns the wake `EventFd` for `vcpu_id`.
     pub fn wake_eventfd(&self, vcpu_id: u32) -> Option<&EventFd> {
         self.wake_eventfds.get(vcpu_id as usize)
@@ -754,7 +782,7 @@ impl PylonVmmState {
         let tid = unsafe { libc::gettid() as u32 };
         self.register_vcpu_tid(vcpu_id, tid);
 
-        let Some(slot) = self.vcpu_slot(vcpu_id) else {
+        let (Some(slot), Some(host)) = (self.vcpu_slot(vcpu_id), self.host_slot(vcpu_id)) else {
             return;
         };
 
@@ -763,6 +791,7 @@ impl PylonVmmState {
         }
 
         if vcpu_id >= self.initial_active_vcpus {
+            host.park_on_boot.store(1, Ordering::Release);
             slot.park_on_boot.store(1, Ordering::Release);
         }
         if self.config.park == PylonPark::Kvm {
@@ -773,6 +802,7 @@ impl PylonVmmState {
                 Err(e) => warn!("Pylon: no park bound for vCPU {vcpu_id}: {e}"),
             }
         }
+        host.state.store(VCPU_STATE_RUNNING, Ordering::Release);
         slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
     }
 
@@ -789,6 +819,10 @@ impl PylonVmmState {
     /// `revoke_requested`, updates the yield counters, publishes `VCPU_STATE_PARKED`, blocks until
     /// woken by `pylond` (or VM shutdown), and restores `VCPU_STATE_RUNNING`. Returns `true` if
     /// the vCPU parked and woke up.
+    ///
+    /// The request comes from the shared page's `state`, the revocation, its deadline and the
+    /// tag from the `PylonHostPage`, which the guest can't write. The VMM writes what it
+    /// publishes to both: `pylond` reads the host page, the guest its copy.
     ///
     /// Before parking, publishes the guest's armed TSC-deadline timer (`read_guest_timer`, in
     /// guest TSC) as `park_timer_deadline_tsc` in host TSC, so `pylond` can give the vCPU a
@@ -808,7 +842,9 @@ impl PylonVmmState {
         read_guest_timer: impl FnOnce() -> Option<u64>,
         mut vcpu_op: impl FnMut(KvmParkOp) -> bool,
     ) -> bool {
-        let Some(slot) = self.vcpu_slot(vcpu_id) else {
+        // The guest can write `slot`: only its `PARKING` request is read from there, and
+        // everything `pylond` acts on is published in `host` first.
+        let (Some(slot), Some(host)) = (self.vcpu_slot(vcpu_id), self.host_slot(vcpu_id)) else {
             return false;
         };
         let parked_in_kvm = &self.parked_in_kvm[vcpu_id as usize];
@@ -837,12 +873,13 @@ impl PylonVmmState {
             }
             parked_in_kvm.store(false, Ordering::Relaxed);
             slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
+            host.state.store(VCPU_STATE_RUNNING, Ordering::Release);
             slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
             return true;
         }
 
-        let revoke_requested = slot.revoke_requested.load(Ordering::Acquire);
-        let decision = if slot.park_on_boot.load(Ordering::Acquire) != 0 && revoke_requested == 1 {
+        let revoke_requested = host.revoke_requested.load(Ordering::Acquire);
+        let decision = if host.park_on_boot.load(Ordering::Acquire) != 0 && revoke_requested == 1 {
             ParkDecision::Boot
         } else {
             park_decision(
@@ -850,7 +887,7 @@ impl PylonVmmState {
                 revoke_requested,
                 // Ordered by the `revoke_requested` Acquire load: `pylond` stores the deadline
                 // before setting `revoke_requested` with Release.
-                slot.revoke_deadline_tsc.load(Ordering::Relaxed),
+                host.revoke_deadline_tsc.load(Ordering::Relaxed),
                 read_host_tsc(),
             )
         };
@@ -867,11 +904,17 @@ impl PylonVmmState {
             return false;
         }
 
+        host.revoke_requested.store(0, Ordering::Release);
         slot.revoke_requested.store(0, Ordering::Release);
         if decision == ParkDecision::Boot {
+            host.park_on_boot.store(0, Ordering::Release);
             slot.park_on_boot.store(0, Ordering::Release);
         } else {
-            slot.yield_count.fetch_add(1, Ordering::Relaxed);
+            let yields = host
+                .yield_count
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            slot.yield_count.store(yields, Ordering::Relaxed);
             slot.last_yield_tsc
                 .store(read_host_tsc(), Ordering::Relaxed);
             if decision == ParkDecision::Forced {
@@ -883,6 +926,7 @@ impl PylonVmmState {
             slot.guest_tsc_offset.load(Ordering::Relaxed),
         );
         slot.park_timer_deadline_tsc.store(timer, Ordering::Relaxed);
+        host.state.store(VCPU_STATE_PARKED, Ordering::Release);
         slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
 
         if self.config.park == PylonPark::Kvm {
@@ -897,6 +941,7 @@ impl PylonVmmState {
 
         slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
         if !self.shutting_down.load(Ordering::Acquire) {
+            host.state.store(VCPU_STATE_RUNNING, Ordering::Release);
             slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
         }
 
@@ -1052,6 +1097,15 @@ fn park_decision(state: u8, revoke_requested: u8, deadline_tsc: u64, now_tsc: u6
     } else {
         ParkDecision::Continue
     }
+}
+
+/// The `PylonHostPage` in the shared memory file that starts at `shared_page`.
+fn host_page_ptr(shared_page: NonNull<PylonSharedPage>) -> *mut PylonHostPage {
+    shared_page
+        .as_ptr()
+        .cast::<u8>()
+        .wrapping_add(PYLON_HOST_PAGE_OFFSET)
+        .cast()
 }
 
 /// Reads the host counter, the clock `pylond` writes `revoke_deadline_tsc` in: the TSC on x86_64,
@@ -1315,6 +1369,19 @@ mod tests {
 
     use super::*;
 
+    /// Asks the VMM to park `vcpu_id`, forcibly from `deadline_tsc` on, as `pylond` does: in the
+    /// host page, and in the guest's copy.
+    fn request_park(state: &PylonVmmState, vcpu_id: u32, deadline_tsc: u64) {
+        let host = state.host_slot(vcpu_id).unwrap();
+        host.revoke_deadline_tsc
+            .store(deadline_tsc, Ordering::Relaxed);
+        host.revoke_requested.store(1, Ordering::Release);
+        let slot = state.vcpu_slot(vcpu_id).unwrap();
+        slot.revoke_deadline_tsc
+            .store(deadline_tsc, Ordering::Relaxed);
+        slot.revoke_requested.store(1, Ordering::Release);
+    }
+
     #[test]
     fn test_pylon_config_parse_valid_and_defaults() {
         let cfg = PylonConfig::parse("shm=/dev/shm/vm1-pylon").unwrap();
@@ -1417,7 +1484,8 @@ mod tests {
 
         let state = PylonVmmState::new(&cfg, 2, 4).unwrap();
         let file_meta = fs::metadata(&shm_path).unwrap();
-        assert_eq!(file_meta.len(), PYLON_SHARED_PAGE_SIZE as u64);
+        assert_eq!(file_meta.len(), PYLON_SHM_FILE_SIZE as u64);
+        assert!(state.host_page().header.is_valid());
 
         let page = state.shared_page();
         assert_eq!(page.header.magic, PYLON_MAGIC);
@@ -1433,8 +1501,12 @@ mod tests {
             assert_eq!(slot.revoke_requested.load(Ordering::Relaxed), 0);
             assert_eq!(slot.host_tid.load(Ordering::Relaxed), 0);
             assert_eq!(slot.assigned_pcpu.load(Ordering::Relaxed), PCPU_UNASSIGNED);
+            let host = state.host_slot(i).unwrap();
+            assert_eq!(host.state.load(Ordering::Relaxed), VCPU_STATE_PARKED);
+            assert_eq!(host.assigned_pcpu.load(Ordering::Relaxed), PCPU_UNASSIGNED);
         }
         assert!(state.vcpu_slot(4).is_none());
+        assert!(state.host_slot(4).is_none());
     }
 
     #[test]
@@ -1495,8 +1567,7 @@ mod tests {
         assert_eq!(slot1.park_on_boot.load(Ordering::Acquire), 1);
 
         // Asked, with a deadline far in the future (a normal revocation would wait).
-        slot1.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
-        slot1.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 1, u64::MAX);
         assert_eq!(
             park_with_timer_on_worker_and_wake(&state, 1, None),
             (true, 0)
@@ -1507,8 +1578,7 @@ mod tests {
 
         // The tag is gone: a later request is an ordinary revocation again, which waits for its
         // deadline.
-        slot1.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
-        slot1.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 1, u64::MAX);
         assert!(!state.check_and_park_vcpu(1, || None, |_| false));
         assert_eq!(slot1.revoke_requested.load(Ordering::Acquire), 1);
     }
@@ -1616,8 +1686,7 @@ mod tests {
         let mut ops = Vec::new();
 
         // A forced park halts the vCPU and returns at once, without blocking.
-        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, 0);
         assert!(state.check_and_park_vcpu(
             0,
             || None,
@@ -1678,8 +1747,7 @@ mod tests {
         };
 
         // A forced park starts the bound.
-        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, 0);
         let timer = state.park_bounds[0].timer.get().unwrap();
         assert!(exit(&mut ops));
         assert!(timer.is_armed());
@@ -1714,8 +1782,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = running_vcpu0_state_parking_in_kvm(&dir);
         let slot0 = state.vcpu_slot(0).unwrap();
-        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, 0);
         assert!(state.check_and_park_vcpu(0, || None, |_| true));
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
         let yields = slot0.yield_count.load(Ordering::Relaxed);
@@ -1738,9 +1805,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = running_vcpu0_state_parking_in_kvm(&dir);
         let slot0 = state.vcpu_slot(0).unwrap();
+        state
+            .host_slot(0)
+            .unwrap()
+            .park_on_boot
+            .store(1, Ordering::Release);
         slot0.park_on_boot.store(1, Ordering::Release);
-        slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, u64::MAX);
         assert!(state.check_and_park_vcpu(0, || None, |_| true));
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
         assert!(!state.park_bounds[0].timer.get().unwrap().is_armed());
@@ -1763,8 +1834,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = running_vcpu0_state_parking_in_kvm(&dir);
         let slot0 = state.vcpu_slot(0).unwrap();
-        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, 0);
 
         for refused in [KvmParkOp::InterruptsEnabled, KvmParkOp::Halt] {
             assert!(!state.check_and_park_vcpu(0, || None, |op| op != refused));
@@ -1785,8 +1855,7 @@ mod tests {
 
         // A revocation still inside its grace period leaves the vCPU running and the
         // request pending.
-        slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, u64::MAX);
         assert!(!state.check_and_park_vcpu(0, || None, |_| false));
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
         assert_eq!(slot0.revoke_requested.load(Ordering::Acquire), 1);
@@ -1800,8 +1869,7 @@ mod tests {
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // The guest agrees to a pending revocation by writing VCPU_STATE_PARKING.
-        slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, u64::MAX);
         slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
 
         assert!(park_on_worker_and_wake(&state, 0));
@@ -1822,12 +1890,35 @@ mod tests {
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // A deadline of 0 has always passed.
-        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, 0);
 
         assert!(park_on_worker_and_wake(&state, 0));
         assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 1);
         assert_eq!(slot0.forced_preempt_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// The guest can write its whole slot, but the revocation and its deadline come from the
+    /// host page: clearing or postponing them there doesn't keep the vCPU running, and a
+    /// `PARKED` it writes isn't published to `pylond`.
+    #[test]
+    fn test_forced_park_ignores_the_guest_copy_of_the_revocation() {
+        let dir = TempDir::new().unwrap();
+        let state = running_vcpu0_state(&dir);
+        let slot0 = state.vcpu_slot(0).unwrap();
+        let host0 = state.host_slot(0).unwrap();
+
+        request_park(&state, 0, 0);
+        slot0.revoke_requested.store(0, Ordering::Release);
+        slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
+        slot0.state.store(VCPU_STATE_PARKED, Ordering::Release);
+        assert_eq!(host0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+
+        slot0.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+        assert!(park_on_worker_and_wake(&state, 0));
+        assert_eq!(host0.yield_count.load(Ordering::Relaxed), 1);
+        assert_eq!(slot0.forced_preempt_count.load(Ordering::Relaxed), 1);
+        assert_eq!(host0.revoke_requested.load(Ordering::Acquire), 0);
+        assert_eq!(host0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
     }
 
     #[test]
@@ -2153,8 +2244,7 @@ mod tests {
         // Do what pylond does once a revocation's deadline has passed: the request is pending,
         // its deadline (0) is over, and the vCPU thread gets the kick signal. Resend it, as
         // pylond does, in case one lands while the thread is outside KVM_RUN.
-        slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, 0);
         for _ in 0..500 {
             if slot0.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
                 break;
@@ -2309,8 +2399,7 @@ mod tests {
         /// Requests a revocation whose grace period is over, as `pylond` does.
         fn request_forced_revocation(&self) {
             let slot0 = self.state.vcpu_slot(0).unwrap();
-            slot0.revoke_deadline_tsc.store(0, Ordering::Relaxed);
-            slot0.revoke_requested.store(1, Ordering::Release);
+            request_park(&self.state, 0, 0);
         }
 
         /// Stops the vCPU thread and waits for it.
@@ -2588,8 +2677,7 @@ mod tests {
 
         // 2. Request a revocation with a deadline that never passes, so only the guest's consent can
         //    park the vCPU: the guest sees [0x80A0] == 1, writes PARKING, executes HLT, and the VMM parks vCPU 0.
-        slot0.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
-        slot0.revoke_requested.store(1, Ordering::Release);
+        request_park(&state, 0, u64::MAX);
 
         for _ in 0..200 {
             if slot0.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {

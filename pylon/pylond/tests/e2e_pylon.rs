@@ -23,7 +23,8 @@ use std::{io, process, ptr};
 use arc_swap::ArcSwap;
 use memmap2::MmapMut;
 use pylon_abi::{
-    PCPU_UNASSIGNED, PYLON_SHARED_PAGE_SIZE, PylonSharedPage, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
+    PCPU_UNASSIGNED, PYLON_HOST_PAGE_OFFSET, PYLON_SHM_FILE_SIZE, PylonHostPage, PylonSharedPage,
+    VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
 };
 use pylond::control::{
     ControlPlane, query_vm_stats, run_prometheus_server, send_policy_update, send_registration,
@@ -99,14 +100,25 @@ impl SimulatedVmm {
             .open(&shm_path)
             .expect("failed to create VM shared memory file");
         shm_file
-            .set_len(PYLON_SHARED_PAGE_SIZE as u64)
+            .set_len(PYLON_SHM_FILE_SIZE as u64)
             .expect("failed to resize VM shared memory file");
 
-        // SAFETY: `shm_file` is 8,192 bytes and accessed atomically through `PylonSharedPage`.
+        // SAFETY: `shm_file` is `PYLON_SHM_FILE_SIZE` bytes and accessed atomically through
+        // `PylonSharedPage` and `PylonHostPage`.
         let mut shm_mmap = unsafe { MmapMut::map_mut(&shm_file).expect("mmap failed") };
-        // SAFETY: `shm_mmap` is page-aligned and 8,192 bytes long.
-        let page = unsafe { &mut *(shm_mmap.as_mut_ptr().cast::<PylonSharedPage>()) };
+        // SAFETY: `shm_mmap` is page-aligned and `PYLON_SHM_FILE_SIZE` bytes long, and the host
+        // page lies at a page-aligned offset in it.
+        let (page, host_page) = unsafe {
+            (
+                &mut *(shm_mmap.as_mut_ptr().cast::<PylonSharedPage>()),
+                &mut *(shm_mmap
+                    .as_mut_ptr()
+                    .add(PYLON_HOST_PAGE_OFFSET)
+                    .cast::<PylonHostPage>()),
+            )
+        };
         page.init(vm_id, num_vcpus, default_counter_khz());
+        host_page.init();
 
         let stop = Arc::new(AtomicBool::new(false));
         let cooperative_flag = Arc::new(AtomicBool::new(cooperative));
@@ -128,7 +140,7 @@ impl SimulatedVmm {
             work_counters.push(Arc::clone(&work_counter));
 
             let thread_file = shm_file.try_clone().expect("failed to clone shm_file");
-            // SAFETY: Mapping the same 8,192-byte shared memory file for the vCPU thread.
+            // SAFETY: Mapping the same shared memory file for the vCPU thread.
             let thread_mmap = unsafe { MmapMut::map_mut(&thread_file).expect("thread mmap") };
             let thread_stop = Arc::clone(&stop);
             let thread_coop = Arc::clone(&cooperative_flag);
@@ -136,14 +148,21 @@ impl SimulatedVmm {
             let handle = thread::Builder::new()
                 .name(format!("vm{vm_id}-vcpu{vcpu_idx}"))
                 .spawn(move || {
-                    // SAFETY: `thread_mmap` is 8,192 bytes and page-aligned.
+                    // SAFETY: `thread_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned.
                     let shared = unsafe { &*(thread_mmap.as_ptr().cast::<PylonSharedPage>()) };
                     let slot = &shared.vcpus[vcpu_idx];
+                    // The guest's request comes from `slot`; the park state `pylond` acts on is
+                    // published in `host`, as the VMM does.
+                    let host = &host_page_of(&thread_mmap).vcpus[vcpu_idx];
+                    let set_state = |state| {
+                        host.state.store(state, Ordering::Release);
+                        slot.state.store(state, Ordering::Release);
+                    };
 
                     // Export real Linux kernel TID (`gettid()`).
                     // SAFETY: `libc::gettid()` is always safe to call.
                     let tid = unsafe { libc::gettid() as u32 };
-                    slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+                    set_state(VCPU_STATE_PARKED);
                     slot.host_tid.store(tid, Ordering::Release);
 
                     let mut parked = true;
@@ -154,21 +173,21 @@ impl SimulatedVmm {
                                 if thread_stop.load(Ordering::Acquire) {
                                     break;
                                 }
-                                slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+                                set_state(VCPU_STATE_RUNNING);
                                 parked = false;
                             }
                             continue;
                         }
 
                         // If forced preemption occurred externally (Phase 3), transition to parked.
-                        if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
+                        if host.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
                             parked = true;
                             continue;
                         }
 
                         // vCPU is RUNNING or WAKING: transition WAKING -> RUNNING and execute work.
-                        if slot.state.load(Ordering::Acquire) != VCPU_STATE_RUNNING {
-                            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+                        if host.state.load(Ordering::Acquire) != VCPU_STATE_RUNNING {
+                            set_state(VCPU_STATE_RUNNING);
                         }
                         work_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -189,9 +208,11 @@ impl SimulatedVmm {
                             && slot.revoke_requested.load(Ordering::Acquire) == 1
                             && slot.in_critical_section.load(Ordering::Acquire) == 0
                         {
+                            host.revoke_requested.store(0, Ordering::Release);
                             slot.revoke_requested.store(0, Ordering::Release);
-                            slot.yield_count.fetch_add(1, Ordering::AcqRel);
-                            slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+                            let yields = host.yield_count.fetch_add(1, Ordering::AcqRel) + 1;
+                            slot.yield_count.store(yields, Ordering::Relaxed);
+                            set_state(VCPU_STATE_PARKED);
                             parked = true;
                         }
                     }
@@ -253,15 +274,19 @@ impl SimulatedVmm {
     }
 
     fn shared_page(&self) -> &PylonSharedPage {
-        // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned.
+        // SAFETY: `shm_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned.
         unsafe { &*(self.shm_mmap.as_ptr().cast::<PylonSharedPage>()) }
+    }
+
+    fn host_page(&self) -> &PylonHostPage {
+        host_page_of(&self.shm_mmap)
     }
 
     /// Overwrites the counter rate in the header, as a guest can: the whole page is mapped
     /// writable into the guest.
     fn write_header_tsc_khz(&mut self, tsc_khz: u64) {
         let page = self.shm_mmap.as_mut_ptr().cast::<PylonSharedPage>();
-        // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned, so `page` points to a whole
+        // SAFETY: `shm_mmap` is `PYLON_SHM_FILE_SIZE` bytes and page-aligned, so `page` points to a whole
         // `PylonSharedPage`, and no reference to the header is alive.
         unsafe { ptr::write_volatile(ptr::addr_of_mut!((*page).header.tsc_khz), tsc_khz) };
     }
@@ -278,6 +303,18 @@ impl SimulatedVmm {
             let _ = handle.join();
         }
         let _ = fs::remove_file(&self.shm_path);
+    }
+}
+
+/// The `PylonHostPage` in `mmap`, a mapping of the whole shared memory file.
+fn host_page_of(mmap: &MmapMut) -> &PylonHostPage {
+    // SAFETY: `mmap` is page-aligned and `PYLON_SHM_FILE_SIZE` bytes, and the host page lies at a
+    // page-aligned offset in it.
+    unsafe {
+        &*(mmap
+            .as_ptr()
+            .add(PYLON_HOST_PAGE_OFFSET)
+            .cast::<PylonHostPage>())
     }
 }
 
@@ -551,10 +588,11 @@ fn test_e2e_zero_core_hibernation_timer_and_rx_doorbell_wakeup() {
     );
 
     // 2. Return VM 201 to 0-core hibernation and test network `host_rx_doorbell` wakeup.
-    page.vcpus[1]
+    let host = vm.host_page();
+    host.vcpus[1]
         .state
         .store(VCPU_STATE_PARKED, Ordering::Release);
-    page.vcpus[1]
+    host.vcpus[1]
         .assigned_pcpu
         .store(PCPU_UNASSIGNED, Ordering::Release);
     page.telemetry.runnable_threads.store(0, Ordering::Release);
@@ -585,19 +623,40 @@ fn test_e2e_zero_core_hibernation_timer_and_rx_doorbell_wakeup() {
 
 #[test]
 fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
-    forced_preemption_when_donor_ignores_kick("preempt", None);
+    forced_preemption_when_donor_ignores_kick("preempt", DonorGuest::Quiet);
 }
 
 /// A guest that writes a huge counter rate into its header must not stretch the revocation
 /// deadline or the forced handoff: `pylond` only uses the host rate.
 #[test]
 fn test_e2e_forced_preemption_ignores_the_guest_written_counter_rate() {
-    forced_preemption_when_donor_ignores_kick("preempt-tsc", Some(u64::MAX));
+    forced_preemption_when_donor_ignores_kick("preempt-tsc", DonorGuest::HeaderTscKhz);
+}
+
+/// A guest that writes a park of its own into its slot, without the VMM parking the vCPU, must
+/// neither count as a cooperative yield nor end the revocation: `pylond` reads the park state
+/// from the host page.
+#[test]
+fn test_e2e_forced_preemption_ignores_a_guest_written_park() {
+    forced_preemption_when_donor_ignores_kick("preempt-park", DonorGuest::FakePark);
+}
+
+/// What the donor's guest writes into its shared page, as it can, while it ignores the
+/// revocation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DonorGuest {
+    /// Nothing.
+    Quiet,
+    /// A counter rate of `u64::MAX` kHz in the header, before the revocation.
+    HeaderTscKhz,
+    /// A park once the revocation is requested: `PARKED`, a new `yield_count`,
+    /// `revoke_requested` cleared and a deadline that never comes.
+    FakePark,
 }
 
 /// Revokes the only core from a donor that never parks and checks that it is forced off on
-/// time. `donor_header_tsc_khz` is written into the donor's header first, as its guest could.
-fn forced_preemption_when_donor_ignores_kick(name: &str, donor_header_tsc_khz: Option<u64>) {
+/// time, whatever the donor's guest writes (`donor_guest`).
+fn forced_preemption_when_donor_ignores_kick(name: &str, donor_guest: DonorGuest) {
     let temp_dir = temp_dir().join(format!("pylon-e2e-{name}-{}", process::id()));
     fs::create_dir_all(&temp_dir).expect("failed to create temp_dir");
     let socket_path = temp_dir.join("pylond.sock");
@@ -626,8 +685,8 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_header_tsc_khz: O
         SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 301, 1, 0, 1, 10, false);
     let recipient =
         SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 302, 1, 0, 1, 300, true);
-    if let Some(tsc_khz) = donor_header_tsc_khz {
-        donor.write_header_tsc_khz(tsc_khz);
+    if donor_guest == DonorGuest::HeaderTscKhz {
+        donor.write_header_tsc_khz(u64::MAX);
     }
 
     let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[4]);
@@ -680,6 +739,14 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_header_tsc_khz: O
         deadline,
         base_tsc + 1_000 + REVOKE_GRACE_PERIOD_US * tsc_khz / 1000
     );
+    if donor_guest == DonorGuest::FakePark {
+        let slot = &donor_page.vcpus[0];
+        slot.revoke_deadline_tsc.store(u64::MAX, Ordering::Relaxed);
+        slot.revoke_requested.store(0, Ordering::Release);
+        slot.yield_count.fetch_add(1, Ordering::Relaxed);
+        slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+    }
+    let donor_host = &donor.host_page().vcpus[0];
 
     // 3. Advance TSC past the 8 us deadline while donor remains in `VCPU_STATE_RUNNING`. The
     //    revocation counts as forced, but pylond keeps waiting for the VMM to park the donor and
@@ -687,15 +754,18 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_header_tsc_khz: O
     let donor_tid = donor_page.vcpus[0].host_tid.load(Ordering::Acquire);
     engine.poll_once(deadline + 1);
     assert_eq!(pcpu_owners.read_owner(4).0, donor_tid);
+    assert_eq!(donor_host.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+    assert_eq!(donor_host.revoke_requested.load(Ordering::Acquire), 1);
     assert_eq!(
-        donor_page.vcpus[0].state.load(Ordering::Acquire),
-        VCPU_STATE_RUNNING
+        donor_host.revoke_deadline_tsc.load(Ordering::Acquire),
+        deadline
     );
     let stats = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
     assert_eq!(
         stats.vms[0].forced_preemptions, 1,
         "Donor forced_preemptions must increment when the 8 us deadline expires"
     );
+    assert_eq!(stats.vms[0].cooperative_yields, 0);
 
     // 4. The simulated donor registered no kick signal and never parks, so the core moves
     //    FORCE_HANDOFF_US after the first signal (sent at `deadline + 1`) and counts as a
@@ -708,6 +778,7 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_header_tsc_khz: O
     assert_eq!(pcpu_owners.read_owner(4).0, recip_tid);
     let stats = query_vm_stats(&socket_path, Some(301)).expect("query stats failed");
     assert_eq!(stats.vms[0].handoffs_without_park, 1);
+    assert_eq!(stats.vms[0].cooperative_yields, 0);
 
     wait_until(
         Duration::from_secs(2),
@@ -872,8 +943,9 @@ fn test_e2e_observability_metering_and_socket_stats() {
 
     // Now simulate vCPU 1 voluntarily idling / parking. Like the VMM, bump `yield_count`
     // before publishing `PARKED`: that is how pylond tells a park from a not-yet-woken vCPU.
-    page.vcpus[1].yield_count.fetch_add(1, Ordering::AcqRel);
-    page.vcpus[1]
+    let host = vm.host_page();
+    host.vcpus[1].yield_count.fetch_add(1, Ordering::AcqRel);
+    host.vcpus[1]
         .state
         .store(VCPU_STATE_PARKED, Ordering::Release);
     page.telemetry.runnable_threads.store(1, Ordering::Release);

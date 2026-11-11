@@ -180,6 +180,11 @@ impl Default for PylonTelemetry {
 
 /// Cache Lines 2..65: One 64-byte slot per vCPU.
 /// Lower 32 bytes are Guest-written; Upper 32 bytes are Host-written.
+///
+/// The guest can write all of it. `state`, `revoke_requested`, `assigned_pcpu`,
+/// `park_on_boot`, `yield_count` and `revoke_deadline_tsc` are copies, for the guest, of the
+/// fields of the same name in [`PylonHostVcpuSlot`], which the VMM and `pylond` act on; the
+/// one exception is `state`, where the guest asks to park by writing `PARKING`.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct PylonVcpuSlot {
@@ -328,6 +333,139 @@ impl PylonSharedPage {
     }
 }
 
+/// Magic value in `PylonHostHeader::magic` ("PYLONHP1").
+pub const PYLON_HOST_MAGIC: u64 = 0x5059_4C4F_4E48_5031;
+/// Version of the host page in `PylonHostHeader::version`. It changes on its own, without
+/// [`PYLON_ABI_VERSION`]: the guest never sees the host page.
+pub const PYLON_HOST_VERSION: u32 = 1;
+/// Offset of the [`PylonHostPage`] in the shared memory file, right after the shared page.
+pub const PYLON_HOST_PAGE_OFFSET: usize = PYLON_SHARED_PAGE_SIZE;
+/// Size in bytes of the [`PylonHostPage`].
+pub const PYLON_HOST_PAGE_SIZE: usize = 8192;
+/// Size in bytes of the shared memory file: the shared page, then the host page.
+pub const PYLON_SHM_FILE_SIZE: usize = PYLON_HOST_PAGE_OFFSET + PYLON_HOST_PAGE_SIZE;
+
+/// Header of the [`PylonHostPage`], written once by the VMM at VM creation.
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PylonHostHeader {
+    pub magic: u64,
+    pub version: u32,
+    pub _reserved: [u8; 52],
+}
+
+impl PylonHostHeader {
+    /// Creates a new initialized `PylonHostHeader`.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            magic: PYLON_HOST_MAGIC,
+            version: PYLON_HOST_VERSION,
+            _reserved: [0u8; 52],
+        }
+    }
+
+    /// Returns `true` if the magic value and version are valid.
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        self.magic == PYLON_HOST_MAGIC && self.version == PYLON_HOST_VERSION
+    }
+}
+
+impl Default for PylonHostHeader {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The host's copy of a vCPU's park state, which only the VMM and `pylond` can write.
+///
+/// The guest can write the whole shared page, whatever the field docs of [`PylonVcpuSlot`]
+/// say, so neither the VMM nor `pylond` acts on what it reads there, except the guest's own
+/// `PARKING` request. The fields of the same name in [`PylonVcpuSlot`] are copies for the
+/// guest: the guest learns of a revocation from `revoke_requested` there.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct PylonHostVcpuSlot {
+    /// `VCPU_STATE_PARKED` or `VCPU_STATE_RUNNING`. Written by the VMM.
+    pub state: AtomicU8,
+    /// Set to 1 by `pylond` when requesting this vCPU to yield its physical core; cleared by
+    /// the VMM when it parks the vCPU.
+    pub revoke_requested: AtomicU8,
+    /// Physical CPU core ID (pCPU) assigned to this vCPU, or reserved for it during a
+    /// revocation, by `pylond`; `PCPU_UNASSIGNED` if none. The VMM initializes it.
+    pub assigned_pcpu: AtomicU8,
+    /// Non-zero while the VMM wants this vCPU parked once the guest has booted. Written by the
+    /// VMM (see `PylonVcpuSlot::park_on_boot`).
+    pub park_on_boot: AtomicU8,
+    pub _pad: [u8; 4],
+    /// Number of times the VMM parked this vCPU, cooperatively or forced. Written by the VMM,
+    /// before it publishes `VCPU_STATE_PARKED`.
+    pub yield_count: AtomicU64,
+    /// Host counter deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
+    /// Written by `pylond` before it sets `revoke_requested`.
+    pub revoke_deadline_tsc: AtomicU64,
+    pub _reserved: [u8; 40],
+}
+
+impl PylonHostVcpuSlot {
+    /// Creates a new parked `PylonHostVcpuSlot`.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(VCPU_STATE_PARKED),
+            revoke_requested: AtomicU8::new(0),
+            assigned_pcpu: AtomicU8::new(PCPU_UNASSIGNED),
+            park_on_boot: AtomicU8::new(0),
+            _pad: [0u8; 4],
+            yield_count: AtomicU64::new(0),
+            revoke_deadline_tsc: AtomicU64::new(0),
+            _reserved: [0u8; 40],
+        }
+    }
+
+    /// Resets the vCPU slot to default parked state.
+    #[inline]
+    pub fn reset(&self) {
+        self.state.store(VCPU_STATE_PARKED, Ordering::Release);
+        self.revoke_requested.store(0, Ordering::Release);
+        self.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+        self.park_on_boot.store(0, Ordering::Release);
+        self.yield_count.store(0, Ordering::Release);
+        self.revoke_deadline_tsc.store(0, Ordering::Release);
+    }
+}
+
+impl Default for PylonHostVcpuSlot {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The part of the shared memory file the guest doesn't see, at [`PYLON_HOST_PAGE_OFFSET`].
+/// The VMM maps only the [`PylonSharedPage`] into the guest; it and `pylond` map both.
+#[repr(C, align(4096))]
+#[derive(Debug)]
+pub struct PylonHostPage {
+    pub header: PylonHostHeader,
+    pub vcpus: [PylonHostVcpuSlot; MAX_VCPUS],
+    pub _tail_pad: [u8; 4032], // Pad to exact 8192 bytes (2 * 4096B pages)
+}
+
+impl PylonHostPage {
+    /// Initializes a `PylonHostPage` in place.
+    #[inline]
+    pub fn init(&mut self) {
+        self.header = PylonHostHeader::new();
+        for slot in &self.vcpus {
+            slot.reset();
+        }
+        self._tail_pad.fill(0);
+    }
+}
+
 // Compile-time layout assertions required by Specification 01.
 const _: () = {
     assert!(size_of::<PylonHeader>() == 64);
@@ -346,6 +484,13 @@ const _: () = {
     assert!(offset_of!(PylonSharedPage, header) == 0);
     assert!(offset_of!(PylonSharedPage, telemetry) == 64);
     assert!(offset_of!(PylonSharedPage, vcpus) == 128);
+    assert!(size_of::<PylonHostHeader>() == 64);
+    assert!(size_of::<PylonHostVcpuSlot>() == 64);
+    assert!(align_of::<PylonHostVcpuSlot>() == 64);
+    assert!(size_of::<PylonHostPage>() == PYLON_HOST_PAGE_SIZE);
+    assert!(align_of::<PylonHostPage>() == 4096);
+    assert!(offset_of!(PylonHostPage, vcpus) == 64);
+    assert!(PYLON_HOST_PAGE_OFFSET.is_multiple_of(align_of::<PylonHostPage>()));
 };
 
 #[cfg(test)]
@@ -385,6 +530,23 @@ mod tests {
         assert_eq!(page.header.num_vcpus, 8);
         assert_eq!(page.header.tsc_khz, 3_000_000);
         assert_eq!(page.active_vcpu_count(), 0);
+        assert_eq!(
+            page.vcpus[0].assigned_pcpu.load(Ordering::Acquire),
+            PCPU_UNASSIGNED
+        );
+    }
+
+    #[test]
+    fn test_host_page_initialization() {
+        // SAFETY: All fields in PylonHostPage are valid when zero-initialized.
+        let mut page: PylonHostPage = unsafe { zeroed() };
+        assert!(!page.header.is_valid());
+        page.init();
+        assert!(page.header.is_valid());
+        assert_eq!(
+            page.vcpus[0].state.load(Ordering::Acquire),
+            VCPU_STATE_PARKED
+        );
         assert_eq!(
             page.vcpus[0].assigned_pcpu.load(Ordering::Acquire),
             PCPU_UNASSIGNED
