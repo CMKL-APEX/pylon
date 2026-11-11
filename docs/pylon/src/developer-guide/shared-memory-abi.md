@@ -40,7 +40,7 @@ the host on the hot path. Its layout is defined once, in
 | 8 | `version` | `u32` | `PYLON_ABI_VERSION` = 3 (same layout as 1 and 2) |
 | 12 | `num_vcpus` | `u32` | Number of slots in use: `max(boot, max)` vCPUs |
 | 16 | `vm_id` | `u64` | From `--pylon vm_id=` |
-| 24 | `tsc_khz` | `u64` | Counter rate used to convert ticks to time, or `0` if unknown. The VMM writes `0`; `pylond` then uses the host counter rate it finds at start. |
+| 24 | `tsc_khz` | `u64` | Counter rate used to convert ticks to time, or `0` if unknown. The VMM writes `0`. `pylond` doesn't read it: it always uses the host counter rate it finds at start. |
 | 32 | `_reserved` | 32 bytes | Zero |
 
 `pylond` rejects a registration whose header fails

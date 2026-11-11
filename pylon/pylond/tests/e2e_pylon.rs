@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use std::{io, process};
+use std::{io, process, ptr};
 
 use arc_swap::ArcSwap;
 use memmap2::MmapMut;
@@ -28,7 +28,9 @@ use pylon_abi::{
 use pylond::control::{
     ControlPlane, query_vm_stats, run_prometheus_server, send_policy_update, send_registration,
 };
-use pylond::engine::{FORCE_HANDOFF_US, MatrixEngine, default_counter_khz, read_tsc};
+use pylond::engine::{
+    FORCE_HANDOFF_US, MatrixEngine, REVOKE_GRACE_PERIOD_US, default_counter_khz, read_tsc,
+};
 use pylond::{
     CoreState, PcpuOwnerTable, VmPolicyUpdateRequest, VmRegistrationRequest, VmSnapshot,
     create_eventfd, read_eventfd, write_eventfd,
@@ -253,6 +255,15 @@ impl SimulatedVmm {
     fn shared_page(&self) -> &PylonSharedPage {
         // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned.
         unsafe { &*(self.shm_mmap.as_ptr().cast::<PylonSharedPage>()) }
+    }
+
+    /// Overwrites the counter rate in the header, as a guest can: the whole page is mapped
+    /// writable into the guest.
+    fn write_header_tsc_khz(&mut self, tsc_khz: u64) {
+        let page = self.shm_mmap.as_mut_ptr().cast::<PylonSharedPage>();
+        // SAFETY: `shm_mmap` is 8,192 bytes and page-aligned, so `page` points to a whole
+        // `PylonSharedPage`, and no reference to the header is alive.
+        unsafe { ptr::write_volatile(ptr::addr_of_mut!((*page).header.tsc_khz), tsc_khz) };
     }
 
     fn shutdown(mut self) {
@@ -574,7 +585,20 @@ fn test_e2e_zero_core_hibernation_timer_and_rx_doorbell_wakeup() {
 
 #[test]
 fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
-    let temp_dir = temp_dir().join(format!("pylon-e2e-preempt-{}", process::id()));
+    forced_preemption_when_donor_ignores_kick("preempt", None);
+}
+
+/// A guest that writes a huge counter rate into its header must not stretch the revocation
+/// deadline or the forced handoff: `pylond` only uses the host rate.
+#[test]
+fn test_e2e_forced_preemption_ignores_the_guest_written_counter_rate() {
+    forced_preemption_when_donor_ignores_kick("preempt-tsc", Some(u64::MAX));
+}
+
+/// Revokes the only core from a donor that never parks and checks that it is forced off on
+/// time. `donor_header_tsc_khz` is written into the donor's header first, as its guest could.
+fn forced_preemption_when_donor_ignores_kick(name: &str, donor_header_tsc_khz: Option<u64>) {
+    let temp_dir = temp_dir().join(format!("pylon-e2e-{name}-{}", process::id()));
     fs::create_dir_all(&temp_dir).expect("failed to create temp_dir");
     let socket_path = temp_dir.join("pylond.sock");
 
@@ -598,11 +622,17 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
     );
 
     // Donor VM 301 is non-cooperative (`cooperative = false`) so it ignores `revoke_requested == 1`.
-    let donor = SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 301, 1, 0, 1, 10, false);
+    let mut donor =
+        SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 301, 1, 0, 1, 10, false);
     let recipient =
         SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 302, 1, 0, 1, 300, true);
+    if let Some(tsc_khz) = donor_header_tsc_khz {
+        donor.write_header_tsc_khz(tsc_khz);
+    }
 
     let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[4]);
+    // The engine's rate, which `set_host_tsc_khz` would replace with a measured one.
+    let tsc_khz = default_counter_khz();
 
     // 1. Donor acquires pCPU 4.
     let donor_page = donor.shared_page();
@@ -646,7 +676,10 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
     let deadline = donor_page.vcpus[0]
         .revoke_deadline_tsc
         .load(Ordering::Acquire);
-    assert!(deadline > base_tsc);
+    assert_eq!(
+        deadline,
+        base_tsc + 1_000 + REVOKE_GRACE_PERIOD_US * tsc_khz / 1000
+    );
 
     // 3. Advance TSC past the 8 us deadline while donor remains in `VCPU_STATE_RUNNING`. The
     //    revocation counts as forced, but pylond keeps waiting for the VMM to park the donor and
@@ -667,10 +700,6 @@ fn test_e2e_hard_deadline_forced_preemption_when_donor_ignores_kick() {
     // 4. The simulated donor registered no kick signal and never parks, so the core moves
     //    FORCE_HANDOFF_US after the first signal (sent at `deadline + 1`) and counts as a
     //    handoff without park.
-    let tsc_khz = match donor_page.header.tsc_khz {
-        0 => default_counter_khz(),
-        khz => khz,
-    };
     let handoff = deadline + 1 + FORCE_HANDOFF_US * tsc_khz / 1000;
     engine.poll_once(handoff - 1);
     assert_eq!(pcpu_owners.read_owner(4).0, donor_tid);

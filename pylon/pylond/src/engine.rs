@@ -321,7 +321,8 @@ pub struct MatrixEngine {
     /// When each vCPU (by VM index in the snapshot) that kept running after a handoff without park
     /// was last signalled (0 if not yet).
     orphan_signalled_tsc: [[u64; MAX_VCPUS]; MAX_TRACKED_VMS],
-    /// Host TSC rate, used for VMs whose header gives none.
+    /// Host TSC rate, used for every VM. The rate in a VM's header is never read: the guest can
+    /// write the shared page, and every `*_tsc` field counts host ticks anyway.
     host_tsc_khz: u64,
     has_timed_wait: bool,
     engine_cpu: usize,
@@ -379,8 +380,7 @@ impl MatrixEngine {
         }
     }
 
-    /// Sets the host TSC rate used for VMs whose header gives none (`tsc_khz == 0`), such as a
-    /// value from `calibrate_tsc_khz`.
+    /// Sets the host TSC rate used for every VM, such as a value from `calibrate_tsc_khz`.
     pub fn set_host_tsc_khz(&mut self, tsc_khz: u64) {
         if tsc_khz > 0 {
             self.host_tsc_khz = tsc_khz;
@@ -547,15 +547,6 @@ impl MatrixEngine {
         tsc_khz.saturating_mul(usec) / 1000
     }
 
-    /// The TSC rate in `vm`'s header, or the host's if the header gives none.
-    #[inline]
-    fn tsc_khz_of(&self, vm: &VmHandle) -> u64 {
-        match vm.shared_page().header.tsc_khz {
-            0 => self.host_tsc_khz,
-            khz => khz,
-        }
-    }
-
     /// Gives `pcpu` to `vcpu` of `vm`: publishes the owner, records the assignment, and wakes
     /// the vCPU thread. The VMM moves the vCPU from `PARKED` to `RUNNING` when it wakes.
     fn assign_pcpu(&mut self, pcpu: usize, vm: &VmHandle, vcpu: u8, now_tsc: u64) {
@@ -651,7 +642,7 @@ impl MatrixEngine {
                 {
                     let last_tsc = self.core_last_metered_tsc[pcpu];
                     if last_tsc > 0 && now_tsc > last_tsc {
-                        let tsc_khz = self.tsc_khz_of(vm);
+                        let tsc_khz = self.host_tsc_khz;
                         let usec = ((now_tsc - last_tsc) * 1000) / tsc_khz;
                         if usec > 0 {
                             vm.add_allocated_core_usec(usec);
@@ -680,7 +671,7 @@ impl MatrixEngine {
                     let last_tsc = self.core_last_metered_tsc[pcpu];
                     if last_tsc > 0 && now_tsc > last_tsc {
                         if let Some(vm) = Self::find_vm(vms, vm_count, vid) {
-                            let tsc_khz = self.tsc_khz_of(vm);
+                            let tsc_khz = self.host_tsc_khz;
                             let elapsed_cycles = now_tsc - last_tsc;
                             let usec = (elapsed_cycles * 1000) / tsc_khz;
                             if usec > 0 {
@@ -818,7 +809,7 @@ impl MatrixEngine {
 
                 if let (Some(donor), Some(recipient)) = (donor_vm, recipient_vm) {
                     let donor_slot = &donor.shared_page().vcpus[donor_vcpu as usize];
-                    let tsc_khz = self.tsc_khz_of(donor);
+                    let tsc_khz = self.host_tsc_khz;
                     let signalled_tsc = self.revoke_signalled_tsc[pcpu];
                     let first_signal_tsc = self.revoke_first_signal_tsc[pcpu];
                     // Only the VMM writes `PARKED`, once the donor thread has left `KVM_RUN`
@@ -908,7 +899,7 @@ impl MatrixEngine {
         let mut i = 0usize;
         while i < vm_count {
             let vm = &vms[i];
-            let tsc_khz = self.tsc_khz_of(vm);
+            let tsc_khz = self.host_tsc_khz;
             let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
             let mut vcpu = 0usize;
             while vcpu < num_vcpus {
@@ -955,7 +946,7 @@ impl MatrixEngine {
                     && now_tsc
                         >= last.saturating_add(Self::us_to_cycles(
                             REVOKE_RESIGNAL_US,
-                            self.tsc_khz_of(vm),
+                            self.host_tsc_khz,
                         ))
                     && vm.signal_vcpu(vcpu as usize).unwrap_or(false)
                 {
@@ -996,7 +987,7 @@ impl MatrixEngine {
             bits &= bits - 1;
         }
 
-        let tsc_khz = self.tsc_khz_of(vm);
+        let tsc_khz = self.host_tsc_khz;
         let demand_cycles = Self::us_to_cycles(WOKEN_DEMAND_US, tsc_khz);
         let elapsed = if self.last_poll_tsc != 0 {
             now_tsc.saturating_sub(self.last_poll_tsc)
@@ -1157,7 +1148,7 @@ impl MatrixEngine {
                 let donor_page = donor_vm.shared_page();
                 let deadline_tsc = now_tsc.saturating_add(Self::us_to_cycles(
                     REVOKE_GRACE_PERIOD_US,
-                    self.tsc_khz_of(donor_vm),
+                    self.host_tsc_khz,
                 ));
 
                 let donor_slot = &donor_page.vcpus[donor_vcpu as usize];
@@ -1212,7 +1203,7 @@ impl MatrixEngine {
             .telemetry
             .guest_heartbeat
             .load(Ordering::Acquire);
-        let hold = Self::us_to_cycles(WOKEN_GRANT_HOLD_US, self.tsc_khz_of(vm));
+        let hold = Self::us_to_cycles(WOKEN_GRANT_HOLD_US, self.host_tsc_khz);
         let mut count = 0u32;
         let mut pcpu = 0usize;
         while pcpu < MAX_PCPUS {

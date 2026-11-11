@@ -92,8 +92,9 @@ pub struct PylonHeader {
     pub version: u32,
     pub num_vcpus: u32,
     pub vm_id: u64,
-    /// Counter rate in kHz, or 0 if the writer doesn't know it. `pylond` then uses the host
-    /// counter rate it finds itself (measured on x86_64, `CNTFRQ_EL0` on aarch64).
+    /// Counter rate in kHz, or 0 if the writer doesn't know it. Informational only: the guest
+    /// can write the page, so `pylond` ignores it and always uses the host counter rate it
+    /// finds itself (measured on x86_64, `CNTFRQ_EL0` on aarch64).
     pub tsc_khz: u64,
     pub _reserved: [u8; 32],
 }

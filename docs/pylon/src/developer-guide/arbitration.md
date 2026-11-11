@@ -77,10 +77,10 @@ usec = (now_tsc - last_tsc) * 1000 / tsc_khz
 
 It carries the remainder forward (it advances `last_tsc` by exactly the
 cycles it counted), so rounding doesn't lose time across sweeps.
-`tsc_khz` comes from the VM's header when it is non-zero. The VMM
-writes `0`, so in practice it is the host counter rate that `pylond`
-finds at start (`calibrate_tsc_khz`): `CNTFRQ_EL0` on aarch64, a 50 ms
-measurement against the system clock on x86_64. If that fails, it
+`tsc_khz` is the host counter rate that `pylond` finds at start
+(`calibrate_tsc_khz`): `CNTFRQ_EL0` on aarch64, a 50 ms measurement
+against the system clock on x86_64. `pylond` never reads the rate in a
+VM's header, since the guest can write the shared page. If that fails, it
 assumes the architectural rate or, on x86_64, 3,000,000.
 
 **Removed VMs.** A CPU still `Assigned` to a VM that is no longer
@@ -264,7 +264,7 @@ Among eligible donors, the engine prefers, in order:
 3. the lowest urgency.
 
 It then sets the donor slot's `revoke_deadline_tsc` to now plus
-`REVOKE_GRACE_PERIOD_US` (8 µs, converted with the donor's `tsc_khz`),
+`REVOKE_GRACE_PERIOD_US` (8 µs, converted with the host's `tsc_khz`),
 stores `revoke_requested = 1`, writes the donor's kick `eventfd`, and
 marks the CPU `Revoking`. It reserves the recipient vCPU by setting its
 `assigned_pcpu` to that CPU, so no other match picks it. The recipient's
