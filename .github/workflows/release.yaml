@@ -3,8 +3,10 @@ on: [create, merge_group]
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
-env:
-  GITHUB_TOKEN: ${{ github.token }}
+# The build jobs only read the repository: they run the build scripts of every dependency. The
+# `publish` job, which builds nothing, is the only one that can write, to create the release.
+permissions:
+  contents: read
 
 jobs:
   release:
@@ -17,16 +19,16 @@ jobs:
       matrix:
         platform:
         - target: x86_64-unknown-linux-gnu
-          args: --release -p cloud-hypervisor --features cloud-hypervisor/mshv
+          args: --locked --release -p cloud-hypervisor --features cloud-hypervisor/mshv
           name_ch: cloud-hypervisor
           name_ch_remote: ch-remote
         - target: x86_64-unknown-linux-musl
-          args: --release -p cloud-hypervisor -p pylon-guest-agent --features cloud-hypervisor/mshv
+          args: --locked --release -p cloud-hypervisor -p pylon-guest-agent --features cloud-hypervisor/mshv
           name_ch: cloud-hypervisor-static
           name_ch_remote: ch-remote-static
           name_agent: pylon-guest-agent-static
         - target: aarch64-unknown-linux-musl
-          args: --release -p cloud-hypervisor -p pylon-guest-agent
+          args: --locked --release -p cloud-hypervisor -p pylon-guest-agent
           name_ch: cloud-hypervisor-static-aarch64
           name_ch_remote: ch-remote-static-aarch64
           name_agent: pylon-guest-agent-static-aarch64
@@ -41,7 +43,9 @@ jobs:
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        run: rsync -rv --exclude=.git . ../pylon-${{ github.event.ref }}
+        env:
+          REF: ${{ github.event.ref }}
+        run: rsync -rv --exclude=.git . "../pylon-$REF"
       - name: Build ${{ matrix.platform.target }}
         uses: houseabsolute/actions-rust-cross@85826e468eac832e251ac58f6191ba784db237c8 # v1
         with:
@@ -80,7 +84,9 @@ jobs:
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        run: tar cJf dist/pylon-${{ github.event.ref }}.tar.xz ../pylon-${{ github.event.ref }}
+        env:
+          REF: ${{ github.event.ref }}
+        run: tar cJf "dist/pylon-$REF.tar.xz" "../pylon-$REF"
       - name: Upload vendored source archive
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
@@ -90,12 +96,6 @@ jobs:
         with:
           path: dist/pylon-${{ github.event.ref }}.tar.xz
           name: pylon-${{ github.event.ref }}.tar.xz
-      - name: Create GitHub Release
-        if: github.event_name == 'create' && github.event.ref_type == 'tag'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          draft: true
-          files: dist/*
 
   # pylond and scx_pylon, built natively because libbpf links the target's libelf. They link
   # glibc, libelf, zlib and zstd dynamically, so they are built on Ubuntu 24.04 to run on hosts
@@ -122,7 +122,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -yqq build-essential clang llvm libelf-dev zlib1g-dev pkg-config
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.89.0"
       - name: Build pylond and scx_pylon
@@ -137,19 +137,15 @@ jobs:
         if: |
           github.event_name == 'create' && github.event.ref_type == 'tag' &&
           matrix.arch == 'x86_64'
-        run: tar czf dist/pv-pylon-${{ github.event.ref }}.tar.gz -C pylon/guest linux
+        env:
+          REF: ${{ github.event.ref }}
+        run: tar czf "dist/pv-pylon-$REF.tar.gz" -C pylon/guest linux
       - name: Upload Release Artifacts
         if: github.event_name == 'create' && github.event.ref_type == 'tag'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Pylon host tools for ${{ matrix.arch }}
           path: dist/
-      - name: Create GitHub Release
-        if: github.event_name == 'create' && github.event.ref_type == 'tag'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          draft: true
-          files: dist/*
 
   pylon-assets:
     if: github.event_name == 'create' && github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v')
@@ -172,7 +168,7 @@ jobs:
             libssl-dev \
             pkg-config
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.89.0"
       - name: Build pylon and pylond
@@ -183,11 +179,39 @@ jobs:
           strip -o assets/pylon-x86_64 target/release/cloud-hypervisor
           strip -o assets/pylond-x86_64 target/release/pylond
           cd assets && sha256sum pylon-x86_64 pylond-x86_64 > SHA256SUMS && cat SHA256SUMS
-      - name: Attach to the draft release
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Pylon release assets for x86_64
+          path: assets/
+
+  # Creates the draft release from the other jobs' files, once all of them have built. It runs
+  # no build, so it is the only job given a token that can write, and it attests where each file
+  # came from (`gh attestation verify <file> --repo CMKL-APEX/pylon`).
+  publish:
+    if: |
+      always() && github.event_name == 'create' && github.event.ref_type == 'tag' &&
+      needs.release.result == 'success' && needs.pylon-host.result == 'success' &&
+      (needs.pylon-assets.result == 'success' || needs.pylon-assets.result == 'skipped')
+    needs: [release, pylon-host, pylon-assets]
+    name: Publish the draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
-          files: |
-            ./assets/pylon-x86_64
-            ./assets/pylond-x86_64
-            ./assets/SHA256SUMS
+          files: dist/*
