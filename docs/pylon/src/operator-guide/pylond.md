@@ -64,6 +64,13 @@ to the users your VMMs run as, through a group of their own rather than
 a shared one such as `kvm` (see the
 [systemd unit](installation.md#a-systemd-unit-for-pylond)).
 
+Each client gets 5 seconds to send its request and read the response,
+and the socket serves at most 64 clients at a time; further ones are
+closed at once. The metrics server has the same limits. When it runs
+out of file descriptors, `pylond` logs the failed `accept` and tries
+again 100 ms later. At start it raises its soft limit on open files to
+the hard limit: each registered VM holds up to 129 of them.
+
 ## Start order
 
 Start `pylond` before Pylon VMs. A VMM registers once, when it starts,

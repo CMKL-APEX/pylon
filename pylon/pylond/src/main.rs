@@ -181,9 +181,36 @@ fn scx_attach(args: &CliArgs, kernel_has_sched_ext: bool) -> ScxAttach {
     }
 }
 
+/// Raises the soft limit on open file descriptors to the hard limit. Each registered VM holds
+/// up to `1 + 2 * MAX_VCPUS` of them, and systemd's default soft limit is 1024.
+fn raise_fd_limit() {
+    // SAFETY: `getrlimit` and `setrlimit` only access `limit`, a valid `rlimit`.
+    unsafe {
+        let mut limit: libc::rlimit = mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            warn!(
+                "Could not read the open file limit: {}",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        if limit.rlim_cur < limit.rlim_max {
+            let soft = limit.rlim_cur;
+            limit.rlim_cur = limit.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                warn!(
+                    "Could not raise the open file limit from {soft}: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let args = CliArgs::parse();
+    raise_fd_limit();
     let tenant_pcpus = parse_core_list(&args.cores)?;
 
     if tenant_pcpus.contains(&args.engine_cpu) {

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val, zeroed};
 use std::net::Shutdown;
@@ -20,8 +21,9 @@ use log::{info, warn};
 use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, VCPU_STATE_PARKED};
 use tokio::io::Interest;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::watch;
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval, sleep, timeout};
 
 use crate::{
     Error, MAX_VM_SLOTS, PARK_LATENCY_BUCKETS_US, VM_SLOT_NONE, VcpuThread, VmHandle,
@@ -35,6 +37,80 @@ pub const MAX_REGISTRATION_FDS: usize = 1 + 2 * MAX_VCPUS;
 
 /// Maximum JSON payload size for a `VmRegistrationRequest`.
 const MAX_PAYLOAD_BYTES: usize = 4096;
+
+/// Connections each listener (the control socket, the metrics server) serves at once. Further
+/// ones are closed at once, so idle clients can't use up `pylond`'s file descriptors.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// How long a connection may take to send its request and receive the response.
+pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause after a failed `accept`, such as `EMFILE`, before accepting again.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How often a listener warns that it is turning connections away.
+const FULL_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Admits connections to one listener: at most `MAX_CONNECTIONS` at a time, each for at most
+/// `CONNECTION_TIMEOUT`.
+struct ConnectionLimit {
+    name: &'static str,
+    permits: Arc<Semaphore>,
+    timeout: Duration,
+    last_full_warn: Option<Instant>,
+}
+
+impl ConnectionLimit {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            timeout: CONNECTION_TIMEOUT,
+            last_full_warn: None,
+        }
+    }
+
+    /// A permit for a new connection, or `None` if `MAX_CONNECTIONS` are open; the caller then
+    /// drops the connection.
+    fn admit(&mut self) -> Option<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok();
+        if permit.is_none()
+            && self
+                .last_full_warn
+                .is_none_or(|last| last.elapsed() >= FULL_WARN_INTERVAL)
+        {
+            warn!(
+                "{}: {MAX_CONNECTIONS} connections open; closing new ones",
+                self.name
+            );
+            self.last_full_warn = Some(Instant::now());
+        }
+        permit
+    }
+
+    /// Runs `conn` with `permit`, ending it after `CONNECTION_TIMEOUT`.
+    fn spawn<F>(&self, permit: OwnedSemaphorePermit, conn: F) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let name = self.name;
+        let limit = self.timeout;
+        tokio::spawn(async move {
+            let _permit = permit;
+            if timeout(limit, conn).await.is_err() {
+                warn!("{name}: closed a connection idle for {limit:?}");
+            }
+        })
+    }
+
+    /// Logs a failed `accept` and waits before the next one. Running out of file descriptors
+    /// (`EMFILE`, `ENFILE`) or a connection aborted before it was accepted doesn't stop
+    /// `pylond`.
+    async fn accept_failed(&self, err: &io::Error) {
+        warn!("{}: accept failed: {err}", self.name);
+        sleep(ACCEPT_ERROR_BACKOFF).await;
+    }
+}
 
 /// Plane 1: Control Plane Unix domain socket server.
 ///
@@ -169,6 +245,7 @@ impl ControlPlane {
         let mut prune = interval(VM_PRUNE_INTERVAL);
         prune.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut listed_vcpus = HashMap::new();
+        let mut limit = ConnectionLimit::new("Control socket");
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -195,12 +272,21 @@ impl ControlPlane {
                     }
                 }
                 accept_res = listener.accept() => {
-                    let (stream, _) = accept_res.map_err(Error::Io)?;
+                    let stream = match accept_res {
+                        Ok((stream, _)) => stream,
+                        Err(err) => {
+                            limit.accept_failed(&err).await;
+                            continue;
+                        }
+                    };
+                    let Some(permit) = limit.admit() else {
+                        continue;
+                    };
                     let snapshot = Arc::clone(&self.vm_snapshot);
                     // The vCPU domain table is `scx_pylon`'s, so it is set exactly when
                     // `scx_pylon` is attached.
                     let scx_attached = self.vcpu_domains.is_some();
-                    tokio::spawn(async move {
+                    limit.spawn(permit, async move {
                         if let Err(err) =
                             handle_client_connection(stream, snapshot, scx_attached).await
                         {
@@ -676,6 +762,7 @@ pub async fn run_prometheus_server(
         }
     };
 
+    let mut limit = ConnectionLimit::new("Metrics server");
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -687,12 +774,15 @@ pub async fn run_prometheus_server(
                 let (mut stream, _) = match accept_res {
                     Ok(conn) => conn,
                     Err(err) => {
-                        warn!("Metrics listener accept error: {err}");
+                        limit.accept_failed(&err).await;
                         continue;
                     }
                 };
+                let Some(permit) = limit.admit() else {
+                    continue;
+                };
                 let snapshot = Arc::clone(&vm_snapshot);
-                tokio::spawn(async move {
+                limit.spawn(permit, async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -808,6 +898,7 @@ pub async fn run_prometheus_server(
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
     use std::sync::Mutex;
 
     use super::*;
@@ -909,6 +1000,27 @@ mod tests {
     /// vCPU `vcpu` of the VM in slot `vm_slot`, whose VMM is `pid`.
     fn thread(pid: u32, vm_slot: u16, vcpu: u16) -> VcpuThread {
         VcpuThread { pid, vm_slot, vcpu }
+    }
+
+    #[tokio::test]
+    async fn connection_limit_turns_away_connections_beyond_the_cap() {
+        let mut limit = ConnectionLimit::new("Test");
+        let permits: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| limit.admit().expect("a permit below the cap"))
+            .collect();
+        assert!(limit.admit().is_none());
+        drop(permits);
+        assert!(limit.admit().is_some());
+    }
+
+    #[tokio::test]
+    async fn connection_limit_ends_an_idle_connection_and_frees_its_permit() {
+        let mut limit = ConnectionLimit::new("Test");
+        limit.timeout = Duration::from_millis(20);
+        let permit = limit.admit().unwrap();
+        // A client that never sends anything.
+        limit.spawn(permit, pending()).await.unwrap();
+        assert_eq!(limit.permits.available_permits(), MAX_CONNECTIONS);
     }
 
     #[test]
