@@ -54,6 +54,17 @@ See [Status and roadmap](status.md) for what works and what doesn't.
 - **`min_cores` is a floor under demand**: a VM with runnable work is
   raised to `min_cores` first, and an idle VM holds no cores
   ([#58](https://github.com/CMKL-APEX/pylon/issues/58)).
+- **The VMM keeps the shared page in a sealed `memfd`** instead of a
+  file under `/dev/shm`, and `pylond` keeps the state it acts on in a
+  host page the guest doesn't map. `--pylon shm=<path>` is gone.
+- **The control socket is per user**: a VM's policy and stats are
+  available only to the user that registered it, root, and `pylond`'s
+  own user. Each connection has 5 seconds, and at most 64 are served at
+  once. Give the socket to a group of the users your VMMs run as
+  ([Running pylond](operator-guide/pylond.md#the-control-socket)).
+- **`pylond` checks what a VM registers with**: the shared memory file
+  must be a `memfd` whose size is sealed, and the kick and wake
+  descriptors `eventfd`s. A VM whose `eventfd` write blocks is dropped.
 - **`pv-pylon` checked against the real `pylond`**
   ([#55](https://github.com/CMKL-APEX/pylon/issues/55)): cooperative
   parks work end to end, but take longer than the grace period (see
@@ -75,6 +86,11 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   VMM, `pylon-guest-agent` and `pv-pylon` from this release work
   together; builds from before #51 (version 2) refuse the page. Update
   all of them together.
+- **Update the VMM and `pylond` together.** Besides the shared page, the
+  VMM's shared memory now holds a host page with its own version (3),
+  which `pylond` requires. The guest side is unaffected.
+- **`--pylon shm=<path>`** is gone, and the VMM refuses a command line
+  that has it: remove it. Every `--pylon` key is now optional.
 - **`PYLON_PARK_IN_KVM`** is gone; use `--pylon park=kvm|vmm`.
 - **Snapshot, restore and live migration** are refused for `--pylon`
   VMs.
