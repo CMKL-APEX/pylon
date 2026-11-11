@@ -1,15 +1,21 @@
 # The --pylon option
 
 ```text
-cloud-hypervisor ... --pylon shm=<path>[,socket=<path>,gpa=<addr>,initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>,park=kvm|vmm]
+cloud-hypervisor ... --pylon [socket=<path>,gpa=<addr>,initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>,park=kvm|vmm]
 ```
 
 Comma-separated `key=value` pairs, parsed like Cloud Hypervisor's other
-device options. An unknown key is an error.
+device options. An unknown key is an error. Every key is optional;
+`--pylon ""` turns Pylon on with the defaults.
+
+The VMM keeps the shared page and the host page after it in a `memfd`
+of 16,384 bytes whose size is sealed. It has no path, so no other user
+can open, replace or truncate it. Only the shared page is mapped into
+the guest. Earlier versions took the file's path as `shm=<path>`; that
+key is now an error.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `shm` | path | **required** | File backing the 8 KiB shared page and the 8 KiB host page after it, for example `/dev/shm/vm17-pylon`. Created if missing (with its parent directories), resized to 16,384 bytes and zeroed at start. Only the shared page is mapped into the guest. Not removed at exit. One file per VM. |
 | `socket` | path | none | `pylond`'s control socket, such as `/run/pylon/pylond.sock`. Without it, the VM never registers, and parked vCPUs are never woken. The VMM registers once, at start, and doesn't retry: if the socket doesn't exist yet, it logs that and runs unregistered. |
 | `gpa` | integer, `0x` hex or decimal | `0xfedf0000` | Guest-physical address of the page. Must be a multiple of 4,096. |
 | `initial_active_vcpus` | integer | `--cpus boot` | vCPUs `0 … n-1` always run; the others run during boot and are parked once the guest reports it is up (first `guest_heartbeat`). Capped at the number of slots. |
@@ -26,13 +32,13 @@ More vCPUs than that is an error.
 
 | Message | Cause |
 |---|---|
-| `Error parsing --pylon: shm path missing` | No `shm`, or it's empty. |
+| `Error parsing --pylon: shm was removed; ...` | The command line still has `shm=<path>`. Drop it. |
 | `Error parsing --pylon: invalid GPA <value>` | `gpa` isn't a number, or isn't 4 KiB-aligned. |
 | `Error parsing --pylon options` | An unknown key, a value that isn't a number, or a `park` other than `kvm` or `vmm`. |
 | `--pylon park=kvm needs KVM; use park=vmm` | `park=kvm` on MSHV. |
 | `Invalid Pylon vCPU count <n> (must be between 1 and 64)` | Too many vCPUs. |
 | `--pylon is not supported on MSHV on aarch64` | The MSHV backend on aarch64 can't read the guest's counter and timer. |
-| `Failed to open Pylon shared memory file` (and others about the file) | The `shm` path can't be created, opened, resized or mapped. |
+| `Failed to create Pylon shared memory file` (and others about the file) | The `memfd` can't be created, resized, sealed or mapped. |
 
 Registration failures aren't errors: the VM boots and the VMM logs a
 warning ([Troubleshooting](../operator-guide/troubleshooting.md)).
@@ -41,5 +47,5 @@ warning ([Troubleshooting](../operator-guide/troubleshooting.md)).
 
 ```text
 --cpus boot=8 \
---pylon shm=/dev/shm/vm17-pylon,socket=/run/pylon/pylond.sock,vm_id=17,initial_active_vcpus=2,min_cores=1,max_cores=6,priority_weight=150
+--pylon socket=/run/pylon/pylond.sock,vm_id=17,initial_active_vcpus=2,min_cores=1,max_cores=6,priority_weight=150
 ```

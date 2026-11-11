@@ -131,7 +131,7 @@ starts ([Running a Pylon VM](../user-guide/pylon-vms.md#what-happens-at-boot)).
 Run `pylond` as root. Attaching `scx_pylon` needs at least `CAP_BPF`
 and `CAP_SYS_ADMIN`, and creating the socket under `/run` needs write
 access there. It reads each
-VM's shared page through the file descriptor the VMM sends, so it
-doesn't need access to `/dev/shm` paths itself.
+VM's shared page through the `memfd` the VMM sends, so it needs no
+access to files of its own for it.
 <!-- TODO(verify): run pylond under a capability-limited unit and confirm
 the minimum capability set. -->

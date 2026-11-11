@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::fs::{File, OpenOptions};
+use std::ffi::CString;
+use std::fs::File;
 use std::io::Read;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
@@ -13,7 +14,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::{fmt, fs, io, mem, ptr, result};
+use std::{fmt, io, mem, ptr, result};
 
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{MsrEntry, msr_index};
@@ -77,9 +78,11 @@ pub enum Error {
     #[error("--pylon park=kvm needs KVM; use park=vmm")]
     ParkInKvmNeedsKvm,
 
-    /// Missing required `shm` parameter in `--pylon`.
-    #[error("Error parsing --pylon: shm path missing")]
-    MissingShmPath,
+    /// `shm` in `--pylon`, which was removed.
+    #[error(
+        "Error parsing --pylon: shm was removed; the VMM keeps the shared page in a memfd, so drop shm=<path>"
+    )]
+    ShmOptionRemoved,
 
     /// `--pylon` on a hypervisor backend that can't read the guest's counter and timer.
     #[error("--pylon is not supported on MSHV on aarch64")]
@@ -97,13 +100,17 @@ pub enum Error {
     #[error("Invalid Pylon vCPU index {0}")]
     InvalidVcpuId(u32),
 
-    /// Failed to create or open the `/dev/shm/<vm-id>-pylon` shared memory file.
-    #[error("Failed to open Pylon shared memory file")]
+    /// Failed to create the shared memory `memfd`, or to duplicate its file descriptor.
+    #[error("Failed to create Pylon shared memory file")]
     ShmOpen(#[source] io::Error),
 
-    /// Failed to set the length of the shared memory file to 8,192 bytes.
+    /// Failed to set the length of the shared memory file.
     #[error("Failed to resize Pylon shared memory file")]
     ShmSetLen(#[source] io::Error),
+
+    /// Failed to seal the shared memory file's size.
+    #[error("Failed to seal Pylon shared memory file")]
+    ShmSeal(#[source] io::Error),
 
     /// Failed to `mmap` the Pylon shared memory page into VMM address space.
     #[error("Failed to mmap Pylon shared memory page")]
@@ -197,8 +204,6 @@ impl fmt::Display for PylonPark {
 /// Configuration for the Pylon microsecond core arbitration subsystem (`--pylon`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PylonConfig {
-    /// Path to the 8,192-byte shared memory backing file (e.g., `/dev/shm/<vm-id>-pylon`).
-    pub shm: PathBuf,
     /// Optional path to the `pylond` control plane Unix socket (e.g., `/run/pylon/pylond.sock`).
     pub socket: Option<PathBuf>,
     /// Guest Physical Address where the shared page is mapped (defaults to `0xFEDF_0000`).
@@ -219,7 +224,7 @@ pub struct PylonConfig {
 
 impl PylonConfig {
     pub const SYNTAX: &'static str = "Pylon elastic core arbitration parameters \
-        \"shm=<shm_path>[,socket=<pylond_sock_path>,gpa=<hex_or_dec_gpa>,\
+        \"[socket=<pylond_sock_path>,gpa=<hex_or_dec_gpa>,\
         initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>,\
         park=kvm|vmm]\"";
 
@@ -238,11 +243,11 @@ impl PylonConfig {
             .add("park");
         parser.parse(pylon).map_err(Error::OptionParse)?;
 
-        let shm_str = parser.get("shm").ok_or(Error::MissingShmPath)?;
-        if shm_str.trim().is_empty() {
-            return Err(Error::MissingShmPath);
+        // Taken only to say why it is refused: a file at a path could be opened, replaced or
+        // truncated by other local users.
+        if parser.is_set("shm") {
+            return Err(Error::ShmOptionRemoved);
         }
-        let shm = PathBuf::from(shm_str);
 
         let socket = parser
             .get("socket")
@@ -293,7 +298,6 @@ impl PylonConfig {
             .unwrap_or_else(PylonPark::host_default);
 
         Ok(PylonConfig {
-            shm,
             socket,
             gpa,
             initial_active_vcpus,
@@ -458,24 +462,7 @@ impl PylonVmmState {
             return Err(Error::InvalidVcpuCount(num_vcpus));
         }
 
-        if let Some(parent) = config.shm.parent()
-            && !parent.as_os_str().is_empty()
-            && !parent.exists()
-        {
-            fs::create_dir_all(parent).map_err(Error::ShmOpen)?;
-        }
-
-        let shm_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&config.shm)
-            .map_err(Error::ShmOpen)?;
-
-        shm_file
-            .set_len(PYLON_SHM_FILE_SIZE as u64)
-            .map_err(Error::ShmSetLen)?;
+        let shm_file = create_shm_memfd(config.vm_id)?;
 
         // SAFETY: Mapping a valid file descriptor of `PYLON_SHM_FILE_SIZE` bytes with `MAP_SHARED`
         // into process memory.
@@ -636,8 +623,8 @@ impl PylonVmmState {
         Ok(())
     }
 
-    /// Maps the 8,192-byte `/dev/shm/<vm-id>-pylon` backing file into guest physical memory
-    /// at `self.config.gpa` (`0xFEDF_0000` by default) with `MAP_SHARED`.
+    /// Maps the 8,192-byte shared page, the start of the shared memory `memfd`, into guest
+    /// physical memory at `self.config.gpa` (`0xFEDF_0000` by default) with `MAP_SHARED`.
     ///
     /// The page gets its own hypervisor memory slot but stays out of `GuestMemory`, like a
     /// device BAR: anything built from guest RAM (E820, PVH memmap, ACPI, hotplug layout)
@@ -683,8 +670,8 @@ impl PylonVmmState {
         }
 
         info!(
-            "Pylon: mapped 8192B shared memory page {:?} at GPA {:#x} (slot {})",
-            self.config.shm, self.config.gpa, slot
+            "Pylon: mapped 8192B shared memory page at GPA {:#x} (slot {})",
+            self.config.gpa, slot
         );
 
         Ok(region)
@@ -1263,6 +1250,37 @@ fn check_park(park: PylonPark, hypervisor_type: HypervisorType) -> result::Resul
     Ok(())
 }
 
+/// Creates the shared memory file: a `memfd`, `PYLON_SHM_FILE_SIZE` bytes long, sealed so its
+/// size never changes. It has no path another user could open, replace or truncate, and
+/// `pylond` refuses a file whose size isn't sealed: shrinking it would make every process
+/// that maps it fault.
+fn create_shm_memfd(vm_id: u64) -> result::Result<File, Error> {
+    let name =
+        CString::new(format!("pylon-vm{vm_id}")).map_err(|err| Error::ShmOpen(err.into()))?;
+    // SAFETY: `name` is a valid NUL-terminated string, and the flags are valid.
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(Error::ShmOpen(io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` is a new file descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(PYLON_SHM_FILE_SIZE as u64)
+        .map_err(Error::ShmSetLen)?;
+    // SAFETY: `F_ADD_SEALS` takes an integer of seal flags on a valid file descriptor.
+    let ret = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+        )
+    };
+    if ret < 0 {
+        return Err(Error::ShmSeal(io::Error::last_os_error()));
+    }
+    Ok(file)
+}
+
 /// Initializes and installs the process-global `PylonVmmState`.
 pub fn configure_global(
     config: &PylonConfig,
@@ -1383,8 +1401,7 @@ mod tests {
 
     #[test]
     fn test_pylon_config_parse_valid_and_defaults() {
-        let cfg = PylonConfig::parse("shm=/dev/shm/vm1-pylon").unwrap();
-        assert_eq!(cfg.shm, PathBuf::from("/dev/shm/vm1-pylon"));
+        let cfg = PylonConfig::parse("").unwrap();
         assert_eq!(cfg.socket, None);
         assert_eq!(cfg.gpa, PYLON_DEFAULT_GPA);
         assert_eq!(cfg.initial_active_vcpus, None);
@@ -1395,11 +1412,10 @@ mod tests {
         assert_eq!(cfg.park, PylonPark::host_default());
 
         let full = PylonConfig::parse(
-            "shm=/dev/shm/vm42-pylon,socket=/run/pylon/pylond.sock,gpa=0xfedf0000,\
+            "socket=/run/pylon/pylond.sock,gpa=0xfedf0000,\
              initial_active_vcpus=2,min_cores=1,max_cores=8,priority_weight=250,vm_id=42,park=vmm",
         )
         .unwrap();
-        assert_eq!(full.shm, PathBuf::from("/dev/shm/vm42-pylon"));
         assert_eq!(full.socket, Some(PathBuf::from("/run/pylon/pylond.sock")));
         assert_eq!(full.gpa, 0xFEDF_0000);
         assert_eq!(full.initial_active_vcpus, Some(2));
@@ -1408,7 +1424,7 @@ mod tests {
         assert_eq!(full.priority_weight, 250);
         assert_eq!(full.vm_id, 42);
         assert_eq!(full.park, PylonPark::Vmm);
-        let kvm = PylonConfig::parse("shm=/dev/shm/vm1-pylon,park=kvm").unwrap();
+        let kvm = PylonConfig::parse("park=kvm").unwrap();
         assert_eq!(kvm.park, PylonPark::Kvm);
     }
 
@@ -1439,51 +1455,46 @@ mod tests {
 
     #[test]
     fn test_pylon_config_parse_errors() {
-        // Missing shm
+        // The removed shm option
         assert!(matches!(
-            PylonConfig::parse("socket=/run/pylon/pylond.sock"),
-            Err(Error::MissingShmPath)
-        ));
-        // Empty shm
-        assert!(matches!(
-            PylonConfig::parse("shm="),
-            Err(Error::MissingShmPath)
+            PylonConfig::parse("shm=/dev/shm/vm1-pylon,socket=/run/pylon/pylond.sock"),
+            Err(Error::ShmOptionRemoved)
         ));
         // Invalid hex GPA
         assert!(matches!(
-            PylonConfig::parse("shm=/dev/shm/test-pylon,gpa=0xnothex"),
+            PylonConfig::parse("gpa=0xnothex"),
             Err(Error::InvalidGpa(_))
         ));
         // Unaligned GPA
         assert!(matches!(
-            PylonConfig::parse("shm=/dev/shm/test-pylon,gpa=0xfedf0123"),
+            PylonConfig::parse("gpa=0xfedf0123"),
             Err(Error::InvalidGpa(_))
         ));
         // Unknown option
         assert!(matches!(
-            PylonConfig::parse("shm=/dev/shm/test-pylon,unknown_key=1"),
+            PylonConfig::parse("unknown_key=1"),
             Err(Error::OptionParse(_))
         ));
         // Unknown park mode
         assert!(matches!(
-            PylonConfig::parse("shm=/dev/shm/test-pylon,park=host"),
+            PylonConfig::parse("park=host"),
             Err(Error::OptionParse(_))
         ));
     }
 
     #[test]
     fn test_pylon_vmm_state_shared_page_init() {
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-init-pylon");
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,vm_id=77,initial_active_vcpus=2",
-            shm_path.display()
-        ))
-        .unwrap();
+        let cfg = PylonConfig::parse("park=vmm,vm_id=77,initial_active_vcpus=2").unwrap();
 
         let state = PylonVmmState::new(&cfg, 2, 4).unwrap();
-        let file_meta = fs::metadata(&shm_path).unwrap();
+        let file_meta = state.shm_file.metadata().unwrap();
         assert_eq!(file_meta.len(), PYLON_SHM_FILE_SIZE as u64);
+        // SAFETY: `F_GET_SEALS` only reads the seals of a valid file descriptor.
+        let seals = unsafe { libc::fcntl(state.shm_file.as_raw_fd(), libc::F_GET_SEALS) };
+        assert_eq!(
+            seals,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
+        );
         assert!(state.host_page().header.is_valid());
 
         let page = state.shared_page();
@@ -1510,13 +1521,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_thread_start_tid_and_boot_tag() {
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-tid-pylon");
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,initial_active_vcpus=1",
-            shm_path.display()
-        ))
-        .unwrap();
+        let cfg = PylonConfig::parse("park=vmm,initial_active_vcpus=1").unwrap();
 
         let state = PylonVmmState::new(&cfg, 1, 2).unwrap();
 
@@ -1551,13 +1556,7 @@ mod tests {
     /// forced park. Until then the vCPU is left alone.
     #[test]
     fn test_boot_park_waits_for_the_request_and_isn_t_a_yield() {
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-boot-park-pylon");
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,initial_active_vcpus=1",
-            shm_path.display()
-        ))
-        .unwrap();
+        let cfg = PylonConfig::parse("park=vmm,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         state.on_vcpu_thread_start(1, || None);
         let slot1 = state.vcpu_slot(1).unwrap();
@@ -1654,9 +1653,8 @@ mod tests {
         (parked, timer)
     }
 
-    fn running_vcpu0_state(dir: &TempDir) -> Arc<PylonVmmState> {
-        let shm_path = dir.path().join("vm-park-pylon");
-        let cfg = PylonConfig::parse(&format!("shm={},park=vmm", shm_path.display())).unwrap();
+    fn running_vcpu0_state() -> Arc<PylonVmmState> {
+        let cfg = PylonConfig::parse("park=vmm").unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         state.on_vcpu_thread_start(0, || None);
         assert_eq!(
@@ -1668,11 +1666,10 @@ mod tests {
 
     /// Like `running_vcpu0_state`, with vCPUs parking inside KVM. vCPU 0 is the calling
     /// thread, which receives its park bound's `SIGRTMIN`, as `vmm/src/cpu.rs` does.
-    fn running_vcpu0_state_parking_in_kvm(dir: &TempDir) -> Arc<PylonVmmState> {
+    fn running_vcpu0_state_parking_in_kvm() -> Arc<PylonVmmState> {
         extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
         register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
-        let shm_path = dir.path().join("vm-park-kvm-pylon");
-        let mut cfg = PylonConfig::parse(&format!("shm={},park=vmm", shm_path.display())).unwrap();
+        let mut cfg = PylonConfig::parse("park=vmm").unwrap();
         cfg.park = PylonPark::Kvm;
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         state.on_vcpu_thread_start(0, || None);
@@ -1681,8 +1678,7 @@ mod tests {
 
     #[test]
     fn test_park_in_kvm_halts_and_runs_again_only_when_woken() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let state = running_vcpu0_state_parking_in_kvm();
         let slot0 = state.vcpu_slot(0).unwrap();
         let mut ops = Vec::new();
 
@@ -1731,8 +1727,7 @@ mod tests {
 
     #[test]
     fn test_park_in_kvm_runs_without_a_core_once_its_bound_passes() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let state = running_vcpu0_state_parking_in_kvm();
         let slot0 = state.vcpu_slot(0).unwrap();
         let mut ops = Vec::new();
         let exit = |ops: &mut Vec<KvmParkOp>| {
@@ -1780,8 +1775,7 @@ mod tests {
 
     #[test]
     fn test_park_in_kvm_guest_park_request_after_forced_park_leaves_vcpu_parked() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let state = running_vcpu0_state_parking_in_kvm();
         let slot0 = state.vcpu_slot(0).unwrap();
         request_park(&state, 0, 0);
         assert!(state.check_and_park_vcpu(0, || None, |_| true));
@@ -1803,8 +1797,7 @@ mod tests {
 
     #[test]
     fn test_park_in_kvm_boot_park_has_no_bound() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let state = running_vcpu0_state_parking_in_kvm();
         let slot0 = state.vcpu_slot(0).unwrap();
         state
             .host_slot(0)
@@ -1832,8 +1825,7 @@ mod tests {
 
     #[test]
     fn test_park_in_kvm_waits_while_interrupts_are_off_or_halting_fails() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state_parking_in_kvm(&dir);
+        let state = running_vcpu0_state_parking_in_kvm();
         let slot0 = state.vcpu_slot(0).unwrap();
         request_park(&state, 0, 0);
 
@@ -1847,8 +1839,7 @@ mod tests {
 
     #[test]
     fn test_revoke_within_grace_period_does_not_park() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state(&dir);
+        let state = running_vcpu0_state();
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // Without a revocation or a request from the guest, nothing happens.
@@ -1865,8 +1856,7 @@ mod tests {
 
     #[test]
     fn test_cooperative_park_and_wake() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state(&dir);
+        let state = running_vcpu0_state();
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // The guest agrees to a pending revocation by writing VCPU_STATE_PARKING.
@@ -1886,8 +1876,7 @@ mod tests {
 
     #[test]
     fn test_forced_park_after_deadline() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state(&dir);
+        let state = running_vcpu0_state();
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // A deadline of 0 has always passed.
@@ -1903,8 +1892,7 @@ mod tests {
     /// `PARKED` it writes isn't published to `pylond`.
     #[test]
     fn test_forced_park_ignores_the_guest_copy_of_the_revocation() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state(&dir);
+        let state = running_vcpu0_state();
         let slot0 = state.vcpu_slot(0).unwrap();
         let host0 = state.host_slot(0).unwrap();
 
@@ -1924,8 +1912,7 @@ mod tests {
 
     #[test]
     fn test_park_publishes_guest_timer_in_host_tsc() {
-        let dir = TempDir::new().unwrap();
-        let state = running_vcpu0_state(&dir);
+        let state = running_vcpu0_state();
         let slot0 = state.vcpu_slot(0).unwrap();
 
         // Without a measured offset, a guest timer can't be placed on the host's clock.
@@ -2026,7 +2013,6 @@ mod tests {
     #[test]
     fn test_daemon_socket_registration_scm_rights() {
         let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-sock-pylon");
         let sock_path = dir.path().join("pylond.sock");
 
         let server = serve_one_registration(
@@ -2035,8 +2021,7 @@ mod tests {
         );
 
         let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,socket={},vm_id=99,min_cores=1,max_cores=2,priority_weight=150",
-            shm_path.display(),
+            "park=vmm,socket={},vm_id=99,min_cores=1,max_cores=2,priority_weight=150",
             sock_path.display()
         ))
         .unwrap();
@@ -2067,15 +2052,13 @@ mod tests {
     #[test]
     fn test_daemon_rejection_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-reject-pylon");
         let sock_path = dir.path().join("pylond.sock");
 
         let server = serve_one_registration(
             UnixListener::bind(&sock_path).unwrap(),
             br#"{"accepted":false,"message":"needs scx_pylon"}"#,
         );
-        let cfg =
-            PylonConfig::parse(&format!("shm={},park=kvm,vm_id=98", shm_path.display())).unwrap();
+        let cfg = PylonConfig::parse("park=kvm,vm_id=98").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
 
         let err = state.register_with_daemon(&sock_path).unwrap_err();
@@ -2091,13 +2074,8 @@ mod tests {
     fn test_real_kvm_vcpu_counter_offset_and_idle_timer() {
         use hypervisor::HypervisorVmConfig;
 
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-kvm-counter-pylon");
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,gpa=0x8000,vm_id=44,initial_active_vcpus=1",
-            shm_path.display()
-        ))
-        .unwrap();
+        let cfg =
+            PylonConfig::parse("park=vmm,gpa=0x8000,vm_id=44,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
 
         let Ok(hv) = hypervisor::new() else {
@@ -2140,13 +2118,8 @@ mod tests {
 
         extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-kvm-forced-pylon");
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,gpa=0x8000,vm_id=43,initial_active_vcpus=1",
-            shm_path.display()
-        ))
-        .unwrap();
+        let cfg =
+            PylonConfig::parse("park=vmm,gpa=0x8000,vm_id=43,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
 
         let Ok(hv) = hypervisor::new() else {
@@ -2281,7 +2254,6 @@ mod tests {
         thread: thread::JoinHandle<()>,
         tid: libc::pid_t,
         _pylon_region: Arc<GuestRegion>,
-        _dir: TempDir,
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -2297,11 +2269,8 @@ mod tests {
             extern "C" fn handle_signal(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
             let hv = hypervisor::new().ok()?;
-            let dir = TempDir::new().unwrap();
-            let shm_path = dir.path().join(format!("vm-kvm-spin-{vm_id}-pylon"));
             let cfg = PylonConfig::parse(&format!(
-                "shm={},park=vmm,gpa=0x8000,vm_id={vm_id},initial_active_vcpus=1",
-                shm_path.display()
+                "park=vmm,gpa=0x8000,vm_id={vm_id},initial_active_vcpus=1",
             ))
             .unwrap();
             let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
@@ -2384,7 +2353,6 @@ mod tests {
                 thread,
                 tid,
                 _pylon_region: pylon_region,
-                _dir: dir,
             })
         }
 
@@ -2547,14 +2515,9 @@ mod tests {
 
         use crate::GuestMemory;
 
-        let dir = TempDir::new().unwrap();
-        let shm_path = dir.path().join("vm-kvm-e2e-pylon");
         // Map Pylon shared page at GPA 0x8000 so 16-bit real-mode guest code can address it directly.
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm,gpa=0x8000,vm_id=42,initial_active_vcpus=1",
-            shm_path.display()
-        ))
-        .unwrap();
+        let cfg =
+            PylonConfig::parse("park=vmm,gpa=0x8000,vm_id=42,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
 
         let Ok(hv) = hypervisor::new() else {

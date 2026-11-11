@@ -64,8 +64,13 @@ All VMM-side logic must be encapsulated inside `vmm/src/pylon.rs` with minimal h
 Add an optional `--pylon` configuration parameter to `VmParams` and `VmConfig`:
 
 ```text
---pylon shm=/dev/shm/<vm-id>-pylon[,socket=/run/pylon/pylond.sock,gpa=0xfedf0000]
+--pylon [socket=/run/pylon/pylond.sock,gpa=0xfedf0000]
 ```
+
+The VMM keeps the shared page and the host page in a `memfd` it creates (`MFD_ALLOW_SEALING`),
+16,384 bytes long and sealed with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`. It has no path that
+another user could pre-create, follow or truncate. The `shm=<path>` key of earlier versions is
+refused.
 
 ### Memory Manager Hook (`vmm/src/memory_manager.rs`)
 During guest memory initialization (`MemoryManager::new`):

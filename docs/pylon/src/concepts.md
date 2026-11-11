@@ -18,8 +18,8 @@ uses for them.
 **Managed CPUs** are the host CPUs listed in `pylond --cores`. Only these
 are given to VMs. `pylond` itself runs on host cores 0 and 1.
 
-**Shared page.** An 8 KiB memory region per VM, backed by a file such as
-`/dev/shm/vm1-pylon`. It's mapped into the VMM, into `pylond`, and into
+**Shared page.** An 8 KiB memory region per VM, backed by a `memfd` the
+VMM creates. It's mapped into the VMM, into `pylond`, and into
 the guest at a fixed guest-physical address (`0xFEDF_0000` by default).
 It holds a header, guest telemetry, and one 64-byte slot per vCPU. The
 same file holds a host page after it, which the guest doesn't see: the

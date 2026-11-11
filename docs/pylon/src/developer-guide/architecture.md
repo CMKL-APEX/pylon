@@ -12,7 +12,7 @@ see [The arbitration engine](arbitration.md).
  cloud-hypervisor --pylon (per VM)          pylond (per host)
  +------------------------------+           +----------------------------+
  | PylonVmmState                |  socket + | Plane 1 (core 0)           |
- |   shm file          ---------+--SCM_RIGHTS->  registrations, policy, |
+ |   shm memfd         ---------+--SCM_RIGHTS->  registrations, policy, |
  |   kick eventfd x N  ---------+---------->|  stats, metrics            |
  |   wake eventfd x N  ---------+---------->|    | publishes VM list     |
  |                              |           |    v (ArcSwap)            |
@@ -50,9 +50,9 @@ Policy changes are the one exception: Plane 1 writes them straight into
 
 ## Flow: registering a VM
 
-1. **VMM, while parsing options.** `PylonVmmState::new` creates (or
-   opens) the `shm` file, sets it to 16,384 bytes (the shared page, then
-   the host page), maps it, zeroes it, writes both headers, and creates a kick and a wake `eventfd` for each
+1. **VMM, while parsing options.** `PylonVmmState::new` creates a
+   `memfd` of 16,384 bytes (the shared page, then the host page), seals
+   its size (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`), maps it, zeroes it, writes both headers, and creates a kick and a wake `eventfd` for each
    vCPU slot.
 2. **VMM → Plane 1, at memory setup.** `setup_memory_region` maps the
    same file into guest-physical memory at `gpa` as a shared memory

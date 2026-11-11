@@ -66,7 +66,7 @@ as "no core on its way".
 ### Memory: `setup_memory_region`
 
 Called from `MemoryManager::new` in `vmm/src/memory_manager.rs`. It
-wraps a clone of the `shm` file descriptor in a guest region at `gpa`
+wraps a clone of the shared memory `memfd` in a guest region at `gpa`
 and registers it with the hypervisor as a new memory slot
 (`MemoryVisibility::Shared`). It doesn't add the region to the guest's
 memory map, like a device BAR

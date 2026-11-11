@@ -5,9 +5,9 @@
 
 ### Plane 1: Control Thread (Pinned to Host Core 0)
 - Runs an asynchronous Tokio runtime listening on a Unix domain socket (`/run/pylon/pylond.sock`).
-- **VM Registration API:** When a `cloud-hypervisor` process boots with `--pylon shm=/dev/shm/<vm-id>-pylon,socket=/run/pylon/pylond.sock`, it connects to `pylond` and passes:
+- **VM Registration API:** When a `cloud-hypervisor` process boots with `--pylon socket=/run/pylon/pylond.sock`, it connects to `pylond` and passes:
   - The VM metadata (`vm_id`, `num_vcpus`, `min_cores`, `max_cores`, `priority_weight`).
-  - File descriptors via `SCM_RIGHTS`: the `memfd`/shared-memory file descriptor and the per-vCPU KVM `irqfd` (for injecting revocation IPIs) and wake `eventfd`s.
+  - File descriptors via `SCM_RIGHTS`: the shared memory `memfd`, sealed against resizing (spec 03), and the per-vCPU KVM `irqfd` (for injecting revocation IPIs) and wake `eventfd`s.
 - **Lockless Publication:** Plane 1 `mmap`s the `PylonSharedPage`, constructs a `VmHandle`, and publishes a new immutable `Arc<Vec<VmHandle>>` snapshot to Plane 2 via `arc_swap::ArcSwap`.
 
 ### Plane 2: Real-Time Matrix Engine (Pinned to Host Core 1, `nohz_full`)

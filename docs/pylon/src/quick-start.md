@@ -57,7 +57,7 @@ Add `--pylon` to an ordinary Cloud Hypervisor command line:
     --cpus boot=8 \
     --memory size=2G \
     --serial tty --console off \
-    --pylon shm=/dev/shm/vm1-pylon,socket=/run/pylon/pylond.sock,vm_id=1,initial_active_vcpus=2,min_cores=1,max_cores=8
+    --pylon socket=/run/pylon/pylond.sock,vm_id=1,initial_active_vcpus=2,min_cores=1,max_cores=8
 ```
 
 The VM boots with eight vCPUs, and the guest brings all eight online.

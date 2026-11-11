@@ -585,7 +585,6 @@ mod tests {
     #[test]
     fn kicks_reach_kvm_once_the_guest_enables_the_vector() {
         use hypervisor::HypervisorVmConfig;
-        use tempfile::TempDir;
 
         use crate::interrupt::MsiInterruptManager;
         use crate::pylon::PylonConfig;
@@ -610,12 +609,7 @@ mod tests {
         ));
         let manager = MsiInterruptManager::new(allocator, Arc::clone(&vm));
 
-        let dir = TempDir::new().unwrap();
-        let cfg = PylonConfig::parse(&format!(
-            "shm={},park=vmm",
-            dir.path().join("kick-pylon").display()
-        ))
-        .unwrap();
+        let cfg = PylonConfig::parse("park=vmm").unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
         let mut device = PylonKickDevice::create(
             "kick".to_string(),

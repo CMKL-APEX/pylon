@@ -8,14 +8,14 @@ happens when the VM starts and stops. Every key is listed in
 ## The option
 
 ```text
---pylon shm=<path>[,socket=<path>,gpa=<addr>,initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>]
+--pylon [socket=<path>,gpa=<addr>,initial_active_vcpus=<n>,min_cores=<n>,max_cores=<n>,priority_weight=<n>,vm_id=<id>]
 ```
 
-Only `shm` is required. A typical VM on a host running `pylond`:
+Every key is optional. A typical VM on a host running `pylond`:
 
 ```text
 --cpus boot=8 \
---pylon shm=/dev/shm/web1-pylon,socket=/run/pylon/pylond.sock,vm_id=17,initial_active_vcpus=2,min_cores=1,max_cores=8,priority_weight=200
+--pylon socket=/run/pylon/pylond.sock,vm_id=17,initial_active_vcpus=2,min_cores=1,max_cores=8,priority_weight=200
 ```
 
 ## Choosing the numbers
@@ -53,9 +53,9 @@ the host.** It defaults to `1`. While a VM's VMM runs, `pylond`
 rejects any other VM that registers with the same id, and logs it. The
 rejected VM boots, but `pylond` never manages it.
 
-**`shm`** is the file backing the VM's shared page. Use a path under
-`/dev/shm`, one per VM. The VMM creates the file if it doesn't exist
-and zeroes it at start.
+The VMM keeps the VM's shared page in a sealed `memfd` with no path.
+Earlier versions took a file path as `shm=<path>`; remove it from old
+command lines, which the VMM now refuses.
 
 **`gpa`** is where the guest finds the page (default `0xFEDF_0000`). It
 must be 4 KiB-aligned. Change it only together with the guest side,
@@ -114,4 +114,3 @@ CPUs the VM held. The VM's `vm_id` is then free for its next start.
   its `pylon-kick` device fails the snapshot.
 - **vCPU hotplug** (`ch-remote resize`). It isn't coordinated with
   Pylon.
-- **Two VMs on one `shm` path.** Each would zero the other's page.
