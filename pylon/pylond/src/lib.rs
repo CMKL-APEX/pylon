@@ -1345,6 +1345,21 @@ mod tests {
         MatrixEngine, calibrate_tsc_khz, detect_timed_wait, pause_cycles, read_tsc,
     };
 
+    /// Counter rate of the test VMs' pages and engines: tick values in the tests assume it, and
+    /// the engine's own default is the host's rate, which differs on aarch64.
+    const TEST_TSC_KHZ: u64 = 3_000_000;
+
+    /// An engine that uses [`TEST_TSC_KHZ`] for every VM.
+    fn test_engine(
+        snapshot: Arc<VmSnapshot>,
+        pcpu_owners: Arc<PcpuOwnerTable>,
+        tenant_pcpus: &[usize],
+    ) -> MatrixEngine {
+        let mut engine = MatrixEngine::new(snapshot, pcpu_owners, tenant_pcpus);
+        engine.set_host_tsc_khz(TEST_TSC_KHZ);
+        engine
+    }
+
     pub(crate) struct TestVmRig {
         pub(crate) req: VmRegistrationRequest,
         pub(crate) shm_fd: OwnedFd,
@@ -1405,7 +1420,7 @@ mod tests {
             kick_signal: None,
             wake_by_signal: false,
         };
-        let shm_fd = create_memfd_shared_page(vm_id, num_vcpus, 3_000_000);
+        let shm_fd = create_memfd_shared_page(vm_id, num_vcpus, TEST_TSC_KHZ);
         let mut kick_fds = Vec::with_capacity(num_vcpus as usize);
         let mut wake_fds = Vec::with_capacity(num_vcpus as usize);
         let mut handle_kick_fds = Vec::with_capacity(num_vcpus as usize);
@@ -1541,8 +1556,7 @@ mod tests {
     fn test_plane2_phase1_zero_core_wakeup_and_stranded_work_tzcnt() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine =
-            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
 
         let vm_timer = build_test_vm(1, 4, 0, 4, 1);
         let vm_rx = build_test_vm(2, 4, 0, 4, 1);
@@ -1629,7 +1643,7 @@ mod tests {
     fn test_plane2_min_cores_is_a_floor_under_demand_only() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(
+        let mut engine = test_engine(
             Arc::clone(&snapshot),
             Arc::clone(&pcpu_owners),
             &[2, 3, 4, 5],
@@ -1670,7 +1684,7 @@ mod tests {
     fn test_plane2_zero_core_wakeup_takes_a_floor_core_at_a_limited_rate() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4]);
 
         // The donor holds its only core, which is also its `min_cores`.
         let donor = build_test_vm(10, 1, 1, 1, 1);
@@ -1724,7 +1738,7 @@ mod tests {
     fn test_plane2_park_timer_wakes_zero_core_vm_on_due_vcpu() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
 
         // An idle VM whose vCPUs 1 and 3 parked with guest timers armed, published by the VMM
         // in host TSC: vCPU 3's is due first.
@@ -1762,7 +1776,7 @@ mod tests {
     fn test_plane2_park_timer_does_not_wake_vm_parked_in_kvm() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
 
         let mut vm = build_test_vm(1, 4, 0, 4, 1);
         vm.req.wake_by_signal = true;
@@ -1804,7 +1818,7 @@ mod tests {
     fn test_plane2_head_wait_uses_guest_tsc_offset() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[2]);
 
         // Two VMs each want one core and there is one. VM 1 has been waiting since host TSC
         // 900,000; VM 2 since host TSC 100, but its guest TSC runs 10,000,000 cycles ahead of
@@ -1837,8 +1851,7 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         // Manage 2 physical cores: pCPU 4 and pCPU 5.
-        let mut engine =
-            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4, 5]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4, 5]);
 
         let donor = build_test_vm(10, 2, 1, 2, 1);
         let recipient = build_test_vm(20, 2, 1, 2, 10);
@@ -2078,7 +2091,7 @@ mod tests {
     fn test_plane2_waking_vcpu_is_not_taken_for_a_parked_donor() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
 
         let donor = build_test_vm(60, 1, 0, 1, 1);
         let recipient = build_test_vm(70, 1, 0, 1, 100);
@@ -2150,7 +2163,7 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let cores = [20, 21, 22, 23];
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &cores);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &cores);
         let a = build_test_vm(80, 4, 1, 4, weight_a);
         let b = build_test_vm(90, 4, 1, 4, weight_b);
         ControlPlane::publish_vm_handle(&snapshot, a.handle.clone());
@@ -2511,7 +2524,7 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6])
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6])
             .with_vm_vcpus(Arc::clone(&vm_vcpus));
 
         // VM 70 parks inside KVM; VM 71 parks in the VMM. All their vCPUs start PARKED.
@@ -2593,7 +2606,7 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6])
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6])
             .with_vm_vcpus(Arc::clone(&vm_vcpus));
 
         let mut rig = build_test_vm(80, 4, 0, 4, 1);
@@ -2638,9 +2651,8 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
-        let mut engine =
-            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
-                .with_vm_vcpus(Arc::clone(&vm_vcpus));
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
+            .with_vm_vcpus(Arc::clone(&vm_vcpus));
 
         // A busy donor that always wants both cores.
         let donor = build_test_vm(60, 2, 0, 2, 1);
@@ -2743,9 +2755,8 @@ mod tests {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
-        let mut engine =
-            MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
-                .with_vm_vcpus(Arc::clone(&vm_vcpus));
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
+            .with_vm_vcpus(Arc::clone(&vm_vcpus));
 
         // The guest reports no runnable threads after the first core, so only wakes show
         // demand.
@@ -2816,7 +2827,7 @@ mod tests {
 
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
 
         let mut vm = build_test_vm(60, 1, 0, 1, 1);
         vm.req.kick_signal = Some(kick_signal);
@@ -2900,7 +2911,7 @@ mod tests {
 
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
 
         let mut donor = build_test_vm(30, 1, 0, 1, 1);
         donor.req.kick_signal = Some(kick_signal);
@@ -3115,7 +3126,7 @@ mod tests {
         ControlPlane::publish_vm_handle(&snapshot, exited);
         ControlPlane::publish_vm_handle(&snapshot, unknown);
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
-        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
         engine.set_core_state(7, CoreState::Assigned { vm_id: 90, vcpu: 0 });
         pcpu_owners.write_owner(7, 90_001, 0);
 
