@@ -68,6 +68,14 @@ files:
 or later, `libelf`, `zlib` and `zstd` (on Ubuntu, `libelf1t64`,
 `zlib1g` and `libzstd1`). On other hosts, build from source.
 
+Every file has a build provenance attestation, which shows that the
+release workflow built it from the tagged source. Check a file before
+installing it:
+
+```bash
+gh attestation verify pylond --repo CMKL-APEX/pylon
+```
+
 ## Build
 
 ```bash
