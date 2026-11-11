@@ -2367,7 +2367,6 @@ mod tests {
 
         /// Requests a revocation whose grace period is over, as `pylond` does.
         fn request_forced_revocation(&self) {
-            let slot0 = self.state.vcpu_slot(0).unwrap();
             request_park(&self.state, 0, 0);
         }
 
