@@ -415,6 +415,9 @@ struct VmHandleInner {
     /// referring to that process, so a reused PID is never signalled.
     vmm_pid: i32,
     vmm_pidfd: Option<OwnedFd>,
+    /// The registering peer's UID from `SO_PEERCRED`, if known. Only that UID, root and
+    /// `pylond`'s own UID may change the VM's policy or read its stats.
+    owner_uid: Option<u32>,
     shm_mmap: MmapMut,
     kick_irqfds: Vec<OwnedFd>,
     wake_eventfds: Vec<OwnedFd>,
@@ -500,6 +503,7 @@ impl VmHandle {
                 wake_by_signal: req.wake_by_signal,
                 vmm_pid: 0,
                 vmm_pidfd: None,
+                owner_uid: None,
                 shm_mmap,
                 kick_irqfds,
                 wake_eventfds,
@@ -673,6 +677,34 @@ impl VmHandle {
         inner.vmm_pid = pid;
         inner.vmm_pidfd = Some(pidfd);
         Ok(self)
+    }
+
+    /// Records the UID of the peer that registered this VM.
+    pub fn with_owner_uid(mut self, uid: u32) -> Result<Self, Error> {
+        let vm_id = self.inner.vm_id;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::InvalidRegistration {
+            vm_id,
+            reason: "VM handle is already shared".to_owned(),
+        })?;
+        inner.owner_uid = Some(uid);
+        Ok(self)
+    }
+
+    /// The UID of the peer that registered this VM, if known.
+    #[inline]
+    pub fn owner_uid(&self) -> Option<u32> {
+        self.inner.owner_uid
+    }
+
+    /// Whether a control socket peer with UID `uid` may change this VM's policy or read its
+    /// stats: root, `pylond`'s own UID, or the UID that registered the VM.
+    pub fn is_managed_by(&self, uid: Option<u32>) -> bool {
+        let Some(uid) = uid else {
+            return false;
+        };
+        // SAFETY: `geteuid` takes no arguments and can't fail.
+        let own_uid = unsafe { libc::geteuid() };
+        uid == 0 || uid == own_uid || self.inner.owner_uid == Some(uid)
     }
 
     /// Whether the VMM process that registered this VM has exited: `Some(true)` or
@@ -1967,6 +1999,43 @@ mod tests {
         assert_eq!(revocations_between_two_hungry_vms(100, 100), 0);
         // Twice the weight is worth a third core.
         assert_eq!(revocations_between_two_hungry_vms(200, 100), 1);
+    }
+
+    #[test]
+    fn test_only_root_pylond_and_the_registering_uid_manage_a_vm() {
+        // SAFETY: `geteuid` takes no arguments and can't fail.
+        let own_uid = unsafe { libc::geteuid() };
+        let owner = own_uid.wrapping_add(1000).max(1);
+        let stranger = own_uid.wrapping_add(2000).max(1);
+
+        let rig = build_test_vm(60, 1, 0, 1, 1);
+        // Without a known owner, only root and `pylond`'s own UID manage the VM.
+        assert!(rig.handle.is_managed_by(Some(0)));
+        assert!(rig.handle.is_managed_by(Some(own_uid)));
+        assert!(!rig.handle.is_managed_by(Some(owner)));
+        assert!(!rig.handle.is_managed_by(None));
+
+        let rig = build_test_vm(61, 1, 0, 1, 1);
+        let handle = VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            rig.kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            rig.wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_owner_uid(owner)
+        .unwrap();
+        assert_eq!(handle.owner_uid(), Some(owner));
+        assert!(handle.is_managed_by(Some(owner)));
+        assert!(handle.is_managed_by(Some(0)));
+        assert!(!handle.is_managed_by(Some(stranger)));
+        assert!(!handle.is_managed_by(None));
     }
 
     #[test]

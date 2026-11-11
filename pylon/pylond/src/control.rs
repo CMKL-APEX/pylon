@@ -259,6 +259,8 @@ async fn handle_client_connection(
     scx_attached: bool,
 ) -> Result<(), Error> {
     let (payload, mut fds) = recv_msg_with_fds_async(&stream).await?;
+    let peer = stream.peer_cred().ok();
+    let peer_uid = peer.map(|cred| cred.uid());
 
     if fds.is_empty() {
         if let Ok(stats_req) = serde_json::from_slice::<VmStatsRequest>(&payload)
@@ -272,6 +274,10 @@ async fn handle_client_connection(
                 if let Some(target_id) = stats_req.vm_id
                     && vm.vm_id() != target_id
                 {
+                    continue;
+                }
+                // Each user sees only the VMs it registered.
+                if !vm.is_managed_by(peer_uid) {
                     continue;
                 }
                 let page = vm.host_page();
@@ -315,7 +321,10 @@ async fn handle_client_connection(
         match serde_json::from_slice::<VmPolicyUpdateRequest>(&payload) {
             Ok(req) => {
                 let snapshot = vm_snapshot.load();
-                let resp = if let Some(vm) = snapshot.iter().find(|v| v.vm_id() == req.vm_id) {
+                let resp = if let Some(vm) = snapshot
+                    .iter()
+                    .find(|v| v.vm_id() == req.vm_id && v.is_managed_by(peer_uid))
+                {
                     match vm.update_policy(req.min_cores, req.max_cores, req.priority_weight) {
                         Ok((min, max, weight)) => {
                             info!(
@@ -341,7 +350,11 @@ async fn handle_client_connection(
                 } else {
                     VmPolicyUpdateResponse {
                         accepted: false,
-                        message: format!("VM {} not found", req.vm_id),
+                        // The same answer for another user's VM, so its existence doesn't leak.
+                        message: format!(
+                            "VM {} not found, or registered by another user",
+                            req.vm_id
+                        ),
                         min_cores: None,
                         max_cores: None,
                         priority_weight: None,
@@ -371,13 +384,15 @@ async fn handle_client_connection(
 
             // `pylond` signals the registering VMM's vCPU threads when a revocation's deadline
             // passes, so bind the VM to the process at the other end of this socket.
-            let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
-            let handle =
-                VmHandle::new(&req, shm_fd, kick_irqfds, wake_eventfds).and_then(|handle| {
-                    match peer_pid {
-                        Some(pid) if pid > 0 => handle.with_vmm_pid(pid),
-                        _ => Ok(handle),
-                    }
+            let peer_pid = peer.and_then(|cred| cred.pid());
+            let handle = VmHandle::new(&req, shm_fd, kick_irqfds, wake_eventfds)
+                .and_then(|handle| match peer_pid {
+                    Some(pid) if pid > 0 => handle.with_vmm_pid(pid),
+                    _ => Ok(handle),
+                })
+                .and_then(|handle| match peer_uid {
+                    Some(uid) => handle.with_owner_uid(uid),
+                    None => Ok(handle),
                 });
             // A `vm_id` stays taken while the VMM that registered it runs: replacing it would
             // leave that VM unmanaged. Plane 1 runs on one thread, and nothing below awaits,

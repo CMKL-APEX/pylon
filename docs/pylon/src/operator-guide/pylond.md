@@ -52,9 +52,17 @@ At start, `pylond` removes any file already at that path and creates
 the socket. `--socket-group` (a group name or GID) and `--socket-mode`
 (octal, such as `660`) set its group and permissions; without them it
 keeps `pylond`'s umask and group, which as root means only root can
-connect. Anyone who can write to the socket can register VMs, change any
-VM's policy and read every VM's stats. Give access only to the users
-your VMMs run as (see the [systemd unit](installation.md#a-systemd-unit-for-pylond)).
+connect.
+
+`pylond` records the UID of the process that registers each VM. A
+VM's policy can be changed, and its stats read, only by that UID, by
+root, and by `pylond`'s own UID; other users see neither. But anyone
+who can write to the socket can register VMs: register under a `vm_id`
+before the VM that should have it starts (that VM is then rejected and
+runs unmanaged), or register VMs that ask for cores. Give access only
+to the users your VMMs run as, through a group of their own rather than
+a shared one such as `kvm` (see the
+[systemd unit](installation.md#a-systemd-unit-for-pylond)).
 
 ## Start order
 

@@ -6,8 +6,11 @@ response**: the client sends one JSON object in a single `sendmsg`,
 optionally with file descriptors attached as `SCM_RIGHTS`, and `pylond`
 replies with one JSON object.
 
-There's no authentication. Anyone who can write to the socket can use
-every message ([Running pylond](../operator-guide/pylond.md#the-control-socket)).
+Anyone who can write to the socket can register a VM. `pylond` records
+the registering peer's UID (`SO_PEERCRED`): stats and policy updates
+cover only the VMs that UID registered, unless the caller is root or
+runs as `pylond`'s own UID, who see and manage every VM
+([Running pylond](../operator-guide/pylond.md#the-control-socket)).
 
 ## Telling messages apart
 
@@ -69,6 +72,7 @@ A registration's `priority_weight` of 0 is stored as 1.
 
 `action` may also be `"metrics"` or `"status"`; they mean the same. With
 `vm_id`, only that VM is listed (an empty list if it isn't registered).
+Only the VMs the caller may manage are listed.
 
 ```json
 {
@@ -116,7 +120,7 @@ Every field except `vm_id` is optional. Missing fields keep their value.
 | Response | When |
 |---|---|
 | `{"accepted": true, "message": "policy updated", "min_cores": 2, "max_cores": 6, "priority_weight": 250}` | Applied. The response gives the resulting values. |
-| `{"accepted": false, "message": "VM 17 not found"}` | No VM with that id. |
+| `{"accepted": false, "message": "VM 17 not found, or registered by another user"}` | No VM with that id, or one the caller may not manage. |
 | `{"accepted": false, "message": "..."}` | The result would have `max_cores` = 0, `min_cores` > `max_cores`, or `max_cores` > `num_vcpus`. |
 
 A `priority_weight` of 0 is stored as 1. Updates take effect in the

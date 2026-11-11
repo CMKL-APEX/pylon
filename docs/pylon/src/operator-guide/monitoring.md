@@ -85,8 +85,10 @@ curl -s http://127.0.0.1:9100/metrics
 ```
 
 It listens on `127.0.0.1` unless you set `--metrics-addr`. The endpoint
-has no authentication. If you bind it to another address, restrict who
-can reach it with a firewall.
+has no authentication and lists every VM, so any local user can read
+every VM's stats from it, unlike the control socket. Turn it on only
+where that's acceptable, and if you bind it to another address, restrict
+who can reach it with a firewall.
 
 A minimal scrape configuration:
 

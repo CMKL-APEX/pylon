@@ -98,8 +98,9 @@ sudo install -m 0755 target/release/pylond /usr/local/bin/
 
 ## A systemd unit for pylond
 
-An example unit. Adjust the CPU list, and the socket group to whatever
-group your VMMs run as:
+An example unit. Adjust the CPU list, and the socket group to a group
+that only the users your VMMs run as belong to. Anyone who can use the
+socket can register VMs ([The control socket](pylond.md#the-control-socket)):
 
 ```ini
 # /etc/systemd/system/pylond.service
@@ -111,8 +112,8 @@ Before=multi-user.target
 Type=simple
 RuntimeDirectory=pylon
 Environment=RUST_LOG=info
-# Let the group the VMMs run as (here: kvm) use the socket.
-ExecStart=/usr/local/bin/pylond --socket /run/pylon/pylond.sock --cores 2-7 --socket-group kvm --socket-mode 660
+# Let only the group the VMMs run as (here: pylon-vmm) use the socket.
+ExecStart=/usr/local/bin/pylond --socket /run/pylon/pylond.sock --cores 2-7 --socket-group pylon-vmm --socket-mode 660
 Restart=on-failure
 
 [Install]
