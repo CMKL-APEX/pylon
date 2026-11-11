@@ -13,7 +13,7 @@
 use std::env::temp_dir;
 use std::fs::{self, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -23,8 +23,8 @@ use std::{io, process};
 use arc_swap::ArcSwap;
 use memmap2::MmapMut;
 use pylon_abi::{
-    PCPU_UNASSIGNED, PYLON_HOST_PAGE_OFFSET, PYLON_SHM_FILE_SIZE, PylonHostPage, PylonSharedPage,
-    VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
+    PCPU_UNASSIGNED, PYLON_HOST_PAGE_OFFSET, PylonHostPage, PylonSharedPage, VCPU_STATE_PARKED,
+    VCPU_STATE_RUNNING,
 };
 use pylond::control::{
     ControlPlane, query_vm_stats, run_prometheus_server, send_policy_update, send_registration,
@@ -34,7 +34,7 @@ use pylond::engine::{
 };
 use pylond::{
     CoreState, PcpuOwnerTable, VmPolicyUpdateRequest, VmRegistrationRequest, VmSnapshot,
-    create_eventfd, read_eventfd, write_eventfd,
+    create_eventfd, create_shared_memory_file, read_eventfd, write_eventfd,
 };
 use scx_pylon::{PCPU_OWNER_MAP_BYTES, PcpuOwnerMap, ScxPylonUserspace};
 use tokio::runtime::Builder;
@@ -68,9 +68,8 @@ fn poll_fd_readable(fd: RawFd, timeout_ms: i32) -> bool {
 }
 
 /// Represents a simulated Cloud Hypervisor VM with real OS vCPU threads,
-/// a shared `/dev/shm` `PylonSharedPage`, and `kick`/`wake` `EventFd` pairs.
+/// a sealed `memfd` `PylonSharedPage`, and `kick`/`wake` `EventFd` pairs.
 struct SimulatedVmm {
-    shm_path: PathBuf,
     shm_mmap: MmapMut,
     stop: Arc<AtomicBool>,
     work_counters: Vec<Arc<AtomicU64>>,
@@ -80,9 +79,7 @@ struct SimulatedVmm {
 }
 
 impl SimulatedVmm {
-    #[expect(clippy::too_many_arguments)]
     fn spawn_and_register(
-        dir: &Path,
         socket_path: &Path,
         vm_id: u64,
         num_vcpus: u32,
@@ -91,17 +88,8 @@ impl SimulatedVmm {
         priority_weight: u32,
         cooperative: bool,
     ) -> Self {
-        let shm_path = dir.join(format!("vm-{vm_id}-pylon.shm"));
-        let shm_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&shm_path)
+        let shm_file = create_shared_memory_file(&format!("vm-{vm_id}-pylon"))
             .expect("failed to create VM shared memory file");
-        shm_file
-            .set_len(PYLON_SHM_FILE_SIZE as u64)
-            .expect("failed to resize VM shared memory file");
 
         // SAFETY: `shm_file` is `PYLON_SHM_FILE_SIZE` bytes and accessed atomically through
         // `PylonSharedPage` and `PylonHostPage`.
@@ -263,7 +251,6 @@ impl SimulatedVmm {
         );
 
         Self {
-            shm_path,
             shm_mmap,
             stop,
             work_counters,
@@ -302,7 +289,6 @@ impl SimulatedVmm {
         for handle in self.vcpu_threads.drain(..) {
             let _ = handle.join();
         }
-        let _ = fs::remove_file(&self.shm_path);
     }
 }
 
@@ -389,7 +375,6 @@ fn test_e2e_full_stack_multi_vm_scale_out_and_cooperative_revocation() {
 
     // 4. Spawn and register two 4-vCPU VMs over the Unix socket with SCM_RIGHTS.
     let vm1 = SimulatedVmm::spawn_and_register(
-        &temp_dir,
         &socket_path,
         101,
         4,
@@ -399,7 +384,6 @@ fn test_e2e_full_stack_multi_vm_scale_out_and_cooperative_revocation() {
         true,
     );
     let vm2 = SimulatedVmm::spawn_and_register(
-        &temp_dir,
         &socket_path,
         102,
         4,
@@ -567,7 +551,7 @@ fn test_e2e_zero_core_hibernation_timer_and_rx_doorbell_wakeup() {
         "ControlPlane socket ready",
     );
 
-    let vm = SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 201, 2, 0, 2, 100, true);
+    let vm = SimulatedVmm::spawn_and_register(&socket_path, 201, 2, 0, 2, 100, true);
     let page = vm.shared_page();
 
     let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
@@ -685,10 +669,8 @@ fn forced_preemption_when_donor_ignores_kick(name: &str, donor_guest: DonorGuest
     );
 
     // Donor VM 301 is non-cooperative (`cooperative = false`) so it ignores `revoke_requested == 1`.
-    let mut donor =
-        SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 301, 1, 0, 1, 10, false);
-    let recipient =
-        SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 302, 1, 0, 1, 300, true);
+    let mut donor = SimulatedVmm::spawn_and_register(&socket_path, 301, 1, 0, 1, 10, false);
+    let recipient = SimulatedVmm::spawn_and_register(&socket_path, 302, 1, 0, 1, 300, true);
     if donor_guest == DonorGuest::HeaderTscKhz {
         donor.write_header_tsc_khz(u64::MAX);
     }
@@ -827,7 +809,6 @@ fn test_e2e_live_policy_update_and_engine_convergence() {
     );
 
     let vm = SimulatedVmm::spawn_and_register(
-        &temp_dir,
         &socket_path,
         201,
         4,
@@ -894,7 +875,7 @@ fn test_e2e_observability_metering_and_socket_stats() {
         "ControlPlane socket creation",
     );
 
-    let vm = SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 301, 2, 1, 2, 100, true);
+    let vm = SimulatedVmm::spawn_and_register(&socket_path, 301, 2, 1, 2, 100, true);
     let page = vm.shared_page();
 
     let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[2, 3]);
@@ -1024,7 +1005,7 @@ fn test_e2e_prometheus_metrics_http_export() {
         "ControlPlane socket creation",
     );
 
-    let vm = SimulatedVmm::spawn_and_register(&temp_dir, &socket_path, 401, 2, 1, 2, 150, true);
+    let vm = SimulatedVmm::spawn_and_register(&socket_path, 401, 2, 1, 2, 150, true);
     let page = vm.shared_page();
 
     let mut engine = MatrixEngine::new(Arc::clone(&vm_snapshot), Arc::clone(&pcpu_owners), &[2, 3]);

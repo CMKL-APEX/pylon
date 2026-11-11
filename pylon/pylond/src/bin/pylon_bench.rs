@@ -12,26 +12,23 @@
 )]
 
 use core::hint::spin_loop;
-use std::env::temp_dir;
-use std::fs::{self, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
-use std::{io, process, thread};
+use std::{io, thread};
 
 use arc_swap::ArcSwap;
 use clap::Parser;
 use memmap2::MmapMut;
 use pylon_abi::{
-    PCPU_UNASSIGNED, PYLON_HOST_PAGE_OFFSET, PYLON_SHM_FILE_SIZE, PylonHostPage, PylonSharedPage,
-    VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
+    PCPU_UNASSIGNED, PYLON_HOST_PAGE_OFFSET, PylonHostPage, PylonSharedPage, VCPU_STATE_PARKED,
+    VCPU_STATE_RUNNING,
 };
 use pylond::engine::{MatrixEngine, default_counter_khz, read_tsc};
 use pylond::{
     CoreState, PcpuOwnerTable, VmHandle, VmRegistrationRequest, VmSnapshot, create_eventfd,
-    read_eventfd, write_eventfd,
+    create_shared_memory_file, read_eventfd, write_eventfd,
 };
 
 /// Command-line options for the Pylon vs. ACPI CPU Hotplug benchmark runner.
@@ -223,17 +220,8 @@ fn run_pylon_elastic_benchmark(
     tasks_per_wave: usize,
     iters_per_task: u64,
 ) -> BenchmarkResult {
-    let shm_path: PathBuf = temp_dir().join(format!("pylon-bench-{}.shm", process::id()));
-    let shm_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&shm_path)
-        .expect("failed to create benchmark shm file");
-    shm_file
-        .set_len(PYLON_SHM_FILE_SIZE as u64)
-        .expect("failed to size benchmark shm file");
+    let shm_file =
+        create_shared_memory_file("pylon-bench").expect("failed to create benchmark shm file");
 
     // SAFETY: `shm_file` is `PYLON_SHM_FILE_SIZE` bytes and accessed atomically via
     // `PylonSharedPage` and `PylonHostPage`.
@@ -441,7 +429,6 @@ fn run_pylon_elastic_benchmark(
     for th in vcpu_threads {
         let _ = th.join();
     }
-    let _ = fs::remove_file(&shm_path);
 
     BenchmarkResult {
         scale_out: LatencyStats::from_samples(&scale_out_samples_ns),

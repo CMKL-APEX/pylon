@@ -52,6 +52,16 @@ Attached descriptors, in order: the shared page's file, then
 `num_vcpus` kick `eventfd`s, then `num_vcpus` wake `eventfd`s (1 + 2 ×
 `num_vcpus` in all).
 
+`pylond` maps the shared page's file and writes the `eventfd`s, so it
+checks them first. The file must be a `memfd` on shmem whose size is
+sealed (`F_SEAL_SHRINK` and `F_SEAL_GROW`): one that could shrink would
+make `pylond` crash with `SIGBUS` when it next reads the page. Each
+kick and wake descriptor must be an `eventfd`. A registrant still
+shares those `eventfd`s and could make a write to one block, so a
+watchdog thread interrupts any write that blocks for 1 ms (with
+`SIGUSR1`); `pylond` then stops writing to that VM's descriptors and
+drops its registration.
+
 | Response | When |
 |---|---|
 | `{"accepted": true, "message": "registered"}` | The page's header is valid and the `vm_id` is free. An earlier registration of the same `vm_id` is replaced only if its VMM has exited. |
@@ -61,7 +71,7 @@ Attached descriptors, in order: the shared page's file, then
 `pylond` closes the connection after the response. Both sides log a
 rejection as a warning; the VM then runs without `pylond`. A registration whose JSON doesn't parse gets no response.
 A registration's `priority_weight` of 0 is stored as 1.
-| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the file couldn't be mapped, is smaller than 16,384 bytes, or the header of its shared page or host page is invalid; or a pidfd for the peer couldn't be opened. |
+| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the file isn't a `memfd` on shmem sealed with `F_SEAL_SHRINK` and `F_SEAL_GROW`, couldn't be mapped, is smaller than 16,384 bytes, or the header of its shared page or host page is invalid; a kick or wake file descriptor isn't an `eventfd`; or a pidfd for the peer couldn't be opened. |
 
 ## Stats
 

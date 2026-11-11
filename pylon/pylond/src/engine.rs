@@ -21,7 +21,7 @@ use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonHostVcpuSlot, VCPU_STATE_PARKED
 
 use crate::{
     CoreState, Error, MAX_PCPUS, MAX_VM_SLOTS, PcpuOwnerTable, VM_SLOT_NONE, VmHandle, VmSnapshot,
-    VmVcpusTable, pin_current_thread_to_core,
+    VmVcpusTable, WriteWatch, pin_current_thread_to_core,
 };
 
 /// Maximum number of concurrent VMs evaluated per stack-allocated sweep in Plane 2.
@@ -341,6 +341,8 @@ pub struct MatrixEngine {
     woken: Box<[WokenTrack; MAX_VM_SLOTS]>,
     /// When the previous sweep ran (0 before the first).
     last_poll_tsc: u64,
+    /// Bounds the engine's writes to VMs' `eventfd`s, if set.
+    write_watch: Option<Arc<WriteWatch>>,
 }
 
 impl MatrixEngine {
@@ -378,6 +380,7 @@ impl MatrixEngine {
             parked_slots: 0,
             woken: Box::new([WokenTrack::EMPTY; MAX_VM_SLOTS]),
             last_poll_tsc: 0,
+            write_watch: None,
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
@@ -419,6 +422,25 @@ impl MatrixEngine {
         self
     }
 
+    /// Writes to VMs' `eventfd`s under `watch`, which `run` binds to the engine thread.
+    #[must_use]
+    pub fn with_write_watch(mut self, watch: Arc<WriteWatch>) -> Self {
+        self.write_watch = Some(watch);
+        self
+    }
+
+    /// Runs `write`, a write to one of `vm`'s `eventfd`s, under the write watch if any.
+    fn write_vm_fd(
+        &self,
+        vm: &VmHandle,
+        write: impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        match &self.write_watch {
+            Some(watch) => watch.write(vm, write),
+            None => write(),
+        }
+    }
+
     pub fn set_core_state(&mut self, pcpu_id: usize, state: CoreState) {
         if pcpu_id < MAX_PCPUS {
             self.core_states[pcpu_id] = state;
@@ -443,6 +465,9 @@ impl MatrixEngine {
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), Error> {
         if let Err(err) = pin_current_thread_to_core(self.engine_cpu) {
             warn!("Plane 2 could not pin to CPU {}: {err}", self.engine_cpu);
+        }
+        if let Some(watch) = &self.write_watch {
+            watch.bind_current_thread();
         }
         let sweep_cycles = ns_to_cycles(SWEEP_INTERVAL_NS, self.host_tsc_khz);
         info!(
@@ -565,7 +590,7 @@ impl MatrixEngine {
         self.pcpu_owners.write_owner(pcpu, tid, flags);
         self.assigned_yield_count[pcpu] = host.yield_count.load(Ordering::Acquire);
         vm.set_assigned_pcpu(vcpu as usize, pcpu as u8);
-        let _ = vm.wake_vcpu(vcpu as usize);
+        let _ = self.write_vm_fd(vm, || vm.wake_vcpu(vcpu as usize));
         // A vCPU parked inside KVM only sees the wake `eventfd` after an exit
         // (`spec/08-park-in-kvm.md` §3.3).
         self.wake_signalled_tsc[pcpu] = 0;
@@ -1159,7 +1184,8 @@ impl MatrixEngine {
                     .yield_count
                     .load(Ordering::Acquire);
                 donor_vm.request_park(donor_vcpu as usize, deadline_tsc);
-                let _ = donor_vm.kick_revoke_irqfd(donor_vcpu as usize);
+                let _ =
+                    self.write_vm_fd(donor_vm, || donor_vm.kick_revoke_irqfd(donor_vcpu as usize));
 
                 self.core_states[donor_pcpu] = CoreState::Revoking {
                     donor_vm_id: donor_eval.vm_id,

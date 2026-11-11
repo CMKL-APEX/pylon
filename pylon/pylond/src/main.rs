@@ -18,7 +18,10 @@ use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
 use pylond::engine::{DEFAULT_ENGINE_CPU, MatrixEngine, calibrate_tsc_khz, default_counter_khz};
-use pylond::{DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot, VmVcpusTable};
+use pylond::{
+    BLOCKED_WRITE_LIMIT, DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot, VmVcpusTable,
+    WriteWatch,
+};
 use scx_pylon::coresched::{CookieDenial, GuardMode, KernelCoreSched};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -181,6 +184,9 @@ fn scx_attach(args: &CliArgs, kernel_has_sched_ext: bool) -> ScxAttach {
     }
 }
 
+/// The signal the write watchdog sends to interrupt a blocked `eventfd` write.
+const WRITE_INTERRUPT_SIGNAL: i32 = libc::SIGUSR1;
+
 /// Raises the soft limit on open file descriptors to the hard limit. Each registered VM holds
 /// up to `1 + 2 * MAX_VCPUS` of them, and systemd's default soft limit is 1024.
 fn raise_fd_limit() {
@@ -323,6 +329,23 @@ fn main() -> Result<()> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // A registrant shares its `eventfd`s with `pylond` and can make a write to one block; the
+    // watchdog interrupts such a write so the engine goes on.
+    WriteWatch::install_interrupt_handler(WRITE_INTERRUPT_SIGNAL)
+        .context("failed to install the write interrupt handler")?;
+    let write_watch = Arc::new(WriteWatch::new(WRITE_INTERRUPT_SIGNAL));
+    let watchdog_watch = Arc::clone(&write_watch);
+    let watchdog_stop = Arc::clone(&stop_flag);
+    thread::Builder::new()
+        .name("pylond-watchdog".to_owned())
+        .spawn(move || {
+            while !watchdog_stop.load(Ordering::Relaxed) {
+                thread::sleep(BLOCKED_WRITE_LIMIT);
+                watchdog_watch.interrupt_blocked(BLOCKED_WRITE_LIMIT);
+            }
+        })
+        .context("failed to spawn the write watchdog thread")?;
+
     // Launch Plane 2 (Real-Time Matrix Engine on Host Core 1).
     let engine_snapshot = Arc::clone(&vm_snapshot);
     let engine_owners = Arc::clone(&pcpu_owners);
@@ -332,7 +355,8 @@ fn main() -> Result<()> {
         .name("pylond-engine".to_owned())
         .spawn(move || {
             let mut engine = MatrixEngine::new(engine_snapshot, engine_owners, &tenant_pcpus)
-                .with_vm_vcpus(vm_vcpus);
+                .with_vm_vcpus(vm_vcpus)
+                .with_write_watch(write_watch);
             engine.set_engine_cpu(engine_cpu);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);

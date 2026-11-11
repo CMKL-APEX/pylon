@@ -301,16 +301,23 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Removes VMs whose VMM process has exited. Plane 2 then frees their cores. Returns the
+    /// Removes VMs whose VMM process has exited, or whose `eventfd` writes block. Plane 2 then frees their cores. Returns the
     /// number removed.
     pub fn remove_exited_vms(vm_snapshot: &VmSnapshot) -> usize {
         let current = vm_snapshot.load();
         let (exited, alive): (Vec<VmHandle>, Vec<VmHandle>) = current
             .iter()
             .cloned()
-            .partition(|vm| vm.vmm_exited() == Some(true));
+            .partition(|vm| vm.vmm_exited() == Some(true) || vm.is_faulty());
         for vm in &exited {
-            info!("VMM of VM {} exited; removed its registration", vm.vm_id());
+            if vm.is_faulty() {
+                warn!(
+                    "A write to an eventfd of VM {} blocked; removed its registration",
+                    vm.vm_id()
+                );
+            } else {
+                info!("VMM of VM {} exited; removed its registration", vm.vm_id());
+            }
         }
         if !exited.is_empty() {
             vm_snapshot.store(Arc::new(alive));

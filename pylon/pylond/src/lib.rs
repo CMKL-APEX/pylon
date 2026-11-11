@@ -7,16 +7,19 @@ pub mod control;
 pub mod engine;
 
 use core::array::from_fn;
-use std::fs::File;
+use std::ffi::CString;
+use std::fs::{self, File};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::{io, ptr};
 
 use arc_swap::ArcSwap;
 use log::warn;
-use memmap2::MmapMut;
+use memmap2::{MmapMut, MmapOptions};
 use pylon_abi::{
     MAX_VCPUS, PYLON_HOST_PAGE_OFFSET, PYLON_SHM_FILE_SIZE, PylonHostPage, PylonSharedPage,
     VCPU_STATE_PARKED,
@@ -405,6 +408,9 @@ struct VmHandleInner {
     /// Host counter value when a zero-core wakeup of this VM last took a core from a donor at
     /// its `min_cores`, or 0. Written by Plane 2 only.
     floor_preempt_tsc: AtomicU64,
+    /// Set when a write to one of the VM's `eventfd`s blocked until `WriteWatch` interrupted
+    /// it. `pylond` writes to none of them again, and Plane 1 drops the VM.
+    faulty: AtomicBool,
     park_latency: ParkLatencyHistogram,
     kick_signal: Option<i32>,
     wake_by_signal: bool,
@@ -474,15 +480,19 @@ impl VmHandle {
         }
 
         let shm_file = File::from(shm_fd);
-        // SAFETY: `shm_file` refers to the Pylon shared memory file, whose contents are
-        // accessed solely via atomic operations defined in `pylon-abi`.
-        let shm_mmap = unsafe { MmapMut::map_mut(&shm_file).map_err(Error::Io)? };
-        if shm_mmap.len() < PYLON_SHM_FILE_SIZE {
-            return Err(Error::SharedMemoryTooSmall {
-                actual: shm_mmap.len(),
-                expected: PYLON_SHM_FILE_SIZE,
-            });
+        check_shared_memory_file(&shm_file, req.vm_id)?;
+        for fd in kick_irqfds.iter().chain(&wake_eventfds) {
+            check_eventfd(fd, req.vm_id)?;
         }
+        // SAFETY: `shm_file` refers to the Pylon shared memory file, whose contents are
+        // accessed solely via atomic operations defined in `pylon-abi`. Its size is sealed
+        // at `PYLON_SHM_FILE_SIZE` or more, so the mapping never extends past its end.
+        let shm_mmap = unsafe {
+            MmapOptions::new()
+                .len(PYLON_SHM_FILE_SIZE)
+                .map_mut(&shm_file)
+                .map_err(Error::Io)?
+        };
 
         let handle = Self {
             inner: Arc::new(VmHandleInner {
@@ -498,6 +508,7 @@ impl VmHandle {
                 woken_shared_usec: AtomicU64::new(0),
                 woken_unowned_usec: AtomicU64::new(0),
                 floor_preempt_tsc: AtomicU64::new(0),
+                faulty: AtomicBool::new(false),
                 park_latency: ParkLatencyHistogram::default(),
                 kick_signal: req.kick_signal,
                 wake_by_signal: req.wake_by_signal,
@@ -943,9 +954,23 @@ impl VmHandle {
         self.inner.host_rx_doorbell.store(value, Ordering::Release);
     }
 
+    /// Whether a write to one of the VM's `eventfd`s blocked (see `faulty`).
+    #[inline]
+    pub fn is_faulty(&self) -> bool {
+        self.inner.faulty.load(Ordering::Relaxed)
+    }
+
+    /// Marks the VM as one whose `eventfd` writes block.
+    pub fn mark_faulty(&self) {
+        self.inner.faulty.store(true, Ordering::Relaxed);
+    }
+
     /// Signals the KVM `irqfd` for `vcpu_idx` to inject an immediate revocation IPI.
     #[inline]
     pub fn kick_revoke_irqfd(&self, vcpu_idx: usize) -> Result<(), Error> {
+        if self.is_faulty() {
+            return Ok(());
+        }
         let fd = self
             .inner
             .kick_irqfds
@@ -960,6 +985,9 @@ impl VmHandle {
     /// Signals the wake `eventfd` for `vcpu_idx` to unpark a recipient vCPU thread.
     #[inline]
     pub fn wake_vcpu(&self, vcpu_idx: usize) -> Result<(), Error> {
+        if self.is_faulty() {
+            return Ok(());
+        }
         let fd = self
             .inner
             .wake_eventfds
@@ -1047,6 +1075,186 @@ pub enum CoreState {
     },
 }
 
+/// Creates a shared memory file as `pylond` accepts it, for VMMs simulated in tests and
+/// benchmarks: a `memfd` named `name`, `PYLON_SHM_FILE_SIZE` bytes long, with its size sealed.
+pub fn create_shared_memory_file(name: &str) -> io::Result<File> {
+    let name = CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `name` is a valid NUL-terminated string, and the flags are valid.
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a new file descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(PYLON_SHM_FILE_SIZE as u64)?;
+    // SAFETY: `F_ADD_SEALS` takes an integer of seal flags on a valid file descriptor.
+    if unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Checks that a registrant's shared memory file can't make `pylond` fault: a `memfd` on
+/// shmem whose size is sealed (`F_SEAL_SHRINK`, `F_SEAL_GROW`) at `PYLON_SHM_FILE_SIZE` or more.
+/// A file that could shrink would raise `SIGBUS` in `pylond` at its next access, and one on
+/// another file system (FUSE, hugetlbfs) could stall or fail page faults.
+fn check_shared_memory_file(file: &File, vm_id: u64) -> Result<(), Error> {
+    let required = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+    // SAFETY: `F_GET_SEALS` only reads the seals of a valid file descriptor.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required {
+        return Err(Error::InvalidRegistration {
+            vm_id,
+            reason: "the shared memory file isn't a memfd sealed with F_SEAL_SHRINK and \
+                     F_SEAL_GROW"
+                .to_owned(),
+        });
+    }
+    // SAFETY: `fstatfs` writes only to `stat`, a valid `statfs`.
+    let mut stat: libc::statfs = unsafe { zeroed() };
+    // SAFETY: `file` is a valid file descriptor and `stat` is a valid `statfs`.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    if stat.f_type != libc::TMPFS_MAGIC {
+        return Err(Error::InvalidRegistration {
+            vm_id,
+            reason: "the shared memory file isn't on shmem".to_owned(),
+        });
+    }
+    // The seals fix the size, so it can't change after this check.
+    let len = file.metadata().map_err(Error::Io)?.len();
+    if len < PYLON_SHM_FILE_SIZE as u64 {
+        return Err(Error::SharedMemoryTooSmall {
+            actual: usize::try_from(len).unwrap_or(usize::MAX),
+            expected: PYLON_SHM_FILE_SIZE,
+        });
+    }
+    Ok(())
+}
+
+/// Checks that a registrant's kick or wake file descriptor is an `eventfd`. A pipe or a FIFO
+/// could block `pylond`'s writes indefinitely.
+fn check_eventfd(fd: &OwnedFd, vm_id: u64) -> Result<(), Error> {
+    let link = fs::read_link(Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()))
+        .map_err(Error::Io)?;
+    if link != Path::new("anon_inode:[eventfd]") {
+        return Err(Error::InvalidRegistration {
+            vm_id,
+            reason: format!("a kick or wake file descriptor isn't an eventfd ({link:?})"),
+        });
+    }
+    Ok(())
+}
+
+/// How long a write to a registrant's `eventfd` may block before `WriteWatch` interrupts it.
+/// A write blocks only when the counter is about to overflow, which takes a registrant that
+/// fills it on purpose; a well-behaved write takes microseconds.
+pub const BLOCKED_WRITE_LIMIT: Duration = Duration::from_millis(1);
+
+/// Lets a watchdog thread interrupt the engine's writes to registrants' `eventfd`s. Registration
+/// checks that each is an `eventfd`, but the registrant shares the open file and can make it
+/// blocking and fill its counter, so that `pylond`'s next write would wait for ever.
+pub struct WriteWatch {
+    base: Instant,
+    signal: i32,
+    /// The watched thread's ID, or 0 before `bind_current_thread`.
+    tid: AtomicI32,
+    /// Nanoseconds since `base` when the current write started, or 0 outside one.
+    started_ns: AtomicU64,
+}
+
+impl WriteWatch {
+    /// A watch that interrupts writes with `signal`, which must have a handler installed
+    /// without `SA_RESTART` (`install_interrupt_handler`).
+    pub fn new(signal: i32) -> Self {
+        Self {
+            base: Instant::now(),
+            signal,
+            tid: AtomicI32::new(0),
+            started_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Installs a handler for `signal` that does nothing and doesn't restart the interrupted
+    /// call, so a blocked `write` returns `EINTR`.
+    pub fn install_interrupt_handler(signal: i32) -> io::Result<()> {
+        extern "C" fn interrupt(_: libc::c_int) {}
+        // SAFETY: `action` is zeroed and then filled in; `interrupt` is async-signal-safe, and
+        // `sigaction` only reads `action`.
+        unsafe {
+            let mut action: libc::sigaction = zeroed();
+            action.sa_sigaction = interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Makes the calling thread the one whose writes are watched.
+    pub fn bind_current_thread(&self) {
+        // SAFETY: `gettid` takes no arguments and can't fail.
+        self.tid.store(unsafe { libc::gettid() }, Ordering::Relaxed);
+    }
+
+    /// Runs `write`, which `interrupt_blocked` may interrupt. If it returns `EINTR` after
+    /// blocking for `BLOCKED_WRITE_LIMIT`, marks `vm` faulty. A shorter one was hit by an
+    /// interrupt meant for an earlier write and is tried once more.
+    pub fn write(&self, vm: &VmHandle, write: impl Fn() -> Result<(), Error>) -> Result<(), Error> {
+        for _ in 0..2 {
+            let start = self.now_ns();
+            self.started_ns.store(start, Ordering::Release);
+            let result = write();
+            self.started_ns.store(0, Ordering::Release);
+            match result {
+                Err(Error::Io(err)) if err.kind() == io::ErrorKind::Interrupted => {
+                    if Duration::from_nanos(self.now_ns() - start) >= BLOCKED_WRITE_LIMIT {
+                        warn!(
+                            "VM {}: a write to its eventfd blocked; dropping the VM",
+                            vm.vm_id()
+                        );
+                        vm.mark_faulty();
+                        return Ok(());
+                    }
+                }
+                result => return result,
+            }
+        }
+        Ok(())
+    }
+
+    /// Interrupts the watched thread if its current write has run for `limit`. Called by the
+    /// watchdog thread every `limit` or so. Returns whether it sent the signal.
+    pub fn interrupt_blocked(&self, limit: Duration) -> bool {
+        let started = self.started_ns.load(Ordering::Acquire);
+        let tid = self.tid.load(Ordering::Relaxed);
+        if started == 0 || tid == 0 || Duration::from_nanos(self.now_ns() - started) < limit {
+            return false;
+        }
+        // SAFETY: `tgkill` takes plain integers and only signals `tid` if it is a thread of
+        // this process.
+        unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, self.signal) };
+        true
+    }
+
+    /// Nanoseconds since `base`, at least 1, so that 0 can mean "no write".
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+}
+
 /// Writes `1u64` to an `eventfd` or `irqfd` file descriptor.
 #[inline]
 pub fn write_eventfd(fd: RawFd) -> Result<(), Error> {
@@ -1119,7 +1327,6 @@ pub fn pin_current_thread_to_core(core_id: usize) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::process::{Command, id as process_id};
@@ -1147,19 +1354,8 @@ mod tests {
     }
 
     fn create_memfd_shared_page(vm_id: u64, num_vcpus: u32, tsc_khz: u64) -> OwnedFd {
-        let name = CString::new(format!("pylon-test-vm-{vm_id}")).unwrap();
-        // SAFETY: `name` is a valid NUL-terminated C string; `MFD_CLOEXEC` is valid.
-        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(raw_fd >= 0, "memfd_create failed");
-        // SAFETY: `raw_fd` is a newly created valid file descriptor.
-        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-
-        // SAFETY: `owned` is a valid memfd file descriptor.
-        let trunc_rc =
-            unsafe { libc::ftruncate(owned.as_raw_fd(), PYLON_SHM_FILE_SIZE as libc::off_t) };
-        assert_eq!(trunc_rc, 0, "ftruncate failed");
-
-        let file = File::from(owned.try_clone().unwrap());
+        let file = create_shared_memory_file(&format!("pylon-test-vm-{vm_id}")).unwrap();
+        let owned = OwnedFd::from(file.try_clone().unwrap());
         // SAFETY: `file` is truncated to `PYLON_SHM_FILE_SIZE`.
         let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         #[expect(
@@ -1999,6 +2195,115 @@ mod tests {
         assert_eq!(revocations_between_two_hungry_vms(100, 100), 0);
         // Twice the weight is worth a third core.
         assert_eq!(revocations_between_two_hungry_vms(200, 100), 1);
+    }
+
+    /// Clones `fds`, for a second `VmHandle::new` on a rig's file descriptors.
+    fn clone_fds(fds: &[OwnedFd]) -> Vec<OwnedFd> {
+        fds.iter().map(|fd| fd.try_clone().unwrap()).collect()
+    }
+
+    #[test]
+    fn test_registration_rejects_a_shared_memory_file_that_can_change_size() {
+        let rig = build_test_vm(70, 1, 0, 1, 1);
+        // The same page in a memfd whose size isn't sealed: it could be truncated later.
+        let name = CString::new("pylon-test-unsealed").unwrap();
+        // SAFETY: `name` is a valid NUL-terminated string, and the flags are valid.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: `fd` is a new file descriptor that nothing else owns.
+        let unsealed = unsafe { File::from_raw_fd(fd) };
+        unsealed.set_len(PYLON_SHM_FILE_SIZE as u64).unwrap();
+        let Err(err) = VmHandle::new(
+            &rig.req,
+            OwnedFd::from(unsealed),
+            clone_fds(&rig.kick_fds),
+            clone_fds(&rig.wake_fds),
+        ) else {
+            panic!("an unsealed file was accepted");
+        };
+        assert!(matches!(err, Error::InvalidRegistration { vm_id: 70, .. }));
+    }
+
+    #[test]
+    fn test_registration_rejects_a_wake_fd_that_is_not_an_eventfd() {
+        let rig = build_test_vm(71, 1, 0, 1, 1);
+        let mut pipe = [0; 2];
+        // SAFETY: `pipe2` writes two file descriptors into `pipe`.
+        let ret = unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(ret, 0);
+        // SAFETY: `pipe2` returned two new file descriptors that nothing else owns.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+        drop(read_end);
+        let Err(err) = VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            clone_fds(&rig.kick_fds),
+            vec![write_end],
+        ) else {
+            panic!("a pipe was accepted as a wake fd");
+        };
+        assert!(matches!(err, Error::InvalidRegistration { vm_id: 71, .. }));
+    }
+
+    /// A registrant that makes its wake `eventfd` blocking and fills its counter can't stop
+    /// the engine: the watchdog interrupts the write, the VM is marked faulty and Plane 1
+    /// drops it.
+    #[test]
+    fn test_write_watch_interrupts_a_write_to_a_full_eventfd() {
+        let rig = build_test_vm(72, 1, 0, 1, 1);
+        // SAFETY: `eventfd` has no memory safety preconditions.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(raw >= 0);
+        // SAFETY: `raw` is a new file descriptor that nothing else owns.
+        let blocking = unsafe { OwnedFd::from_raw_fd(raw) };
+        let vm = VmHandle::new(
+            &rig.req,
+            rig.shm_fd.try_clone().unwrap(),
+            clone_fds(&rig.kick_fds),
+            vec![blocking.try_clone().unwrap()],
+        )
+        .unwrap();
+        // One below the maximum: any further write blocks.
+        let full: u64 = u64::MAX - 1;
+        // SAFETY: `blocking` is a valid eventfd and `full` an 8-byte buffer.
+        let written = unsafe {
+            libc::write(
+                blocking.as_raw_fd(),
+                (&raw const full).cast::<libc::c_void>(),
+                size_of::<u64>(),
+            )
+        };
+        assert_eq!(written, 8);
+
+        WriteWatch::install_interrupt_handler(libc::SIGUSR1).unwrap();
+        let watch = Arc::new(WriteWatch::new(libc::SIGUSR1));
+        watch.bind_current_thread();
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let watch = Arc::clone(&watch);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    thread::sleep(BLOCKED_WRITE_LIMIT);
+                    watch.interrupt_blocked(BLOCKED_WRITE_LIMIT);
+                }
+            })
+        };
+
+        let start = Instant::now();
+        watch.write(&vm, || vm.wake_vcpu(0)).unwrap();
+        done.store(true, Ordering::Relaxed);
+        watchdog.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(vm.is_faulty());
+        // No further writes, so nothing blocks again.
+        vm.wake_vcpu(0).unwrap();
+
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        ControlPlane::publish_vm_handle(&snapshot, vm);
+        assert_eq!(ControlPlane::remove_exited_vms(&snapshot), 1);
+        assert!(snapshot.load().is_empty());
     }
 
     #[test]
