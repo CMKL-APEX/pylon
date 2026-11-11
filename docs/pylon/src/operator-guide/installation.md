@@ -8,7 +8,7 @@
 | Hypervisor | KVM. Pylon hasn't been run on MSHV. |
 | Rust | The workspace's MSRV, 1.89.0, or newer. |
 | Build packages | Cloud Hypervisor's usual ones, plus `clang` (with the BPF target), `llvm`, `libelf-dev`, `zlib1g-dev` and `pkg-config`, for `scx_pylon`. |
-| Kernel (optional) | Linux built with `CONFIG_SCHED_CLASS_EXT` (6.12 or later) to use `scx_pylon`. Without it, Pylon still works, using the host's normal scheduler. |
+| Kernel | Linux built with `CONFIG_SCHED_CLASS_EXT` (6.12 or later) to use `scx_pylon`. The default `--pylon park=kvm` needs it: without `scx_pylon`, `pylond` refuses such VMs. On other kernels, Pylon works with `park=vmm`, using the host's normal scheduler. |
 
 On Debian or Ubuntu:
 
@@ -46,6 +46,27 @@ beyond the table above:
 
 The aarch64 numbers so far are in [Benchmarks](../developer-guide/benchmarks.md).
 A booted aarch64 guest hasn't been run with Pylon yet.
+
+## Download a release
+
+Each [release](https://github.com/CMKL-APEX/pylon/releases) has these
+files:
+
+| File | What it is |
+|---|---|
+| `cloud-hypervisor`, `ch-remote` | The VMM and its client for x86_64, linked to glibc. |
+| `cloud-hypervisor-static`, `ch-remote-static` | The same, static (musl), for x86_64. |
+| `cloud-hypervisor-static-aarch64`, `ch-remote-static-aarch64` | The same, static, for aarch64. |
+| `pylond`, `scx_pylon` | The host daemon and the BPF scheduler tool for x86_64. |
+| `pylond-aarch64`, `scx_pylon-aarch64` | The same for aarch64. |
+| `pylon-x86_64`, `pylond-x86_64`, `SHA256SUMS` | The VMM and `pylond` for x86_64, built on Ubuntu 24.04, with their SHA-256 checksums, for installers that pin them. |
+| `pylon-guest-agent-static`, `pylon-guest-agent-static-aarch64` | The guest agent, static, to copy into Linux guests. |
+| `pv-pylon-<version>.tar.gz` | The `pv-pylon` guest module's source. Build it against the guest's kernel headers. |
+| `pylon-<version>.tar.xz` | The source, with its Rust dependencies vendored. |
+
+`pylond` and `scx_pylon` are built on Ubuntu 24.04. They need glibc 2.39
+or later, `libelf`, `zlib` and `zstd` (on Ubuntu, `libelf1t64`,
+`zlib1g` and `libzstd1`). On other hosts, build from source.
 
 ## Build
 

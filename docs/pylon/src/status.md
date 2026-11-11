@@ -1,9 +1,9 @@
 # Status and roadmap
 
 This page says what works in Pylon today, what doesn't, and what is
-planned. It reflects `main` as of 2026-11-10. Open work is tracked as
-GitHub issues: the [`v0.0.8` milestone](https://github.com/CMKL-APEX/pylon/milestone/1) holds what the next
-release needs, and the [`v0.0.9` milestone](https://github.com/CMKL-APEX/pylon/milestone/2) the rest.
+planned. It reflects the `v0.0.8` release (see the [release
+notes](release-notes.md)). Open work is tracked as GitHub issues on the
+[`v0.0.9` milestone](https://github.com/CMKL-APEX/pylon/milestone/2).
 The detailed tracker is
 [`spec/05-implementation-status.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md).
 
@@ -13,7 +13,7 @@ The detailed tracker is
 |---|---|
 | Shared page | Created per VM, mapped into the guest at a fixed address, and shared with `pylond`. Layout checked at compile time. |
 | `--pylon` option | Parsed and validated. VMs boot with only `initial_active_vcpus` running; the guest agent's first heartbeat parks the rest. |
-| Registration | The VMM registers with `pylond` at boot, passing the shared page and per-vCPU `eventfd`s. A VM is removed when its VMM exits. |
+| Registration | The VMM registers with `pylond` at boot, passing the shared page and per-vCPU `eventfd`s, and logs whether `pylond` accepted the VM. A VM is removed when its VMM exits. |
 | Waking parked vCPUs | `pylond` wakes a parked vCPU when its VM has demand and a managed CPU is idle, or takes a core from another VM. |
 | Taking back idle cores | When a vCPU parks on its own, `pylond` reclaims its core. |
 | Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. Repeated signals back off up to 1 ms. |
@@ -82,14 +82,9 @@ But:
 
 ## Roadmap
 
-The next release, `v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)), is scoped to these
-issues:
-
-| Work | Issue |
-|---|---|
-| Make parking inside KVM a `--pylon` option, the default on x86_64 KVM hosts, with ABI version 3. | [#51](https://github.com/CMKL-APEX/pylon/issues/51) |
-
-The rest is on `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
+`v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)) made parking inside KVM a `--pylon`
+option, the default on x86_64 KVM hosts, with ABI version 3 ([#51](https://github.com/CMKL-APEX/pylon/issues/51)).
+The next release is `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
 
 | Work | Issues |
 |---|---|

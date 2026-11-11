@@ -66,12 +66,14 @@ which looks there by default.
 1. While parsing its options, the VMM creates and zeroes the shared
    page, writes the header (magic, ABI version, vCPU count, `vm_id`),
    and creates two `eventfd`s per vCPU.
-2. If `socket` is given and exists, the VMM registers the VM with
-   `pylond`, passing the shared page and the `eventfd`s. If the socket
-   doesn't exist yet, the VM boots without registering; if connecting
-   fails, the VMM logs a warning and boots anyway. **It doesn't retry**,
-   so start `pylond` before the VMs.
-3. The VMM maps the page into guest memory at `gpa`.
+2. While setting up guest memory, the VMM maps the page into guest
+   memory at `gpa`.
+3. If `socket` is given and exists, the VMM then registers the VM with
+   `pylond`, passing the shared page and the `eventfd`s, and logs
+   whether `pylond` accepted it. If the socket doesn't exist yet, the VM
+   boots without registering; if connecting fails or `pylond` rejects
+   the VM, the VMM logs a warning and boots anyway, unmanaged. **It
+   doesn't retry**, so start `pylond` before the VMs.
 4. Each vCPU thread records its host thread ID in its slot and enters
    the guest as `RUNNING`. vCPUs from `initial_active_vcpus` on are also
    tagged `park_on_boot`.

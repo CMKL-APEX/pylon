@@ -19,7 +19,8 @@ cargo build --release -p cloud-hypervisor -p pylond
 ```
 
 This produces `target/release/cloud-hypervisor` and
-`target/release/pylond`.
+`target/release/pylond`. You can instead download both from a
+[release](operator-guide/installation.md#download-a-release).
 
 ## 2. Start pylond
 
