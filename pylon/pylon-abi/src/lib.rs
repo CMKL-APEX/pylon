@@ -204,8 +204,8 @@ impl Default for PylonTelemetry {
 /// Lower 32 bytes are Guest-written; Upper 32 bytes are Host-written.
 ///
 /// The guest can write all of it. `state`, `revoke_requested`, `assigned_pcpu`,
-/// `park_on_boot`, `host_tid`, `yield_count` and `revoke_deadline_tsc` are copies, for the
-/// guest, of the fields of the same name in [`PylonHostVcpuSlot`], which the VMM and `pylond`
+/// `park_on_boot`, `host_tid`, `yield_count`, `revoke_deadline_tsc` and
+/// `park_timer_deadline_tsc` are copies, for the guest, of the fields of the same name in [`PylonHostVcpuSlot`], which the VMM and `pylond`
 /// act on; the one exception is `state`, where the guest asks to park by writing `PARKING`.
 #[repr(C, align(64))]
 #[derive(Debug)]
@@ -360,7 +360,7 @@ impl PylonSharedPage {
 pub const PYLON_HOST_MAGIC: u64 = 0x5059_4C4F_4E48_5031;
 /// Version of the host page in `PylonHostHeader::version`. It changes on its own, without
 /// [`PYLON_ABI_VERSION`]: the guest never sees the host page.
-pub const PYLON_HOST_VERSION: u32 = 2;
+pub const PYLON_HOST_VERSION: u32 = 3;
 /// Offset of the [`PylonHostPage`] in the shared memory file, right after the shared page.
 pub const PYLON_HOST_PAGE_OFFSET: usize = PYLON_SHARED_PAGE_SIZE;
 /// Size in bytes of the [`PylonHostPage`].
@@ -431,7 +431,10 @@ pub struct PylonHostVcpuSlot {
     /// Host counter deadline after which the VMM force-parks the vCPU if it hasn't agreed to park.
     /// Written by `pylond` before it sets `revoke_requested`.
     pub revoke_deadline_tsc: AtomicU64,
-    pub _reserved: [u8; 40],
+    /// Host counter value at which the guest's timer on this vCPU was due when the VMM parked
+    /// it, or 0 (see `PylonVcpuSlot::park_timer_deadline_tsc`). Written by the VMM.
+    pub park_timer_deadline_tsc: AtomicU64,
+    pub _reserved: [u8; 32],
 }
 
 impl PylonHostVcpuSlot {
@@ -446,7 +449,8 @@ impl PylonHostVcpuSlot {
             host_tid: AtomicU32::new(0),
             yield_count: AtomicU64::new(0),
             revoke_deadline_tsc: AtomicU64::new(0),
-            _reserved: [0u8; 40],
+            park_timer_deadline_tsc: AtomicU64::new(0),
+            _reserved: [0u8; 32],
         }
     }
 
@@ -460,6 +464,7 @@ impl PylonHostVcpuSlot {
         self.host_tid.store(0, Ordering::Release);
         self.yield_count.store(0, Ordering::Release);
         self.revoke_deadline_tsc.store(0, Ordering::Release);
+        self.park_timer_deadline_tsc.store(0, Ordering::Release);
     }
 }
 
@@ -514,6 +519,7 @@ const _: () = {
     assert!(size_of::<PylonHostVcpuSlot>() == 64);
     assert!(align_of::<PylonHostVcpuSlot>() == 64);
     assert!(offset_of!(PylonHostVcpuSlot, host_tid) == 4);
+    assert!(offset_of!(PylonHostVcpuSlot, park_timer_deadline_tsc) == 24);
     assert!(size_of::<PylonHostPage>() == PYLON_HOST_PAGE_SIZE);
     assert!(align_of::<PylonHostPage>() == 4096);
     assert!(offset_of!(PylonHostPage, vcpus) == 64);

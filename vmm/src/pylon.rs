@@ -868,6 +868,7 @@ impl PylonVmmState {
                 warn!("Pylon: failed to make parked vCPU {vcpu_id} runnable");
             }
             parked_in_kvm.store(false, Ordering::Relaxed);
+            host.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
             slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
             host.state.store(VCPU_STATE_RUNNING, Ordering::Release);
             slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
@@ -921,6 +922,7 @@ impl PylonVmmState {
             read_guest_timer(),
             slot.guest_tsc_offset.load(Ordering::Relaxed),
         );
+        host.park_timer_deadline_tsc.store(timer, Ordering::Relaxed);
         slot.park_timer_deadline_tsc.store(timer, Ordering::Relaxed);
         host.state.store(VCPU_STATE_PARKED, Ordering::Release);
         slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
@@ -935,6 +937,7 @@ impl PylonVmmState {
 
         self.park_vcpu(vcpu_id);
 
+        host.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
         slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
         if !self.shutting_down.load(Ordering::Acquire) {
             host.state.store(VCPU_STATE_RUNNING, Ordering::Release);

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use pylon_abi::clock::{architectural_counter_khz, read_counter};
-use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonHostVcpuSlot, PylonVcpuSlot, VCPU_STATE_PARKED};
+use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonHostVcpuSlot, VCPU_STATE_PARKED};
 
 use crate::{
     CoreState, Error, MAX_PCPUS, MAX_VM_SLOTS, PcpuOwnerTable, VM_SLOT_NONE, VmHandle, VmSnapshot,
@@ -63,6 +63,11 @@ pub const WOKEN_DEMAND_US: u64 = 4_000;
 /// since (`spec/08-park-in-kvm.md` §4.2). The agent reports every 50 ms by default; a guest
 /// without one gets the same bound.
 pub const WOKEN_GRANT_HOLD_US: u64 = 50_000;
+
+/// How often a VM woken from zero cores may take a core from a donor at its `min_cores`. The
+/// wakeup's urgency comes from timers and telemetry the guest writes, so without a limit a
+/// guest that parks and wakes again and again would keep taking cores below other VMs' floor.
+pub const FLOOR_PREEMPT_INTERVAL_US: u64 = 10_000;
 
 /// Delay between polling sweeps in nanoseconds (~1000 cycles on a 3 GHz core). The engine turns it
 /// into counter ticks with the host rate, so it doesn't depend on the counter's frequency.
@@ -462,14 +467,13 @@ impl MatrixEngine {
             return Some(vcpu);
         }
 
-        let page = vm.shared_page();
         let host_page = vm.host_page();
         let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
         let mut first_parked = None;
         let mut idx = 0usize;
         while idx < num_vcpus {
             if Self::is_unassigned_parked(&host_page.vcpus[idx]) {
-                if Self::park_timer_due(&page.vcpus[idx], now_tsc) {
+                if Self::park_timer_due(&host_page.vcpus[idx], now_tsc) {
                     return Some(idx as u8);
                 }
                 first_parked = first_parked.or(Some(idx as u8));
@@ -505,7 +509,7 @@ impl MatrixEngine {
     /// Whether the guest timer that was armed when `slot`'s vCPU parked is due. A parked
     /// vCPU's timer interrupt can't fire until the vCPU gets a core again.
     #[inline]
-    fn park_timer_due(slot: &PylonVcpuSlot, now_tsc: u64) -> bool {
+    fn park_timer_due(slot: &PylonHostVcpuSlot, now_tsc: u64) -> bool {
         let deadline = slot.park_timer_deadline_tsc.load(Ordering::Relaxed);
         deadline != 0 && now_tsc >= deadline
     }
@@ -516,10 +520,7 @@ impl MatrixEngine {
         let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
         vm.host_page().vcpus[..num_vcpus]
             .iter()
-            .zip(&vm.shared_page().vcpus)
-            .any(|(host, slot)| {
-                Self::is_unassigned_parked(host) && Self::park_timer_due(slot, now_tsc)
-            })
+            .any(|host| Self::is_unassigned_parked(host) && Self::park_timer_due(host, now_tsc))
     }
 
     /// A vCPU is free to receive a core when it is parked and no core is on its way to it.
@@ -1135,11 +1136,16 @@ impl MatrixEngine {
                 }
 
                 // 2. Preemption Path: Select an over-allocated or lower-urgency donor core.
-                let Some((donor_pcpu, donor_eval_idx, donor_vcpu)) =
-                    self.select_donor_pcpu(vms, vm_count, recipient_eval)
+                let below_floor_allowed = recipient_eval.zero_core_wakeup
+                    && Self::floor_preempt_ready(recipient_vm, now_tsc, self.host_tsc_khz);
+                let Some((donor_pcpu, donor_eval_idx, donor_vcpu, at_floor)) =
+                    self.select_donor_pcpu(vms, vm_count, recipient_eval, below_floor_allowed)
                 else {
                     break;
                 };
+                if at_floor {
+                    recipient_vm.set_floor_preempt_tsc(now_tsc);
+                }
 
                 let donor_eval = self.eval_buf[donor_eval_idx];
                 let donor_vm = &vms[donor_eval.vm_idx];
@@ -1308,15 +1314,27 @@ impl MatrixEngine {
         found
     }
 
-    /// Selects the best donor `(pcpu, donor_eval_idx, donor_vcpu)` to preempt for `recipient`,
-    /// preferring donor vCPUs with `in_critical_section == 0`.
+    /// Whether `vm`, woken from zero cores, may take a core from a donor at its `min_cores`:
+    /// at most once per `FLOOR_PREEMPT_INTERVAL_US`.
+    #[inline]
+    fn floor_preempt_ready(vm: &VmHandle, now_tsc: u64, tsc_khz: u64) -> bool {
+        let last = vm.floor_preempt_tsc();
+        last == 0
+            || now_tsc
+                >= last.saturating_add(Self::us_to_cycles(FLOOR_PREEMPT_INTERVAL_US, tsc_khz))
+    }
+
+    /// Selects the best donor `(pcpu, donor_eval_idx, donor_vcpu, at_floor)` to preempt for
+    /// `recipient`, preferring donor vCPUs with `in_critical_section == 0`. A donor at its
+    /// `min_cores` (`at_floor`) is eligible only if `below_floor_allowed`.
     fn select_donor_pcpu(
         &self,
         vms: &[VmHandle],
         vm_count: usize,
         recipient: VmDemandEval,
-    ) -> Option<(usize, usize, u8)> {
-        let mut best: Option<(usize, usize, u8, bool, bool, u64)> = None;
+        below_floor_allowed: bool,
+    ) -> Option<(usize, usize, u8, bool)> {
+        let mut best: Option<(usize, usize, u8, bool, bool, u64, bool)> = None;
 
         let mut pcpu = 0usize;
         while pcpu < MAX_PCPUS {
@@ -1348,7 +1366,7 @@ impl MatrixEngine {
                 let above_min = donor_eval.assigned_cores > donor_eval.min_cores;
 
                 let eligible = (above_min && (over_desired || over_fair_share || lower_urgency))
-                    || (recipient.zero_core_wakeup && lower_urgency);
+                    || (recipient.zero_core_wakeup && below_floor_allowed && lower_urgency);
                 // A `PARKED` vCPU on an assigned core either hasn't woken since the assignment
                 // or has given the core back, which phase 0 reclaims. Revoking it would race
                 // its wakeup.
@@ -1367,7 +1385,7 @@ impl MatrixEngine {
 
                     let replace = match best {
                         None => true,
-                        Some((_, _, _, best_not_in_cs, best_over_desired, best_urgency)) => {
+                        Some((_, _, _, best_not_in_cs, best_over_desired, best_urgency, _)) => {
                             if not_in_cs != best_not_in_cs {
                                 not_in_cs
                             } else if over_desired != best_over_desired {
@@ -1386,6 +1404,7 @@ impl MatrixEngine {
                             not_in_cs,
                             over_desired,
                             donor_eval.urgency,
+                            !above_min,
                         ));
                     }
                 }
@@ -1393,7 +1412,7 @@ impl MatrixEngine {
             pcpu += 1;
         }
 
-        best.map(|(pcpu, eval_idx, vcpu, _, _, _)| (pcpu, eval_idx, vcpu))
+        best.map(|(pcpu, eval_idx, vcpu, _, _, _, at_floor)| (pcpu, eval_idx, vcpu, at_floor))
     }
 
     #[inline]

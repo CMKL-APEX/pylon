@@ -146,7 +146,7 @@ or whose host header is invalid.
 
 | Offset | Size | Structure | Contents |
 |---|---|---|---|
-| `0x0000` | 64 | `PylonHostHeader` | `magic` = `PYLON_HOST_MAGIC` (`"PYLONHP1"`), `version` = `PYLON_HOST_VERSION` = 2. Written once by the VMM. |
+| `0x0000` | 64 | `PylonHostHeader` | `magic` = `PYLON_HOST_MAGIC` (`"PYLONHP1"`), `version` = `PYLON_HOST_VERSION` = 3. Written once by the VMM. |
 | `0x0040` | 64 × 64 | `[PylonHostVcpuSlot; 64]` | One slot per vCPU. |
 | `0x1040` | 4,032 | `_tail_pad` | Zero padding to 8,192 bytes. |
 
@@ -162,6 +162,7 @@ who gets a core, and of the vCPU's thread ID:
 | `host_tid` | `u32` | The VMM, when the vCPU thread starts. `pylond` signals this thread and makes it the owner of the CPUs it gives the vCPU in `scx_pylon`. |
 | `yield_count` | `u64` | The VMM, before it publishes `PARKED`. |
 | `revoke_deadline_tsc` | `u64` | `pylond`, before it sets `revoke_requested`. |
+| `park_timer_deadline_tsc` | `u64` | The VMM, when it parks the vCPU; 0 when it runs again. |
 
 Each writer updates the host slot first and then the guest's copy in
 `PylonVcpuSlot`, so a guest still learns of a revocation from
@@ -173,7 +174,8 @@ guest that writes another thread's ID into its `host_tid`.
 
 The host page has its own version, which changes without
 `PYLON_ABI_VERSION`, since guests never see it. The VMM and `pylond`
-have to be upgraded together. Version 2 added `host_tid`.
+have to be upgraded together. Version 2 added `host_tid`, version 3
+`park_timer_deadline_tsc`.
 
 ## Time bases
 

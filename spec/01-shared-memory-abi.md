@@ -125,7 +125,7 @@ only the shared page into the guest; the VMM and `pylond` map the whole file.
 #[repr(C, align(64))]
 pub struct PylonHostHeader {
     pub magic: u64,   // PYLON_HOST_MAGIC, "PYLONHP1"
-    pub version: u32, // PYLON_HOST_VERSION, 2
+    pub version: u32, // PYLON_HOST_VERSION, 3
     pub _reserved: [u8; 52],
 }
 
@@ -138,7 +138,8 @@ pub struct PylonHostVcpuSlot {
     pub host_tid: AtomicU32,        // VMM, at vCPU thread start
     pub yield_count: AtomicU64,         // VMM, before publishing PARKED
     pub revoke_deadline_tsc: AtomicU64, // pylond, before setting revoke_requested
-    pub _reserved: [u8; 40],
+    pub park_timer_deadline_tsc: AtomicU64, // VMM, at park; 0 when the vCPU runs
+    pub _reserved: [u8; 32],
 }
 
 #[repr(C, align(4096))]

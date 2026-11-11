@@ -56,8 +56,8 @@ takes a signal (phase 2), and it tells `scx_pylon` which vCPUs are
 parked (after phase 3).
 
 The engine reads a vCPU's `state`, `yield_count`, `revoke_requested`,
-`revoke_deadline_tsc`, `assigned_pcpu`, `park_on_boot` and `host_tid`
-from the VM's [host page](shared-memory-abi.md#the-host-page), which
+`revoke_deadline_tsc`, `assigned_pcpu`, `park_on_boot`, `host_tid` and
+`park_timer_deadline_tsc` from the VM's [host page](shared-memory-abi.md#the-host-page), which
 the guest can't write, and writes `assigned_pcpu` and revocations there and to the
 guest's copies. Below, those fields mean the host page's.
 
@@ -248,8 +248,16 @@ and ((donor above its min_cores
                  and (recipient's committed + 1) × donor's weight
                      ≤ donor's cores × recipient's weight)))
      or (recipient is a zero-core wakeup
+         and recipient took no core from a donor at its min_cores
+             in the last FLOOR_PREEMPT_INTERVAL_US
          and donor's urgency < recipient's urgency))
 ```
+
+A zero-core wakeup has the highest urgency, and the timers and
+telemetry behind it come from the guest. So a VM woken from zero cores
+takes a core from a donor at its `min_cores` at most once every
+`FLOOR_PREEMPT_INTERVAL_US` (10 ms). A guest that parks and wakes again
+and again otherwise keeps taking cores below other VMs' floor.
 
 A `PARKED` vCPU on an assigned CPU either hasn't woken since it was
 given the CPU, or has given it back and phase 0 will reclaim it.

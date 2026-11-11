@@ -402,6 +402,9 @@ struct VmHandleInner {
     handoff_without_park_count: AtomicU64,
     woken_shared_usec: AtomicU64,
     woken_unowned_usec: AtomicU64,
+    /// Host counter value when a zero-core wakeup of this VM last took a core from a donor at
+    /// its `min_cores`, or 0. Written by Plane 2 only.
+    floor_preempt_tsc: AtomicU64,
     park_latency: ParkLatencyHistogram,
     kick_signal: Option<i32>,
     wake_by_signal: bool,
@@ -491,6 +494,7 @@ impl VmHandle {
                 handoff_without_park_count: AtomicU64::new(0),
                 woken_shared_usec: AtomicU64::new(0),
                 woken_unowned_usec: AtomicU64::new(0),
+                floor_preempt_tsc: AtomicU64::new(0),
                 park_latency: ParkLatencyHistogram::default(),
                 kick_signal: req.kick_signal,
                 wake_by_signal: req.wake_by_signal,
@@ -609,6 +613,20 @@ impl VmHandle {
     #[inline]
     pub fn woken_unowned_usec(&self) -> u64 {
         self.inner.woken_unowned_usec.load(Ordering::Acquire)
+    }
+
+    /// When a zero-core wakeup of this VM last took a core from a donor at its `min_cores`.
+    #[inline]
+    pub fn floor_preempt_tsc(&self) -> u64 {
+        self.inner.floor_preempt_tsc.load(Ordering::Relaxed)
+    }
+
+    /// Records that a zero-core wakeup of this VM took a core from a donor at its `min_cores`.
+    #[inline]
+    pub fn set_floor_preempt_tsc(&self, now_tsc: u64) {
+        self.inner
+            .floor_preempt_tsc
+            .store(now_tsc, Ordering::Relaxed);
     }
 
     /// Adds `usec` of woken vCPU time, shared on the VM's own cores if `owned`.
@@ -1418,6 +1436,62 @@ mod tests {
         assert_eq!(held(&engine), 2);
     }
 
+    /// A zero-core wakeup may take a core from a donor at its `min_cores` at most once per
+    /// `FLOOR_PREEMPT_INTERVAL_US`: its urgency comes from timers the guest controls.
+    #[test]
+    fn test_plane2_zero_core_wakeup_takes_a_floor_core_at_a_limited_rate() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = MatrixEngine::new(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[4]);
+
+        // The donor holds its only core, which is also its `min_cores`.
+        let donor = build_test_vm(10, 1, 1, 1, 1);
+        let recipient = build_test_vm(20, 1, 0, 1, 1);
+        donor
+            .handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, donor.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, recipient.handle.clone());
+        engine.poll_once(1_000);
+        assert_eq!(
+            engine.core_state(4),
+            CoreState::Assigned { vm_id: 10, vcpu: 0 }
+        );
+        donor.handle.host_page().vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+
+        // The recipient's guest says a timer is due, and it took a floor core just before.
+        recipient
+            .handle
+            .shared_page()
+            .telemetry
+            .next_timer_tsc
+            .store(1, Ordering::Release);
+        recipient.handle.set_floor_preempt_tsc(1_500);
+        engine.poll_once(2_000);
+        assert_eq!(
+            engine.core_state(4),
+            CoreState::Assigned { vm_id: 10, vcpu: 0 }
+        );
+
+        // Once the interval (10 ms, 30,000,000 cycles at 3 GHz) has passed, it may again.
+        let later = 1_500 + 30_000_000;
+        engine.poll_once(later);
+        assert!(matches!(
+            engine.core_state(4),
+            CoreState::Revoking {
+                donor_vm_id: 10,
+                recipient_vm_id: 20,
+                ..
+            }
+        ));
+        assert_eq!(recipient.handle.floor_preempt_tsc(), later);
+    }
+
     #[test]
     fn test_plane2_park_timer_wakes_zero_core_vm_on_due_vcpu() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
@@ -1427,13 +1501,17 @@ mod tests {
         // An idle VM whose vCPUs 1 and 3 parked with guest timers armed, published by the VMM
         // in host TSC: vCPU 3's is due first.
         let vm = build_test_vm(1, 4, 0, 4, 1);
-        let page = vm.handle.shared_page();
-        page.vcpus[1]
+        let host = vm.handle.host_page();
+        host.vcpus[1]
             .park_timer_deadline_tsc
             .store(50_000, Ordering::Release);
-        page.vcpus[3]
+        host.vcpus[3]
             .park_timer_deadline_tsc
             .store(5_000, Ordering::Release);
+        // A deadline the guest writes into its own page counts for nothing.
+        vm.handle.shared_page().vcpus[0]
+            .park_timer_deadline_tsc
+            .store(1, Ordering::Release);
         ControlPlane::publish_vm_handle(&snapshot, vm.handle.clone());
 
         // Nothing is due yet, and the guest has nothing to run.
@@ -1474,7 +1552,7 @@ mod tests {
         )
         .unwrap();
         let page = handle.shared_page();
-        page.vcpus[3]
+        handle.host_page().vcpus[3]
             .park_timer_deadline_tsc
             .store(5_000, Ordering::Release);
         page.telemetry
