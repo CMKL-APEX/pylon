@@ -59,6 +59,7 @@ files:
 | `cloud-hypervisor-static-aarch64`, `ch-remote-static-aarch64` | The same, static, for aarch64. |
 | `pylond`, `scx_pylon` | The host daemon and the BPF scheduler tool for x86_64. |
 | `pylond-aarch64`, `scx_pylon-aarch64` | The same for aarch64. |
+| `pylon-x86_64`, `pylond-x86_64`, `SHA256SUMS` | The VMM and `pylond` for x86_64, built on Ubuntu 24.04, with their SHA-256 checksums, for installers that pin them. |
 | `pylon-guest-agent-static`, `pylon-guest-agent-static-aarch64` | The guest agent, static, to copy into Linux guests. |
 | `pv-pylon-<version>.tar.gz` | The `pv-pylon` guest module's source. Build it against the guest's kernel headers. |
 | `pylon-<version>.tar.xz` | The source, with its Rust dependencies vendored. |

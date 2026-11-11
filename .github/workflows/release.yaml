@@ -150,3 +150,44 @@ jobs:
         with:
           draft: true
           files: dist/*
+
+  pylon-assets:
+    if: github.event_name == 'create' && github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v')
+    name: Pylon release assets (x86_64)
+    # The hosts run Ubuntu 24.04; a newer runner's glibc would not load there.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install BPF & VMM build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq \
+            build-essential \
+            clang \
+            llvm \
+            libelf-dev \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89.0"
+      - name: Build pylon and pylond
+        run: cargo build --release --locked --bin cloud-hypervisor --bin pylond
+      - name: Collect assets
+        run: |
+          mkdir assets
+          strip -o assets/pylon-x86_64 target/release/cloud-hypervisor
+          strip -o assets/pylond-x86_64 target/release/pylond
+          cd assets && sha256sum pylon-x86_64 pylond-x86_64 > SHA256SUMS && cat SHA256SUMS
+      - name: Attach to the draft release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          files: |
+            ./assets/pylon-x86_64
+            ./assets/pylond-x86_64
+            ./assets/SHA256SUMS
