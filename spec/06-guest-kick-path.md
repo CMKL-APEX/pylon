@@ -447,7 +447,8 @@ the VMM installs its logger afterwards. The VMM now also reads
   revoked again. `pylond` must skip slots with `host_tid == 0` when choosing
   donors and recipients (not verified against the current engine).
 - **`pylond` restart:** the VMM keeps running. Parked vCPUs stay parked until a
-  new `pylond` re-registers the VM, so the VMM needs a reconnect path (Q5).
+  new `pylond` re-registers the VM, so the VMM needs a reconnect path (Q5). Spec 10
+  proposes one.
 - **Shutdown:** unchanged (`shutdown_all` wakes every parked thread).
 
 ---
@@ -514,6 +515,7 @@ forced park, which is honest about the current state, and the metrics show it.
   kernel changes, not just the module (§4.6, items 5 and 6).
 - **Q4:** Whether the MSHV backend turns signal-interrupted runs into
   `VmExit::Ignore`.
-- **Q5:** The VMM reconnect protocol after a `pylond` restart.
+- **Q5:** The VMM reconnect protocol after a `pylond` restart. **Proposed
+  (2026-11-13)** in `spec/10-pylond-restart.md` (#60).
 - **Q6:** Whether `FORCE_HANDOFF_US = 50` is right, or whether it should be
   per-VM policy (`VmPolicyUpdate`).
