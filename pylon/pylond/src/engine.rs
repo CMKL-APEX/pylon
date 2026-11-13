@@ -337,6 +337,11 @@ pub struct MatrixEngine {
     host_tsc_khz: u64,
     has_timed_wait: bool,
     engine_cpu: usize,
+    /// How long a donor has to park before it is signalled (`REVOKE_GRACE_PERIOD_US` unless set).
+    revoke_grace_us: u64,
+    /// How long after the first signal the core is handed over anyway (`FORCE_HANDOFF_US`
+    /// unless set).
+    force_handoff_us: u64,
     /// SMT sibling ring: the next CPU on the same core, or the CPU itself.
     smt_next: [u16; MAX_PCPUS],
     /// Per-VM parked vCPU bitmasks shared with `scx_pylon` (`spec/08-park-in-kvm.md` §4.3).
@@ -392,6 +397,8 @@ impl MatrixEngine {
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
+            revoke_grace_us: REVOKE_GRACE_PERIOD_US,
+            force_handoff_us: FORCE_HANDOFF_US,
             smt_next: from_fn(|pcpu| pcpu as u16),
         }
     }
@@ -466,6 +473,14 @@ impl MatrixEngine {
     /// Sets the host CPU the polling loop pins itself to in [`Self::run`].
     pub fn set_engine_cpu(&mut self, cpu: usize) {
         self.engine_cpu = cpu;
+    }
+
+    /// Sets how long a donor has to park after a revocation request before it is signalled
+    /// (`grace_us`), and how long after the first signal its core is handed over anyway
+    /// (`force_handoff_us`).
+    pub fn set_revocation_timing(&mut self, grace_us: u64, force_handoff_us: u64) {
+        self.revoke_grace_us = grace_us;
+        self.force_handoff_us = force_handoff_us;
     }
 
     /// Pins the calling thread to the engine CPU and runs the real-time polling loop until `stop`
@@ -928,7 +943,7 @@ impl MatrixEngine {
                     } else if first_signal_tsc != 0
                         && now_tsc
                             >= first_signal_tsc
-                                .saturating_add(Self::us_to_cycles(FORCE_HANDOFF_US, tsc_khz))
+                                .saturating_add(Self::us_to_cycles(self.force_handoff_us, tsc_khz))
                     {
                         // The donor still hasn't parked; give the core away regardless and let
                         // `scx_pylon` preempt the donor thread. It parks at its next exit.
@@ -1226,10 +1241,8 @@ impl MatrixEngine {
 
                 let donor_eval = self.eval_buf[donor_eval_idx];
                 let donor_vm = &vms[donor_eval.vm_idx];
-                let deadline_tsc = now_tsc.saturating_add(Self::us_to_cycles(
-                    REVOKE_GRACE_PERIOD_US,
-                    self.host_tsc_khz,
-                ));
+                let deadline_tsc = now_tsc
+                    .saturating_add(Self::us_to_cycles(self.revoke_grace_us, self.host_tsc_khz));
 
                 self.revoke_yield_count[donor_pcpu] = donor_vm.host_page().vcpus
                     [donor_vcpu as usize]
