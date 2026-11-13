@@ -206,8 +206,6 @@ rejects such a VM (spec 08 §2). How it works:
 
 Still open:
 
-- **aarch64** defaults to `park=vmm` until parking inside KVM is
-  verified there (spec 08 §6, V1).
 - **Most parks end by the 4 ms bound**, not by a wake
   ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
 - **Snapshot and migration** stay refused.
