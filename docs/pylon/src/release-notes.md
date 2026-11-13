@@ -101,8 +101,8 @@ See [Status and roadmap](status.md) for what works and what doesn't.
 
 ### Known limits
 
-- **Wake latency has a tail of about 1.9 ms** when another VM is busy,
-  nested and on bare metal
+- **Wake latency has a tail of about 0.45 ms** when another VM is busy
+  (about 1.9 ms in `v0.0.8-rc1`), nested and on bare metal
   ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
 - **Cooperative parks are too slow for the grace period**: a guest
   takes 80–140 µs to park after a revocation, against `pylond`'s 8 µs

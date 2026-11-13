@@ -147,7 +147,8 @@ interrupt or a signal. An interrupt, such as the guest's timer, runs the
 guest again without an exit and without a core: the vCPU stays
 `PARKED`. `scx_pylon` marks such a vCPU *woken* and runs it on a CPU its
 VM owns, in turns with that CPU's owner. `pylond` reads the woken
-vCPUs, and counts one woken for 4 ms or longer as demand for a core of
+vCPUs, gives each a spare core (idle, or held by a VM that wants
+none), and counts one woken for 4 ms or longer as demand for any core of
 its own. After a
 park the guest or a revocation asked for, the VMM also makes the vCPU
 runnable, still `PARKED`, once it has been parked for 4 ms
