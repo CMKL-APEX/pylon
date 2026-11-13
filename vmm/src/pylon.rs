@@ -18,7 +18,7 @@ use std::{fmt, io, mem, ptr, result};
 
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::{MsrEntry, msr_index};
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+#[cfg(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use hypervisor::kvm::KvmHypervisor;
 use hypervisor::{HypervisorType, MemoryVisibility, Vcpu, Vm};
 use log::{info, warn};
@@ -169,11 +169,11 @@ pub enum PylonPark {
 }
 
 impl PylonPark {
-    /// `Kvm` on x86_64 when KVM is available, which is the backend the VMM picks first;
-    /// `Vmm` elsewhere. Parking inside KVM hasn't been verified on aarch64 yet
-    /// (`spec/08-park-in-kvm.md` §6, V1).
+    /// `Kvm` on x86_64 and aarch64 when KVM is available, which is the backend the VMM picks
+    /// first; `Vmm` elsewhere. On aarch64 it was verified with real guests on the reference
+    /// host (`spec/07-aarch64-support.md` A-T8).
     pub fn host_default() -> Self {
-        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        #[cfg(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if KvmHypervisor::is_available().unwrap_or(false) {
             return PylonPark::Kvm;
         }
@@ -1435,9 +1435,9 @@ mod tests {
 
     #[test]
     fn test_pylon_park_default_and_hypervisor_check() {
-        #[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+        #[cfg(not(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         assert_eq!(PylonPark::host_default(), PylonPark::Vmm);
-        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        #[cfg(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64")))]
         assert_eq!(
             PylonPark::host_default() == PylonPark::Kvm,
             Path::new("/dev/kvm").exists()
