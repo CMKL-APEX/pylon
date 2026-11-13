@@ -1691,6 +1691,42 @@ mod tests {
         assert_eq!(read_eventfd(vm_rx.wake_fds[1].as_raw_fd()).unwrap(), 1);
     }
 
+    /// A vCPU whose thread hasn't started (one past `boot_vcpus`, never hot-plugged) gets no
+    /// core, however much demand its VM shows (spec 06 §7).
+    #[test]
+    fn test_plane2_vcpu_without_a_thread_gets_no_core() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = test_engine(
+            Arc::clone(&snapshot),
+            Arc::clone(&pcpu_owners),
+            &[2, 3, 4, 5],
+        );
+
+        let vm = build_test_vm(1, 4, 0, 4, 1);
+        for vcpu in 2..4 {
+            vm.handle.host_page().vcpus[vcpu]
+                .host_tid
+                .store(0, Ordering::Release);
+        }
+        ControlPlane::publish_vm_handle(&snapshot, vm.handle.clone());
+        vm.handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(4, Ordering::Release);
+
+        engine.poll_once(1_000);
+        let assigned: Vec<u8> = [2, 3, 4, 5]
+            .into_iter()
+            .filter_map(|pcpu| match engine.core_state(pcpu) {
+                CoreState::Assigned { vm_id: 1, vcpu } => Some(vcpu),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assigned, vec![0, 1]);
+    }
+
     #[test]
     fn test_plane2_min_cores_is_a_floor_under_demand_only() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
