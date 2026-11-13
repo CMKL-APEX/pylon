@@ -112,5 +112,8 @@ CPUs the VM held. The VM's `vm_id` is then free for its next start.
 - **Snapshot, restore and live migration.** Pylon state isn't saved or
   moved, so the VMM refuses to snapshot or migrate a VM with `--pylon`:
   its `pylon-kick` device fails the snapshot.
-- **vCPU hotplug** (`ch-remote resize`). It isn't coordinated with
-  Pylon.
+- **vCPU hotplug** (`ch-remote resize` with `--cpus`). The VMM refuses
+  it for a VM with `--pylon`: `pylond` learns a VM's vCPUs once, at
+  registration. Boot the VM with all its vCPUs (`--cpus boot=N`) and let
+  `pylond` park those it doesn't need; `initial_active_vcpus` sets how
+  many run at boot.

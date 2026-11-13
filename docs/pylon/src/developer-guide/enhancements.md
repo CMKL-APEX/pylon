@@ -237,8 +237,9 @@ These are from spec 06 §10:
   ([#65](https://github.com/CMKL-APEX/pylon/issues/65)).
 - **Q5.** How a VMM reconnects after `pylond` restarts
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
-- **Q6.** Whether 50 µs is the right last-resort bound, or whether it
-  should be per-VM policy
+- **Q6.** *Answered:* the last-resort bound is a host-wide `pylond`
+  option, `--force-handoff-us` (default 50 µs), not per-VM policy: one
+  VM's value would delay another's handoff
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
 
 ## Other planned work

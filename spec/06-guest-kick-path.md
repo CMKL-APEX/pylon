@@ -443,9 +443,12 @@ the VMM installs its logger afterwards. The VMM now also reads
   `pylon-kick` device's snapshot fails with "VMs with --pylon can't be
   snapshotted or migrated".
 - **vCPU hotplug:** `num_vcpus` is fixed at `max_vcpus`, so the MSI-X table
-  size doesn't change. A hot-removed vCPU must be woken and must not be
-  revoked again. `pylond` must skip slots with `host_tid == 0` when choosing
-  donors and recipients (not verified against the current engine).
+  size doesn't change. *Implemented (#60):* `pylond` gives no core to a slot
+  with `host_tid == 0`, a vCPU past `boot_vcpus` whose thread never started
+  (before, such slots looked `PARKED` and took cores). The VMM refuses to
+  resize the vCPUs of a VM with `--pylon` ("VMs with --pylon can't change
+  their vCPU count"): `pylond` would not learn a hot-plugged vCPU's thread,
+  and a hot-removed one would have to be woken and never revoked again.
 - **`pylond` restart:** the VMM keeps running. Parked vCPUs stay parked until a
   new `pylond` re-registers the VM, so the VMM needs a reconnect path (Q5).
 - **Shutdown:** unchanged (`shutdown_all` wakes every parked thread).
@@ -516,4 +519,10 @@ forced park, which is honest about the current state, and the metrics show it.
   `VmExit::Ignore`.
 - **Q5:** The VMM reconnect protocol after a `pylond` restart.
 - **Q6:** Whether `FORCE_HANDOFF_US = 50` is right, or whether it should be
-  per-VM policy (`VmPolicyUpdate`).
+  per-VM policy (`VmPolicyUpdate`). *Answered (#60):* a host-wide
+  `pylond` option, `--force-handoff-us` (default 50), like
+  `--revoke-grace-us`. The bound protects the recipient from a donor that
+  can't park; that is a property of the host's VMM and kernel, not of the
+  VM, and a per-VM value would let one VM's policy delay another's
+  handoff. On bare metal a forced park takes 55–67 µs at the median
+  (§S6), so most donors park inside the bound.

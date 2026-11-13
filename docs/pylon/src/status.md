@@ -80,8 +80,9 @@ But:
   guest as RAM, and the layout declares it, but it still sits at the fixed
   address `0xFEDF_0000` instead of a PCI BAR ([#59](https://github.com/CMKL-APEX/pylon/issues/59)).
 - **Lifecycle.** Snapshot and live migration are refused with
-  `--pylon` ([#61](https://github.com/CMKL-APEX/pylon/issues/61)). vCPU hotplug and a `pylond` restart aren't handled:
-  the VMM registers once, at boot, and doesn't reconnect ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
+  `--pylon` ([#61](https://github.com/CMKL-APEX/pylon/issues/61)), and so
+  is resizing the vCPUs. A `pylond` restart isn't handled: the VMM
+  registers once, at boot, and doesn't reconnect ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
 - **PCI ID.** `pylon-kick` uses a provisional ID, `0x1AF4:0x10F0`, from
   QEMU's experimental range ([#64](https://github.com/CMKL-APEX/pylon/issues/64)).
 
