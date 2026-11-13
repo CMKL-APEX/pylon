@@ -116,6 +116,7 @@ inside KVM`
 ## Logging
 
 `pylond` logs to standard error through `env_logger`. Set `RUST_LOG`
-(`info`, `debug`) to choose the level. At `info`, it logs the managed
-CPUs, whether `scx_pylon` was attached, registrations, and policy
-changes.
+(`warn`, `debug`) to choose the level; the default is `info`. At
+`info`, it logs the managed CPUs, whether `scx_pylon` was attached,
+registrations, and policy changes. If the kernel rejects `scx_pylon`,
+libbpf prints the verifier's log just before `pylond`'s warning.
