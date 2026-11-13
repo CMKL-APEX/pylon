@@ -317,6 +317,12 @@ pub struct MatrixEngine {
     /// TSC at which an assigned vCPU of a VM that parks inside KVM was last signalled to wake
     /// (0 if not, or once it left `PARKED`).
     wake_signalled_tsc: [u64; MAX_PCPUS],
+    /// TSC at which a core was assigned, until its vCPU is seen running (0 then, or if the
+    /// core left `Assigned` first). For the wake and handoff latencies (spec 06 S6).
+    wake_pending_tsc: [u64; MAX_PCPUS],
+    /// TSC of the revocation request that handed the core over, while `wake_pending_tsc` is
+    /// set (0 if the core was idle).
+    handoff_requested_tsc: [u64; MAX_PCPUS],
     /// When the vCPU a core is assigned or being handed to was picked while woken (0 if it
     /// wasn't), and the guest's `guest_heartbeat` then. The core stays wanted until the agent
     /// reports again or `WOKEN_GRANT_HOLD_US` passes (`spec/08-park-in-kvm.md` §4.2). Read only
@@ -373,6 +379,8 @@ impl MatrixEngine {
             revoke_first_signal_tsc: [0; MAX_PCPUS],
             revoke_yield_count: [0; MAX_PCPUS],
             wake_signalled_tsc: [0; MAX_PCPUS],
+            wake_pending_tsc: [0; MAX_PCPUS],
+            handoff_requested_tsc: [0; MAX_PCPUS],
             woken_grant_tsc: [0; MAX_PCPUS],
             woken_grant_heartbeat: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
@@ -603,9 +611,52 @@ impl MatrixEngine {
             vcpu,
         };
         self.core_last_metered_tsc[pcpu] = now_tsc;
+        self.wake_pending_tsc[pcpu] = now_tsc;
+        self.handoff_requested_tsc[pcpu] = self.revoke_requested_tsc[pcpu];
         self.revoke_requested_tsc[pcpu] = 0;
         self.revoke_signalled_tsc[pcpu] = 0;
         self.revoke_first_signal_tsc[pcpu] = 0;
+    }
+
+    /// Records, the first sweep an assigned vCPU is seen running, the time since its core was
+    /// assigned and, after a revocation, since the revocation was requested
+    /// (`spec/06-guest-kick-path.md` §8 S6). The VMM writes `RUNNING` once the vCPU thread has
+    /// taken the assignment; a `PARKED` vCPU with a higher `yield_count` ran and parked again.
+    /// Each value is late by at most one sweep.
+    fn record_wake_latencies(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
+        let tsc_khz = self.host_tsc_khz;
+        let mut pcpu = 0usize;
+        while pcpu < MAX_PCPUS {
+            let assigned_tsc = self.wake_pending_tsc[pcpu];
+            if assigned_tsc != 0 {
+                let mut done = true;
+                if let CoreState::Assigned { vm_id, vcpu } = self.core_states[pcpu]
+                    && let Some(vm) = Self::find_vm(vms, vm_count, vm_id)
+                {
+                    let slot = &vm.host_page().vcpus[vcpu as usize];
+                    let running = slot.state.load(Ordering::Acquire) != VCPU_STATE_PARKED
+                        || slot.yield_count.load(Ordering::Acquire)
+                            != self.assigned_yield_count[pcpu];
+                    if running {
+                        let to_us = |since: u64| {
+                            now_tsc.saturating_sub(since).saturating_mul(1000) / tsc_khz
+                        };
+                        vm.record_wake_latency_us(to_us(assigned_tsc));
+                        let requested_tsc = self.handoff_requested_tsc[pcpu];
+                        if requested_tsc != 0 {
+                            vm.record_handoff_latency_us(to_us(requested_tsc));
+                        }
+                    } else {
+                        done = false;
+                    }
+                }
+                if done {
+                    self.wake_pending_tsc[pcpu] = 0;
+                    self.handoff_requested_tsc[pcpu] = 0;
+                }
+            }
+            pcpu += 1;
+        }
     }
 
     /// Executes one full 3-phase arbitration sweep at timestamp `now_tsc`.
@@ -632,6 +683,7 @@ impl MatrixEngine {
         self.progress_revocations_phase2(vms, vm_count, now_tsc);
         self.signal_orphaned_donors(vms, vm_count, now_tsc);
         self.signal_unwoken_recipients(vms, vm_count, now_tsc);
+        self.record_wake_latencies(vms, vm_count, now_tsc);
 
         // =====================================================================
         // Phase 3: Match Hungry VMs with Idle or Donor Cores

@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval, sleep, timeout};
 
 use crate::{
-    Error, MAX_VM_SLOTS, PARK_LATENCY_BUCKETS_US, VM_SLOT_NONE, VcpuThread, VmHandle,
+    Error, LATENCY_BUCKETS_US, LatencyHistogram, MAX_VM_SLOTS, VM_SLOT_NONE, VcpuThread, VmHandle,
     VmPolicyUpdateRequest, VmPolicyUpdateResponse, VmRegistrationRequest, VmRegistrationResponse,
     VmSnapshot, VmStats, VmStatsRequest, VmStatsResponse, pin_current_thread_to_core,
 };
@@ -862,29 +862,28 @@ pub async fn run_prometheus_server(
                                 vm.woken_unowned_usec()
                             ));
                         }
-                        body.push_str("# HELP pylon_vm_park_latency_microseconds Time from a revocation request to the donor vCPU parking\n");
-                        body.push_str("# TYPE pylon_vm_park_latency_microseconds histogram\n");
-                        for vm in vms.iter() {
-                            let vid = vm.vm_id();
-                            let latency = vm.park_latency();
-                            let cumulative = latency.cumulative_buckets();
-                            for (bound, count) in PARK_LATENCY_BUCKETS_US.iter().zip(cumulative.iter()) {
-                                body.push_str(&format!(
-                                    "pylon_vm_park_latency_microseconds_bucket{{vm_id=\"{vid}\",le=\"{bound}\"}} {count}\n"
-                                ));
+                        let histograms: [MetricHistogram; 3] = [
+                            (
+                                "pylon_vm_park_latency_microseconds",
+                                "Time from a revocation request to the donor vCPU parking",
+                                VmHandle::park_latency,
+                            ),
+                            (
+                                "pylon_vm_wake_latency_microseconds",
+                                "Time from assigning a core to a vCPU to that vCPU running",
+                                VmHandle::wake_latency,
+                            ),
+                            (
+                                "pylon_vm_handoff_latency_microseconds",
+                                "Time from a revocation request to the recipient vCPU running",
+                                VmHandle::handoff_latency,
+                            ),
+                        ];
+                        for (name, help, histogram) in histograms {
+                            body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+                            for vm in vms.iter() {
+                                write_histogram(&mut body, name, vm.vm_id(), histogram(vm));
                             }
-                            body.push_str(&format!(
-                                "pylon_vm_park_latency_microseconds_bucket{{vm_id=\"{vid}\",le=\"+Inf\"}} {}\n",
-                                cumulative[PARK_LATENCY_BUCKETS_US.len()]
-                            ));
-                            body.push_str(&format!(
-                                "pylon_vm_park_latency_microseconds_sum{{vm_id=\"{vid}\"}} {}\n",
-                                latency.sum_us()
-                            ));
-                            body.push_str(&format!(
-                                "pylon_vm_park_latency_microseconds_count{{vm_id=\"{vid}\"}} {}\n",
-                                latency.count()
-                            ));
                         }
 
                         let resp = format!(
@@ -901,6 +900,29 @@ pub async fn run_prometheus_server(
             }
         }
     }
+}
+
+/// A per-VM histogram metric: its name, its help text, and how to read it from a VM.
+type MetricHistogram = (
+    &'static str,
+    &'static str,
+    fn(&VmHandle) -> &LatencyHistogram,
+);
+
+/// Appends `histogram` as the Prometheus histogram `name` for `vm_id`.
+fn write_histogram(body: &mut String, name: &str, vm_id: u64, histogram: &LatencyHistogram) {
+    let cumulative = histogram.cumulative_buckets();
+    for (bound, count) in LATENCY_BUCKETS_US.iter().zip(cumulative.iter()) {
+        body.push_str(&format!(
+            "{name}_bucket{{vm_id=\"{vm_id}\",le=\"{bound}\"}} {count}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "{name}_bucket{{vm_id=\"{vm_id}\",le=\"+Inf\"}} {}\n{name}_sum{{vm_id=\"{vm_id}\"}} {}\n{name}_count{{vm_id=\"{vm_id}\"}} {}\n",
+        cumulative[LATENCY_BUCKETS_US.len()],
+        histogram.sum_us(),
+        histogram.count()
+    ));
 }
 
 #[cfg(test)]

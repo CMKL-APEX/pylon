@@ -411,7 +411,11 @@ struct VmHandleInner {
     /// Set when a write to one of the VM's `eventfd`s blocked until `WriteWatch` interrupted
     /// it. `pylond` writes to none of them again, and Plane 1 drops the VM.
     faulty: AtomicBool,
-    park_latency: ParkLatencyHistogram,
+    park_latency: LatencyHistogram,
+    /// From a core's assignment to its vCPU running, for every assignment.
+    wake_latency: LatencyHistogram,
+    /// From a revocation request to the recipient vCPU running on the revoked core.
+    handoff_latency: LatencyHistogram,
     kick_signal: Option<i32>,
     wake_by_signal: bool,
     /// Slot in `VmVcpusTable` and `scx_pylon`'s per-VM queues, given when the handle is
@@ -509,7 +513,9 @@ impl VmHandle {
                 woken_unowned_usec: AtomicU64::new(0),
                 floor_preempt_tsc: AtomicU64::new(0),
                 faulty: AtomicBool::new(false),
-                park_latency: ParkLatencyHistogram::default(),
+                park_latency: LatencyHistogram::default(),
+                wake_latency: LatencyHistogram::default(),
+                handoff_latency: LatencyHistogram::default(),
                 kick_signal: req.kick_signal,
                 wake_by_signal: req.wake_by_signal,
                 vmm_pid: 0,
@@ -663,8 +669,32 @@ impl VmHandle {
 
     /// Returns the revocation-to-park latency histogram for this VM.
     #[inline]
-    pub fn park_latency(&self) -> &ParkLatencyHistogram {
+    pub fn park_latency(&self) -> &LatencyHistogram {
         &self.inner.park_latency
+    }
+
+    /// Records the time from assigning a core to one of this VM's vCPUs to that vCPU running.
+    #[inline]
+    pub fn record_wake_latency_us(&self, usec: u64) {
+        self.inner.wake_latency.record(usec);
+    }
+
+    /// Returns the assignment-to-running latency histogram for this VM.
+    #[inline]
+    pub fn wake_latency(&self) -> &LatencyHistogram {
+        &self.inner.wake_latency
+    }
+
+    /// Records the time from a revocation request to this VM's recipient vCPU running.
+    #[inline]
+    pub fn record_handoff_latency_us(&self, usec: u64) {
+        self.inner.handoff_latency.record(usec);
+    }
+
+    /// Returns the revocation-to-recipient-running latency histogram for this VM.
+    #[inline]
+    pub fn handoff_latency(&self) -> &LatencyHistogram {
+        &self.inner.handoff_latency
     }
 
     /// Binds this freshly registered VM to the VMM process `pid` that registered it, so
@@ -1000,20 +1030,45 @@ impl VmHandle {
     }
 }
 
-/// Upper bounds, in microseconds, of the revocation-to-park latency histogram buckets.
-pub const PARK_LATENCY_BUCKETS_US: [u64; 11] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+/// Number of finite buckets in [`LATENCY_BUCKETS_US`].
+const LATENCY_BUCKET_COUNT: usize = 16 + 8 * 8;
 
-/// Allocation-free histogram of revocation-to-park latencies, in microseconds. Written by
-/// Plane 2, read by the Prometheus exporter.
+/// Upper bounds, in microseconds, of the latency histogram buckets: every microsecond up to
+/// 16 µs, around the 8 µs grace (`spec/06-guest-kick-path.md` §8 S6), then eight buckets per
+/// doubling up to 4,096 µs, so a percentile read from the buckets is within 12.5%.
+pub const LATENCY_BUCKETS_US: [u64; LATENCY_BUCKET_COUNT] = latency_buckets();
+
+const fn latency_buckets() -> [u64; LATENCY_BUCKET_COUNT] {
+    let mut bounds = [0u64; LATENCY_BUCKET_COUNT];
+    let mut i = 0;
+    while i < 16 {
+        bounds[i] = i as u64 + 1;
+        i += 1;
+    }
+    let mut base = 16u64;
+    while i < LATENCY_BUCKET_COUNT {
+        let mut step = 1;
+        while step <= 8 {
+            bounds[i] = base + base * step / 8;
+            step += 1;
+            i += 1;
+        }
+        base *= 2;
+    }
+    bounds
+}
+
+/// Allocation-free latency histogram, in microseconds. Written by Plane 2, read by the
+/// Prometheus exporter.
 #[derive(Debug)]
-pub struct ParkLatencyHistogram {
+pub struct LatencyHistogram {
     /// Per-bucket counts (not cumulative); the last entry counts values above every bound.
-    buckets: [AtomicU64; PARK_LATENCY_BUCKETS_US.len() + 1],
+    buckets: [AtomicU64; LATENCY_BUCKETS_US.len() + 1],
     sum_us: AtomicU64,
     count: AtomicU64,
 }
 
-impl Default for ParkLatencyHistogram {
+impl Default for LatencyHistogram {
     fn default() -> Self {
         Self {
             buckets: from_fn(|_| AtomicU64::new(0)),
@@ -1023,20 +1078,17 @@ impl Default for ParkLatencyHistogram {
     }
 }
 
-impl ParkLatencyHistogram {
+impl LatencyHistogram {
     /// Records one latency of `usec` microseconds.
     pub fn record(&self, usec: u64) {
-        let idx = PARK_LATENCY_BUCKETS_US
-            .iter()
-            .position(|&bound| usec <= bound)
-            .unwrap_or(PARK_LATENCY_BUCKETS_US.len());
+        let idx = LATENCY_BUCKETS_US.partition_point(|&bound| bound < usec);
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(usec, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Release);
     }
 
-    /// Cumulative counts for each bound in `PARK_LATENCY_BUCKETS_US`, then for `+Inf`.
-    pub fn cumulative_buckets(&self) -> [u64; PARK_LATENCY_BUCKETS_US.len() + 1] {
+    /// Cumulative counts for each bound in `LATENCY_BUCKETS_US`, then for `+Inf`.
+    pub fn cumulative_buckets(&self) -> [u64; LATENCY_BUCKETS_US.len() + 1] {
         let mut total = 0u64;
         from_fn(|i| {
             total += self.buckets[i].load(Ordering::Relaxed);
@@ -1984,6 +2036,24 @@ mod tests {
             VCPU_STATE_PARKED
         );
         assert_eq!(read_eventfd(recipient.wake_fds[0].as_raw_fd()).unwrap(), 1);
+
+        // The recipient hasn't run yet: no wake or handoff latency is recorded.
+        assert_eq!(recipient.handle.wake_latency().count(), 0);
+        assert_eq!(recipient.handle.handoff_latency().count(), 0);
+        // Its thread takes the core: the next sweep records 2 us since the handover (5,000)
+        // and 3 us since the request (2,000), once each.
+        recipient_host.vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        engine.poll_once(11_000);
+        engine.poll_once(12_000);
+        assert_eq!(recipient.handle.wake_latency().count(), 1);
+        assert_eq!(recipient.handle.wake_latency().sum_us(), 2);
+        assert_eq!(recipient.handle.handoff_latency().count(), 1);
+        assert_eq!(recipient.handle.handoff_latency().sum_us(), 3);
+        recipient_host.vcpus[0]
+            .state
+            .store(VCPU_STATE_PARKED, Ordering::Release);
 
         // Step 4: Test Forced Preemption on deadline expiry!
         // Suppose Donor's min_cores is lowered or Donor drops runnable_threads to 0 so Donor vCPU 0 is over-allocated,
@@ -3165,21 +3235,35 @@ mod tests {
     }
 
     #[test]
-    fn test_park_latency_histogram_buckets() {
-        let histogram = ParkLatencyHistogram::default();
-        for usec in [0, 1, 3, 8, 9, 5_000] {
+    fn test_latency_histogram_bounds() {
+        assert_eq!(
+            &LATENCY_BUCKETS_US[..17],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18]
+        );
+        assert_eq!(&LATENCY_BUCKETS_US[23..25], &[32, 36]);
+        assert_eq!(LATENCY_BUCKETS_US[LATENCY_BUCKETS_US.len() - 1], 4096);
+        assert!(LATENCY_BUCKETS_US.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn test_latency_histogram_buckets() {
+        let histogram = LatencyHistogram::default();
+        for usec in [0, 1, 3, 8, 9, 17, 5_000] {
             histogram.record(usec);
         }
         let cumulative = histogram.cumulative_buckets();
-        // le=1: {0, 1}; le=4: +3; le=8: +8; le=16: +9; +Inf: +5,000.
+        // le=1: {0, 1}; le=3: +3; le=8: +8; le=9: +9; le=18: +17; +Inf: +5,000.
         assert_eq!(cumulative[0], 2);
+        assert_eq!(cumulative[1], 2);
         assert_eq!(cumulative[2], 3);
-        assert_eq!(cumulative[3], 4);
-        assert_eq!(cumulative[4], 5);
-        assert_eq!(cumulative[PARK_LATENCY_BUCKETS_US.len() - 1], 5);
-        assert_eq!(cumulative[PARK_LATENCY_BUCKETS_US.len()], 6);
-        assert_eq!(histogram.count(), 6);
-        assert_eq!(histogram.sum_us(), 5_021);
+        assert_eq!(cumulative[7], 4);
+        assert_eq!(cumulative[8], 5);
+        assert_eq!(cumulative[15], 5);
+        assert_eq!(cumulative[16], 6);
+        assert_eq!(cumulative[LATENCY_BUCKETS_US.len() - 1], 6);
+        assert_eq!(cumulative[LATENCY_BUCKETS_US.len()], 7);
+        assert_eq!(histogram.count(), 7);
+        assert_eq!(histogram.sum_us(), 5_038);
     }
 
     #[test]
