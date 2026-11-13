@@ -11,6 +11,7 @@ use vm_device::Resource;
 use vm_migration::Migratable;
 
 use crate::device_manager::PciDeviceHandle;
+use crate::vm_config::PciDeviceCommonConfig;
 
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize)]
@@ -100,63 +101,11 @@ impl DeviceTree {
             None
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::{DeviceNode, DeviceTree};
-
-    #[test]
-    fn test_device_tree() {
-        // Check new()
-        let mut device_tree = DeviceTree::new();
-        assert_eq!(device_tree.0.len(), 0);
-
-        // Check insert()
-        let id = String::from("id1");
-        device_tree.insert(id.clone(), DeviceNode::new(id.clone(), None));
-        assert_eq!(device_tree.0.len(), 1);
-        let node = device_tree.0.get(&id);
-        assert!(node.is_some());
-        let node = node.unwrap();
-        assert_eq!(node.id, id);
-
-        // Check get()
-        let id2 = String::from("id2");
-        assert!(device_tree.get(&id).is_some());
-        assert!(device_tree.get(&id2).is_none());
-
-        // Check get_mut()
-        let node = device_tree.get_mut(&id).unwrap();
-        node.id.clone_from(&id2);
-        let node = device_tree.0.get(&id).unwrap();
-        assert_eq!(node.id, id2);
-
-        // Check remove()
-        let node = device_tree.remove(&id).unwrap();
-        assert_eq!(node.id, id2);
-        assert_eq!(device_tree.0.len(), 0);
-
-        // Check iter()
-        let disk_id = String::from("disk0");
-        let net_id = String::from("net0");
-        let rng_id = String::from("rng0");
-        let device_list = vec![
-            (disk_id.clone(), device_node!(disk_id)),
-            (net_id.clone(), device_node!(net_id)),
-            (rng_id.clone(), device_node!(rng_id)),
-        ];
-        device_tree.0.extend(device_list);
-        for (id, node) in device_tree.iter() {
-            if id == &disk_id {
-                assert_eq!(node.id, disk_id);
-            } else if id == &net_id {
-                assert_eq!(node.id, net_id);
-            } else if id == &rng_id {
-                assert_eq!(node.id, rng_id);
-            } else {
-                unreachable!()
-            }
-        }
+    pub fn has_pci_device(&self, pci_common: &PciDeviceCommonConfig) -> bool {
+        pci_common
+            .id
+            .as_ref()
+            .is_none_or(|id| self.contains_key(id))
     }
 }

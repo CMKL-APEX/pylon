@@ -61,6 +61,8 @@ const AMX_COMPLEX: u8 = 8; // AMX tile computation on complex numbers
 const AMX_TILECFG_BIT: u8 = 17; // AMX tile cfg state component bit
 const AMX_TILEDATA_BIT: u8 = 18; // AMX tile data state component bit
 
+const EFER_LMSLE_UNSUPPORTED_BIT: u8 = 20;
+
 // Cache descriptor fields in EAX of the CPUID 0x4 (Intel) and
 // 0x8000001d (AMD) subleaves. The core IDs field exists on 0x4 only.
 const CACHE_TYPE_MASK: u32 = 0x1f;
@@ -71,6 +73,9 @@ const CACHE_CORE_IDS_MASK: u32 = 0x3f;
 
 // KVM feature bits
 const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
+
+// KVM hint bits (EDX of leaf 0x4000_0001)
+const KVM_HINTS_REALTIME: u8 = 0;
 
 pub const _NSIG: i32 = 65;
 
@@ -91,6 +96,7 @@ const E820_RESERVED: u32 = 2;
 pub struct CpuidConfig {
     pub phys_bits: u8,
     pub kvm_hyperv: bool,
+    pub kvm_hint_realtime: bool,
     pub amx: bool,
     pub cpuid_overrides: Vec<CpuidOverride>,
 }
@@ -567,6 +573,12 @@ impl CpuidFeatureEntry {
                 feature_reg: CpuidReg::EDX,
                 compatible_check: CpuidCompatibleCheck::BitwiseSubset,
             },
+            CpuidFeatureEntry {
+                function: 0x8000_0008,
+                index: 0,
+                feature_reg: CpuidReg::EBX,
+                compatible_check: CpuidCompatibleCheck::BitwiseSubset,
+            },
             // KVM CPUID bits: https://www.kernel.org/doc/html/latest/virt/kvm/x86/cpuid.html
             // Leaf 0x4000_0000, EAX/EBX/ECX/EDX, KVM CPUID SIGNATURE
             CpuidFeatureEntry {
@@ -689,9 +701,18 @@ impl CpuidFeatureEntry {
             .enumerate()
         {
             let entry = &feature_entry_list[i];
+
             let entry_compatible = match entry.compatible_check {
                 CpuidCompatibleCheck::BitwiseSubset => {
-                    let different_feature_bits = src_vm_feature ^ dest_vm_feature;
+                    let mut different_feature_bits = src_vm_feature ^ dest_vm_feature;
+
+                    if entry.function == 0x8000_0008
+                        && entry.index == 0
+                        && entry.feature_reg == CpuidReg::EBX
+                    {
+                        // Ignore obsolete defeature bit
+                        different_feature_bits &= !(1 << EFER_LMSLE_UNSUPPORTED_BIT);
+                    }
                     let src_vm_feature_bits_only = different_feature_bits & src_vm_feature;
                     src_vm_feature_bits_only == 0
                 }
@@ -1000,6 +1021,11 @@ fn required_common_cpuid_updates(
                 // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
                 // device interrupts to cpus with APIC IDs > 254 without interrupt remapping.
                 entry.eax |= 1 << KVM_FEATURE_MSI_EXT_DEST_ID;
+
+                // Advertise that every vCPU owns a dedicated host CPU
+                if config.kvm_hint_realtime {
+                    entry.edx |= 1 << KVM_HINTS_REALTIME;
+                }
             }
             _ => {}
         }
@@ -2244,5 +2270,32 @@ mod tests {
         update_cpuid_topology(&mut cpuid, 2, 3000, 1, 1, CpuVendor::Intel, 0);
 
         assert_eq!(sharing_field(&cpuid, 0x4, 3), 0xfff);
+    }
+
+    #[test]
+    fn test_kvm_hint_realtime() {
+        fn kvm_features_edx(kvm_hint_realtime: bool) -> u32 {
+            let cpuid = vec![CpuIdEntry {
+                function: 0x4000_0001,
+                ..Default::default()
+            }];
+            let config = CpuidConfig {
+                phys_bits: 46,
+                kvm_hyperv: false,
+                kvm_hint_realtime,
+                amx: false,
+                cpuid_overrides: Vec::new(),
+            };
+            let updated = required_common_cpuid_updates(
+                cpuid,
+                &config,
+                #[cfg(feature = "kvm")]
+                hypervisor::HypervisorType::Kvm,
+            );
+            CpuidPatch::get_cpuid_reg(&updated, 0x4000_0001, Some(0), CpuidReg::EDX).unwrap()
+        }
+
+        assert_eq!(kvm_features_edx(true), 1 << KVM_HINTS_REALTIME);
+        assert_eq!(kvm_features_edx(false), 0);
     }
 }

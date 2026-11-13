@@ -19,6 +19,8 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::exit;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
@@ -102,6 +104,7 @@ use crate::migration::url_to_file;
 use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::MeasuredBootInfo;
+use crate::util::flatten_error_chain_to_string;
 #[cfg(feature = "fw_cfg")]
 use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
@@ -508,6 +511,15 @@ pub struct Vm {
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
 }
 
+impl Drop for Vm {
+    fn drop(&mut self) {
+        if catch_unwind(AssertUnwindSafe(|| self.shutdown())).is_err() {
+            error!("FATAL: Panic during shutdown");
+            exit(1);
+        }
+    }
+}
+
 impl Vm {
     pub const HANDLED_SIGNALS: [i32; 1] = [SIGWINCH];
 
@@ -911,7 +923,7 @@ impl Vm {
 
         // Create fw_cfg device if configured
         #[cfg(feature = "fw_cfg")]
-        Self::create_fw_cfg_if_enabled(config, device_manager)?;
+        Self::create_fw_cfg_if_enabled(config, device_manager, snapshot)?;
 
         Ok(load_payload_handle)
     }
@@ -979,7 +991,7 @@ impl Vm {
             .map_err(Error::DeviceManager)?;
 
         #[cfg(feature = "fw_cfg")]
-        Self::create_fw_cfg_if_enabled(config, device_manager)?;
+        Self::create_fw_cfg_if_enabled(config, device_manager, snapshot)?;
 
         Ok(load_payload_handle)
     }
@@ -1060,6 +1072,7 @@ impl Vm {
     fn create_fw_cfg_if_enabled(
         config: &Arc<Mutex<VmConfig>>,
         device_manager: &Arc<Mutex<DeviceManager>>,
+        snapshot: Option<&Snapshot>,
     ) -> Result<()> {
         let fw_cfg_enabled = config
             .lock()
@@ -1072,7 +1085,7 @@ impl Vm {
             device_manager
                 .lock()
                 .unwrap()
-                .create_fw_cfg_device()
+                .create_fw_cfg_device(snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID))
                 .map_err(Error::DeviceManager)?;
         }
 
@@ -1080,7 +1093,70 @@ impl Vm {
     }
 
     #[cfg(feature = "fw_cfg")]
-    fn populate_fw_cfg(
+    fn populate_fw_cfg(&self) -> Result<()> {
+        let fw_cfg_enabled = self
+            .config
+            .lock()
+            .unwrap()
+            .payload
+            .as_ref()
+            .is_some_and(|p| p.fw_cfg_config.is_some());
+        if !fw_cfg_enabled {
+            return Ok(());
+        }
+
+        let fw_cfg_config = self
+            .config
+            .lock()
+            .unwrap()
+            .payload
+            .as_ref()
+            .map(|p| p.fw_cfg_config.clone())
+            .unwrap_or_default()
+            .ok_or(Error::VmMissingConfig)?;
+        #[cfg(target_arch = "x86_64")]
+        let kvm_sev_snp_enabled = {
+            #[cfg(feature = "sev_snp")]
+            {
+                let sev_snp_enabled = self.config.lock().unwrap().is_sev_snp_enabled();
+                sev_snp_enabled
+                    && self.cpu_manager.lock().unwrap().hypervisor_type()
+                        == hypervisor::HypervisorType::Kvm
+            }
+            #[cfg(not(feature = "sev_snp"))]
+            {
+                false
+            }
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let boot_memory = self.memory_manager.lock().unwrap().boot_guest_memory();
+        Self::populate_fw_cfg_items(
+            &fw_cfg_config,
+            &self.device_manager,
+            &self.config,
+            #[cfg(target_arch = "x86_64")]
+            &boot_memory,
+            #[cfg(target_arch = "x86_64")]
+            kvm_sev_snp_enabled,
+        )?;
+
+        if fw_cfg_config.acpi_tables {
+            let tpm_enabled = self.config.lock().unwrap().tpm.is_some();
+            acpi::create_acpi_tables_for_fw_cfg(
+                &self.device_manager.lock().unwrap(),
+                &self.cpu_manager.lock().unwrap(),
+                &self.memory_manager.lock().unwrap(),
+                &self.numa_nodes,
+                tpm_enabled,
+            )
+            .map_err(Error::CreatingAcpiTables)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fw_cfg")]
+    fn populate_fw_cfg_items(
         fw_cfg_config: &FwCfgConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
@@ -1299,56 +1375,54 @@ impl Vm {
             Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
         };
 
-        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        if vm_config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
-            vm.enable_x2apic_api().unwrap();
-        }
+        let memory_manager = {
+            let config = vm_config.lock().unwrap();
 
-        let phys_bits = physical_bits(
-            hypervisor.as_ref(),
-            vm_config.lock().unwrap().cpus.max_phys_bits,
-        );
+            #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+            if config.max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
+                vm.enable_x2apic_api().unwrap();
+            }
 
-        let mut memory_restore_mode = memory_restore_mode.unwrap_or_default();
-        if memory_restore_mode == MemoryRestoreMode::CopyOnWrite
-            && !is_restore_cow_supported(&vm_config.lock().unwrap())
-        {
-            warn!(
-                "Restore (mode=copyonwrite): requires non-resizable private RAM without passthrough, NUMA binding or KSM, falling back to copy"
-            );
-            memory_restore_mode = MemoryRestoreMode::Copy;
-        }
+            let phys_bits = physical_bits(hypervisor.as_ref(), config.cpus.max_phys_bits);
 
-        let memory_manager =
+            let mut memory_restore_mode = memory_restore_mode.unwrap_or_default();
+            if memory_restore_mode == MemoryRestoreMode::CopyOnWrite
+                && !is_restore_cow_supported(&config)
+            {
+                warn!(
+                    "Restore (mode=copyonwrite): requires non-resizable private RAM without passthrough, NUMA binding or KSM, falling back to copy"
+                );
+                memory_restore_mode = MemoryRestoreMode::Copy;
+            }
+
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
-                let vm_config = vm_config.lock().unwrap();
                 MemoryManager::new_from_snapshot(
                     snapshot,
                     Arc::clone(&vm),
-                    &vm_config.memory.clone(),
+                    &config.memory.clone(),
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode,
                     phys_bits,
                     &exit_evt,
                     #[cfg(feature = "sev_snp")]
-                    vm_config.is_sev_snp_enabled(),
+                    config.is_sev_snp_enabled(),
                 )
                 .map_err(Error::MemoryManager)?
             } else {
-                let vm_config = vm_config.lock().unwrap();
                 MemoryManager::new(
                     Arc::clone(&vm),
-                    &vm_config.memory.clone(),
+                    &config.memory.clone(),
                     None,
                     phys_bits,
                     #[cfg(feature = "sev_snp")]
-                    vm_config.is_sev_snp_enabled(),
+                    config.is_sev_snp_enabled(),
                     None,
                     Default::default(),
                 )
                 .map_err(Error::MemoryManager)?
-            };
+            }
+        };
 
         Vm::new_from_memory_manager(
             vm_config,
@@ -1784,8 +1858,10 @@ impl Vm {
             self.config.lock().unwrap().payload.as_ref().unwrap(),
             &self.device_manager,
         )?;
-        let vcpu_mpidrs = self.cpu_manager.lock().unwrap().get_mpidrs();
-        let vcpu_topology = self.cpu_manager.lock().unwrap().get_vcpu_topology();
+        let (vcpu_mpidrs, vcpu_topology) = {
+            let cpu_manager = self.cpu_manager.lock().unwrap();
+            (cpu_manager.get_mpidrs(), cpu_manager.get_vcpu_topology())
+        };
         let mem = self.memory_manager.lock().unwrap().boot_guest_memory();
         let mut pci_space_info: Vec<PciSpaceInfo> = Vec::new();
         let initramfs_config = match self.initramfs {
@@ -1812,13 +1888,18 @@ impl Vm {
             pci_space_info.push(pci_space);
         }
 
-        let virtio_iommu_bdf = self
+        let virtio_iommu_devices = self
             .device_manager
             .lock()
             .unwrap()
             .iommu_attached_devices()
             .as_ref()
-            .map(|(v, _)| *v);
+            .map(|(v, ids)| {
+                (
+                    (*v).into(),
+                    ids.iter().map(|id| (*id).into()).collect::<Vec<u32>>(),
+                )
+            });
 
         let vgic = self
             .device_manager
@@ -1864,7 +1945,9 @@ impl Vm {
             device_info,
             &initramfs_config,
             &pci_space_info,
-            virtio_iommu_bdf.map(|bdf| bdf.into()),
+            virtio_iommu_devices
+                .as_ref()
+                .map(|(v, ids)| (*v, ids.as_slice())),
             &vgic,
             &self.numa_nodes,
             pmu_supported,
@@ -1958,24 +2041,28 @@ impl Vm {
         self.device_manager.lock().unwrap().console_resize_pipe()
     }
 
-    pub fn shutdown(&mut self) -> Result<()> {
-        let new_state = VmState::Shutdown;
+    /// Exit the process on a shutdown error.
+    pub fn shutdown(&mut self) {
+        if self.state == VmState::Shutdown {
+            return;
+        }
 
-        self.state.valid_transition(new_state)?;
-
-        self.cpu_manager
-            .lock()
-            .unwrap()
-            .shutdown()
-            .map_err(Error::CpuManager)?;
+        if let Err(e) = self.cpu_manager.lock().unwrap().shutdown() {
+            error!(
+                "FATAL: Failed stopping vCPUs during shutdown: {}",
+                flatten_error_chain_to_string(&e)
+            );
+            exit(1);
+        }
 
         // Wait for all the threads to finish
         for thread in self.threads.drain(..) {
-            thread.join().map_err(Error::ThreadCleanup)?;
+            if let Err(e) = thread.join() {
+                error!("FATAL: Failed joining VM thread during shutdown: {e:?}");
+                exit(1);
+            }
         }
-        self.state = new_state;
-
-        Ok(())
+        self.state = VmState::Shutdown;
     }
 
     pub fn resize(
@@ -2017,17 +2104,14 @@ impl Vm {
             let hotplug_method = self.config.lock().unwrap().memory.hotplug_method;
 
             if let Some(new_region) = &new_region {
-                self.device_manager
-                    .lock()
-                    .unwrap()
+                let device_manager = self.device_manager.lock().unwrap();
+                device_manager
                     .update_memory(new_region)
                     .map_err(Error::DeviceManager)?;
 
                 match hotplug_method {
                     HotplugMethod::Acpi => {
-                        self.device_manager
-                            .lock()
-                            .unwrap()
+                        device_manager
                             .notify_hotplug(AcpiNotificationFlags::MEMORY_DEVICES_CHANGED)
                             .map_err(Error::DeviceManager)?;
                     }
@@ -2167,15 +2251,12 @@ impl Vm {
     }
 
     pub fn remove_device(&mut self, id: &str) -> Result<()> {
-        self.device_manager
-            .lock()
-            .unwrap()
+        let mut device_manager = self.device_manager.lock().unwrap();
+        device_manager
             .remove_device(id)
             .map_err(Error::DeviceManager)?;
 
-        self.device_manager
-            .lock()
-            .unwrap()
+        device_manager
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
         Ok(())
@@ -2415,64 +2496,7 @@ impl Vm {
             .map_err(Error::LockingError)?;
 
         #[cfg(feature = "fw_cfg")]
-        {
-            let fw_cfg_enabled = self
-                .config
-                .lock()
-                .unwrap()
-                .payload
-                .as_ref()
-                .is_some_and(|p| p.fw_cfg_config.is_some());
-            if fw_cfg_enabled {
-                let fw_cfg_config = self
-                    .config
-                    .lock()
-                    .unwrap()
-                    .payload
-                    .as_ref()
-                    .map(|p| p.fw_cfg_config.clone())
-                    .unwrap_or_default()
-                    .ok_or(Error::VmMissingConfig)?;
-                #[cfg(target_arch = "x86_64")]
-                let kvm_sev_snp_enabled = {
-                    #[cfg(feature = "sev_snp")]
-                    {
-                        let sev_snp_enabled = self.config.lock().unwrap().is_sev_snp_enabled();
-                        sev_snp_enabled
-                            && self.cpu_manager.lock().unwrap().hypervisor_type()
-                                == hypervisor::HypervisorType::Kvm
-                    }
-                    #[cfg(not(feature = "sev_snp"))]
-                    {
-                        false
-                    }
-                };
-
-                #[cfg(target_arch = "x86_64")]
-                let boot_memory = self.memory_manager.lock().unwrap().boot_guest_memory();
-                Self::populate_fw_cfg(
-                    &fw_cfg_config,
-                    &self.device_manager,
-                    &self.config,
-                    #[cfg(target_arch = "x86_64")]
-                    &boot_memory,
-                    #[cfg(target_arch = "x86_64")]
-                    kvm_sev_snp_enabled,
-                )?;
-
-                if fw_cfg_config.acpi_tables {
-                    let tpm_enabled = self.config.lock().unwrap().tpm.is_some();
-                    acpi::create_acpi_tables_for_fw_cfg(
-                        &self.device_manager.lock().unwrap(),
-                        &self.cpu_manager.lock().unwrap(),
-                        &self.memory_manager.lock().unwrap(),
-                        &self.numa_nodes,
-                        tpm_enabled,
-                    )
-                    .map_err(Error::CreatingAcpiTables)?;
-                }
-            }
-        }
+        self.populate_fw_cfg()?;
 
         // Do earlier to parallelise with loading kernel
         #[cfg(target_arch = "x86_64")]
@@ -2578,6 +2602,9 @@ impl Vm {
             .unwrap()
             .try_lock_disks()
             .map_err(Error::LockingError)?;
+
+        #[cfg(feature = "fw_cfg")]
+        self.populate_fw_cfg()?;
 
         // Any restore may be a fork, so reseed before the guest runs.
         #[cfg(not(target_arch = "riscv64"))]
@@ -2939,7 +2966,11 @@ impl Pausable for Vm {
 
 #[derive(Serialize, Deserialize)]
 pub struct VmSnapshot {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(target_arch = "x86_64", serde(flatten))]
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub clock: Option<hypervisor::ClockState>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     pub common_cpuid: Vec<x86::CpuIdEntry>,
@@ -3185,12 +3216,13 @@ impl Debuggable for Vm {
     }
 
     fn active_vcpus(&self) -> usize {
-        let active_vcpus = self.cpu_manager.lock().unwrap().active_vcpus();
+        let cpu_manager = self.cpu_manager.lock().unwrap();
+        let active_vcpus = cpu_manager.active_vcpus();
         if active_vcpus > 0 {
             active_vcpus
         } else {
             // The VM is not booted yet. Report boot_vcpus() instead.
-            self.cpu_manager.lock().unwrap().boot_vcpus() as usize
+            cpu_manager.boot_vcpus() as usize
         }
     }
 }
@@ -3227,14 +3259,11 @@ impl GuestDebuggable for Vm {
         self.write_note(&coredump_state)?;
         self.write_loads(&coredump_state)?;
 
-        self.cpu_manager
-            .lock()
-            .unwrap()
-            .cpu_write_elf64_note(&coredump_state)?;
-        self.cpu_manager
-            .lock()
-            .unwrap()
-            .cpu_write_vmm_note(&coredump_state)?;
+        {
+            let mut cpu_manager = self.cpu_manager.lock().unwrap();
+            cpu_manager.cpu_write_elf64_note(&coredump_state)?;
+            cpu_manager.cpu_write_vmm_note(&coredump_state)?;
+        }
 
         self.memory_manager
             .lock()
@@ -3321,8 +3350,11 @@ mod tests {
 
     #[test]
     pub(crate) fn test_vm() {
+        use std::sync::atomic::AtomicU32;
+
         use hypervisor::VmExit;
-        use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
+        use vm_allocator::{GuestRegion, MemorySlotAllocator};
+        use vm_memory::GuestMemoryBackend;
         // This example based on https://lwn.net/Articles/658511/
         let code = [
             0xba, 0xf8, 0x03, /* mov $0x3f8, %dx */
@@ -3336,30 +3368,33 @@ mod tests {
 
         let mem_size = 0x1000;
         let load_addr = GuestAddress(0x1000);
-        let mem = GuestMemory::from_ranges(&[(load_addr, mem_size)]).unwrap();
 
         let hv = hypervisor::new().unwrap();
         let vm = hv
             .create_vm(HypervisorVmConfig::default())
             .expect("new VM creation failed");
 
-        for (index, region) in mem.iter().enumerate() {
-            // SAFETY: inputs are valid
-            unsafe {
-                vm.create_user_memory_region(
-                    index as u32,
-                    region.start_addr().raw_value(),
-                    region.len().try_into().unwrap(),
-                    region.as_ptr(),
-                    false,
-                    false,
-                    hypervisor::MemoryVisibility::Shared,
-                )
-                .expect("Cannot configure guest memory");
-            }
-        }
+        let slot_allocator = Arc::new(MemorySlotAllocator::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let region = GuestRegion::from_mmap(
+            vm_memory::MmapRegion::new(mem_size).unwrap(),
+            load_addr,
+            Arc::clone(&vm),
+            slot_allocator,
+            false,
+            false,
+            false,
+            hypervisor::MemoryVisibility::Shared,
+        )
+        .unwrap();
+        let mem = GuestMemory::from_regions(vec![region]).unwrap();
         mem.write_slice(&code, load_addr)
             .expect("Writing code to memory failed");
+        for region in mem.iter() {
+            region.register().expect("Cannot configure guest memory");
+        }
 
         let mut vcpu = vm
             .create_vcpu(0, None, Default::default())
@@ -3440,6 +3475,7 @@ mod tests {
 
         let hv = hypervisor::new().unwrap();
         let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let _ = vm.create_vcpu(0, None).unwrap();
         let vgic_config = Gic::create_config(1, None).unwrap();
         let gic = vm.create_vgic(&vgic_config).expect("Cannot create gic");
         arch::aarch64::fdt::create_fdt(

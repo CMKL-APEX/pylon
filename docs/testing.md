@@ -35,8 +35,12 @@ flag.
 
 Test workloads (guest images, kernels, firmware) are stored on the host
 under `$HOME/workloads` and bind-mounted into the container at
-`/root/workloads`. Most test scripts download missing workloads
-automatically on first run.
+`/root/workloads`. Before it starts the container, `dev_cli.sh tests`
+runs `scripts/fetch_workloads.py` on the host. It downloads the
+workloads listed in `scripts/test_assets.yaml` that are missing or
+have a wrong checksum. `dev_cli.sh fetch-workloads` runs only this
+step. The test scripts do not download anything: run directly, they
+exit with a `Missing:` error if a workload is absent.
 
 ## Prerequisites
 
@@ -50,7 +54,8 @@ ls -l /dev/kvm
 ```
 
 The container image bundles all build dependencies. No Rust toolchain
-is needed on the host.
+is needed on the host, but `dev_cli.sh tests` needs `python3` on the
+host to fetch the workloads.
 
 ## The dev_cli.sh entry point
 
@@ -131,11 +136,11 @@ dev_cli.sh tests <flags> -- <script args> -- <binary args>
 The test scripts accept the following common arguments via
 `process_common_args()` in `scripts/test-util.sh`:
 
-| Argument              | Description                                  |
-|-----------------------|----------------------------------------------|
+| Argument                 | Description                                                                                                |
+|--------------------------|------------------------------------------------------------------------------------------------------------|
 | `--hypervisor kvm\|mshv` | Override the hypervisor (auto-detected from the host device node when omitted; also passed by dev_cli.sh). |
-| `--test-filter <name>`| Run only tests matching the filter.           |
-| `--test-exclude <name>`| Exclude tests matching the pattern.          |
+| `--test-filter <name>`   | Run only tests matching the filter.                                                                        |
+| `--test-exclude <name>`  | Exclude tests matching the pattern. Only the metrics script uses it. The integration scripts ignore it.    |
 
 **Example — run a single integration test:**
 
@@ -197,6 +202,8 @@ cargo test --lib --bins --target <target> --release --workspace
 cargo test --doc --target <target> --release --workspace
 ```
 
+Disk image unit tests require `qemu-img`. A missing executable or a failed command fails the test.
+
 The container is _not_ fully privileged. It receives `--device
 /dev/kvm` (or `/dev/mshv`), `--device /dev/net/tun`, and `--cap-add
 net_admin` so that tests requiring a hypervisor device or TAP
@@ -214,10 +221,12 @@ The hypervisor backend is auto-detected from the host device node:
 All integration test containers run with `--privileged` and full
 access to `/dev`. Workloads are bind-mounted from the host.
 
-Test scripts use `cargo nextest run` with the `--release` profile.
+Test scripts build Cloud Hypervisor with `cargo build --release` and
+run the tests with `cargo nextest run`, using the profiles from
+`.config/nextest.toml`.
 Tests are grouped by module name filter (e.g., `common_parallel`,
-`common_sequential`). Most groups support automatic retries (default
-3). The nextest configuration in `.config/nextest.toml` sets a
+`common_sequential`). Most groups retry a failed test up to 2
+times. The nextest configuration in `.config/nextest.toml` sets a
 slow-timeout of 60 seconds per period with automatic termination
 after 10 periods (i.e., any single test running longer than 10
 minutes is terminated).
@@ -247,12 +256,12 @@ scripts/dev_cli.sh tests --integration [--libc musl|gnu]
 ```
 
 Runs `scripts/run_integration_tests_x86_64.sh`. The script
-automatically downloads and prepares all required workloads:
+prepares all required workloads:
 
 - **Kernel:** `vmlinux-x86_64`.
 - **Firmware:** `hypervisor-fw` (rust-hypervisor-firmware).
 - **OVMF:** `CLOUDHV.fd`.
-- **Guest images:** Ubuntu Focal and Jammy cloud images in multiple
+- **Guest images:** Ubuntu Jammy cloud images in multiple
   formats (raw, qcow2, compressed, backing-file variants).
 - **Alpine:** Minirootfs and initramfs for lightweight boot tests.
 - **virtiofsd:** Built from source for virtio-fs tests.
@@ -283,7 +292,7 @@ mirrors x86_64 with aarch64-specific images:
 
 - **Kernel:** `Image-arm64`.
 - **OVMF:** `CLOUDHV_EFI.fd`.
-- **Guest images:** Focal and Jammy aarch64 cloud images.
+- **Guest images:** Ubuntu Jammy aarch64 cloud images.
 
 **Test groups executed:** `common_parallel`, `common_sequential`,
 `aarch64_acpi`, `dbus_api`, `fw_cfg`, `ivshmem`.
@@ -325,7 +334,7 @@ concurrent test runs without corrupting the base image.
 | x86_64       | `windows-server-2025-amd64-1.raw`            | `CLOUDHV.fd`     |
 | aarch64      | `windows-11-iot-enterprise-aarch64.raw`       | `CLOUDHV_EFI.fd` |
 
-**Test group:** `windows` (single-threaded, retries 3).
+**Test group:** `windows` (up to 4 tests in parallel, retries 2).
 
 ### Rate limiter
 
@@ -333,8 +342,8 @@ concurrent test runs without corrupting the base image.
 scripts/dev_cli.sh tests --integration-rate-limiter
 ```
 
-Runs `scripts/run_integration_tests_rate_limiter.sh`. Downloads Jammy
-guest images and a prebuilt kernel.
+Runs `scripts/run_integration_tests_rate_limiter.sh`. Uses the Jammy
+guest image and the prebuilt kernel.
 
 **Test group:** `rate_limiter` (single-threaded, no retries).
 
@@ -347,7 +356,7 @@ scripts/dev_cli.sh tests --integration-cvm
 Runs `scripts/run_integration_tests_cvm.sh`. MSHV requires prebuilt
 IGVM files in `/usr/share/cloud-hypervisor/cvm` on the host.
 
-**Test group:** `common_cvm` (`nproc / 4` threads, retries 3).
+**Test group:** `common_cvm` (`nproc / 4` threads, retries 2).
 
 #### KVM SEV-SNP
 

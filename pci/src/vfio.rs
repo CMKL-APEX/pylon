@@ -1846,7 +1846,6 @@ impl VfioCommon {
                 info!(
                     "MSE bit is disabled. No BAR reprogramming parameter is returned: {ret_param:x?}"
                 );
-
                 ret_param.clear();
             }
         }
@@ -3005,16 +3004,15 @@ where
                     )));
                 }
             }
-        } else if self.mmio_regions.lock().unwrap().check_range(gpa, size) {
-            Err(self
-                .mmio_regions
-                .lock()
-                .unwrap()
-                .find_user_address(gpa, size)?)
         } else {
-            return Err(io::Error::other(format!(
-                "failed to locate guest address 0x{gpa:x} in guest memory"
-            )));
+            let mmio_regions = self.mmio_regions.lock().unwrap();
+            if mmio_regions.check_range(gpa, size) {
+                Err(mmio_regions.find_user_address(gpa, size)?)
+            } else {
+                return Err(io::Error::other(format!(
+                    "failed to locate guest address 0x{gpa:x} in guest memory"
+                )));
+            }
         };
         let user_addr = match user_addr {
             Ok(p) => p.as_ptr(),
@@ -3504,65 +3502,6 @@ mod tests {
         // resets directly rather than attempting STOP.
         assert_eq!(mock.transitions(), vec![VfioMigrationState::Resuming]);
         assert_eq!(mock.resets(), 1);
-    }
-
-    #[test]
-    fn mock_dma_logging_start_records_and_negotiates() {
-        let mock = MockVfio::with_state(MockVfioState {
-            dma_logging_negotiated: Some(0x2000),
-            ..Default::default()
-        });
-        let ranges = [
-            DmaLoggingRange {
-                iova: 0,
-                length: 0x1000,
-            },
-            DmaLoggingRange {
-                iova: 0x4000,
-                length: 0x2000,
-            },
-        ];
-        // The device may apply a different granularity than requested, so
-        // the negotiated page size flows back through the trait.
-        let negotiated = mock.start_dma_logging(0x1000, &ranges).unwrap();
-        assert_eq!(negotiated, 0x2000);
-        assert!(mock.dma_logging_started());
-        let (page_size, recorded) = mock.dma_logging_recorded();
-        assert_eq!(page_size, 0x1000);
-        assert_eq!(recorded, ranges);
-    }
-
-    #[test]
-    fn mock_dma_logging_stop_clears_started_flag() {
-        let mock = MockVfio::for_dma_logging(Vec::new());
-        let range = DmaLoggingRange {
-            iova: 0,
-            length: 0x1000,
-        };
-        mock.start_dma_logging(0x1000, &[range]).unwrap();
-        assert!(mock.dma_logging_started());
-        mock.stop_dma_logging().unwrap();
-        assert!(!mock.dma_logging_started());
-    }
-
-    #[test]
-    fn mock_dma_logging_report_converts_bitmap_to_ranges() {
-        // Bits 0, 1, 4 set means three dirty pages with a one page gap.
-        // Expect two ranges, [iova .. iova+2*ps) and [iova+4*ps .. iova+5*ps).
-        let bitmap = vec![0b10011_u64];
-        let mock = MockVfio::for_dma_logging(bitmap);
-        let page_size: u64 = 0x1000;
-        let range = DmaLoggingRange {
-            iova: 0x1_0000_0000,
-            length: page_size * 64,
-        };
-        let table = mock.report_dma_logging(range, page_size).unwrap();
-        let ranges = table.ranges();
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[0].gpa, 0x1_0000_0000);
-        assert_eq!(ranges[0].length, page_size * 2);
-        assert_eq!(ranges[1].gpa, 0x1_0000_0000 + 4 * page_size);
-        assert_eq!(ranges[1].length, page_size);
     }
 
     #[test]

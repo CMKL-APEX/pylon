@@ -153,7 +153,7 @@ pub enum Error {
     /// Cannot start D-Bus session
     #[cfg(feature = "dbus_api")]
     #[error("Error starting D-Bus session")]
-    CreateDBusSession(#[source] zbus::Error),
+    CreateDBusSession(#[source] Box<zbus::Error>),
 
     /// Cannot create `event-monitor` thread
     #[error("Error spawning `event-monitor` thread")]
@@ -1240,24 +1240,19 @@ impl Vmm {
                         "Timed out waiting for postcopy fault connection: {e}"
                     ))
                 })?;
-            let mm = Arc::clone(&config_data.memory_manager);
-            let saved_regions = mm
-                .lock()
-                .unwrap()
-                .memory_range_table(MemoryRangePolicy::Full)?;
-            mm.lock()
-                .unwrap()
-                .start_postcopy_serving(
-                    &saved_regions,
-                    shared_backing,
-                    config_data.background_fetch_pages,
-                    fault_stream,
-                    &self.exit_evt,
-                )
-                .map_err(|e| {
-                    config_data.connections.cleanup().ok();
-                    MigratableError::MigrateReceive(anyhow!("start_postcopy_serving: {e:?}"))
-                })?;
+            let mut mm = config_data.memory_manager.lock().unwrap();
+            let saved_regions = mm.memory_range_table(MemoryRangePolicy::Full)?;
+            mm.start_postcopy_serving(
+                &saved_regions,
+                shared_backing,
+                config_data.background_fetch_pages,
+                fault_stream,
+                &self.exit_evt,
+            )
+            .map_err(|e| {
+                config_data.connections.cleanup().ok();
+                MigratableError::MigrateReceive(anyhow!("start_postcopy_serving: {e:?}"))
+            })?;
         }
 
         // The fault connection is in hand, so stop the accept thread.
@@ -1349,41 +1344,29 @@ impl Vmm {
                 .map_err(MigratableError::MigrateReceive)?,
         );
 
-        if self
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .landlock_enable
-        {
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
-            apply_landlock(&mut config)
+        let mut vm_config = config.lock().unwrap();
+
+        if vm_config.landlock_enable {
+            apply_landlock(&mut vm_config)
                 .context("Error applying landlock")
                 .map_err(MigratableError::MigrateReceive)?;
         }
 
-        let vm = Vm::create_hypervisor_vm(
-            self.hypervisor.as_ref(),
-            (&*self.vm_config.as_ref().unwrap().lock().unwrap()).into(),
-        )
-        .map_err(|e| {
-            MigratableError::MigrateReceive(anyhow!(
-                "Error creating hypervisor VM from snapshot: {e:?}"
-            ))
-        })?;
+        let vm = Vm::create_hypervisor_vm(self.hypervisor.as_ref(), (&*vm_config).into()).map_err(
+            |e| {
+                MigratableError::MigrateReceive(anyhow!(
+                    "Error creating hypervisor VM from snapshot: {e:?}"
+                ))
+            },
+        )?;
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        if config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
+        if vm_config.max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
             vm.enable_x2apic_api().unwrap();
         }
 
-        let phys_bits = vm::physical_bits(
-            self.hypervisor.as_ref(),
-            config.lock().unwrap().cpus.max_phys_bits,
-        );
+        let phys_bits = vm::physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
 
-        let vm_config = config.lock().unwrap();
         let memory_manager = MemoryManager::new(
             vm,
             &vm_config.memory.clone(),
@@ -2047,6 +2030,7 @@ impl Vmm {
                 &arch::CpuidConfig {
                     phys_bits,
                     kvm_hyperv: vm_config.cpus.kvm_hyperv,
+                    kvm_hint_realtime: vm_config.cpus.kvm_hint_realtime,
                     amx: vm_config.cpus.features.amx,
                     cpuid_overrides: vm_config.cpus.cpuid_overrides.clone(),
                 },
@@ -2120,16 +2104,11 @@ impl Vmm {
                     Some(memory_restore_mode),
                 )?;
 
-                if self
-                    .vm_config
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .landlock_enable
                 {
                     let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
-                    apply_landlock(&mut config).map_err(VmError::ApplyLandlock)?;
+                    if config.landlock_enable {
+                        apply_landlock(&mut config).map_err(VmError::ApplyLandlock)?;
+                    }
                 }
 
                 // Now we can restore the rest of the VM.
@@ -2205,12 +2184,7 @@ impl Vmm {
 
                 // Since the VMM explicitly no longer owns the VM, the exit
                 // event won't call the shutdown path automatically.
-                if let Err(e) = vm.shutdown() {
-                    error!(
-                        "Failed shutting down the VM after migration: {}",
-                        flatten_error_chain_to_string(&e)
-                    );
-                }
+                vm.shutdown();
 
                 if let Err(e) = self.exit_evt.write(1) {
                     error!("Failed exiting the VMM after migration: {e}");
@@ -2230,12 +2204,7 @@ impl Vmm {
                     );
                     self.vm = VmOwnership::None;
                     let mut vm = vm;
-                    if let Err(e) = vm.shutdown() {
-                        warn!(
-                            "Failed tearing down the VM after failed postcopy migration: {}",
-                            flatten_error_chain_to_string(&e)
-                        );
-                    }
+                    vm.shutdown();
                 } else {
                     try_resume_vm_after_failed_migration(vm);
                 }
@@ -2653,12 +2622,9 @@ impl RequestHandler for Vmm {
                     return Err(VmError::VmAlreadyCreated);
                 }
 
-                let source_url = restore_cfg.source_url.as_path().to_str();
-                if source_url.is_none() {
+                let Some(source_url) = restore_cfg.source_url.as_path().to_str() else {
                     return Err(VmError::InvalidRestoreSourceUrl);
-                }
-                // Safe to unwrap as we checked it was Some(&str).
-                let source_url = source_url.unwrap();
+                };
 
                 let vm_config = Arc::new(Mutex::new(
                     recv_vm_config(source_url).map_err(VmError::Restore)?,
@@ -2759,13 +2725,9 @@ impl RequestHandler for Vmm {
         let mut vm = self.vm.take_owned_or(VmError::VmNotRunning)?;
         // Drain console_info so that the FDs are not reused
         let _ = self.console_info.take();
-        let r = vm.shutdown();
-
-        if r.is_ok() {
-            event!("vm", "shutdown");
-        }
-
-        r
+        vm.shutdown();
+        event!("vm", "shutdown");
+        Ok(())
     }
 
     fn vm_reboot(&mut self) -> result::Result<(), VmError> {
@@ -2777,7 +2739,7 @@ impl RequestHandler for Vmm {
             let mut vm = self.vm.take_owned_or(VmError::VmNotCreated)?;
             let config = vm.get_config();
             // First we stop the current VM
-            vm.shutdown()?;
+            vm.shutdown();
             config
         };
 
@@ -3447,13 +3409,8 @@ impl RequestHandler for Vmm {
                 );
                 event!("vm", "migration-receive-failed");
                 let vm = self.vm.take_owned_or(VmError::VmNotCreated);
-                if let Ok(mut vm) = vm
-                    && let Err(err) = vm.shutdown()
-                {
-                    error!(
-                        "Failed shutting down the VM after failed receive migration: {}",
-                        flatten_error_chain_to_string(&err)
-                    );
+                if let Ok(mut vm) = vm {
+                    vm.shutdown();
                 }
                 self.vm_config = None;
             })
@@ -3676,13 +3633,12 @@ mod tests {
 
     use super::*;
     use crate::config::{RestoredVfioConfig, ValidationError};
-    use crate::console_devices::ConsoleDeviceError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
-        BalloonConfig, CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling,
-        CpuFeatures, CpusConfig, DeviceConfig, ExternalFd, MemoryConfig, MemoryZoneConfig,
-        PayloadConfig, PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
+        BalloonConfig, ConsoleConfig, ConsoleOutput, CoreScheduling, CpuFeatures, CpusConfig,
+        DeviceConfig, ExternalFd, MemoryConfig, MemoryZoneConfig, PayloadConfig,
+        PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
     };
 
     fn create_dummy_vmm() -> Vmm {
@@ -3709,6 +3665,8 @@ mod tests {
                 max_vcpus: 1,
                 topology: None,
                 kvm_hyperv: false,
+                #[cfg(target_arch = "x86_64")]
+                kvm_hint_realtime: false,
                 max_phys_bits: 46,
                 affinity: None,
                 features: CpuFeatures::default(),
@@ -3756,21 +3714,11 @@ mod tests {
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                    tcp: None,
-                },
+                output: ConsoleOutput::Null,
             },
             console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    // Caution: Don't use `Tty` to not mess with users terminal
-                    mode: ConsoleOutputMode::Off,
-                    socket: None,
-                    tcp: None,
-                },
+                // Caution: Don't use `Tty` to not mess with users terminal
+                output: ConsoleOutput::Off,
                 pci_common: PciDeviceCommonConfig::default(),
             },
             #[cfg(target_arch = "x86_64")]
@@ -3811,21 +3759,6 @@ mod tests {
         assert!(matches!(
             vmm.vm_create(config),
             Err(VmError::VmAlreadyCreated)
-        ));
-    }
-
-    // vm.create sets up the console devices before the config is validated.
-    #[test]
-    fn test_vmm_vm_create_serial_file_without_path() {
-        let mut vmm = create_dummy_vmm();
-        let mut config = create_dummy_vm_config();
-        config.serial.common.mode = ConsoleOutputMode::File;
-
-        assert!(matches!(
-            vmm.vm_create(config),
-            Err(VmError::CreateConsoleDevices(
-                ConsoleDeviceError::MissingFilePath
-            ))
         ));
     }
 
@@ -4477,20 +4410,6 @@ mod tests {
             Some(iommu.clone()),
         );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_stale_fd_needs_replacement() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        {
-            let mut config = vm_config.lock().unwrap();
-            let device = &mut config.devices.as_mut().unwrap()[0];
-            device.path = None;
-            device.fd = Default::default();
-        }
-        receive_data(None, None)
-            .validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
     }
 
