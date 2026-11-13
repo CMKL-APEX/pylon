@@ -151,7 +151,8 @@ for host tasks, which is the open gap below.
 
 | Figure | Kind | Source |
 |---|---|---|
-| Grace period: 8 µs | Default | `REVOKE_GRACE_PERIOD_US`, `pylond/src/engine.rs` |
+| Grace period: 8 µs | Default (`--revoke-grace-us`) | `REVOKE_GRACE_PERIOD_US`, `pylond/src/engine.rs` |
+| Forced handoff: 50 µs after the first signal | Default (`--force-handoff-us`) | `FORCE_HANDOFF_US` |
 | Pause between sweeps: 333 ns, converted to counter ticks with the host rate (about 1,000 ticks on a 3 GHz TSC) | Default | `SWEEP_INTERVAL_NS` |
 | Handoff target: "~3–6 µs" | Design goal | `spec/00-architecture.md` §1 |
 

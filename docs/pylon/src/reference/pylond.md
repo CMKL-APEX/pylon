@@ -18,6 +18,8 @@ pylond [--socket <path>] [--socket-group <group>] [--socket-mode <mode>]
 | `--no-scx` | off | Never attach `scx_pylon`. |
 | `--core-sched-guard <mode>` | `auto` | Keep `scx_pylon` away from kernel core scheduling: `auto` on kernels that lack the fix for issue #15, `on` on every kernel that can core-schedule, `off` never ([Core scheduling](../operator-guide/sched-ext.md#core-scheduling)). |
 | `--core-sched-deny <answer>` | `eperm` | With the guard, what a process asking for a core scheduling cookie gets while `scx_pylon` is attached: `eperm`, `enodev`, or `off` to let it through and disable `scx_pylon`. `eperm` and `enodev` need the bpf LSM. |
+| `--revoke-grace-us <µs>` | `8` | How long a donor vCPU has to park after a revocation request before `pylond` signals it to park by force (1 to 100,000). |
+| `--force-handoff-us <µs>` | `50` | How long after it first signals a donor that hasn't parked `pylond` hands the core over anyway (1 to 100,000). |
 | `--pcpu-map-file <path>` | none | Keep the pCPU owner table in this existing file instead of in memory. Turns off automatic `scx_pylon` attachment. |
 | `--metrics-port <port>` | none | Serve Prometheus metrics over HTTP on this port. |
 | `--metrics-addr <addr>` | `127.0.0.1` | Address for the metrics server. |

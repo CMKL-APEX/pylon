@@ -2943,7 +2943,8 @@ mod tests {
         page.telemetry.runnable_threads.store(1, Ordering::Release);
         ControlPlane::publish_vm_handle(&snapshot, handle.clone());
 
-        // At 3 GHz, the signal is resent every 10 us (30,000 cycles).
+        // At 3 GHz, the signal is first resent after `WAKE_RESIGNAL_US` (100 us, 300,000
+        // cycles), not while the VMM may still be waking the vCPU.
         let before = WAKE_SIGNALS_SEEN.load(Ordering::SeqCst);
         engine.poll_once(1_000_000);
         assert_eq!(
@@ -2952,15 +2953,18 @@ mod tests {
         );
         wait_for_wake_signals(before + 1);
 
-        engine.poll_once(1_010_000);
         engine.poll_once(1_030_000);
+        engine.poll_once(1_150_000);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(WAKE_SIGNALS_SEEN.load(Ordering::SeqCst), before + 1);
+        engine.poll_once(1_300_000);
         wait_for_wake_signals(before + 2);
 
         // Running again: no more signals.
         host.vcpus[0]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);
-        engine.poll_once(1_100_000);
+        engine.poll_once(2_000_000);
         thread::sleep(Duration::from_millis(20));
         assert_eq!(WAKE_SIGNALS_SEEN.load(Ordering::SeqCst), before + 2);
 
