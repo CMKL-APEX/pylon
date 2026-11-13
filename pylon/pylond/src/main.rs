@@ -214,7 +214,7 @@ fn raise_fd_limit() {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = CliArgs::parse();
     raise_fd_limit();
     let tenant_pcpus = parse_core_list(&args.cores)?;

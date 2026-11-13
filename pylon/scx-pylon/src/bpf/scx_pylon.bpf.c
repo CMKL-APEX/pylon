@@ -203,6 +203,21 @@ __u32 cpu_claim[MAX_PCPUS];
  * such as per-CPU kworkers, run between turns and don't change it.
  */
 __u32 woken_turn[MAX_PCPUS];
+
+_Static_assert((MAX_PCPUS & (MAX_PCPUS - 1)) == 0, "pcpu_index() masks with MAX_PCPUS - 1");
+
+/*
+ * @i, already checked to be below MAX_PCPUS, as an index into cpu_claim or
+ * woken_turn. clang may check the bound on one register and index with a copy
+ * that the verifier doesn't tie to the check, which it then rejects as an
+ * unbounded access (pylon#85). The mask bounds the register used for the
+ * access, and barrier_var() keeps clang from dropping it as redundant.
+ */
+static __always_inline __u32 pcpu_index(__u32 i)
+{
+    barrier_var(i);
+    return i & (MAX_PCPUS - 1);
+}
 /* Next VM queue that dispatch checks for vCPUs left without a CPU of their VM */
 __u32 vm_dsq_cursor;
 
@@ -372,7 +387,7 @@ static __always_inline bool is_woken_turn(s32 cpu)
     /* Unsigned, as in read_claim(). */
     __u32 i = (__u32)cpu;
 
-    return i < MAX_PCPUS && *(volatile __u32 *)&woken_turn[i];
+    return i < MAX_PCPUS && *(volatile __u32 *)&woken_turn[pcpu_index(i)];
 }
 
 static __always_inline void set_woken_turn(s32 cpu, bool turn)
@@ -380,7 +395,7 @@ static __always_inline void set_woken_turn(s32 cpu, bool turn)
     __u32 i = (__u32)cpu;
 
     if (i < MAX_PCPUS) {
-        *(volatile __u32 *)&woken_turn[i] = turn;
+        *(volatile __u32 *)&woken_turn[pcpu_index(i)] = turn;
     }
 }
 
@@ -393,7 +408,7 @@ static __always_inline __u32 read_claim(s32 cpu)
     if (i >= MAX_PCPUS) {
         return CLAIM_NONE;
     }
-    return *(volatile __u32 *)&cpu_claim[i];
+    return *(volatile __u32 *)&cpu_claim[pcpu_index(i)];
 }
 
 /*
@@ -408,7 +423,7 @@ static void set_claim(s32 cpu, __u32 claim)
         return;
     }
 
-    __u32 old = __atomic_exchange_n(&cpu_claim[i], claim, __ATOMIC_SEQ_CST);
+    __u32 old = __atomic_exchange_n(&cpu_claim[pcpu_index(i)], claim, __ATOMIC_SEQ_CST);
     if (old == CLAIM_NONE || old == CLAIM_HOST || old == claim) {
         return;
     }
