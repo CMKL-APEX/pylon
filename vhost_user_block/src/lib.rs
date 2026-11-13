@@ -80,9 +80,9 @@ enum Error {
 }
 
 pub const SYNTAX: &str = "vhost-user-block backend parameters \
- \"path=<image_path>,socket=<socket_path>,num_queues=<number_of_queues>,\
- queue_size=<size_of_each_queue>,readonly=true|false,direct=true|false,\
- poll_queue=true|false\"";
+    \"path=<image_path>,socket=<socket_path>,num_queues=<number_of_queues>,\
+    queue_size=<size_of_each_queue>,readonly=true|false,direct=true|false,\
+    poll_queue=true|false\"";
 
 impl convert::From<Error> for io::Error {
     fn from(e: Error) -> Self {
@@ -131,7 +131,7 @@ impl VhostUserBlkThread {
         {
             debug!("got an element in the queue");
             let len = match Request::parse(&mut desc_chain, None) {
-                Ok(mut request) => {
+                (Ok(mut request), Some(status_addr)) => {
                     debug!("element is a valid request");
                     request.writeback = self.writeback.load(Ordering::Acquire);
                     let (status, len) = match request.execute(
@@ -147,18 +147,29 @@ impl VhostUserBlkThread {
                         Err(e) => (e.status(), 1),
                     };
 
-                    if let Err(e) = desc_chain.memory().write_obj(status, request.status_addr()) {
+                    if let Err(e) = desc_chain.memory().write_obj(status, status_addr) {
                         warn!(
                             "vhost-user-blk: failed to write status to 0x{:x}: {e:?}",
-                            request.status_addr().0
+                            status_addr.0
                         );
                         0
                     } else {
                         len
                     }
                 }
-                Err(err) => {
+                (Ok(_), None) => unreachable!("parse() returns the status address with a request"),
+                (Err(err), status_addr) => {
                     error!("failed to parse available descriptor chain: {err:?}");
+                    if let Some(status_addr) = status_addr
+                        && let Err(e) = desc_chain
+                            .memory()
+                            .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
+                    {
+                        info!(
+                            "vhost-user-blk: failed to write status to 0x{:x}: {e:?}",
+                            status_addr.0
+                        );
+                    }
                     0
                 }
             };

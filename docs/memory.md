@@ -20,7 +20,7 @@ struct MemoryConfig {
     hugepages: bool,
     hugepage_size: Option<u64>,
     prefault: bool,
-    reserve: bool,
+    reserve: Option<bool>,
     thp: bool,
     zones: Option<Vec<MemoryZoneConfig>>,
 }
@@ -34,7 +34,7 @@ struct MemoryConfig {
 
 Size of the RAM in the guest VM.
 
-This option is mandatory when using the `--memory` parameter.
+If this option is not specified, the guest gets 512 MiB of RAM.
 
 Value is an unsigned integer of 64 bits.
 
@@ -53,6 +53,8 @@ KSM daemon.
 
 This option can be used when trying to reach a higher density of VMs running
 on a single host, as it will reduce the amount of memory consumed by each VM.
+
+This option cannot be combined with `shared=on`.
 
 By default this option is turned off.
 
@@ -133,16 +135,18 @@ _Example_
 Specifies if the memory must be created and `mmap(2)` with `MAP_HUGETLB` and size
 flags. This performs a memory mapping relying on the specified huge page size.
 If no huge page size is supplied the system's default huge page size is used.
+Setting `hugepage_size` without `hugepages=on` is rejected.
 
 By using hugepages, one can improve the overall performance of the VM, assuming
 the guest will allocate hugepages as well. Another interesting use case is VFIO
 as it speeds up the VM's boot time since the amount of IOMMU mappings is reduced.
 
 The user is responsible for ensuring there are sufficient huge pages of the
-specified size for the VMM to use. Failure to do so may result in strange VMM
-behaviour, e.g. error with `ReadKernelImage` is common. If there is a strange
-error with `hugepages` enabled, just disable it or check whether there are enough
-huge pages.
+specified size for the VMM to use. Otherwise VM creation fails, as
+`hugepages=on` reserves the memory by default. With `reserve=off`, a shortfall
+may instead result in strange VMM behaviour, e.g. error with `ReadKernelImage`
+is common. If there is a strange error with `hugepages` enabled, just disable it
+or check whether there are enough huge pages.
 
 If `hugepages=on` then the value of `shared` is ignored as huge pages always
 requires `MAP_SHARED`.
@@ -186,19 +190,20 @@ Specifies if guest memory should be `mmap(2)`-ed _without_ the `MAP_NORESERVE`
 flag, asking the kernel to reserve the backing pages (swap space, or huge pages
 for hugepage-backed memory) for the whole region up front at `mmap` time.
 
-By default Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so VM
-creation succeeds even when the backing pool cannot satisfy the full guest size.
-The shortfall then surfaces only later, as a `SIGBUS` delivered to the guest when
-it faults a page the pool cannot back. With `reserve=on` the reservation is made
-when the memory is mapped, so an over-committed configuration fails cleanly at VM
-creation with an out-of-memory error instead of crashing the guest at run time.
-This is most useful for hugepage-backed memory, where the huge pages are reserved
-from the pool.
+With `reserve=off` Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so
+VM creation succeeds even when the backing pool cannot satisfy the full guest
+size. The shortfall then surfaces only later, as a `SIGBUS` delivered to the
+guest when it faults a page the pool cannot back. With `reserve=on` the
+reservation is made when the memory is mapped, so an over-committed
+configuration fails cleanly at VM creation with an out-of-memory error instead
+of crashing the guest at run time. This is most useful for hugepage-backed
+memory, where the huge pages are reserved from the pool.
 
 Unlike `prefault`, this does not populate or fault in the memory, so it does not
 slow down boot; it only reserves it.
 
-By default this option is turned off.
+By default this option has the same value as `hugepages`: it is on with
+`hugepages=on` and off otherwise.
 
 _Example_
 
@@ -254,7 +259,7 @@ struct MemoryZoneConfig {
     hotplug_size: Option<u64>,
     hotplugged_size: Option<u64>,
     prefault: bool,
-    reserve: bool,
+    reserve: Option<bool>,
     mergeable: bool,
 }
 ```
@@ -312,10 +317,11 @@ the backing file for the `mmap(2)` operation.
 
 This option can be particularly useful when trying to back a part of the guest
 RAM with a well known file. In the context of the snapshot/restore feature, and
-if the provided path is a file, the snapshot operation will not perform any
-copy of the guest RAM content for this specific memory zone since the user has
-access to it and it would duplicate data already stored on the current
-filesystem.
+if the provided path is a file and the zone uses `shared=on`, the snapshot
+operation will not perform any copy of the guest RAM content for this specific
+memory zone since the user has access to it and it would duplicate data
+already stored on the current filesystem. With `shared=off`, guest writes do
+not reach the file, so the snapshot copies the zone content.
 
 Value is a string.
 
@@ -359,10 +365,11 @@ the guest will allocate hugepages as well. Another interesting use case is VFIO
 as it speeds up the VM's boot time since the amount of IOMMU mappings is reduced.
 
 The user is responsible for ensuring there are sufficient huge pages of the
-specified size for the VMM to use. Failure to do so may result in strange VMM
-behaviour, e.g. error with `ReadKernelImage` is common. If there is a strange
-error with `hugepages` enabled, just disable it or check whether there are enough
-huge pages.
+specified size for the VMM to use. Otherwise VM creation fails, as
+`hugepages=on` reserves the memory by default. With `reserve=off`, a shortfall
+may instead result in strange VMM behaviour, e.g. error with `ReadKernelImage`
+is common. If there is a strange error with `hugepages` enabled, just disable it
+or check whether there are enough huge pages.
 
 If `hugepages=on` then the value of `shared` is ignored as huge pages always
 require `MAP_SHARED`.
@@ -383,6 +390,7 @@ pick a specific NUMA node from which the memory must be allocated. After the
 memory zone is `mmap(2)`, the NUMA policy for this memory mapping will be
 applied through `mbind(2)`, relying on the provided node identifier. If the
 node does not exist on the host, the call to `mbind(2)` will fail.
+This option cannot be combined with a `file` mapped with `shared=on`.
 
 This option is useful when trying to back a VM memory with a specific type of
 memory from the host. Assuming a host has two types of memory, with one slower
@@ -473,19 +481,20 @@ Specifies if the memory for this zone should be `mmap(2)`-ed _without_ the
 or huge pages for hugepage-backed memory) for the whole zone up front at `mmap`
 time.
 
-By default Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so VM
-creation succeeds even when the backing pool cannot satisfy the full zone size.
-The shortfall then surfaces only later, as a `SIGBUS` delivered to the guest when
-it faults a page the pool cannot back. With `reserve=on` the reservation is made
-when the memory is mapped, so an over-committed configuration fails cleanly at VM
-creation with an out-of-memory error instead of crashing the guest at run time.
-This is most useful for hugepage-backed zones, where the huge pages are reserved
-from the pool.
+With `reserve=off` Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so
+VM creation succeeds even when the backing pool cannot satisfy the full zone
+size. The shortfall then surfaces only later, as a `SIGBUS` delivered to the
+guest when it faults a page the pool cannot back. With `reserve=on` the
+reservation is made when the memory is mapped, so an over-committed
+configuration fails cleanly at VM creation with an out-of-memory error instead
+of crashing the guest at run time. This is most useful for hugepage-backed
+zones, where the huge pages are reserved from the pool.
 
 Unlike `prefault`, this does not populate or fault in the memory, so it does not
 slow down boot; it only reserves it.
 
-By default this option is turned off.
+By default this option has the same value as `hugepages`: it is on with
+`hugepages=on` and off otherwise.
 
 _Example_
 
@@ -504,8 +513,9 @@ It allows KSM to be enabled selectively — for example, enabling it only on a
 hotplug zone while leaving boot memory unaffected:
 
 ```
---memory size=2G,mergeable=off
---memory-zone id=hotplug,size=0,hotplug_size=8G,mergeable=on
+--memory size=0,hotplug_method=virtio-mem
+--memory-zone id=boot,size=2G,mergeable=off \
+    id=hotplug,size=1G,hotplug_size=8G,mergeable=on
 ```
 
 For KSM to have any effect, the host kernel must have KSM enabled:
@@ -513,7 +523,9 @@ For KSM to have any effect, the host kernel must have KSM enabled:
 echo 1 > /sys/kernel/mm/ksm/run
 ```
 
-By default this option is turned off.
+On the command line, a zone without `mergeable` inherits the value of
+`--memory`, which is off by default. In the REST API, a zone without
+`mergeable` is always off, independent of the top-level `memory.mergeable`.
 
 _Example_
 
@@ -630,10 +642,14 @@ _Example_
 
 ```
 # Explicit bidirectional distances
---numa guest_numa_id=0,distances=[1@15,2@25] guest_numa_id=1,distances=[0@15,2@20] guest_numa_id=2,distances=[0@25,1@20]
+--numa guest_numa_id=0,cpus=[0],distances=[1@15,2@25] \
+    guest_numa_id=1,cpus=[1],distances=[0@15,2@20] \
+    guest_numa_id=2,cpus=[2],distances=[0@25,1@20]
 
 # Simplified with symmetry - only specify in one direction
---numa guest_numa_id=0,distances=[1@15,2@25] guest_numa_id=1,distances=[2@20]
+--numa guest_numa_id=0,cpus=[0],distances=[1@15,2@25] \
+    guest_numa_id=1,cpus=[1],distances=[2@20] \
+    guest_numa_id=2,cpus=[2]
 # Results in the same topology: 0↔1=15, 0↔2=25, 1↔2=20
 
 # Using defaults - only specify non-default distances
@@ -713,18 +729,21 @@ _Example_
 In this configuration:
 - Node 0: CPUs 0-1, 2GB memory
 - Node 1: CPUs 2-3, 2GB memory
-- Node 2 (auto-assigned): GPU device, closer to node 0 (distance=25) than node 1 (distance=30)
+- Node 2: GPU device, closer to node 0 (distance=25) than node 1 (distance=30)
 
 ### PCI bus
 
 Cloud Hypervisor supports guests with one or more PCI segments. The default PCI segment always
 has affinity to NUMA node 0. By default, all other PCI segments have affinity to NUMA node 0.
-The user may configure the NUMA affinity for any additional PCI segments.
+The user may configure the NUMA affinity for any additional PCI segments with
+the `pci_segments` option of `--numa`. Each segment must exist on the platform
+and belong to a single NUMA node, and segment 0 can only belong to node 0.
 
 _Example_
 
 ```
 --platform num_pci_segments=2
+--memory size=0
 --memory-zone size=16G,host_numa_node=0,id=mem0
 --memory-zone size=16G,host_numa_node=1,id=mem1
 --numa guest_numa_id=0,memory_zones=mem0,pci_segments=[0]

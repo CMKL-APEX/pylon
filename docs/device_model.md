@@ -4,24 +4,24 @@ This document describes the device model supported by `cloud-hypervisor`.
 
 ## Summary
 
-| Device | Build configurable | Enabled by default | Runtime configurable |
-| :----: | :----: | :----: | :----: |
-| Serial port | :x: | :x: | :heavy_check_mark: |
-| RTC/CMOS | :heavy_check_mark: | :heavy_check_mark: | :x: |
-| I/O APIC | :x: | :x: | :heavy_check_mark: |
-| i8042 shutdown/reboot | :x: | :x: | :x: |
-| ACPI shutdown/reboot | :x: | :heavy_check_mark: | :x: |
-| virtio-blk | :x: | :x: | :heavy_check_mark: |
-| virtio-console | :x: | :x: | :heavy_check_mark: |
-| virtio-iommu | :x: | :x: | :heavy_check_mark: |
-| virtio-net | :x: | :x: | :heavy_check_mark: |
-| virtio-pmem | :x: | :x: | :heavy_check_mark: |
-| virtio-rng | :x: | :x: | :heavy_check_mark: |
-| virtio-vsock | :x: | :x: | :heavy_check_mark: |
-| vhost-user-blk | :x: | :x: | :heavy_check_mark: |
-| vhost-user-fs | :x: | :x: | :heavy_check_mark: |
-| vhost-user-net | :x: | :x: | :heavy_check_mark: |
-| VFIO | :heavy_check_mark: | :x: | :heavy_check_mark: |
+| Device                | Build configurable | Enabled by default | Runtime configurable |
+| :-------------------: | :----------------: | :----------------: | :------------------: |
+| Serial port           | :x:                | :heavy_check_mark: | :heavy_check_mark:   |
+| RTC/CMOS              | :x:                | :heavy_check_mark: | :x:                  |
+| I/O APIC              | :x:                | :heavy_check_mark: | :x:                  |
+| i8042 shutdown/reboot | :x:                | :heavy_check_mark: | :x:                  |
+| ACPI shutdown/reboot  | :x:                | :heavy_check_mark: | :x:                  |
+| virtio-blk            | :x:                | :x:                | :heavy_check_mark:   |
+| virtio-console        | :x:                | :x:                | :heavy_check_mark:   |
+| virtio-iommu          | :x:                | :x:                | :heavy_check_mark:   |
+| virtio-net            | :x:                | :x:                | :heavy_check_mark:   |
+| virtio-pmem           | :x:                | :x:                | :heavy_check_mark:   |
+| virtio-rng            | :x:                | :x:                | :heavy_check_mark:   |
+| virtio-vsock          | :x:                | :x:                | :heavy_check_mark:   |
+| vhost-user-blk        | :x:                | :x:                | :heavy_check_mark:   |
+| vhost-user-fs         | :x:                | :x:                | :heavy_check_mark:   |
+| vhost-user-net        | :x:                | :x:                | :heavy_check_mark:   |
+| VFIO                  | :x:                | :x:                | :heavy_check_mark:   |
 
 ## Legacy devices
 
@@ -36,8 +36,9 @@ be used as the default console for Linux when booting with the option
 `console=ttyS0`. For AArch64, the default serial port is from an emulated
 PL011 UART device. The related command line for AArch64 is `console=ttyAMA0`.
 
-This device is always built-in, and it is disabled by default. It can be
-enabled with the `--serial` option, as long as its parameter is not `off`.
+This device is always built-in, and it is enabled by default with
+`--serial null`, which discards the output. It can be disabled with
+`--serial off`.
 
 The `--serial` parameter selects where the port is connected. Besides `off`,
 `null`, `tty`, `pty`, and `file=<path>`, the port can be exposed on a UNIX
@@ -61,9 +62,8 @@ Overriding the destination console address is not currently supported.
 For environments such as Windows or EFI which cannot rely on KVM clock, the
 emulation of this legacy device makes the platform usable.
 
-This device is built-in by default, but it can be compiled out with Rust
-features. When compiled in, it is always enabled, and cannot be disabled
-from the command line.
+On x86-64, this device is always built-in and always enabled, and it cannot
+be disabled from the command line.
 
 For AArch64 machines, an ARM PrimeCell Real Time Clock (PL031) is implemented.
 This device is built-in by default for the AArch64 platform, and it is always
@@ -84,19 +84,16 @@ implementing support for the [IOAPIC](https://wiki.osdev.org/IOAPIC).
 By moving part of the IRQ chip implementation from kernel space to user space,
 the IRQ chip emulation does not always run in a fully privileged mode.
 
-The device is always built-in, and it is enabled depending on the presence of
-the serial port. If the serial port is disabled, and because no other device
-would require pin based interrupts (INTx), the I/O APIC is disabled.
+The device is always built-in and always enabled on x86-64.
 
 ### i8042
 
 Simplified PS/2 port since it supports only one key to trigger a reboot or
 shutdown, depending on the ACPI support.
 
-This device is always built-in, but it is disabled by default. Because ACPI is
-enabled by default, the handling of reboot/shutdown goes through the dedicated
-ACPI device. In case ACPI is disabled, this device is enabled to bring to the
-VM some reboot/shutdown support.
+This device is always built-in and always enabled on x86-64. Because ACPI is
+enabled by default, the handling of reboot/shutdown usually goes through the
+dedicated ACPI device.
 
 ### ARM PrimeCell General Purpose Input/Output (PL061)
 
@@ -108,8 +105,7 @@ trigger a graceful shutdown of the AArch64 guest.
 This is a dedicated device for handling ACPI shutdown and reboot when ACPI is
 enabled.
 
-This device is always built-in, and it is enabled by default since the ACPI
-feature is enabled by default.
+This device is always built-in and always enabled.
 
 ## Virtio devices
 
@@ -268,8 +264,5 @@ physical devices into its guest.
 See our [VFIO documentation](vfio.md) for more details on how to directly
 assign host devices to `cloud-hypervisor` guests.
 
-Because VFIO implies `vfio-pci` in the `cloud-hypervisor` context, the VFIO
-support is built-in when the `pci` feature is selected. And because the `pci`
-feature is built-in by default, VFIO support is also built-in by default.
-When VFIO support is built-in, a physical device can be passed through, using
-the flag `--device` in order to enable the VFIO code.
+VFIO support is always built-in. A physical device can be passed through with
+the `--device` flag.

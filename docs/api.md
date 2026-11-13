@@ -74,19 +74,19 @@ The Cloud Hypervisor API exposes the following actions through its endpoints:
 
 | Action                                  | Endpoint                     | Request Body                      | Response Body                   | Prerequisites                                            |
 | --------------------------------------- | ---------------------------- | --------------------------------- | ------------------------------- | -------------------------------------------------------- |
-| Add VFIO PCI device to the VM           | `/vm.add-device`             | `/schemas/VmAddDevice`            | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add disk device to the VM               | `/vm.add-disk`               | `/schemas/DiskConfig`             | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add fs device to the VM                 | `/vm.add-fs`                 | `/schemas/FsConfig`               | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add generic vhost-user device to the VM | `/vm.add-generic-vhost-user` | `/schemas/GenericVhostUserConfig` | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add network device to the VM            | `/vm.add-net`                | `/schemas/NetConfig`              | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add pmem device to the VM               | `/vm.add-pmem`               | `/schemas/PmemConfig`             | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add userspace PCI device to the VM      | `/vm.add-user-device`        | `/schemas/VmAddUserDevice`        | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add vdpa device to the VM               | `/vm.add-vdpa`               | `/schemas/VdpaConfig`             | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
-| Add vsock device to the VM              | `/vm.add-vsock`              | `/schemas/VsockConfig`            | `/schemas/PciDeviceInfo`        | The VM is booted                                         |
+| Add VFIO PCI device to the VM           | `/vm.add-device`             | `/schemas/VmAddDevice`            | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add disk device to the VM               | `/vm.add-disk`               | `/schemas/DiskConfig`             | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add fs device to the VM                 | `/vm.add-fs`                 | `/schemas/FsConfig`               | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add generic vhost-user device to the VM | `/vm.add-generic-vhost-user` | `/schemas/GenericVhostUserConfig` | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add network device to the VM            | `/vm.add-net`                | `/schemas/NetConfig`              | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add pmem device to the VM               | `/vm.add-pmem`               | `/schemas/PmemConfig`             | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add userspace PCI device to the VM      | `/vm.add-user-device`        | `/schemas/VmAddUserDevice`        | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add vdpa device to the VM               | `/vm.add-vdpa`               | `/schemas/VdpaConfig`             | `/schemas/PciDeviceInfo`        | The VM is created                                        |
+| Add vsock device to the VM              | `/vm.add-vsock`              | `/schemas/VsockConfig`            | `/schemas/PciDeviceInfo`        | The VM is created                                        |
 | Get virtio-balloon statistics           | `/vm.balloon-stats`          | N/A                               | `/schemas/BalloonStatsResponse` | The VM is running and balloon statistics were negotiated |
 | Boot the VM                             | `/vm.boot`                   | N/A                               | N/A                             | The VM is created but not booted                         |
 | Cancel an ongoing VM migration          | `/vm.cancel-migration`       | N/A                               | N/A                             | The VM is migrating                                      |
-| Perform a coredump of the VM*           | `/vm.coredump`               | `/schemas/VmCoredumpData`         | N/A                             | The VM is paused                                         |
+| Perform a coredump of the VM*           | `/vm.coredump`               | `/schemas/VmCoredumpData`         | N/A                             | The VM is booted                                         |
 | Dump the VM counters                    | `/vm.counters`               | N/A                               | `/schemas/VmCounters`           | The VM is booted                                         |
 | Create the VM                           | `/vm.create`                 | `/schemas/VmConfig`               | N/A                             | The VM is not created yet                                |
 | Delete the VM                           | `/vm.delete`                 | N/A                               | N/A                             | N/A                                                      |
@@ -96,12 +96,12 @@ The Cloud Hypervisor API exposes the following actions through its endpoints:
 | Trigger power button of the VM          | `/vm.power-button`           | N/A                               | N/A                             | The VM is booted                                         |
 | Reboot the VM                           | `/vm.reboot`                 | N/A                               | N/A                             | The VM is booted                                         |
 | Prepare to receive a migration          | `/vm.receive-migration`      | `/schemas/ReceiveMigrationData`   | N/A                             | N/A                                                      |
-| Remove device from the VM               | `/vm.remove-device`          | `/schemas/VmRemoveDevice`         | N/A                             | The VM is booted                                         |
-| Add/remove CPUs to/from the VM          | `/vm.resize`                 | `/schemas/VmResize`               | N/A                             | The VM is booted                                         |
-| Add/remove memory from the VM           | `/vm.resize`                 | `/schemas/VmResize`               | N/A                             | The VM is booted                                         |
-| Resize a disk attached to the VM        | `/vm.resize-disk`            | `/schemas/VmResizeDisk`           | N/A                             | The VM is created                                        |
-| Add/remove memory from a zone           | `/vm.resize-zone`            | `/schemas/VmResizeZone`           | N/A                             | The VM is booted                                         |
-| Restore the VM from a snapshot          | `/vm.restore`                | `/schemas/RestoreConfig`          | N/A                             | The VM is created but not booted                         |
+| Remove device from the VM               | `/vm.remove-device`          | `/schemas/VmRemoveDevice`         | N/A                             | The VM is created                                        |
+| Add/remove CPUs to/from the VM          | `/vm.resize`                 | `/schemas/VmResize`               | N/A                             | The VM is created                                        |
+| Add/remove memory from the VM           | `/vm.resize`                 | `/schemas/VmResize`               | N/A                             | The VM is created                                        |
+| Resize a disk attached to the VM        | `/vm.resize-disk`            | `/schemas/VmResizeDisk`           | N/A                             | The VM is booted                                         |
+| Add/remove memory from a zone           | `/vm.resize-zone`            | `/schemas/VmResizeZone`           | N/A                             | The VM is created                                        |
+| Restore the VM from a snapshot          | `/vm.restore`                | `/schemas/RestoreConfig`          | N/A                             | The VM is not created yet                                |
 | Resume the VM                           | `/vm.resume`                 | N/A                               | N/A                             | The VM is paused                                         |
 | Start to send migration to target       | `/vm.send-migration`         | `/schemas/SendMigrationData`      | N/A                             | The VM is booted and (shared mem or hugepages enabled)   |
 | Shut the VM down                        | `/vm.shutdown`               | N/A                               | N/A                             | The VM is booted                                         |
@@ -142,6 +142,7 @@ curl --unix-socket /tmp/cloud-hypervisor.sock -i \
      -H 'Content-Type: application/json'         \
      -d '{
          "cpus":{"boot_vcpus": 4, "max_vcpus": 4},
+         "memory":{"size": 1073741824},
          "payload":{"kernel":"/opt/clh/kernel/vmlinux-virtio-fs-virtio-iommu", "cmdline":"console=ttyS0 console=hvc0 root=/dev/vda1 rw"},
          "disks":[{"path":"/opt/clh/images/focal-server-cloudimg-amd64.raw", "image_type":"Raw"}],
          "rng":{"src":"/dev/urandom"},

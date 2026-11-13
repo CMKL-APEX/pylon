@@ -41,7 +41,9 @@ use virtio_bindings::virtio_blk::*;
 use virtio_bindings::virtio_config::*;
 use virtio_bindings::virtio_ring::{VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC};
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
-use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError};
+use vm_memory::{
+    ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError,
+};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
@@ -176,7 +178,7 @@ struct BlockEpollHandler {
     writeback: Arc<AtomicBool>,
     counters: BlockCounters,
     queue_evt: EventFd,
-    inflight_requests: VecDeque<(u16, Request)>,
+    inflight_requests: VecDeque<(u16, Request, GuestAddress)>,
     // The active count includes `inflight_requests` plus requests in transition
     // from the queue to inflight or inflight to completion.
     active_request_count: Arc<AtomicUsize>,
@@ -217,11 +219,11 @@ impl BlockEpollHandler {
     // corresponding chain is still available (virtio 1.x §2.7.13.4).
     // Double check the guest driver is behaving.
     fn is_head_in_flight(
-        inflight: &VecDeque<(u16, Request)>,
-        batch: &[(u16, Request)],
+        inflight: &VecDeque<(u16, Request, GuestAddress)>,
+        batch: &[(u16, Request, GuestAddress)],
         head: u16,
     ) -> bool {
-        batch.iter().any(|(h, _)| *h == head) || inflight.iter().any(|(h, _)| *h == head)
+        batch.iter().any(|(h, ..)| *h == head) || inflight.iter().any(|(h, ..)| *h == head)
     }
 
     fn process_queue_submit(&mut self) -> Result<()> {
@@ -266,11 +268,18 @@ impl BlockEpollHandler {
                 return Err(Error::QueueDuplicatedHeadIndex);
             }
 
-            let mut request = match Request::parse(&mut desc_chain, self.access_platform.as_deref())
-            {
-                Ok(r) => r,
-                Err(e) => {
+            let result = Request::parse(&mut desc_chain, self.access_platform.as_deref());
+            let (mut request, status_addr) = match result {
+                (Ok(request), Some(status_addr)) => (request, status_addr),
+                (Ok(_), None) => unreachable!("parse() returns the status address with a request"),
+                (Err(e), status_addr) => {
                     warn!("Failed to parse virtio-blk request at head {head}: {e}");
+                    if let Some(status_addr) = status_addr {
+                        desc_chain
+                            .memory()
+                            .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
+                            .map_err(Error::RequestStatus)?;
+                    }
                     queue
                         .add_used(desc_chain.memory(), head, 0)
                         .map_err(Error::QueueAddUsed)?;
@@ -288,7 +297,7 @@ impl BlockEpollHandler {
                 warn!("Request check failed: {request:x?} {e:?}");
                 desc_chain
                     .memory()
-                    .write_obj(VIRTIO_BLK_S_IOERR as u8, request.status_addr())
+                    .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
                     .map_err(Error::RequestStatus)?;
 
                 // If no asynchronous operation has been submitted, we can
@@ -350,10 +359,13 @@ impl BlockEpollHandler {
             {
                 if let Some(batch_request) = batch_request {
                     batch_requests.push(batch_request);
-                    batch_inflight_requests.push((desc_chain.head_index(), request));
+                    batch_inflight_requests.push((desc_chain.head_index(), request, status_addr));
                 } else {
-                    self.inflight_requests
-                        .push_back((desc_chain.head_index(), request));
+                    self.inflight_requests.push_back((
+                        desc_chain.head_index(),
+                        request,
+                        status_addr,
+                    ));
                     self.active_request_count.fetch_add(1, Ordering::SeqCst);
                 }
             } else {
@@ -367,7 +379,7 @@ impl BlockEpollHandler {
 
                 desc_chain
                     .memory()
-                    .write_obj(status as u8, request.status_addr())
+                    .write_obj(status as u8, status_addr)
                     .map_err(Error::RequestStatus)?;
 
                 let len = if status == VIRTIO_BLK_S_OK
@@ -398,11 +410,11 @@ impl BlockEpollHandler {
                 }
                 Err(e) => {
                     // If batch submission fails, report VIRTIO_BLK_S_IOERR for all requests.
-                    for (user_data, request) in batch_inflight_requests {
+                    for (user_data, request, status_addr) in batch_inflight_requests {
                         warn!("Request failed with batch submission: {request:x?} {e:?}");
                         let desc_index = user_data;
                         let mem = self.mem.memory();
-                        mem.write_obj(VIRTIO_BLK_S_IOERR as u8, request.status_addr())
+                        mem.write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
                             .map_err(Error::RequestStatus)?;
                         queue
                             .add_used(mem.deref(), desc_index, 1)
@@ -454,7 +466,7 @@ impl BlockEpollHandler {
     }
 
     #[inline]
-    fn find_inflight_request(&mut self, completed_head: u16) -> Result<Request> {
+    fn find_inflight_request(&mut self, completed_head: u16) -> Result<(Request, GuestAddress)> {
         // This loop neatly handles the fast path where the completions are
         // in order (it turns into just a pop_front()) and the 1% of the time
         // (analysis during boot) where slight out of ordering has been
@@ -465,9 +477,11 @@ impl BlockEpollHandler {
         // This is a O(1) operation and is prepared for the future as it it likely
         // the next completion would be for the one that was skipped which will
         // now be the new front.
-        for (i, (head, _)) in self.inflight_requests.iter().enumerate() {
+        for (i, (head, ..)) in self.inflight_requests.iter().enumerate() {
             if head == &completed_head {
-                return Ok(self.inflight_requests.swap_remove_front(i).unwrap().1);
+                let (_, request, status_addr) =
+                    self.inflight_requests.swap_remove_front(i).unwrap();
+                return Ok((request, status_addr));
             }
         }
 
@@ -485,7 +499,7 @@ impl BlockEpollHandler {
             let mut result = completion.result;
             let desc_index = completion.user_data as u16;
 
-            let mut request = self.find_inflight_request(desc_index)?;
+            let (mut request, status_addr) = self.find_inflight_request(desc_index)?;
             let _active_request = ActiveRequestGuard::new(&self.active_request_count);
 
             request
@@ -612,7 +626,7 @@ impl BlockEpollHandler {
                 (VIRTIO_BLK_S_OK as u8, len)
             };
 
-            mem.write_obj(status, request.status_addr())
+            mem.write_obj(status, status_addr)
                 .map_err(Error::RequestStatus)?;
 
             let queue = &mut self.queue;
@@ -1376,13 +1390,14 @@ impl Migratable for Block {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Result as IoResult;
+    use std::io::{self, Result as IoResult};
     use std::path::Path;
     use std::sync::{Mutex, mpsc};
 
     use block::async_io::{AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
     use hypervisor::Vm;
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use virtio_queue::desc::split::Descriptor;
     use vm_memory::GuestAddress;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EFD_NONBLOCK;
@@ -1623,6 +1638,94 @@ mod tests {
         assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8, 0xff, 0xff, 0xff]);
     }
 
+    fn used_len(vq: &GuestQ<'_, GuestMemory>, mem: &GuestMemory) -> u32 {
+        mem.read_obj(GuestAddress(vq.used.ring[0].location.0 + 4))
+            .unwrap()
+    }
+
+    /// Processes the chain `descs`, which holds a read request that fails to
+    /// parse, and returns the 4 bytes at `probe`, poisoned with 0xff before.
+    fn process_rejected(descs: &[Descriptor], probe: u64) -> [u8; 4] {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        mem.write_slice(&[0xff; 4], GuestAddress(probe)).unwrap();
+        for (i, desc) in descs.iter().enumerate() {
+            vq.dtable[i].set(desc.addr().0, desc.len(), desc.flags(), desc.next());
+        }
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let mut handler = make_handler(vq.create_queue(), &mem, 0);
+        handler.process_queue_submit().unwrap();
+
+        // A rejected request is returned with used length 0.
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(used_len(&vq, &mem), 0);
+        let mut bytes = [0u8; 4];
+        mem.read_slice(&mut bytes, GuestAddress(probe)).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn parse_failure_reports_ioerr() {
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        let status = process_rejected(
+            &[
+                Descriptor::new(REQ_HDR_ADDR, 16, next, 1),
+                // The data buffer lides outside the guest memory
+                Descriptor::new(0x1_0000_0000, 4096, next | write, 2),
+                Descriptor::new(REQ_STATUS_ADDR, 1, write, 0),
+            ],
+            REQ_STATUS_ADDR,
+        );
+        assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn parse_failure_past_the_status_reports_ioerr() {
+        let status = process_rejected(
+            &[
+                Descriptor::new(REQ_HDR_ADDR, 16, VRING_DESC_F_NEXT as u16, 1),
+                Descriptor::new(REQ_STATUS_ADDR, 1, VRING_DESC_F_WRITE as u16, 0),
+            ],
+            REQ_STATUS_ADDR,
+        );
+        assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn parse_failure_leaves_a_device_readable_status_alone() {
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        let status = process_rejected(
+            &[
+                Descriptor::new(REQ_HDR_ADDR, 16, next, 1),
+                Descriptor::new(0x1_0000_0000, 4096, next | write, 2),
+                Descriptor::new(REQ_STATUS_ADDR, 1, 0, 0),
+            ],
+            REQ_STATUS_ADDR,
+        );
+        assert_eq!(status, [0xff; 4]);
+    }
+
+    #[test]
+    fn parse_failure_leaves_a_truncated_chain_alone() {
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        let data = process_rejected(
+            &[
+                Descriptor::new(REQ_HDR_ADDR, 16, next, 1),
+                Descriptor::new(0x1_0000_0000, 4096, next | write, 2),
+                Descriptor::new(REQ_DATA_ADDR, 512, next | write, 9),
+            ],
+            REQ_DATA_ADDR,
+        );
+        assert_eq!(data, [0xff; 4]);
+    }
+
     // Completes every write in full and fails every fsync.
     struct FailingFsync(EventFd, Vec<AsyncIoCompletion>);
     impl AsyncIo for FailingFsync {
@@ -1810,6 +1913,46 @@ mod tests {
         assert_eq!(
             completion_status(VIRTIO_BLK_T_IN, -libc::EIO),
             (VIRTIO_BLK_S_IOERR as u8, 1)
+        );
+    }
+
+    #[derive(Debug)]
+    struct Offset;
+    impl AccessPlatform for Offset {
+        fn translate_gva(&self, base: u64, _size: u64) -> IoResult<u64> {
+            base.checked_sub(0x8000_0000)
+                .ok_or_else(|| io::Error::other("unmapped"))
+        }
+        fn translate_gpa(&self, base: u64, _size: u64) -> IoResult<u64> {
+            Ok(base + 0x8000_0000)
+        }
+    }
+
+    #[test]
+    fn parse_failure_reports_ioerr_through_access_platform() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        mem.write_slice(&[0xff; 4], GuestAddress(REQ_STATUS_ADDR))
+            .unwrap();
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        vq.dtable[0].set(0x8000_0000 + REQ_HDR_ADDR, 16, next, 1);
+        vq.dtable[1].set(0x1_0000_0000, 4096, next | write, 2);
+        vq.dtable[2].set(0x8000_0000 + REQ_STATUS_ADDR, 1, write, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let mut handler = make_handler(vq.create_queue(), &mem, 0);
+        handler.access_platform = Some(Arc::new(Offset));
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(used_len(&vq, &mem), 0);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(REQ_STATUS_ADDR)).unwrap(),
+            VIRTIO_BLK_S_IOERR as u8
         );
     }
 }

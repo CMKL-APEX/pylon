@@ -53,9 +53,10 @@ Start to send migration for the source VM (on the host machine):
 $ target/release/ch-remote --api-socket=/tmp/api1 send-migration destination_url=unix:/tmp/sock,memory_mode=memfds
 ```
 
-When the above commands completed, the source VM should be successfully
-migrated to the destination VM. Now the destination VM is running while
-the source VM is terminated gracefully.
+`send-migration` only starts the migration and returns immediately, so its exit
+status does not tell whether the migration succeeded. Use the [events](#events)
+to observe the result. Once the migration has finished, the destination VM is
+running while the source VM is terminated gracefully.
 
 ## TCP/TLS Migration
 
@@ -147,12 +148,13 @@ src $ ch-remote --api-socket=/tmp/api send-migration destination_url=tcp:{dst}:{
 > Replace {dst}:{port} with the actual host name or IP address and port of
 > your destination host. For a same-host migration, use `localhost`.
 
-After completing the above commands, the source VM will be migrated to
-the destination host and continue running there. The source VM instance
-will terminate normally. All ongoing processes and connections within
-the VM should remain intact after the migration.
-See [Network Announcements After Resume](#network-announcements-after-resume)
-for the announcement behavior after a VM resumes.
+`send-migration` only starts the migration, see [Events](#events) for observing
+the result. After the migration has finished, the VM continues running on the
+destination host and the source VM instance terminates normally. All ongoing
+processes and connections within the VM should remain intact after the
+migration. See
+[Network Announcements After Resume](#network-announcements-after-resume) for
+the announcement behavior after a VM resumes.
 
 #### Encryption
 
@@ -300,13 +302,15 @@ following parameters. Unless marked otherwise, they apply to
 - `memory_mode <memfds|precopy|postcopy>`: \
   Memory transfer mode. `memfds` passes the guest memory backing file
   descriptors over a UNIX socket. It requires every guest memory region to use
-  shared memory or hugepage backing. `postcopy` resumes the destination first
-  and faults guest pages in on demand over a dedicated connection. Defaults to
-  `precopy`. `postcopy` is not supported with:
+  shared memory or hugepage backing. `postcopy` (experimental) resumes the
+  destination first and faults guest pages in on demand over a dedicated
+  connection. Defaults to `precopy`. `postcopy` is not supported with:
   - VFIO devices
   - vDPA devices
   - vfio-user devices
   - vhost-user devices
+  - memory prefault (`prefault=on`)
+  - multiple connections (`connections` greater than `1`)
 - `preserve_source <on|off>`: \
   Keep the source VM in a paused state after migration completes. This is only
   supported with `memory_mode=memfds` and defaults to `off`.
@@ -383,7 +387,8 @@ Starting with `v54`, Cloud Hypervisor guarantees migration compatibility from
 the previous two versions ("n-2"), e.g. `v54` accepts migrations from `v52` and
 `v53`. Upgrades spanning more major versions might work. It is, however,
 strongly recommended to do incremental upgrades, e.g., `v54 -> v56 -> v58`.
-Backward migrations, such as `v54 -> v52`, are **not** supported.
+Backward migrations, such as `v54 -> v52`, are **not** supported. Experimental
+features, such as `memory_mode=postcopy`, are excluded from this guarantee.
 
 New VMM functionality is designed in a way that it does not cause any
 incompatibility for VMs coming from older versions of Cloud Hypervisor. If new

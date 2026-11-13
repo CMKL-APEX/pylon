@@ -28,7 +28,12 @@ use vmm_sys_util::tempdir::TempDir;
 use vmm_sys_util::tempfile::TempFile;
 use wait_timeout::ChildExt;
 
-mod common;
+pub mod common {
+    include!("common/mod.rs");
+    pub(crate) mod tests_wrappers;
+    pub(crate) mod utils;
+}
+use common::QemuImgCommand;
 use common::tests_wrappers::*;
 use common::utils::*;
 
@@ -1070,33 +1075,29 @@ mod common_parallel {
         // Create test image based on configuration and capture backing checksum if applicable
         let initial_backing_checksum = match *image_config {
             QcowTestImageConfig::Simple(size) => {
-                Command::new("qemu-img")
-                    .arg("create")
-                    .args(["-f", "qcow2"])
-                    .arg(test_image_path.to_str().unwrap())
-                    .arg(size)
-                    .output()
-                    .expect("Failed to create QCOW2 test image");
+                QemuImgCommand::new()
+                    .create("qcow2", "")
+                    .args(&[test_image_path.to_str().unwrap(), size])
+                    .run("Failed to create QCOW2 test image");
                 None
             }
             QcowTestImageConfig::WithBacking => {
                 let backing_path = guest.tmp_dir.as_path().join("backing.qcow2");
-                Command::new("qemu-img")
-                    .arg("create")
-                    .args(["-f", "qcow2"])
-                    .arg(backing_path.to_str().unwrap())
-                    .arg("256M")
-                    .output()
-                    .expect("Failed to create backing QCOW2");
+                QemuImgCommand::new()
+                    .create("qcow2", "")
+                    .args(&[backing_path.to_str().unwrap(), "256M"])
+                    .run("Failed to create backing QCOW2");
 
-                Command::new("qemu-img")
-                    .arg("create")
-                    .args(["-f", "qcow2"])
-                    .args(["-b", backing_path.to_str().unwrap()])
-                    .args(["-F", "qcow2"])
-                    .arg(test_image_path.to_str().unwrap())
-                    .output()
-                    .expect("Failed to create overlay QCOW2");
+                QemuImgCommand::new()
+                    .create("qcow2", "")
+                    .args(&[
+                        "-b",
+                        backing_path.to_str().unwrap(),
+                        "-F",
+                        "qcow2",
+                        test_image_path.to_str().unwrap(),
+                    ])
+                    .run("Failed to create overlay QCOW2");
 
                 compute_backing_checksum(&test_image_path)
             }
@@ -1740,12 +1741,12 @@ mod common_parallel {
 
     // Direct=on data disk on a 4k sector loop FS, aligned O_DIRECT round trip.
     fn _test_virtio_block_direct_io_data_disk_4k(image_type: ImageType) {
-        let (qemu_fmt, qemu_extra): (&str, &[&str]) = match image_type {
-            ImageType::Raw => ("raw", &[]),
-            ImageType::Qcow2 => ("qcow2", &[]),
-            ImageType::FixedVhd => ("vpc", &["-o", "subformat=fixed"]),
-            ImageType::Vhdx => ("vhdx", &[]),
-            ImageType::FlatVmdk => ("vmdk", &["-o", "subformat=monolithicFlat"]),
+        let (qemu_fmt, qemu_options) = match image_type {
+            ImageType::Raw => ("raw", ""),
+            ImageType::Qcow2 => ("qcow2", ""),
+            ImageType::FixedVhd => ("vpc", "subformat=fixed"),
+            ImageType::Vhdx => ("vhdx", ""),
+            ImageType::FlatVmdk => ("vmdk", "subformat=monolithicFlat"),
             ImageType::Unknown => panic!("unsupported image_type {image_type}"),
         };
         let image_type_str = image_type.to_string();
@@ -1788,9 +1789,10 @@ mod common_parallel {
         );
 
         let test_disk = mnt_dir.join(format!("data.{image_type_str}"));
-        let mut create_args: Vec<&str> = vec!["create", "-f", qemu_fmt];
-        create_args.extend_from_slice(qemu_extra);
-        let res = run_qemu_img(&test_disk, &create_args, Some(&["64M"]));
+        let res = QemuImgCommand::new()
+            .create(qemu_fmt, qemu_options)
+            .args(&[test_disk.to_str().unwrap(), "64M"])
+            .run("qemu-img create failed");
         assert!(res.status.success(), "qemu-img create failed: {res:?}");
 
         let vmdk_backing = if matches!(image_type, ImageType::FlatVmdk) {
@@ -1896,7 +1898,10 @@ mod common_parallel {
         // not from the backend.
         let test_disk = guest.tmp_dir.as_path().join(format!("lbs-test.{ext}"));
         let test_disk_path = test_disk.to_str().unwrap().to_owned();
-        let res = run_qemu_img(&test_disk, &["create", "-f", qemu_fmt], Some(&["64M"]));
+        let res = QemuImgCommand::new()
+            .create(qemu_fmt, "")
+            .args(&[test_disk_path.as_str(), "64M"])
+            .run("qemu-img create failed");
         assert!(res.status.success(), "qemu-img create failed: {res:?}");
 
         let direct_opt = if direct { ",direct=on" } else { "" };
@@ -2238,16 +2243,14 @@ mod common_parallel {
         vhd_file_path.push(JAMMY_IMAGE_NAME_VHD);
 
         // Generate VHD file from RAW file
-        Command::new("qemu-img")
-            .arg("convert")
-            .arg("-p")
-            .args(["-f", "raw"])
-            .args(["-O", "vpc"])
-            .args(["-o", "subformat=fixed"])
-            .arg(raw_file_path.to_str().unwrap())
-            .arg(vhd_file_path.to_str().unwrap())
-            .output()
-            .expect("Expect generating VHD image from RAW image");
+        QemuImgCommand::new()
+            .convert("raw", "vpc", "subformat=fixed")
+            .args(&[
+                "-p",
+                raw_file_path.to_str().unwrap(),
+                vhd_file_path.to_str().unwrap(),
+            ])
+            .run("Expect generating VHD image from RAW image");
         let guest = make_virtio_block_guest(
             &GuestFactory::new_regular_guest_factory(),
             JAMMY_IMAGE_NAME_VHD,
@@ -2266,15 +2269,14 @@ mod common_parallel {
         vhdx_file_path.push(JAMMY_IMAGE_NAME_VHDX);
 
         // Generate dynamic VHDX file from RAW file
-        Command::new("qemu-img")
-            .arg("convert")
-            .arg("-p")
-            .args(["-f", "raw"])
-            .args(["-O", "vhdx"])
-            .arg(raw_file_path.to_str().unwrap())
-            .arg(vhdx_file_path.to_str().unwrap())
-            .output()
-            .expect("Expect generating dynamic VHDx image from RAW image");
+        QemuImgCommand::new()
+            .convert("raw", "vhdx", "")
+            .args(&[
+                "-p",
+                raw_file_path.to_str().unwrap(),
+                vhdx_file_path.to_str().unwrap(),
+            ])
+            .run("Expect generating dynamic VHDx image from RAW image");
         let guest = make_virtio_block_guest(
             &GuestFactory::new_regular_guest_factory(),
             JAMMY_IMAGE_NAME_VHDX,
@@ -3766,6 +3768,107 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(not(feature = "mshv"))] // See issue #7435
+    #[cfg(target_arch = "x86_64")]
+    fn test_snapshot_restore_cpu_pause_resume() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=4,max=4"])
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--api-socket", &api_socket_source])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert_eq!(guest.get_cpu_count().unwrap(), 4);
+
+            // Pause before requesting removal so the guest cannot acknowledge
+            // it until after restore. All four vCPU threads must be restored
+            // even though the configured CPU count is now two.
+            assert!(remote_command(&api_socket_source, "pause", None));
+            assert!(resize_command(
+                &api_socket_source,
+                Some(2),
+                None,
+                None,
+                None,
+            ));
+            assert!(remote_command(
+                &api_socket_source,
+                "snapshot",
+                Some(&format!("file://{snapshot_dir}")),
+            ));
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = temp_event_monitor_path(&guest.tmp_dir);
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args(["--event-monitor", &format!("path={event_path_restored}")])
+            .args(["--restore", &format!("source_url=file://{snapshot_dir}")])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            assert!(wait_for_latest_events_exact_str(
+                Duration::from_secs(30),
+                &["restored"],
+                &event_path_restored,
+            ));
+            assert_eq!(
+                fs::read_dir(format!("/proc/{}/task", child.id()))
+                    .unwrap()
+                    .filter_map(|task| fs::read_to_string(task.unwrap().path().join("comm")).ok())
+                    .filter(|name| name.starts_with("vcpu"))
+                    .count(),
+                4,
+                "Restore must start CPUs still awaiting guest ejection",
+            );
+            assert!(remote_command(&api_socket_restored, "resume", None));
+
+            // Checking present CPUs also requires Linux to finish ejection,
+            // rather than merely taking the CPUs offline.
+            assert!(
+                wait_until(Duration::from_secs(20), || {
+                    guest
+                        .ssh_command("cat /sys/devices/system/cpu/present")
+                        .is_ok_and(|present| present.trim() == "0-1")
+                }),
+                "Pending CPU removal did not complete after restore: {:?}",
+                guest.ssh_command("cat /sys/devices/system/cpu/present"),
+            );
+            assert_eq!(guest.get_cpu_count().unwrap(), 2);
+
+            let mut vcpu_threads = fs::read_dir(format!("/proc/{}/task", child.id()))
+                .unwrap()
+                .filter_map(|task| fs::read_to_string(task.unwrap().path().join("comm")).ok())
+                .filter(|name| name.starts_with("vcpu"))
+                .map(|name| name.trim().to_string())
+                .collect::<Vec<_>>();
+            vcpu_threads.sort();
+            assert_eq!(vcpu_threads, ["vcpu0", "vcpu1"]);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     #[cfg_attr(target_arch = "aarch64", ignore = "See #8187")]
     fn test_memory_hotplug() {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
@@ -4275,14 +4378,10 @@ mod common_parallel {
         let test_disk_path = guest.tmp_dir.as_path().join("resize-test.qcow2");
 
         // Create a 16MB QCOW2 disk image
-        assert!(
-            exec_host_command_output(&format!(
-                "qemu-img create -f qcow2 {} 16M",
-                test_disk_path.to_str().unwrap()
-            ))
-            .status
-            .success()
-        );
+        QemuImgCommand::new()
+            .create("qcow2", "")
+            .args(&[test_disk_path.to_str().unwrap(), "16M"])
+            .run("Failed to create QCOW2 resize test image");
 
         let mut cmd = GuestCommand::new(&guest);
 
@@ -4518,18 +4617,10 @@ mod common_parallel {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         let test_disk_path = guest.tmp_dir.as_path().join("test.img");
 
-        let output = exec_host_command_output(
-            format!(
-                "qemu-img create -f raw {} 16M",
-                test_disk_path.to_str().unwrap()
-            )
-            .as_str(),
-        );
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("qemu-img command failed\nstdout\n{stdout}\nstderr\n{stderr}");
-        }
+        QemuImgCommand::new()
+            .create("raw", "")
+            .args(&[test_disk_path.to_str().unwrap(), "16M"])
+            .run("qemu-img command failed");
 
         let loop_dev = create_loop_device(test_disk_path.to_str().unwrap(), 4096, 5);
         _test_virtio_block_topology(&guest, &loop_dev);
@@ -4745,11 +4836,9 @@ mod common_parallel {
 
     // Helper function to count zero flagged regions in QCOW2 image
     fn count_qcow2_zero_regions(test_disk_path: &str) -> Option<usize> {
-        let res =
-            exec_host_command_output(&format!("qemu-img map --output=json -U {test_disk_path}"));
-        if !res.status.success() {
-            return None;
-        }
+        let res = QemuImgCommand::new()
+            .map(test_disk_path)
+            .run("Failed to get QCOW2 zero regions");
 
         let out = String::from_utf8_lossy(&res.stdout);
         let map_json = serde_json::from_str::<serde_json::Value>(&out).ok()?;
@@ -4854,18 +4943,11 @@ mod common_parallel {
             .as_path()
             .join(format!("discard_test.{}", format_name.to_lowercase()));
 
-        let mut cmd = format!("qemu-img create -f {qemu_img_format} ");
-        if !extra_create_args.is_empty() {
-            cmd.push_str(&extra_create_args.join(" "));
-            cmd.push(' ');
-        }
-        cmd.push_str(&format!("{} 2G", test_disk_path.to_str().unwrap()));
-
-        let res = exec_host_command_output(&cmd);
-        assert!(
-            res.status.success(),
-            "Failed to create {format_name} test image"
-        );
+        QemuImgCommand::new()
+            .create(qemu_img_format, "")
+            .args(extra_create_args)
+            .args(&[test_disk_path.to_str().unwrap(), "2G"])
+            .run(&format!("Failed to create {format_name} test image"));
 
         let mut child = GuestCommand::new(&guest)
             .args(["--cpus", "boot=4"])
@@ -5152,7 +5234,10 @@ mod common_parallel {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let test_disk_path = guest.tmp_dir.as_path().join("loop_discard_test.raw");
-        let res = run_qemu_img(&test_disk_path, &["create", "-f", "raw"], Some(&["128M"]));
+        let res = QemuImgCommand::new()
+            .create("raw", "")
+            .args(&[test_disk_path.to_str().unwrap(), "128M"])
+            .run("Failed to create raw backing image");
         assert!(
             res.status.success(),
             "Failed to create raw backing image: {}",
@@ -5248,7 +5333,10 @@ mod common_parallel {
         let origin_path = guest.tmp_dir.as_path().join("dm_origin.raw");
         let cow_path = guest.tmp_dir.as_path().join("dm_cow.raw");
 
-        let res = run_qemu_img(&origin_path, &["create", "-f", "raw"], Some(&["128M"]));
+        let res = QemuImgCommand::new()
+            .create("raw", "")
+            .args(&[origin_path.to_str().unwrap(), "128M"])
+            .run("Failed to create origin image");
         assert!(
             res.status.success(),
             "Failed to create origin image: {}",
@@ -5435,18 +5523,11 @@ mod common_parallel {
             .as_path()
             .join(format!("fstrim_test.{}", format_name.to_lowercase()));
 
-        let mut cmd = format!("qemu-img create -f {qemu_img_format} ");
-        if !extra_create_args.is_empty() {
-            cmd.push_str(&extra_create_args.join(" "));
-            cmd.push(' ');
-        }
-        cmd.push_str(&format!("{} 2G", test_disk_path.to_str().unwrap()));
-
-        let res = exec_host_command_output(&cmd);
-        assert!(
-            res.status.success(),
-            "Failed to create {format_name} test image"
-        );
+        QemuImgCommand::new()
+            .create(qemu_img_format, "")
+            .args(extra_create_args)
+            .args(&[test_disk_path.to_str().unwrap(), "2G"])
+            .run(&format!("Failed to create {format_name} test image"));
 
         let mut child = GuestCommand::new(&guest)
             .args(["--cpus", "boot=4"])
@@ -5727,10 +5808,10 @@ mod common_parallel {
         let test_disk_path = guest.tmp_dir.as_path().join("sparse_off_test.qcow2");
         let test_disk_path = test_disk_path.to_str().unwrap();
 
-        let res = exec_host_command_output(&format!(
-            "qemu-img create -f qcow2 {test_disk_path} {TEST_DISK_SIZE}"
-        ));
-        assert!(res.status.success(), "Failed to create QCOW2 test image");
+        QemuImgCommand::new()
+            .create("qcow2", "")
+            .args(&[test_disk_path, TEST_DISK_SIZE])
+            .run("Failed to create QCOW2 test image");
 
         let zero_regions_before = count_qcow2_zero_regions(test_disk_path)
             .expect("Failed to get initial zero regions count");
@@ -10213,7 +10294,7 @@ mod ivshmem {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn test_snapshot_restore_pvpanic() {
         snapshot_restore_common::_test_snapshot_restore_devices(true);
     }
@@ -13035,16 +13116,10 @@ mod windows {
             let _ = fs::remove_file(&img);
 
             // Create an image file
-            let out = Command::new("qemu-img")
-                .args([
-                    "create",
-                    "-f",
-                    "raw",
-                    img.to_str().unwrap(),
-                    format!("{sz}m").as_str(),
-                ])
-                .output()
-                .expect("qemu-img command failed")
+            let out = QemuImgCommand::new()
+                .create("raw", "")
+                .args(&[img.to_str().unwrap(), &format!("{sz}m")])
+                .run("qemu-img command failed")
                 .stdout;
             println!("{out:?}");
 
@@ -15238,7 +15313,7 @@ mod rate_limiter {
         false
     }
 
-    fn _test_rate_limiter_net(rx: bool) {
+    fn _test_rate_limiter_net(rx: bool, burst: Option<(u64, u64)>) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
 
@@ -15246,9 +15321,10 @@ mod rate_limiter {
         let queue_size = 256;
         let bw_size = 104857600_u64; // bytes
         let bw_refill_time = 1000; // ms
-        let limit_bps = (bw_size * 8 * 1000) as f64 / bw_refill_time as f64;
+        let limit_bytes = burst.map_or(bw_size * 1000 / bw_refill_time, |(rate, _)| rate);
+        let limit_bps = (limit_bytes * 8) as f64;
 
-        let net_params = format!(
+        let mut net_params = format!(
             "tap=,mac={},ip={},mask=255.255.255.128,num_queues={},queue_size={},bw_size={},bw_one_time_burst=0,bw_refill_time={}",
             guest.network.guest_mac0,
             guest.network.host_ip0,
@@ -15257,6 +15333,9 @@ mod rate_limiter {
             bw_size,
             bw_refill_time,
         );
+        if let Some((burst_rate, burst_seconds)) = burst {
+            net_params += &format!(",bw_burst_rate={burst_rate},bw_burst_seconds={burst_seconds}");
+        }
 
         let mut child = GuestCommand::new(&guest)
             .args(["--cpus", &format!("boot={}", num_queues / 2)])
@@ -15288,15 +15367,35 @@ mod rate_limiter {
 
     #[test]
     fn test_rate_limiter_net_rx() {
-        _test_rate_limiter_net(true);
+        _test_rate_limiter_net(true, None);
     }
 
     #[test]
     fn test_rate_limiter_net_tx() {
-        _test_rate_limiter_net(false);
+        _test_rate_limiter_net(false, None);
     }
 
-    fn _test_rate_limiter_block(bandwidth: bool, num_queues: u16) {
+    // At twice the sustained rate, the 60 s burst outlasts the 20 s run.
+    #[test]
+    fn test_rate_limiter_net_rx_burst() {
+        _test_rate_limiter_net(true, Some((209715200, 60)));
+    }
+
+    #[test]
+    fn test_rate_limiter_net_tx_burst() {
+        _test_rate_limiter_net(false, Some((209715200, 60)));
+    }
+
+    fn block_rate_limiter_fio_command(fio_ops: &FioOps, num_queues: u16, ramp_time: u32) -> String {
+        format!(
+            "sudo fio --filename=/dev/vdc --name=test --output-format=json \
+            --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 \
+            --rw={fio_ops} --runtime={BLOCK_RATE_LIMITER_RUNTIME} \
+            --ramp_time={ramp_time} --numjobs={num_queues}",
+        )
+    }
+
+    fn _test_rate_limiter_block(bandwidth: bool, num_queues: u16, burst: Option<(u64, u64, u64)>) {
         let fio_ops = FioOps::RandRW;
 
         let bw_size = if bandwidth {
@@ -15305,7 +15404,10 @@ mod rate_limiter {
             1000_u64 // I/O
         };
         let bw_refill_time = 1000; // ms
-        let limit_rate = (bw_size * 1000) as f64 / bw_refill_time as f64;
+        let limit_rate = burst.map_or(
+            (bw_size * 1000) as f64 / bw_refill_time as f64,
+            |(_, _, expected_rate)| expected_rate as f64,
+        );
 
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -15323,7 +15425,7 @@ mod rate_limiter {
             .success()
         );
 
-        let test_blk_params = if bandwidth {
+        let mut test_blk_params = if bandwidth {
             format!(
                 "path={blk_rate_limiter_test_img},num_queues={num_queues},bw_size={bw_size},bw_one_time_burst=0,bw_refill_time={bw_refill_time},image_type=raw"
             )
@@ -15332,6 +15434,10 @@ mod rate_limiter {
                 "path={blk_rate_limiter_test_img},num_queues={num_queues},ops_size={bw_size},ops_one_time_burst=0,ops_refill_time={bw_refill_time},image_type=raw"
             )
         };
+        if let Some((burst_rate, burst_seconds, _)) = burst {
+            test_blk_params +=
+                &format!(",ops_burst_rate={burst_rate},ops_burst_seconds={burst_seconds}");
+        }
 
         let mut child = GuestCommand::new(&guest)
             .args(["--cpus", &format!("boot={num_queues}")])
@@ -15348,12 +15454,8 @@ mod rate_limiter {
         let r = panic::catch_unwind(|| {
             guest.wait_vm_boot().unwrap();
 
-            let fio_command = format!(
-                "sudo fio --filename=/dev/vdc --name=test --output-format=json \
-                --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 \
-                --rw={fio_ops} --runtime={BLOCK_RATE_LIMITER_RUNTIME} \
-                --ramp_time={BLOCK_RATE_LIMITER_RAMP_TIME} --numjobs={num_queues}",
-            );
+            let fio_command =
+                block_rate_limiter_fio_command(&fio_ops, num_queues, BLOCK_RATE_LIMITER_RAMP_TIME);
             let output = guest.ssh_command(&fio_command).unwrap();
 
             // Parse fio output
@@ -15474,8 +15576,8 @@ mod rate_limiter {
 
     #[test]
     fn test_rate_limiter_block_bandwidth() {
-        _test_rate_limiter_block(true, 1);
-        _test_rate_limiter_block(true, 2);
+        _test_rate_limiter_block(true, 1, None);
+        _test_rate_limiter_block(true, 2, None);
     }
 
     #[test]
@@ -15488,8 +15590,101 @@ mod rate_limiter {
 
     #[test]
     fn test_rate_limiter_block_iops() {
-        _test_rate_limiter_block(false, 1);
-        _test_rate_limiter_block(false, 2);
+        _test_rate_limiter_block(false, 1, None);
+        _test_rate_limiter_block(false, 2, None);
+    }
+
+    #[test]
+    fn test_rate_limiter_block_iops_burst() {
+        // At 2000 IOPS, the 120000-token depth lasts 120 s, covering ramp and runtime.
+        _test_rate_limiter_block(false, 1, Some((2000, 60, 2000)));
+    }
+
+    #[test]
+    fn test_rate_limiter_block_iops_burst_exhausted() {
+        // At 2000 IOPS, the 2000-token depth is exhausted within the 5 s fio ramp.
+        _test_rate_limiter_block(false, 1, Some((2000, 1, 1000)));
+    }
+
+    #[test]
+    fn test_rate_limiter_block_iops_burst_recharge() {
+        let fio_ops = FioOps::RandRW;
+        let num_queues = 1;
+
+        for burst_recharge_seconds in [Some(4), None] {
+            let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+            let guest = Guest::new(Box::new(disk_config));
+            let api_socket = temp_api_path(&guest.tmp_dir);
+            let test_img_dir = TempDir::new_with_prefix("/var/tmp/ch").unwrap();
+            let test_img_path = test_img_dir.as_path().join("blk.img");
+            let test_img_path = test_img_path.to_str().unwrap();
+
+            assert!(
+                exec_host_command_output(&format!(
+                    "dd if=/dev/zero of={test_img_path} bs=1M count=1024"
+                ))
+                .status
+                .success()
+            );
+
+            let mut test_blk_params = format!(
+                "path={test_img_path},num_queues={num_queues},ops_size=500,ops_refill_time=1000,\
+                ops_burst_rate=5000,ops_burst_seconds=2,image_type=raw"
+            );
+            if let Some(recharge_seconds) = burst_recharge_seconds {
+                test_blk_params += &format!(",ops_burst_recharge_seconds={recharge_seconds}");
+            }
+
+            let mut child = GuestCommand::new(&guest)
+                .args(["--cpus", &format!("boot={num_queues}")])
+                .args(["--memory", "size=1G"])
+                .default_kernel_cmdline()
+                .default_disks()
+                .args(["--disk", test_blk_params.as_str()])
+                .default_net()
+                .args(["--api-socket", &api_socket])
+                .capture_output()
+                .spawn()
+                .unwrap();
+
+            let r = panic::catch_unwind(|| {
+                guest.wait_vm_boot().unwrap();
+
+                let fio_command = block_rate_limiter_fio_command(
+                    &fio_ops,
+                    num_queues,
+                    BLOCK_RATE_LIMITER_RAMP_TIME,
+                );
+                let output = guest.ssh_command(&fio_command).unwrap();
+                let measured_iops =
+                    parse_fio_output_iops(&output, &fio_ops, num_queues.into()).unwrap();
+                // D = 10000 ops drains within the 5 s ramp; sustained R = 500 IOPS.
+                assert!(check_rate_limit(measured_iops, 500.0, 0.1));
+
+                // Keep the recharge gap in the guest command.
+                let fio_command = format!(
+                    "sleep 5 && {} --time_based",
+                    block_rate_limiter_fio_command(&fio_ops, num_queues, 0)
+                );
+                let output = guest.ssh_command(&fio_command).unwrap();
+                let measured_iops =
+                    parse_fio_output_iops(&output, &fio_ops, num_queues.into()).unwrap();
+                if burst_recharge_seconds.is_some() {
+                    // P = 4 restores D: (10000 + 500 * 20) / 20 = 1000 IOPS.
+                    assert!(check_rate_limit(measured_iops, 1000.0, 0.1));
+                } else {
+                    // Implicit D/R = 20 s: a 5-6 s gap restores only ~625-650 IOPS.
+                    assert!(
+                        measured_iops < 900.0,
+                        "Implicit recharge unexpectedly reached {measured_iops} IOPS"
+                    );
+                }
+            });
+
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            handle_child_output(r, &output);
+        }
     }
 
     #[test]
@@ -15504,6 +15699,66 @@ mod rate_limiter {
 #[cfg(not(target_arch = "riscv64"))]
 mod fw_cfg {
     use crate::*;
+
+    #[test]
+    fn test_fw_cfg_snapshot_restore() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+        let file = guest.tmp_dir.as_path().join("fw-cfg-item");
+        fs::write(&file, "snapshot contents").unwrap();
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args([
+                "--fw-cfg-config",
+                &format!(
+                    "initramfs=off,items=[name=opt/test,file={}]",
+                    file.display()
+                ),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+        let read_item = "sudo cat /sys/firmware/qemu_fw_cfg/by_name/opt/test/raw";
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert_eq!(guest.ssh_command(read_item).unwrap(), "snapshot contents");
+            assert!(remote_command(&api_socket, "pause", None));
+            assert!(remote_command(
+                &api_socket,
+                "snapshot",
+                Some(&format!("file://{snapshot_dir}"))
+            ));
+        });
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let mut child = GuestCommand::new(&guest)
+            .args([
+                "--restore",
+                &format!("source_url=file://{snapshot_dir},resume=on"),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+        let r = panic::catch_unwind(|| {
+            guest.wait_for_ssh(Duration::from_secs(30)).unwrap();
+            assert_eq!(
+                guest.ssh_command(read_item).unwrap(),
+                "snapshot contents",
+                "Restored fw_cfg content should equal the original content"
+            );
+        });
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
 
     #[test]
     fn test_fw_cfg() {

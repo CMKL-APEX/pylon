@@ -987,6 +987,7 @@ fn new_direct_ctrl_handler(
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             MAX_VIRTQUEUE_PAIRS,
             Arc::new(std::sync::atomic::AtomicU16::new(MAX_VIRTQUEUE_PAIRS)),
+            u64::MAX,
         ),
         queue_evt,
         queue,
@@ -1565,11 +1566,17 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
             size: 64,
             one_time_burst: Some(0),
             refill_time: 2,
+            burst_rate: None,
+            burst_seconds: None,
+            burst_recharge_seconds: None,
         }),
         ops: Some(TokenBucketConfig {
             size: 256,
             one_time_burst: Some(0),
             refill_time: 1,
+            burst_rate: None,
+            burst_seconds: None,
+            burst_recharge_seconds: None,
         }),
     });
     run_stateful_activation(

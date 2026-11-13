@@ -9,14 +9,12 @@ use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::LazyLock;
 use std::{io, result};
 
 use arch::CpuProfileConfig;
 #[cfg(target_arch = "x86_64")]
 use arch::CpuidOverride;
 use block::ImageType;
-use clap::ArgMatches;
 use log::warn;
 #[cfg(target_arch = "x86_64")]
 use option_parser::split_commas;
@@ -38,6 +36,8 @@ use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 96;
 const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
+const MIN_PHYS_BITS: u8 = 32;
+const MAX_PHYS_BITS: u8 = 64;
 
 // Maximum queue size is largest power of 2 that fits into a u16
 const VIRTIO_MAX_QUEUE_SIZE: u16 = 32768;
@@ -230,27 +230,29 @@ pub enum ValidationError {
     /// Missing socket path for console
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
-    /// Socket path given without socket console mode
-    #[error("Path only valid when using socket console mode")]
-    ConsoleSocketPathUnexpected,
     /// Missing address for TCP console mode
     #[error("Address missing when using TCP console mode")]
     ConsoleTcpAddressMissing,
-    /// TCP address given without TCP console mode
-    #[error("Address only valid when using TCP console mode")]
-    ConsoleTcpUnexpected,
     #[error("Server is only valid when using TCP console mode")]
     ConsoleTcpServerUnexpected,
     #[error("TCP console client mode is not supported")]
     ConsoleTcpClientUnsupported,
     #[error("TCP console port must not be zero")]
     ConsoleTcpPortZero,
+    /// Boot has no vCPUs
+    #[error("Number of boot vCPUs must be greater than 0")]
+    CpusBootZero,
     /// Max is less than boot
     #[error("Max CPUs ({0}) lower than boot CPUs ({1})")]
     CpusMaxLowerThanBoot(u32 /* max vCPUs */, u32 /* boot vCPUs */),
     /// Too many CPUs.
     #[error("Too many CPUs: specified {0} but {MAX_SUPPORTED_CPUS} is the limit")]
     TooManyCpus(u32 /* specified CPUs */),
+    /// Maximum physical address bits outside the supported range
+    #[error(
+        "Maximum physical address bits must be between {MIN_PHYS_BITS} and {MAX_PHYS_BITS}: {0}"
+    )]
+    InvalidMaxPhysBits(u8 /* specified bits */),
     #[cfg(target_arch = "aarch64")]
     /// The GICv3 layout does not fit this many CPUs.
     #[error("Too many CPUs for the GICv3 layout: specified {0} but {1} is the limit")]
@@ -261,6 +263,9 @@ pub enum ValidationError {
         usize, /* specified affinity */
         usize, /* maximum affinity */
     ),
+    /// kvm_hint_realtime conflicts with kvm_hyperv
+    #[error("`kvm_hint_realtime=on` cannot be combined with `kvm_hyperv=on`")]
+    KvmHintRealtimeWithKvmHyperv,
     /// Both socket and path specified
     #[error("Disk path and vhost socket both provided")]
     DiskSocketAndPath,
@@ -307,6 +312,9 @@ pub enum ValidationError {
     /// Huge page size is not power of 2
     #[error("Huge page size is not power of 2: {0}")]
     InvalidHugePageSize(u64),
+    /// Invalid number of queues
+    #[error("Invalid number of queues: {0}")]
+    InvalidNumQueues(usize),
     /// Insufficient vCPUs for queues
     #[error("Queue count ({0}) must not exceed boot vCPUs ({1})")]
     TooManyQueues(u16 /* queues */, usize /* vCPUs */),
@@ -406,6 +414,37 @@ pub enum ValidationError {
     /// Invalid rate-limiter group
     #[error("Invalid rate-limiter group")]
     InvalidRateLimiterGroup,
+    /// A burst duration requires a burst rate
+    #[error("Rate limiter burst duration {0} seconds requires a burst rate")]
+    RateLimiterBurstSecondsWithoutRate(u64),
+    /// Burst rate and duration must be positive
+    #[error("Rate limiter burst rate {0} and duration {1} seconds must be positive")]
+    RateLimiterBurstZero(u64, u64),
+    /// A bounded burst cannot be combined with a one-time burst
+    #[error("Rate limiter burst rate {0} cannot be combined with one-time burst {1}")]
+    RateLimiterBurstWithOneTimeBurst(u64, u64),
+    /// A bounded burst requires an enabled sustained bucket
+    #[error("Rate limiter burst rate {0} requires nonzero size {1} and refill time {2} ms")]
+    RateLimiterBurstDisabledBucket(u64, u64, u64),
+    /// Burst rate cannot be below the sustained rate
+    #[error("Rate limiter burst rate {0} is below the sustained rate of {1} tokens per {2} ms")]
+    RateLimiterBurstBelowSustained(u64, u64, u64),
+    /// Burst capacity must fit in a u64
+    #[error("Rate limiter burst rate {0} times duration {1} seconds overflows token capacity")]
+    RateLimiterBurstCapacityOverflow(u64, u64),
+    /// A recharge duration requires a bounded burst
+    #[error("Rate limiter burst recharge time {0} seconds requires a burst rate")]
+    RateLimiterBurstRechargeWithoutRate(u64),
+    /// Recharge must take longer than refilling the base meter
+    #[error(
+        "Rate limiter burst recharge time {0} seconds must be at least {1} seconds to exceed the base refill time"
+    )]
+    RateLimiterBurstRechargeTooShort(u64, u128),
+    /// Recharge only applies to burst credit above the base capacity
+    #[error(
+        "Rate limiter burst recharge time {0} seconds has no effect: burst capacity {1} does not exceed the base capacity {2}"
+    )]
+    RateLimiterBurstRechargeWithoutCredit(u64, u64, u128),
     /// Rate limiting is not supported with vhost-user
     #[error("Rate limiting is not supported with vhost-user")]
     VhostUserRateLimiterNotSupported,
@@ -420,7 +459,7 @@ pub enum ValidationError {
     #[error("Invalid host data format")]
     InvalidHostData,
     #[cfg(feature = "sev_snp")]
-    #[error("SEV-SNP requires an IGVM payload (--payload igvm=<path>)")]
+    #[error("SEV-SNP requires an IGVM payload (--igvm <path>)")]
     SevSnpRequiresIgvm,
     #[cfg(all(feature = "kvm", feature = "sev_snp"))]
     #[error("SEV-SNP on KVM requires ACPI tables supplied through fw_cfg")]
@@ -614,135 +653,6 @@ pub struct VmParams<'a> {
     pub pylon: Option<&'a str>,
 }
 
-impl<'a> VmParams<'a> {
-    pub fn from_arg_matches(args: &'a ArgMatches) -> Self {
-        // These .unwrap()s cannot fail as there is a default value defined
-        let cpus = args.get_one::<String>("cpus").unwrap();
-        let memory = args.get_one::<String>("memory").unwrap();
-        let memory_zones: Option<Vec<&str>> = args
-            .get_many::<String>("memory-zone")
-            .map(|x| x.map(|y| y as &str).collect());
-        let rng = args.get_one::<String>("rng").unwrap();
-        let serial = args.get_one::<String>("serial").unwrap();
-        let firmware = args.get_one::<String>("firmware").map(|x| x as &str);
-        let kernel = args.get_one::<String>("kernel").map(|x| x as &str);
-        let initramfs = args.get_one::<String>("initramfs").map(|x| x as &str);
-        let cmdline = args.get_one::<String>("cmdline").map(|x| x as &str);
-        let rate_limit_groups: Option<Vec<&str>> = args
-            .get_many::<String>("rate-limit-group")
-            .map(|x| x.map(|y| y as &str).collect());
-        let disks: Option<Vec<&str>> = args
-            .get_many::<String>("disk")
-            .map(|x| x.map(|y| y as &str).collect());
-        let net: Option<Vec<&str>> = args
-            .get_many::<String>("net")
-            .map(|x| x.map(|y| y as &str).collect());
-        let console = args.get_one::<String>("console").unwrap();
-        #[cfg(target_arch = "x86_64")]
-        let debug_console = args.get_one::<String>("debug-console").unwrap().as_str();
-        let balloon = args.get_one::<String>("balloon").map(|x| x as &str);
-        let fs: Option<Vec<&str>> = args
-            .get_many::<String>("fs")
-            .map(|x| x.map(|y| y as &str).collect());
-        let generic_vhost_user: Option<Vec<&str>> = args
-            .get_many::<String>("generic-vhost-user")
-            .map(|x| x.map(|y| y as &str).collect());
-        let pmem: Option<Vec<&str>> = args
-            .get_many::<String>("pmem")
-            .map(|x| x.map(|y| y as &str).collect());
-        let devices: Option<Vec<&str>> = args
-            .get_many::<String>("device")
-            .map(|x| x.map(|y| y as &str).collect());
-        let user_devices: Option<Vec<&str>> = args
-            .get_many::<String>("user-device")
-            .map(|x| x.map(|y| y as &str).collect());
-        let vdpa: Option<Vec<&str>> = args
-            .get_many::<String>("vdpa")
-            .map(|x| x.map(|y| y as &str).collect());
-        let vsock: Option<&str> = args.get_one::<String>("vsock").map(|x| x as &str);
-        #[cfg(feature = "pvmemcontrol")]
-        let pvmemcontrol = args.get_flag("pvmemcontrol");
-        let pvpanic = args.get_flag("pvpanic");
-        let numa: Option<Vec<&str>> = args
-            .get_many::<String>("numa")
-            .map(|x| x.map(|y| y as &str).collect());
-        let watchdog = args.get_flag("watchdog");
-        let rtc: Option<&str> = args.get_one::<String>("rtc").map(|x| x as &str);
-        let pci_segments: Option<Vec<&str>> = args
-            .get_many::<String>("pci-segment")
-            .map(|x| x.map(|y| y as &str).collect());
-        let platform = args.get_one::<String>("platform").map(|x| x as &str);
-        #[cfg(feature = "guest_debug")]
-        let gdb = args.contains_id("gdb");
-        let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
-        #[cfg(feature = "igvm")]
-        let igvm = args.get_one::<String>("igvm").map(|x| x as &str);
-        #[cfg(feature = "sev_snp")]
-        let host_data = args.get_one::<String>("host-data").map(|x| x as &str);
-        let landlock_enable = args.get_flag("landlock");
-        let landlock_rules: Option<Vec<&str>> = args
-            .get_many::<String>("landlock-rules")
-            .map(|x| x.map(|y| y as &str).collect());
-        #[cfg(feature = "fw_cfg")]
-        let fw_cfg_config: Option<&str> =
-            args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
-        #[cfg(feature = "ivshmem")]
-        let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
-        let pylon: Option<&str> = args
-            .try_get_one::<String>("pylon")
-            .ok()
-            .flatten()
-            .map(String::as_str);
-        VmParams {
-            cpus,
-            memory,
-            memory_zones,
-            firmware,
-            kernel,
-            initramfs,
-            cmdline,
-            rate_limit_groups,
-            disks,
-            net,
-            rng,
-            balloon,
-            fs,
-            generic_vhost_user,
-            pmem,
-            serial,
-            console,
-            #[cfg(target_arch = "x86_64")]
-            debug_console,
-            devices,
-            user_devices,
-            vdpa,
-            vsock,
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol,
-            pvpanic,
-            numa,
-            watchdog,
-            rtc,
-            #[cfg(feature = "guest_debug")]
-            gdb,
-            pci_segments,
-            platform,
-            tpm,
-            #[cfg(feature = "igvm")]
-            igvm,
-            #[cfg(feature = "sev_snp")]
-            host_data,
-            landlock_enable,
-            landlock_rules,
-            #[cfg(feature = "fw_cfg")]
-            fw_cfg_config,
-            #[cfg(feature = "ivshmem")]
-            ivshmem,
-            pylon,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum ParseHotplugMethodError {
     InvalidValue(String),
@@ -891,6 +801,17 @@ fn parse_cpuid_override_entry(
 }
 
 impl CpusConfig {
+    pub const SYNTAX: &'static str = "CPU parameters \
+        \"boot=<boot_vcpus>,max=<max_vcpus>,\
+        topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,\
+        kvm_hyperv=on|off,kvm_hint_realtime=on|off,\
+        max_phys_bits=<maximum_number_of_physical_bits>,\
+        affinity=<list_of_vcpus_with_their_associated_cpuset>,\
+        features=<list_of_features_to_enable>,\
+        nested=on|off,core_scheduling=vm|vcpu|off,\
+        profile=host|path:<file>,\
+        x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]\"";
+
     pub fn parse(cpus: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -906,6 +827,8 @@ impl CpusConfig {
             .add("profile");
         #[cfg(target_arch = "x86_64")]
         parser.add("x-cpuid-overrides");
+        #[cfg(target_arch = "x86_64")]
+        parser.add("kvm_hint_realtime");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
         let boot_vcpus: u32 = parser
@@ -919,6 +842,12 @@ impl CpusConfig {
         let topology = parser.convert("topology").map_err(Error::ParseCpus)?;
         let kvm_hyperv = parser
             .convert::<Toggle>("kvm_hyperv")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or(Toggle(false))
+            .0;
+        #[cfg(target_arch = "x86_64")]
+        let kvm_hint_realtime = parser
+            .convert::<Toggle>("kvm_hint_realtime")
             .map_err(Error::ParseCpus)?
             .unwrap_or(Toggle(false))
             .0;
@@ -991,6 +920,8 @@ impl CpusConfig {
             max_vcpus,
             topology,
             kvm_hyperv,
+            #[cfg(target_arch = "x86_64")]
+            kvm_hint_realtime,
             max_phys_bits,
             affinity,
             features,
@@ -1005,7 +936,8 @@ impl CpusConfig {
 
 impl PciSegmentConfig {
     pub const SYNTAX: &'static str = "PCI Segment parameters \
-         \"pci_segment=<segment_id>,mmio32_aperture_weight=<scale>,mmio64_aperture_weight=<scale>\"";
+        \"pci_segment=<segment_id>,mmio32_aperture_weight=<scale>,\
+        mmio64_aperture_weight=<scale>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1061,30 +993,29 @@ impl PciSegmentConfig {
     }
 }
 
+// Shared by both variants of `PlatformConfig::SYNTAX`.
+macro_rules! platform_syntax {
+    ($($extra:literal)?) => {
+        concat!(
+            "Platform configuration parameters \
+                \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
+                iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,vfio_p2p_dma=on|off,\
+                system_manufacturer=<dmi_system_manufacturer>,\
+                system_product_name=<dmi_system_product_name>,system_version=<dmi_system_version>,\
+                system_serial_number=<dmi_system_serial_number>,system_uuid=<dmi_system_uuid>,\
+                system_sku_number=<dmi_system_sku_number>,system_family=<dmi_system_family>,\
+                oem_strings=<list_of_strings>,chassis_asset_tag=<dmi_chassis_asset_tag>",
+            $($extra,)?
+            "\""
+        )
+    };
+}
+
 impl PlatformConfig {
-    pub fn syntax() -> &'static str {
-        static SYNTAX: LazyLock<String> = LazyLock::new(|| {
-            let mut syntax = "Platform configuration parameters \
-            \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
-            iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,vfio_p2p_dma=on|off,\
-            system_manufacturer=<dmi_system_manufacturer>,\
-            system_product_name=<dmi_system_product_name>,system_version=<dmi_system_version>,\
-            system_serial_number=<dmi_system_serial_number>,system_uuid=<dmi_system_uuid>,\
-            system_sku_number=<dmi_system_sku_number>,system_family=<dmi_system_family>,\
-            oem_strings=<list_of_strings>,chassis_asset_tag=<dmi_chassis_asset_tag>"
-                .to_string();
-
-            if cfg!(feature = "sev_snp") {
-                syntax.push_str(",sev_snp=on|off");
-            }
-
-            syntax.push('"');
-
-            syntax
-        });
-
-        &SYNTAX
-    }
+    #[cfg(feature = "sev_snp")]
+    pub const SYNTAX: &'static str = platform_syntax!(",sev_snp=on|off");
+    #[cfg(not(feature = "sev_snp"))]
+    pub const SYNTAX: &'static str = platform_syntax!();
 
     /// # Safety
     /// Live FDs named in the input must be exclusively owned by the caller.
@@ -1248,13 +1179,31 @@ impl PlatformConfig {
     }
 }
 
+impl MemoryZoneConfig {
+    pub const SYNTAX: &'static str = "User defined memory zone parameters \
+        \"size=<guest_memory_region_size>,file=<backing_file>,\
+        shared=on|off,\
+        hugepages=on|off,hugepage_size=<hugepage_size>,\
+        host_numa_node=<node_id>,\
+        id=<zone_identifier>,hotplug_size=<hotpluggable_memory_size>,\
+        hotplugged_size=<hotplugged_memory_size>,\
+        prefault=on|off,reserve=on|off\"";
+}
+
 impl MemoryConfig {
+    pub const SYNTAX: &'static str = "Memory parameters \
+        \"size=<guest_memory_size>,mergeable=on|off,shared=on|off,\
+        hugepages=on|off,hugepage_size=<hugepage_size>,\
+        hotplug_method=acpi|virtio-mem,\
+        hotplug_size=<hotpluggable_memory_size>,\
+        hotplugged_size=<hotplugged_memory_size>,\
+        prefault=on|off,reserve=on|off,thp=on|off\"";
+
     #[expect(clippy::needless_pass_by_value)]
     pub fn parse(memory: &str, memory_zones: Option<Vec<&str>>) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
             .add("size")
-            .add("file")
             .add("mergeable")
             .add("hotplug_method")
             .add("hotplug_size")
@@ -1463,77 +1412,137 @@ impl MemoryConfig {
     }
 }
 
+const RATE_LIMITER_OPTIONS: &[&str] = &[
+    "bw_size",
+    "bw_one_time_burst",
+    "bw_refill_time",
+    "bw_burst_rate",
+    "bw_burst_seconds",
+    "bw_burst_recharge_seconds",
+    "ops_size",
+    "ops_one_time_burst",
+    "ops_refill_time",
+    "ops_burst_rate",
+    "ops_burst_seconds",
+    "ops_burst_recharge_seconds",
+];
+
+fn parse_rate_limiter_config(
+    parser: &OptionParser,
+) -> result::Result<RateLimiterConfig, OptionParserError> {
+    let bandwidth = TokenBucketConfig {
+        size: parser.convert("bw_size")?.unwrap_or_default(),
+        one_time_burst: Some(parser.convert("bw_one_time_burst")?.unwrap_or_default()),
+        refill_time: parser.convert("bw_refill_time")?.unwrap_or_default(),
+        burst_rate: parser.convert("bw_burst_rate")?,
+        burst_seconds: parser.convert("bw_burst_seconds")?,
+        burst_recharge_seconds: parser.convert("bw_burst_recharge_seconds")?,
+    };
+    let ops = TokenBucketConfig {
+        size: parser.convert("ops_size")?.unwrap_or_default(),
+        one_time_burst: Some(parser.convert("ops_one_time_burst")?.unwrap_or_default()),
+        refill_time: parser.convert("ops_refill_time")?.unwrap_or_default(),
+        burst_rate: parser.convert("ops_burst_rate")?,
+        burst_seconds: parser.convert("ops_burst_seconds")?,
+        burst_recharge_seconds: parser.convert("ops_burst_recharge_seconds")?,
+    };
+    let [bandwidth, ops] = [bandwidth, ops].map(|bucket| {
+        ((bucket.size != 0 && bucket.refill_time != 0)
+            || bucket.burst_rate.is_some()
+            || bucket.burst_seconds.is_some()
+            || bucket.burst_recharge_seconds.is_some())
+        .then_some(bucket)
+    });
+    Ok(RateLimiterConfig { bandwidth, ops })
+}
+
+fn validate_rate_limiter_config(cfg: &RateLimiterConfig) -> ValidationResult<()> {
+    for bucket in [cfg.bandwidth, cfg.ops].into_iter().flatten() {
+        let Some(rate) = bucket.burst_rate else {
+            if let Some(seconds) = bucket.burst_seconds {
+                return Err(ValidationError::RateLimiterBurstSecondsWithoutRate(seconds));
+            }
+            if let Some(recharge) = bucket.burst_recharge_seconds {
+                return Err(ValidationError::RateLimiterBurstRechargeWithoutRate(
+                    recharge,
+                ));
+            }
+            continue;
+        };
+        let seconds = bucket.burst_seconds.unwrap_or(1);
+        if rate == 0 || seconds == 0 {
+            return Err(ValidationError::RateLimiterBurstZero(rate, seconds));
+        }
+        if let Some(burst) = bucket.one_time_burst
+            && burst > 0
+        {
+            return Err(ValidationError::RateLimiterBurstWithOneTimeBurst(
+                rate, burst,
+            ));
+        }
+        if bucket.size == 0 || bucket.refill_time == 0 {
+            return Err(ValidationError::RateLimiterBurstDisabledBucket(
+                rate,
+                bucket.size,
+                bucket.refill_time,
+            ));
+        }
+        if u128::from(rate) * u128::from(bucket.refill_time) < u128::from(bucket.size) * 1000 {
+            return Err(ValidationError::RateLimiterBurstBelowSustained(
+                rate,
+                bucket.size,
+                bucket.refill_time,
+            ));
+        }
+        if rate.checked_mul(seconds).is_none() {
+            return Err(ValidationError::RateLimiterBurstCapacityOverflow(
+                rate, seconds,
+            ));
+        }
+        if let Some(recharge) = bucket.burst_recharge_seconds {
+            let sustained = u128::from(bucket.size) * 1000;
+            let refill_time = u128::from(bucket.refill_time);
+            let base_depth = sustained.div_ceil(refill_time);
+            let base_refill_seconds = base_depth * refill_time / sustained;
+            let capacity = rate * seconds;
+            if u128::from(capacity) <= base_depth {
+                return Err(ValidationError::RateLimiterBurstRechargeWithoutCredit(
+                    recharge, capacity, base_depth,
+                ));
+            }
+            if u128::from(recharge) <= base_refill_seconds {
+                return Err(ValidationError::RateLimiterBurstRechargeTooShort(
+                    recharge,
+                    base_refill_seconds + 1,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl RateLimiterGroupConfig {
     pub const SYNTAX: &'static str = "Rate Limit Group parameters \
         \"bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
         id=<device_id>\"";
 
     pub fn parse(rate_limit_group: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
-            .add("id");
+        parser.add_all(RATE_LIMITER_OPTIONS).add("id");
         parser
             .parse(rate_limit_group)
             .map_err(Error::ParseRateLimiterGroup)?;
 
         let id = parser.get("id").unwrap_or_default();
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-
         Ok(RateLimiterGroupConfig {
             id,
-            rate_limiter_config: RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            },
+            rate_limiter_config: parse_rate_limiter_config(&parser)
+                .map_err(Error::ParseRateLimiterGroup)?,
         })
     }
 
@@ -1545,6 +1554,8 @@ impl RateLimiterGroupConfig {
         if self.id.is_empty() {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
+
+        validate_rate_limiter_config(&self.rate_limiter_config)?;
 
         Ok(())
     }
@@ -1618,17 +1629,21 @@ impl PciDeviceCommonConfig {
 
 impl DiskConfig {
     pub const SYNTAX: &'static str = "Disk parameters \
-         \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=off|virtio,\
-         num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
-         vhost_user=on|off,socket=<vhost_user_socket_path>,\
-         bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
-         id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-         rate_limit_group=<group_id>,\
-         queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
-         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
-         image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-         guest_block_size=<size_in_bytes>";
+        \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=off|virtio,\
+        num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
+        vhost_user=on|off,socket=<vhost_user_socket_path>,\
+        bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
+        ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
+        id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+        rate_limit_group=<group_id>,\
+        queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
+        serial=<serial_number>,backing_files=on|off,sparse=on|off,\
+        image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
+        guest_block_size=<size_in_bytes>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1640,12 +1655,7 @@ impl DiskConfig {
             .add("num_queues")
             .add("vhost_user")
             .add("socket")
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
+            .add_all(RATE_LIMITER_OPTIONS)
             .add("_disable_io_uring")
             .add("_disable_aio")
             .add("serial")
@@ -1696,30 +1706,7 @@ impl DiskConfig {
             .unwrap_or(Toggle(false))
             .0;
         let rate_limit_group = parser.get("rate_limit_group");
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
+        let rate_limiter_config = parse_rate_limiter_config(&parser).map_err(Error::ParseDisk)?;
         let serial = parser.get("serial");
         let queue_affinity = parser
             .convert::<TupleList<u16, Vec<usize>>>("queue_affinity")
@@ -1757,32 +1744,9 @@ impl DiskConfig {
             .convert::<u32>("guest_block_size")
             .map_err(Error::ParseDisk)?;
 
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
+        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+            || rate_limiter_config.ops.is_some())
+        .then_some(rate_limiter_config);
         let sparse = parser
             .convert::<Toggle>("sparse")
             .map_err(Error::ParseDisk)?
@@ -1816,6 +1780,10 @@ impl DiskConfig {
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         self.pci_common.validate(vm_config, true)?;
+
+        if self.num_queues == 0 {
+            return Err(ValidationError::InvalidNumQueues(self.num_queues.into()));
+        }
 
         if self.num_queues as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
@@ -1857,6 +1825,10 @@ impl DiskConfig {
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
             return Err(ValidationError::InvalidRateLimiterGroup);
+        }
+
+        if let Some(cfg) = &self.rate_limiter_config {
+            validate_rate_limiter_config(cfg)?;
         }
 
         // Check Block device serial length
@@ -1913,9 +1885,7 @@ impl FromStr for IommuType {
         match s.to_lowercase().as_str() {
             "" | "off" | "false" => Ok(IommuType::Off),
             "on" | "true" => {
-                warn!(
-                    "iommu=on is deprecated, use iommu=virtio instead. It will be removed in a future release"
-                );
+                warn!("'iommu=on' is deprecated: use 'iommu=virtio' instead");
                 Ok(IommuType::Virtio)
             }
             "virtio" => Ok(IommuType::Virtio),
@@ -1927,14 +1897,18 @@ impl FromStr for IommuType {
 
 impl NetConfig {
     pub const SYNTAX: &'static str = "Network parameters \
-    \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<host_mac_addr>,\
-    fd=<[fd1,fd2,...]>,iommu=off|virtio,mtu=<mtu>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
-    vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
-    bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-    offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off\"";
+        \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<host_mac_addr>,\
+        fd=<[fd1,fd2,...]>,iommu=off|virtio,mtu=<mtu>,num_queues=<number_of_queues>,\
+        queue_size=<size_of_each_queue>,id=<device_id>,\
+        vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
+        bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
+        ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+        offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off\"";
 
     /// # Safety
     /// Live FDs named in the input must be exclusively owned by the caller.
@@ -1959,12 +1933,7 @@ impl NetConfig {
             .add("socket")
             .add("vhost_mode")
             .add("fd")
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
+            .add_all(RATE_LIMITER_OPTIONS)
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(net).map_err(Error::ParseNetwork)?;
 
@@ -2018,56 +1987,11 @@ impl NetConfig {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
+        let rate_limiter_config =
+            parse_rate_limiter_config(&parser).map_err(Error::ParseNetwork)?;
+        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+            || rate_limiter_config.ops.is_some())
+        .then_some(rate_limiter_config);
 
         let pci_common = PciDeviceCommonConfig::parse(net)?;
 
@@ -2138,6 +2062,10 @@ impl NetConfig {
             return Err(ValidationError::VhostUserRateLimiterNotSupported);
         }
 
+        if let Some(cfg) = &self.rate_limiter_config {
+            validate_rate_limiter_config(cfg)?;
+        }
+
         if let Some(mtu) = self.mtu
             && mtu < net::MIN_MTU
         {
@@ -2161,8 +2089,8 @@ impl NetConfig {
 }
 
 impl RngConfig {
-    pub const SYNTAX: &'static str = "Random number generator parameters \"\
-        src=<entropy_source_path>,iommu=off|virtio,pci_segment=<segment_id>,\
+    pub const SYNTAX: &'static str = "Random number generator parameters \
+        \"src=<entropy_source_path>,iommu=off|virtio,pci_segment=<segment_id>,\
         pci_device_id=<pci_slot>\"";
 
     pub fn parse(rng: &str) -> Result<Self> {
@@ -2189,8 +2117,8 @@ impl RngConfig {
 }
 
 impl RtcConfig {
-    pub const SYNTAX: &'static str = "Virtio RTC parameters \"\
-        iommu=off|virtio,id=<device_id>,\
+    pub const SYNTAX: &'static str = "Virtio RTC parameters \
+        \"iommu=off|virtio,id=<device_id>,\
         pci_segment=<segment_id>,pci_device_id=<pci_slot>\". \
         Passing --rtc with no arguments enables the device with default \
         settings.";
@@ -2211,7 +2139,8 @@ impl RtcConfig {
 }
 
 impl BalloonConfig {
-    pub const SYNTAX: &'static str = "Balloon parameters \"size=<balloon_size>,deflate_on_oom=on|off,\
+    pub const SYNTAX: &'static str = "Balloon parameters \
+        \"size=<balloon_size>,deflate_on_oom=on|off,\
         free_page_reporting=on|off,iommu=off|virtio,id=<device_id>,pci_segment=<segment_id>,\
         pci_device_id=<pci_slot>\"";
 
@@ -2257,10 +2186,10 @@ impl BalloonConfig {
 
 impl GenericVhostUserConfig {
     pub const SYNTAX: &'static str = "generic vhost-user parameters \
-    \"device_type=<ID number for virtio device type (FS, block, net, etc) or symbolic name>,\
-    socket=<socket_path>,\
-    queue_sizes=<list of queue sizes>,\
-    id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+        \"device_type=<ID number for virtio device type (FS, block, net, etc) or symbolic name>,\
+        socket=<socket_path>,\
+        queue_sizes=<list of queue sizes>,\
+        id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(vhost_user: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2376,9 +2305,9 @@ impl GenericVhostUserConfig {
 
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
-    \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+        \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
+        queue_size=<size_of_each_queue>,id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2417,6 +2346,10 @@ impl FsConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.num_queues == 0 {
+            return Err(ValidationError::InvalidNumQueues(self.num_queues.into()));
+        }
+
         if self.num_queues as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
@@ -2437,8 +2370,8 @@ impl FsConfig {
 #[cfg(feature = "fw_cfg")]
 impl FwCfgConfig {
     pub const SYNTAX: &'static str = "Boot params to pass to FW CFG device \
-    \"e820=on|off,kernel=on|off,cmdline=on|off,initramfs=on|off,acpi_table=on|off, \
-    items=[name=<item_name>,file=<file_path>:name=<item_name>,string=<string_value>]\"";
+        \"e820=on|off,kernel=on|off,cmdline=on|off,initramfs=on|off,acpi_table=on|off,\
+        items=[name=<item_name>,file=<file_path>:name=<item_name>,string=<string_value>]\"";
     pub fn parse(fw_cfg_config: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -2536,9 +2469,9 @@ impl FwCfgItem {
 
 impl PmemConfig {
     pub const SYNTAX: &'static str = "Persistent memory parameters \
-    \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=off|virtio,\
-    discard_writes=on|off,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+        \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=off|virtio,\
+        discard_writes=on|off,id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(pmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2574,7 +2507,7 @@ impl PmemConfig {
     }
 }
 
-impl CommonConsoleConfig {
+impl ConsoleOutput {
     const VALUELESS_OPTIONS: &[&str] = &["off", "pty", "tty", "null"];
     const VALUE_OPTIONS: &[&str] = &["file", "socket", "tcp", "server"];
 
@@ -2585,31 +2518,29 @@ impl CommonConsoleConfig {
             .add_all(Self::VALUE_OPTIONS);
         parser.parse_subset(console).map_err(&map_err)?;
 
-        let mut file: Option<PathBuf> = None;
-        let mut socket: Option<PathBuf> = None;
-        let mut tcp: Option<TcpConsoleConfig> = None;
-        let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
-
-        if parser.is_set("off") {
+        let output = if parser.is_set("off") {
+            ConsoleOutput::Off
         } else if parser.is_set("pty") {
-            mode = ConsoleOutputMode::Pty;
+            ConsoleOutput::Pty { file: None }
         } else if parser.is_set("tty") {
-            mode = ConsoleOutputMode::Tty;
+            ConsoleOutput::Tty
         } else if parser.is_set("null") {
-            mode = ConsoleOutputMode::Null;
+            ConsoleOutput::Null
         } else if parser.is_set("file") {
-            mode = ConsoleOutputMode::File;
-            file =
-                Some(PathBuf::from(parser.get("file").ok_or(
-                    Error::Validation(ValidationError::ConsoleFileMissing),
-                )?));
+            let file = parser
+                .get("file")
+                .ok_or(Error::Validation(ValidationError::ConsoleFileMissing))?;
+            ConsoleOutput::File {
+                file: PathBuf::from(file),
+            }
         } else if parser.is_set("socket") {
-            mode = ConsoleOutputMode::Socket;
-            socket = Some(PathBuf::from(parser.get("socket").ok_or(
-                Error::Validation(ValidationError::ConsoleSocketPathMissing),
-            )?));
+            let socket = parser
+                .get("socket")
+                .ok_or(Error::Validation(ValidationError::ConsoleSocketPathMissing))?;
+            ConsoleOutput::Socket {
+                socket: PathBuf::from(socket),
+            }
         } else if parser.is_set("tcp") {
-            mode = ConsoleOutputMode::Tcp;
             let address = parser
                 .get("tcp")
                 .ok_or(Error::Validation(ValidationError::ConsoleTcpAddressMissing))?;
@@ -2623,51 +2554,34 @@ impl CommonConsoleConfig {
                     ValidationError::ConsoleTcpClientUnsupported,
                 ));
             }
-            tcp = Some(TcpConsoleConfig {
-                address: parse_tcp_address(&address)
-                    .map_err(|source| Error::ResolveConsoleTcpAddress { address, source })?,
-                server,
-            });
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: parse_tcp_address(&address)
+                        .map_err(|source| Error::ResolveConsoleTcpAddress { address, source })?,
+                    server,
+                },
+            }
         } else {
             return Err(Error::ParseConsoleInvalidModeGiven);
-        }
+        };
 
-        if parser.is_set("server") && mode != ConsoleOutputMode::Tcp {
+        if parser.is_set("server") && !matches!(output, ConsoleOutput::Tcp { .. }) {
             return Err(Error::Validation(
                 ValidationError::ConsoleTcpServerUnexpected,
             ));
         }
 
-        Ok(Self {
-            mode,
-            file,
-            socket,
-            tcp,
-        })
+        Ok(output)
     }
 
     pub fn validate(&self) -> ValidationResult<()> {
-        if self.mode == ConsoleOutputMode::Socket && self.socket.is_none() {
-            return Err(ValidationError::ConsoleSocketPathMissing);
-        }
-        if self.socket.is_some() && self.mode != ConsoleOutputMode::Socket {
-            return Err(ValidationError::ConsoleSocketPathUnexpected);
-        }
-        if self.mode == ConsoleOutputMode::Tcp && self.tcp.is_none() {
-            return Err(ValidationError::ConsoleTcpAddressMissing);
-        }
-        if self.tcp.is_some() && self.mode != ConsoleOutputMode::Tcp {
-            return Err(ValidationError::ConsoleTcpUnexpected);
-        }
-        if let Some(tcp) = &self.tcp
-            && !tcp.server
-        {
-            return Err(ValidationError::ConsoleTcpClientUnsupported);
-        }
-        if let Some(tcp) = &self.tcp
-            && tcp.address.port() == 0
-        {
-            return Err(ValidationError::ConsoleTcpPortZero);
+        if let ConsoleOutput::Tcp { tcp } = self {
+            if !tcp.server {
+                return Err(ValidationError::ConsoleTcpClientUnsupported);
+            }
+            if tcp.address.port() == 0 {
+                return Err(ValidationError::ConsoleTcpPortZero);
+            }
         }
         Ok(())
     }
@@ -2677,19 +2591,19 @@ impl ConsoleConfig {
     pub fn parse(console: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
-            .add_all_valueless(CommonConsoleConfig::VALUELESS_OPTIONS)
-            .add_all(CommonConsoleConfig::VALUE_OPTIONS)
+            .add_all_valueless(ConsoleOutput::VALUELESS_OPTIONS)
+            .add_all(ConsoleOutput::VALUE_OPTIONS)
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(console).map_err(Error::ParseConsole)?;
 
-        let common = CommonConsoleConfig::parse(console, Error::ParseConsole)?;
+        let output = ConsoleOutput::parse(console, Error::ParseConsole)?;
         let pci_common = PciDeviceCommonConfig::parse(console)?;
 
-        Ok(Self { common, pci_common })
+        Ok(Self { output, pci_common })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        self.common.validate()?;
+        self.output.validate()?;
         self.pci_common.validate(vm_config, true)
     }
 }
@@ -2698,21 +2612,24 @@ impl SerialConfig {
     pub fn parse(serial: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
-            .add_all_valueless(CommonConsoleConfig::VALUELESS_OPTIONS)
-            .add_all(CommonConsoleConfig::VALUE_OPTIONS);
+            .add_all_valueless(ConsoleOutput::VALUELESS_OPTIONS)
+            .add_all(ConsoleOutput::VALUE_OPTIONS);
         parser.parse(serial).map_err(Error::ParseSerial)?;
 
-        let common = CommonConsoleConfig::parse(serial, Error::ParseSerial)?;
-        Ok(Self { common })
+        let output = ConsoleOutput::parse(serial, Error::ParseSerial)?;
+        Ok(Self { output })
     }
 
     pub fn validate(&self) -> ValidationResult<()> {
-        self.common.validate()
+        self.output.validate()
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl DebugConsoleConfig {
+    pub const SYNTAX: &'static str = "Debug console: \
+        \"off|null|pty|tty|file=<path>,iobase=<port in hex>\"";
+
     pub fn parse(debug_console_ops: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -2726,26 +2643,8 @@ impl DebugConsoleConfig {
             .parse(debug_console_ops)
             .map_err(Error::ParseConsole)?;
 
-        let mut file: Option<PathBuf> = None;
+        let output = ConsoleOutput::parse(debug_console_ops, Error::ParseConsole)?;
         let mut iobase: Option<u16> = None;
-        let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
-
-        if parser.is_set("off") {
-        } else if parser.is_set("pty") {
-            mode = ConsoleOutputMode::Pty;
-        } else if parser.is_set("tty") {
-            mode = ConsoleOutputMode::Tty;
-        } else if parser.is_set("null") {
-            mode = ConsoleOutputMode::Null;
-        } else if parser.is_set("file") {
-            mode = ConsoleOutputMode::File;
-            file =
-                Some(PathBuf::from(parser.get("file").ok_or(
-                    Error::Validation(ValidationError::ConsoleFileMissing),
-                )?));
-        } else {
-            return Err(Error::ParseConsoleInvalidModeGiven);
-        }
 
         if parser.is_set("iobase")
             && let Some(iobase_opt) = parser.get("iobase")
@@ -2761,17 +2660,17 @@ impl DebugConsoleConfig {
                 })?);
         }
 
-        Ok(Self { file, mode, iobase })
+        Ok(Self { output, iobase })
     }
 }
 
 impl DeviceConfig {
     pub const SYNTAX: &'static str = "Direct device assignment parameters \
-    \"path=<device_path>,fd=<vfio_cdev_fd>,iommu=off|virtio|smmuv3,\
-    id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-    x_nv_gpudirect_clique=<clique_id>,\
-    x_exclude_mmap_bars=[<bar>...]\"";
+        \"path=<device_path>,fd=<vfio_cdev_fd>,iommu=off|virtio|smmuv3,\
+        id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+        x_nv_gpudirect_clique=<clique_id>,\
+        x_exclude_mmap_bars=[<bar>...]\"";
 
     /// # Safety
     /// Live FDs named in the input must be exclusively owned by the caller.
@@ -2862,7 +2761,8 @@ impl DeviceConfig {
 }
 
 impl UserDeviceConfig {
-    pub const SYNTAX: &'static str = "Userspace device socket=<socket_path>,id=<device_id>,\
+    pub const SYNTAX: &'static str = "Userspace device \
+        \"socket=<socket_path>,id=<device_id>,\
         pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(user_device: &str) -> Result<Self> {
@@ -2919,7 +2819,13 @@ impl VdpaConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        self.pci_common.validate(vm_config, true)
+        self.pci_common.validate(vm_config, true)?;
+
+        if self.num_queues == 0 {
+            return Err(ValidationError::InvalidNumQueues(self.num_queues.into()));
+        }
+
+        Ok(())
     }
 }
 
@@ -2960,8 +2866,8 @@ impl VsockConfig {
 
 impl NumaConfig {
     pub const SYNTAX: &'static str = "Settings related to a given NUMA node \
-        \"guest_numa_id=<node_id>,cpus=<cpus_id>,distances=<list_of_distances_to_destination_nodes>,\
-        device_id=<device_id>,\
+        \"guest_numa_id=<node_id>,cpus=<cpus_id>,\
+        distances=<list_of_distances_to_destination_nodes>,device_id=<device_id>,\
         memory_zones=<list_of_memory_zones>,\
         pci_segments=<list_of_pci_segments>\"";
 
@@ -3159,23 +3065,29 @@ pub struct RestoreConfig {
 }
 
 impl RestoreConfig {
-    pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
+    pub const SYNTAX: &'static str = "Restore from a VM snapshot.\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
+        memory_restore_mode=copy|ondemand|copyonwrite,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
-        zone_updates=<list_of_updates>\"
-        \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
-        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
+        zone_updates=<list_of_updates>\"\n\
+        \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo)\
+        \n`prefault` controls eager prefaulting for the copy-based restore path \
+        (disabled by default)\
+        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, \
+        `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if \
+        userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the \
+        snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise)\
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
-        e.g. vfio_fds=[vfio0@5,vfio1@6]. Required for every VFIO device.\
+        e.g. vfio_fds=[vfio0@5,vfio1@6]. Required for every VFIO device. \
         Requires `iommufd_fd` and platform `iommufd=on`.\
         \n`iommufd_fd` is a new iommufd file descriptor for the restored VM. \
         The one saved in the snapshot does not survive serialization.\
-        \n `resume` controls whether the VM will be directly resumed after restore \
-        \n `zone_updates` can be used to update NUMA memory zones. Expects a list of elements in the form `id@host_numa_node`";
+        \n`resume` controls whether the VM will be directly resumed after restore\
+        \n`zone_updates` can be used to update NUMA memory zones. \
+        Expects a list of elements in the form `id@host_numa_node`";
 
     /// # Safety
     /// Live FDs named in the input must be exclusively owned by the caller.
@@ -3451,10 +3363,10 @@ impl LandlockConfig {
 #[cfg(feature = "ivshmem")]
 impl IvshmemConfig {
     pub const SYNTAX: &'static str = "Ivshmem device. Specify the backend file path and size \
-    for the shared memory: \"path=</path/to/a/file>,size=<file_size>,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\" \
-    \nThe <file_size> must be a power of 2 (e.g., 2M, 4M, etc.), as it represents the size \
-    of the memory region mapped to the guest. Default size is 128M.";
+        for the shared memory: \"path=</path/to/a/file>,size=<file_size>,id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>\"\
+        \nThe <file_size> must be a power of 2 (e.g., 2M, 4M, etc.), as it represents the size \
+        of the memory region mapped to the guest. Default size is 128M.";
     pub fn parse(ivshmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("path").add("size");
@@ -3692,27 +3604,22 @@ impl VmConfig {
         // "console=hvc0 earlyprintk=ttyS0"
 
         let mut tty_consoles = Vec::new();
-        if self.console.common.mode == ConsoleOutputMode::Tty {
+        if self.console.output == ConsoleOutput::Tty {
             tty_consoles.push("virtio-console");
         }
-        if self.serial.common.mode == ConsoleOutputMode::Tty {
+        if self.serial.output == ConsoleOutput::Tty {
             tty_consoles.push("serial-console");
         }
         #[cfg(target_arch = "x86_64")]
-        if self.debug_console.mode == ConsoleOutputMode::Tty {
+        if self.debug_console.output == ConsoleOutput::Tty {
             tty_consoles.push("debug-console");
         }
         if tty_consoles.len() > 1 {
             warn!("Using TTY output for multiple consoles: {tty_consoles:?}");
         }
 
-        if self.console.common.mode == ConsoleOutputMode::File && self.console.common.file.is_none()
-        {
-            return Err(ValidationError::ConsoleFileMissing);
-        }
-
-        if self.serial.common.mode == ConsoleOutputMode::File && self.serial.common.file.is_none() {
-            return Err(ValidationError::ConsoleFileMissing);
+        if self.cpus.boot_vcpus == 0 {
+            return Err(ValidationError::CpusBootZero);
         }
 
         if self.cpus.max_vcpus < self.cpus.boot_vcpus {
@@ -3720,6 +3627,15 @@ impl VmConfig {
                 self.cpus.max_vcpus,
                 self.cpus.boot_vcpus,
             ));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if self.cpus.kvm_hint_realtime && self.cpus.kvm_hyperv {
+            return Err(ValidationError::KvmHintRealtimeWithKvmHyperv);
+        }
+
+        if !(MIN_PHYS_BITS..=MAX_PHYS_BITS).contains(&self.cpus.max_phys_bits) {
+            return Err(ValidationError::InvalidMaxPhysBits(self.cpus.max_phys_bits));
         }
 
         if self.cpus.max_vcpus > MAX_SUPPORTED_CPUS {
@@ -3877,11 +3793,22 @@ impl VmConfig {
                 return Err(ValidationError::CpuTopologyDiesPerPackage);
             }
 
-            let total: u32 = (t.threads_per_core as u32)
-                * (t.cores_per_die as u32)
-                * (t.dies_per_package as u32)
-                * (t.packages as u32);
-            if total != self.cpus.max_vcpus {
+            for count in [
+                t.threads_per_core,
+                t.cores_per_die,
+                t.dies_per_package,
+                t.packages,
+            ] {
+                if u32::from(count) > MAX_SUPPORTED_CPUS {
+                    return Err(ValidationError::TooManyCpus(u32::from(count)));
+                }
+            }
+
+            let total = u64::from(t.threads_per_core)
+                * u64::from(t.cores_per_die)
+                * u64::from(t.dies_per_package)
+                * u64::from(t.packages);
+            if total != u64::from(self.cpus.max_vcpus) {
                 return Err(ValidationError::CpuTopologyCount);
             }
         }
@@ -4702,6 +4629,20 @@ mod tests {
                 ..Default::default()
             }
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                CpusConfig::parse("boot=1,kvm_hint_realtime=on")?,
+                CpusConfig {
+                    boot_vcpus: 1,
+                    max_vcpus: 1,
+                    kvm_hint_realtime: true,
+                    ..Default::default()
+                }
+            );
+            assert!(!CpusConfig::parse("boot=1")?.kvm_hint_realtime);
+            CpusConfig::parse("boot=1,kvm_hint_realtime=maybe").unwrap_err();
+        }
         assert_eq!(
             CpusConfig::parse("boot=2,affinity=[0@[0,2],1@[1,3]]")?,
             CpusConfig {
@@ -4886,6 +4827,7 @@ mod tests {
     #[test]
     fn test_mem_parsing() -> Result<()> {
         assert_eq!(MemoryConfig::parse("", None)?, MemoryConfig::default());
+        MemoryConfig::parse("size=512M,file=/some/file", None).unwrap_err();
         // Default string
         assert_eq!(
             MemoryConfig::parse("size=512M", None)?,
@@ -4968,6 +4910,9 @@ mod tests {
                         size: 1000,
                         one_time_burst: Some(0),
                         refill_time: 100,
+                        burst_rate: None,
+                        burst_seconds: None,
+                        burst_recharge_seconds: None,
                     }),
                     ops: None,
                 }
@@ -4983,11 +4928,578 @@ mod tests {
                         size: 1000,
                         one_time_burst: Some(0),
                         refill_time: 100,
+                        burst_rate: None,
+                        burst_seconds: None,
+                        burst_recharge_seconds: None,
                     }),
                 }
             }
         );
         Ok(())
+    }
+
+    fn parse_rate_limiter_configs(options: &str) -> [RateLimiterConfig; 3] {
+        [
+            DiskConfig::parse(options)
+                .unwrap()
+                .rate_limiter_config
+                .unwrap(),
+            // SAFETY: These test inputs contain no inherited descriptors.
+            unsafe { NetConfig::parse(options) }
+                .unwrap()
+                .rate_limiter_config
+                .unwrap(),
+            RateLimiterGroupConfig::parse(options)
+                .unwrap()
+                .rate_limiter_config,
+        ]
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_parsing() {
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,bw_burst_seconds=3,\
+            ops_size=100,ops_refill_time=1000,ops_burst_rate=400,ops_burst_seconds=2";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(2000),
+                burst_seconds: Some(3),
+                burst_recharge_seconds: None,
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(400),
+                burst_seconds: Some(2),
+                burst_recharge_seconds: None,
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,\
+            ops_size=100,ops_refill_time=1000,ops_burst_rate=400";
+        let expected = RateLimiterConfig {
+            bandwidth: expected.bandwidth.map(|b| TokenBucketConfig {
+                burst_seconds: None,
+                ..b
+            }),
+            ops: expected.ops.map(|b| TokenBucketConfig {
+                burst_seconds: None,
+                ..b
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_recharge_parsing() {
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,bw_burst_seconds=3,\
+            bw_burst_recharge_seconds=4,ops_size=100,ops_refill_time=1000,ops_burst_rate=400,\
+            ops_burst_seconds=2,ops_burst_recharge_seconds=5";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(2000),
+                burst_seconds: Some(3),
+                burst_recharge_seconds: Some(4),
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(400),
+                burst_seconds: Some(2),
+                burst_recharge_seconds: Some(5),
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+            for result in rate_limiter_validation_results(config) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_plain_parsing() {
+        let options = "bw_size=1000,bw_refill_time=100,bw_one_time_burst=2000,\
+            ops_size=100,ops_refill_time=100,ops_one_time_burst=200";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(2000),
+                refill_time: 100,
+                burst_rate: None,
+                burst_seconds: None,
+                burst_recharge_seconds: None,
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(200),
+                refill_time: 100,
+                burst_rate: None,
+                burst_seconds: None,
+                burst_recharge_seconds: None,
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+
+        for config in parse_rate_limiter_configs(
+            "bw_size=1000,bw_refill_time=100,ops_size=100,ops_refill_time=100",
+        ) {
+            assert_eq!(
+                config,
+                RateLimiterConfig {
+                    bandwidth: expected.bandwidth.map(|b| TokenBucketConfig {
+                        one_time_burst: Some(0),
+                        ..b
+                    }),
+                    ops: expected.ops.map(|b| TokenBucketConfig {
+                        one_time_burst: Some(0),
+                        ..b
+                    }),
+                }
+            );
+        }
+
+        for options in ["", "bw_size=1000", "ops_refill_time=100"] {
+            assert_eq!(
+                DiskConfig::parse(options).unwrap().rate_limiter_config,
+                None
+            );
+            assert_eq!(
+                // SAFETY: These test inputs contain no inherited descriptors.
+                unsafe { NetConfig::parse(options) }
+                    .unwrap()
+                    .rate_limiter_config,
+                None
+            );
+            assert_eq!(
+                RateLimiterGroupConfig::parse(options)
+                    .unwrap()
+                    .rate_limiter_config,
+                RateLimiterConfig::default()
+            );
+        }
+    }
+
+    fn rate_limiter_validation_results(cfg: RateLimiterConfig) -> [ValidationResult<()>; 3] {
+        let vm_config: VmConfig = serde_json::from_str("{}").unwrap();
+        let mut disk = raw_disk_fixture();
+        disk.rate_limiter_config = Some(cfg);
+        let mut net = net_fixture();
+        net.rate_limiter_config = Some(cfg);
+        let group = RateLimiterGroupConfig {
+            id: "group0".to_string(),
+            rate_limiter_config: cfg,
+        };
+        [
+            disk.validate(&vm_config),
+            net.validate(&vm_config),
+            group.validate(&vm_config),
+        ]
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_disabled_parsing() {
+        for (options, expected) in [
+            (
+                "bw_burst_rate=2000",
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 0),
+            ),
+            (
+                "ops_burst_rate=2000",
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 0),
+            ),
+            (
+                "bw_burst_seconds=2",
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                "ops_burst_seconds=2",
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                "bw_burst_recharge_seconds=4",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(4),
+            ),
+            (
+                "ops_burst_recharge_seconds=4",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(4),
+            ),
+            (
+                "bw_burst_recharge_seconds=0",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(0),
+            ),
+            (
+                "ops_burst_recharge_seconds=0",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(0),
+            ),
+        ] {
+            for cfg in parse_rate_limiter_configs(options) {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_validation() {
+        let bucket = TokenBucketConfig {
+            size: 1000,
+            one_time_burst: Some(0),
+            refill_time: 1000,
+            burst_rate: Some(2000),
+            burst_seconds: Some(2),
+            burst_recharge_seconds: None,
+        };
+        let invalid = [
+            (
+                TokenBucketConfig {
+                    burst_rate: None,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstZero(0, 2),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_seconds: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstZero(2000, 0),
+            ),
+            (
+                TokenBucketConfig {
+                    one_time_burst: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstWithOneTimeBurst(2000, 1),
+            ),
+            (
+                TokenBucketConfig { size: 0, ..bucket },
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 1000),
+            ),
+            (
+                TokenBucketConfig {
+                    refill_time: 0,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 1000, 0),
+            ),
+            (
+                TokenBucketConfig {
+                    size: 1001,
+                    burst_rate: Some(1000),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstBelowSustained(1000, 1001, 1000),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(u64::MAX),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstCapacityOverflow(u64::MAX, 2),
+            ),
+        ];
+        for (bucket, expected) in invalid {
+            for cfg in [
+                RateLimiterConfig {
+                    bandwidth: Some(bucket),
+                    ops: None,
+                },
+                RateLimiterConfig {
+                    bandwidth: None,
+                    ops: Some(bucket),
+                },
+            ] {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+
+        for bucket in [
+            bucket,
+            TokenBucketConfig {
+                one_time_burst: None,
+                burst_seconds: None,
+                ..bucket
+            },
+            // Depth can be smaller than size: size/refill_time defines only the rate.
+            TokenBucketConfig {
+                size: 10_000,
+                refill_time: 10_000,
+                burst_rate: Some(1000),
+                burst_seconds: Some(1),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: u64::MAX,
+                refill_time: u64::MAX,
+                burst_rate: Some(u64::MAX),
+                burst_seconds: Some(1),
+                ..bucket
+            },
+            // No new validation is applied to plain buckets.
+            TokenBucketConfig {
+                one_time_burst: Some(2000),
+                burst_rate: None,
+                burst_seconds: None,
+                ..bucket
+            },
+        ] {
+            for result in rate_limiter_validation_results(RateLimiterConfig {
+                bandwidth: Some(bucket),
+                ops: Some(bucket),
+            }) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_recharge_validation() {
+        let bucket = TokenBucketConfig {
+            size: 1,
+            one_time_burst: Some(0),
+            refill_time: 2000,
+            burst_rate: Some(2),
+            burst_seconds: Some(2),
+            burst_recharge_seconds: Some(3),
+        };
+        let invalid = [
+            (
+                TokenBucketConfig {
+                    burst_rate: None,
+                    burst_seconds: None,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeWithoutRate(3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(0, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(1, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(2),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(2, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    size: 3,
+                    burst_recharge_seconds: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(1, 2),
+            ),
+            (
+                TokenBucketConfig {
+                    refill_time: u64::MAX,
+                    burst_recharge_seconds: Some(u64::MAX / 1000),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(
+                    u64::MAX / 1000,
+                    u128::from(u64::MAX / 1000) + 1,
+                ),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(1),
+                    burst_seconds: Some(1),
+                    burst_recharge_seconds: Some(10),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeWithoutCredit(10, 1, 1),
+            ),
+        ];
+        for (bucket, expected) in invalid {
+            for cfg in [
+                RateLimiterConfig {
+                    bandwidth: Some(bucket),
+                    ops: None,
+                },
+                RateLimiterConfig {
+                    bandwidth: None,
+                    ops: Some(bucket),
+                },
+            ] {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+
+        for bucket in [
+            bucket,
+            TokenBucketConfig {
+                size: 3,
+                burst_recharge_seconds: Some(2),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: u64::MAX,
+                refill_time: u64::MAX,
+                burst_rate: Some(u64::MAX),
+                burst_seconds: Some(1),
+                burst_recharge_seconds: Some(u64::MAX),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: 2_000_000_001,
+                refill_time: 4_000_000_000_000,
+                burst_rate: Some(1),
+                burst_seconds: Some(10),
+                burst_recharge_seconds: Some(2),
+                ..bucket
+            },
+            TokenBucketConfig {
+                refill_time: u64::MAX,
+                burst_recharge_seconds: Some(u64::MAX / 1000 + 1),
+                ..bucket
+            },
+        ] {
+            for result in rate_limiter_validation_results(RateLimiterConfig {
+                bandwidth: Some(bucket),
+                ops: Some(bucket),
+            }) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_serde() {
+        let old_json = r#"{"size":1000,"one_time_burst":0,"refill_time":1000}"#;
+        let plain: TokenBucketConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(plain.burst_rate, None);
+        assert_eq!(plain.burst_seconds, None);
+        assert_eq!(plain.burst_recharge_seconds, None);
+        assert_eq!(serde_json::to_string(&plain).unwrap(), old_json);
+        let old_config_json = format!(r#"{{"bandwidth":{old_json},"ops":null}}"#);
+        let plain_config: RateLimiterConfig = serde_json::from_str(&old_config_json).unwrap();
+        assert_eq!(plain_config.bandwidth, Some(plain));
+        assert_eq!(
+            serde_json::to_string(&plain_config).unwrap(),
+            old_config_json
+        );
+
+        let burst = TokenBucketConfig {
+            burst_rate: Some(2000),
+            burst_seconds: Some(3),
+            ..plain
+        };
+        let json = serde_json::to_string(&burst).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TokenBucketConfig>(&json).unwrap(),
+            burst
+        );
+        let config = RateLimiterConfig {
+            bandwidth: Some(burst),
+            ops: Some(burst),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RateLimiterConfig>(&json).unwrap(),
+            config
+        );
+
+        let recharge = TokenBucketConfig {
+            burst_recharge_seconds: Some(4),
+            ..burst
+        };
+        let json = serde_json::to_string(&recharge).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["burst_recharge_seconds"], 4);
+        assert_eq!(
+            serde_json::from_str::<TokenBucketConfig>(&json).unwrap(),
+            recharge
+        );
+        let config = RateLimiterConfig {
+            bandwidth: Some(recharge),
+            ops: Some(recharge),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RateLimiterConfig>(&json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_token_bucket_config() {
+        let plain = TokenBucketConfig {
+            size: 1000,
+            one_time_burst: Some(2000),
+            refill_time: 100,
+            burst_rate: None,
+            burst_seconds: None,
+            burst_recharge_seconds: None,
+        };
+        let bucket = plain.token_bucket().unwrap();
+        assert_eq!(bucket.capacity(), 1000);
+        assert_eq!(bucket.one_time_burst(), 2000);
+        assert_eq!(bucket.refill_time_ms(), 100);
+        assert_eq!(bucket.budget(), 1000);
+
+        let burst = TokenBucketConfig {
+            one_time_burst: Some(0),
+            burst_rate: Some(20_000),
+            ..plain
+        };
+        let bucket = burst.token_bucket().unwrap();
+        assert_eq!(bucket.capacity(), 20_000);
+        assert_eq!(bucket.one_time_burst(), 0);
+        assert_eq!(bucket.refill_time_ms(), 100);
+        let bucket = TokenBucketConfig {
+            burst_seconds: Some(3),
+            ..burst
+        }
+        .token_bucket()
+        .unwrap();
+        assert_eq!(bucket.capacity(), 60_000);
+        let bucket = TokenBucketConfig {
+            burst_seconds: Some(3),
+            burst_recharge_seconds: Some(4),
+            ..burst
+        }
+        .token_bucket()
+        .unwrap();
+        assert_eq!(bucket.capacity(), 60_000);
+        assert_eq!(bucket.budget(), 60_000);
     }
 
     #[test]
@@ -5581,13 +6093,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_console_parsing() -> Result<()> {
-        let console_config = |mode, file, socket, iommu| ConsoleConfig {
-            common: CommonConsoleConfig {
-                file,
-                mode,
-                socket,
-                tcp: None,
-            },
+        let console_config = |output, iommu| ConsoleConfig {
+            output,
             pci_common: PciDeviceCommonConfig {
                 iommu,
                 ..Default::default()
@@ -5598,73 +6105,82 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         ConsoleConfig::parse("badmode").unwrap_err();
         assert_eq!(
             ConsoleConfig::parse("off")?,
-            console_config(ConsoleOutputMode::Off, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Off, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("pty")?,
-            console_config(ConsoleOutputMode::Pty, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Pty { file: None }, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("tty")?,
-            console_config(ConsoleOutputMode::Tty, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Tty, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("null")?,
-            console_config(ConsoleOutputMode::Null, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Null, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console")?,
             console_config(
-                ConsoleOutputMode::File,
-                Some(PathBuf::from("/tmp/console")),
-                None,
+                ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/console"),
+                },
                 IommuType::Off
             )
         );
         assert_eq!(
             ConsoleConfig::parse("null,iommu=on")?,
-            console_config(ConsoleOutputMode::Null, None, None, IommuType::Virtio)
+            console_config(ConsoleOutput::Null, IommuType::Virtio)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
             console_config(
-                ConsoleOutputMode::File,
-                Some(PathBuf::from("/tmp/console")),
-                None,
+                ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/console"),
+                },
                 IommuType::Virtio
             )
         );
         assert_eq!(
             ConsoleConfig::parse("socket=/tmp/serial.sock,iommu=on")?,
             console_config(
-                ConsoleOutputMode::Socket,
-                None,
-                Some(PathBuf::from("/tmp/serial.sock")),
+                ConsoleOutput::Socket {
+                    socket: PathBuf::from("/tmp/serial.sock"),
+                },
                 IommuType::Virtio
             )
         );
         assert_eq!(
-            ConsoleConfig::parse("tcp=127.0.0.1:4444")?.common.tcp,
-            Some(TcpConsoleConfig {
-                address: "127.0.0.1:4444".parse().unwrap(),
-                server: true,
-            })
+            ConsoleConfig::parse("tcp=127.0.0.1:4444")?.output,
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            }
         );
         assert_eq!(
-            ConsoleConfig::parse("tcp=[::1]:4444")?.common.tcp,
-            Some(TcpConsoleConfig {
-                address: "[::1]:4444".parse().unwrap(),
-                server: true,
-            })
+            ConsoleConfig::parse("tcp=[::1]:4444")?.output,
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "[::1]:4444".parse().unwrap(),
+                    server: true,
+                },
+            }
         );
         SerialConfig::parse("tcp=localhost:4444").unwrap_err();
         for options in ["tcp=127.0.0.1:4444", "tcp=127.0.0.1:4444,server=on"] {
             let serial = SerialConfig::parse(options)?;
             let console = ConsoleConfig::parse(options)?;
-            assert_eq!(serial.common, console.common);
-            assert!(serial.common.tcp.as_ref().unwrap().server);
+            assert_eq!(serial.output, console.output);
+            assert!(matches!(
+                serial.output,
+                ConsoleOutput::Tcp {
+                    tcp: TcpConsoleConfig { server: true, .. }
+                }
+            ));
             serial.validate().unwrap();
-            console.common.validate().unwrap();
+            console.output.validate().unwrap();
         }
         for options in ["tcp=127.0.0.1:4444,server=invalid", "null,server=on"] {
             ConsoleConfig::parse(options).unwrap_err();
@@ -5696,7 +6212,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ValidationError::ConsoleTcpPortZero
             );
             assert_eq!(
-                console.common.validate().unwrap_err(),
+                console.output.validate().unwrap_err(),
                 ValidationError::ConsoleTcpPortZero
             );
 
@@ -5711,7 +6227,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ValidationError::ConsoleTcpPortZero
             );
             assert_eq!(
-                console.common.validate().unwrap_err(),
+                console.output.validate().unwrap_err(),
                 ValidationError::ConsoleTcpPortZero
             );
         }
@@ -5725,14 +6241,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         });
         let serial: SerialConfig = serde_json::from_value(config.clone()).unwrap();
         let console: ConsoleConfig = serde_json::from_value(config.clone()).unwrap();
-        let expected = Some(TcpConsoleConfig {
-            address: "127.0.0.1:4444".parse().unwrap(),
-            server: true,
-        });
-        assert_eq!(serial.common.tcp, expected);
-        assert_eq!(console.common.tcp, expected);
+        let expected = ConsoleOutput::Tcp {
+            tcp: TcpConsoleConfig {
+                address: "127.0.0.1:4444".parse().unwrap(),
+                server: true,
+            },
+        };
+        assert_eq!(serial.output, expected);
+        assert_eq!(console.output, expected);
         serial.validate().unwrap();
-        console.common.validate().unwrap();
+        console.output.validate().unwrap();
 
         let mut hostname = config.clone();
         hostname["tcp"]["address"] = serde_json::json!("localhost:4444");
@@ -5757,9 +6275,110 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ValidationError::ConsoleTcpClientUnsupported
         );
         assert_eq!(
-            console.common.validate().unwrap_err(),
+            console.output.validate().unwrap_err(),
             ValidationError::ConsoleTcpClientUnsupported
         );
+    }
+
+    // The HTTP API, snapshots, and migration rely on this JSON format.
+    #[test]
+    fn test_console_output_json_format() {
+        let tcp = TcpConsoleConfig {
+            address: "127.0.0.1:4444".parse().unwrap(),
+            server: true,
+        };
+        let cases = [
+            (serde_json::json!({ "mode": "Off" }), ConsoleOutput::Off),
+            (
+                serde_json::json!({ "mode": "Pty" }),
+                ConsoleOutput::Pty { file: None },
+            ),
+            (
+                serde_json::json!({ "mode": "Pty", "file": "/dev/pts/3" }),
+                ConsoleOutput::Pty {
+                    file: Some(PathBuf::from("/dev/pts/3")),
+                },
+            ),
+            (serde_json::json!({ "mode": "Tty" }), ConsoleOutput::Tty),
+            (
+                serde_json::json!({ "mode": "File", "file": "/tmp/console" }),
+                ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/console"),
+                },
+            ),
+            (
+                serde_json::json!({ "mode": "Socket", "socket": "/tmp/console.sock" }),
+                ConsoleOutput::Socket {
+                    socket: PathBuf::from("/tmp/console.sock"),
+                },
+            ),
+            (
+                serde_json::json!({
+                    "mode": "Tcp",
+                    "tcp": { "address": "127.0.0.1:4444", "server": true }
+                }),
+                ConsoleOutput::Tcp { tcp },
+            ),
+            (serde_json::json!({ "mode": "Null" }), ConsoleOutput::Null),
+        ];
+        for (json, output) in cases {
+            let config = SerialConfig { output };
+            assert_eq!(
+                serde_json::from_value::<SerialConfig>(json.clone()).unwrap(),
+                config
+            );
+            assert_eq!(serde_json::to_value(&config).unwrap(), json);
+        }
+
+        // Versions before v53 serialized unset paths as null.
+        let config: SerialConfig = serde_json::from_value(serde_json::json!({
+            "mode": "Socket",
+            "file": null,
+            "socket": "/tmp/console.sock"
+        }))
+        .unwrap();
+        assert_eq!(
+            config.output,
+            ConsoleOutput::Socket {
+                socket: PathBuf::from("/tmp/console.sock"),
+            }
+        );
+
+        for mode in ["File", "Socket", "Tcp"] {
+            serde_json::from_value::<SerialConfig>(serde_json::json!({ "mode": mode }))
+                .unwrap_err();
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_debug_console_config() {
+        let config = DebugConsoleConfig {
+            output: ConsoleOutput::File {
+                file: PathBuf::from("/tmp/console"),
+            },
+            iobase: Some(0xe9),
+        };
+        assert_eq!(
+            DebugConsoleConfig::parse("file=/tmp/console,iobase=0xe9").unwrap(),
+            config
+        );
+
+        let json = serde_json::json!({
+            "mode": "File",
+            "file": "/tmp/console",
+            "iobase": 0xe9
+        });
+        assert_eq!(
+            serde_json::from_value::<DebugConsoleConfig>(json.clone()).unwrap(),
+            config
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), json);
+
+        // The debug console has no socket or TCP backend.
+        for options in ["socket=/tmp/console.sock", "tcp=127.0.0.1:4444"] {
+            DebugConsoleConfig::parse(options).unwrap_err();
+        }
     }
 
     fn device_fixture() -> DeviceConfig {
@@ -6842,20 +7461,10 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                    tcp: None,
-                },
+                output: ConsoleOutput::Null,
             },
             console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    socket: None,
-                    tcp: None,
-                },
+                output: ConsoleOutput::Tty,
                 pci_common: PciDeviceCommonConfig::default(),
             },
             #[cfg(target_arch = "x86_64")]
@@ -6894,9 +7503,59 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::ImageTypeRequired)
         );
 
+        for max_phys_bits in [0, 31, 65, u8::MAX] {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.cpus.max_phys_bits = max_phys_bits;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::InvalidMaxPhysBits(max_phys_bits))
+            );
+        }
+
+        for max_phys_bits in [MIN_PHYS_BITS, MAX_PHYS_BITS] {
+            let mut valid_phys_config = valid_config.clone();
+            valid_phys_config.cpus.max_phys_bits = max_phys_bits;
+            valid_phys_config.validate().unwrap();
+        }
+
         let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::Tty;
-        invalid_config.console.common.mode = ConsoleOutputMode::Tty;
+        invalid_config.disks = Some(vec![DiskConfig {
+            num_queues: 0,
+            ..raw_disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidNumQueues(0))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.vdpa = Some(vec![VdpaConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            path: PathBuf::from("/dev/vhost-vdpa-0"),
+            num_queues: 0,
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidNumQueues(0))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.fs = Some(vec![FsConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            tag: "test".to_string(),
+            socket: PathBuf::from("/tmp/fs.sock"),
+            num_queues: 0,
+            queue_size: 1024,
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidNumQueues(0))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.serial.output = ConsoleOutput::Tty;
+        invalid_config.console.output = ConsoleOutput::Tty;
         valid_config.validate().unwrap();
 
         let mut invalid_config = valid_config.clone();
@@ -6975,27 +7634,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::File;
-        invalid_config.serial.common.file = None;
+        invalid_config.cpus.max_vcpus = 0;
+        invalid_config.cpus.boot_vcpus = 0;
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::ConsoleFileMissing)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::Socket;
-        invalid_config.serial.common.socket = None;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ConsoleSocketPathMissing)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.console.common.mode = ConsoleOutputMode::Tty;
-        invalid_config.console.common.socket = Some(PathBuf::from("/tmp/console.sock"));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ConsoleSocketPathUnexpected)
+            Err(ValidationError::CpusBootZero)
         );
 
         let mut invalid_config = valid_config.clone();
@@ -7005,6 +7648,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
         );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut hint_config = valid_config.clone();
+            hint_config.cpus.kvm_hint_realtime = true;
+            hint_config.validate().unwrap();
+            hint_config.cpus.kvm_hyperv = true;
+            assert_eq!(
+                hint_config.validate(),
+                Err(ValidationError::KvmHintRealtimeWithKvmHyperv)
+            );
+        }
 
         let mut invalid_config = valid_config.clone();
         invalid_config.cpus.max_vcpus = 16;
@@ -7041,6 +7696,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             packages: 1,
         });
         still_valid_config.validate().unwrap();
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.cpus.boot_vcpus = 1;
+        invalid_config.cpus.max_vcpus = 1;
+        invalid_config.cpus.topology = Some(CpuTopology {
+            threads_per_core: 2,
+            cores_per_die: 65535,
+            dies_per_package: 1,
+            packages: 1,
+        });
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::TooManyCpus(65535))
+        );
 
         // Don't test MAX_SUPPORTED_CPUS because it's not guaranteed
         // as other limitation might come in earlier.
