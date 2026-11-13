@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval, sleep, timeout};
 
 use crate::{
-    Error, MAX_VM_SLOTS, PARK_LATENCY_BUCKETS_US, VM_SLOT_NONE, VcpuThread, VmHandle,
+    Error, LATENCY_BUCKETS_US, LatencyHistogram, MAX_VM_SLOTS, VM_SLOT_NONE, VcpuThread, VmHandle,
     VmPolicyUpdateRequest, VmPolicyUpdateResponse, VmRegistrationRequest, VmRegistrationResponse,
     VmSnapshot, VmStats, VmStatsRequest, VmStatsResponse, pin_current_thread_to_core,
 };
@@ -229,14 +229,21 @@ impl ControlPlane {
             fs::remove_file(&self.socket_path).map_err(Error::Io)?;
         }
 
-        let listener = UnixListener::bind(&self.socket_path).map_err(Error::Io)?;
+        // Bind under a temporary name and rename the socket into place once it listens and has
+        // its group and mode: a client that finds the path can then connect. A VMM that found
+        // it between bind() and listen() was refused, and doesn't retry.
+        let bind_path = temporary_socket_path(&self.socket_path);
+        if bind_path.exists() {
+            fs::remove_file(&bind_path).map_err(Error::Io)?;
+        }
+        let listener = UnixListener::bind(&bind_path).map_err(Error::Io)?;
         if let Some(gid) = self.socket_gid {
-            chown(&self.socket_path, None, Some(gid)).map_err(Error::Io)?;
+            chown(&bind_path, None, Some(gid)).map_err(Error::Io)?;
         }
         if let Some(mode) = self.socket_mode {
-            fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(mode))
-                .map_err(Error::Io)?;
+            fs::set_permissions(&bind_path, fs::Permissions::from_mode(mode)).map_err(Error::Io)?;
         }
+        fs::rename(&bind_path, &self.socket_path).map_err(Error::Io)?;
         info!(
             "Plane 1 (Control) listening on {}",
             self.socket_path.display()
@@ -582,6 +589,14 @@ async fn send_json_response_async<T: serde::Serialize>(
     Ok(())
 }
 
+/// The name the control socket is bound under, in the same directory as `socket_path`, before
+/// it is renamed to `socket_path`.
+fn temporary_socket_path(socket_path: &Path) -> PathBuf {
+    let mut name = socket_path.file_name().unwrap_or_default().to_owned();
+    name.push(".tmp");
+    socket_path.with_file_name(name)
+}
+
 /// Synchronous client helper that sends a `VmRegistrationRequest` and its `SCM_RIGHTS` file
 /// descriptors (`shm_fd`, `kick_irqfds`, `wake_eventfds`) to `pylond` and reads the response.
 pub fn send_registration(
@@ -862,29 +877,28 @@ pub async fn run_prometheus_server(
                                 vm.woken_unowned_usec()
                             ));
                         }
-                        body.push_str("# HELP pylon_vm_park_latency_microseconds Time from a revocation request to the donor vCPU parking\n");
-                        body.push_str("# TYPE pylon_vm_park_latency_microseconds histogram\n");
-                        for vm in vms.iter() {
-                            let vid = vm.vm_id();
-                            let latency = vm.park_latency();
-                            let cumulative = latency.cumulative_buckets();
-                            for (bound, count) in PARK_LATENCY_BUCKETS_US.iter().zip(cumulative.iter()) {
-                                body.push_str(&format!(
-                                    "pylon_vm_park_latency_microseconds_bucket{{vm_id=\"{vid}\",le=\"{bound}\"}} {count}\n"
-                                ));
+                        let histograms: [MetricHistogram; 3] = [
+                            (
+                                "pylon_vm_park_latency_microseconds",
+                                "Time from a revocation request to the donor vCPU parking",
+                                VmHandle::park_latency,
+                            ),
+                            (
+                                "pylon_vm_wake_latency_microseconds",
+                                "Time from assigning a core to a vCPU to that vCPU running",
+                                VmHandle::wake_latency,
+                            ),
+                            (
+                                "pylon_vm_handoff_latency_microseconds",
+                                "Time from a revocation request to the recipient vCPU running",
+                                VmHandle::handoff_latency,
+                            ),
+                        ];
+                        for (name, help, histogram) in histograms {
+                            body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+                            for vm in vms.iter() {
+                                write_histogram(&mut body, name, vm.vm_id(), histogram(vm));
                             }
-                            body.push_str(&format!(
-                                "pylon_vm_park_latency_microseconds_bucket{{vm_id=\"{vid}\",le=\"+Inf\"}} {}\n",
-                                cumulative[PARK_LATENCY_BUCKETS_US.len()]
-                            ));
-                            body.push_str(&format!(
-                                "pylon_vm_park_latency_microseconds_sum{{vm_id=\"{vid}\"}} {}\n",
-                                latency.sum_us()
-                            ));
-                            body.push_str(&format!(
-                                "pylon_vm_park_latency_microseconds_count{{vm_id=\"{vid}\"}} {}\n",
-                                latency.count()
-                            ));
                         }
 
                         let resp = format!(
@@ -903,9 +917,34 @@ pub async fn run_prometheus_server(
     }
 }
 
+/// A per-VM histogram metric: its name, its help text, and how to read it from a VM.
+type MetricHistogram = (
+    &'static str,
+    &'static str,
+    fn(&VmHandle) -> &LatencyHistogram,
+);
+
+/// Appends `histogram` as the Prometheus histogram `name` for `vm_id`.
+fn write_histogram(body: &mut String, name: &str, vm_id: u64, histogram: &LatencyHistogram) {
+    let cumulative = histogram.cumulative_buckets();
+    for (bound, count) in LATENCY_BUCKETS_US.iter().zip(cumulative.iter()) {
+        body.push_str(&format!(
+            "{name}_bucket{{vm_id=\"{vm_id}\",le=\"{bound}\"}} {count}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "{name}_bucket{{vm_id=\"{vm_id}\",le=\"+Inf\"}} {}\n{name}_sum{{vm_id=\"{vm_id}\"}} {}\n{name}_count{{vm_id=\"{vm_id}\"}} {}\n",
+        cumulative[LATENCY_BUCKETS_US.len()],
+        histogram.sum_us(),
+        histogram.count()
+    ));
+}
+
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
     use std::future::pending;
+    use std::process::id as process_id;
     use std::sync::Mutex;
 
     use super::*;
@@ -957,6 +996,34 @@ mod tests {
         handle_client_connection(daemon, snapshot, false)
             .await
             .unwrap();
+    }
+
+    /// The control socket appears at its path only once it accepts connections and has its
+    /// mode, and the name it was bound under is gone.
+    #[tokio::test]
+    async fn control_socket_appears_once_it_listens() {
+        let dir = temp_dir().join(format!("pylond-ready-{}", process_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("pylond.sock");
+        let control =
+            ControlPlane::new(&socket_path, Arc::new(VmSnapshot::from_pointee(Vec::new())))
+                .with_socket_permissions(Some(0o660), None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move { control.run(shutdown_rx).await });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !socket_path.exists() {
+            assert!(Instant::now() < deadline, "control socket did not appear");
+            sleep(Duration::from_micros(100)).await;
+        }
+        StdUnixStream::connect(&socket_path).unwrap();
+        let mode = fs::metadata(&socket_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o660);
+        assert!(!temporary_socket_path(&socket_path).exists());
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Registers `rig`'s VM over a socket pair, with `scx_pylon` attached or not, and returns

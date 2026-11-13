@@ -1,10 +1,10 @@
 # Performance and benchmarks
 
 This page collects Pylon's performance figures: what was run, where,
-when and how, and how to run it again. There are few so far. Pylon has
-**no measurement of a real core handoff between real VMs yet**: that is
-step S6 of [Enhancements](enhancements.md#implementation-steps)
-([#53](https://github.com/CMKL-APEX/pylon/issues/53)).
+when and how, and how to run it again. There are few so far. A core
+handoff between real VMs takes about 100–125 µs at the median, against
+a 3–6 µs target: see
+[Handoff latency between real VMs](#handoff-latency-between-real-vms-measured-2026-11-13).
 
 ## How to read the numbers
 
@@ -222,11 +222,58 @@ forced.
 - VM 1's VMM used 32 to 41% of a CPU with `park=kvm`, against 27% for
   the baseline.
 
+## Handoff latency between real VMs (measured, 2026-11-13)
+
+Spec 06 step S6 ([#53](https://github.com/CMKL-APEX/pylon/issues/53)),
+from `pylond`'s latency histograms
+([Metrics](../reference/metrics.md)).
+
+**Setup:** a bare-metal x86_64 host (AMD EPYC 7282, 16 cores with SMT,
+Ubuntu 7.0.0-43 kernel), `pylond` with `scx_pylon` on 3 managed CPUs.
+Two 4-vCPU Ubuntu guests park inside KVM (the default) and load
+`pv-pylon`. VM 1 runs the spec 06 S5 load (two spinners and a `/proc`
+reader on every CPU); VM 2 spins on 3 vCPUs for 100 ms every second, so
+cores move about 200 times each way per run. 150 s runs, the first 40 s
+dropped, two runs each; percentiles are read from the buckets. The
+default grace (8 µs) makes every revocation forced; a 200 µs grace
+(`--revoke-grace-us 200`) makes them cooperative.
+
+| Interval, µs (p50 / p99) | Grace 8 µs (forced) | Grace 200 µs (cooperative) |
+|---|---|---|
+| Revocation request → donor `PARKED` | 55–67 / 64–72 (a few per run: most donors hadn't parked 50 µs after the signal) | 66–82 / 79–153 |
+| Core assigned → recipient running | 38–48 / 57–140 | 42–47 / 59–78 |
+| Revocation request → recipient running | 100–112 / 117–205 | 114–126 / 137–291 |
+
+These are with the re-signal back-off below. The target is a handoff in
+3–6 µs and a park within the 8 µs grace; both are an order of magnitude
+off.
+
+**Where the time goes** (from a host trace of signals, KVM exits and
+system calls):
+
+- The signal stops the vCPU's `KVM_RUN` within 3–6 µs.
+- The VMM then takes 40–60 µs before it publishes `PARKED` (forced park)
+  or re-enters the guest (wake). About 17 µs of it pass before the
+  first signal handler returns, and aren't explained yet.
+- `pylond` re-signalled a waking vCPU every 10 µs, so several signals
+  were delivered during one wake. Backing the re-signals off from
+  100 µs cut wake p50 from 53–58 to 42–46 µs and p99 from 88–124 to
+  59–78 µs.
+- The VMM's seccomp filter costs 5–10% (`--seccomp false`: wake p50
+  47–61 µs, park p50 60–81 µs).
+- Holding the cores out of deep idle (PM QoS 0) changed nothing on this
+  host, unlike on the aarch64 reference host.
+- A cooperative park takes about as long as a forced one: the guest's
+  kick-to-doorbell path (interrupt, `SCHED_FIFO` park thread, doorbell
+  exit) adds up to the same 60–80 µs
+  ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
+
 ## Other figures
 
 | Figure | Kind | Source |
 |---|---|---|
-| Grace period: 8 µs | Default | `REVOKE_GRACE_PERIOD_US`, `pylond/src/engine.rs` |
+| Grace period: 8 µs | Default (`--revoke-grace-us`) | `REVOKE_GRACE_PERIOD_US`, `pylond/src/engine.rs` |
+| Forced handoff: 50 µs after the first signal | Default (`--force-handoff-us`) | `FORCE_HANDOFF_US` |
 | Pause between sweeps: 333 ns, converted to counter ticks with the host rate (about 1,000 ticks on a 3 GHz TSC) | Default | `SWEEP_INTERVAL_NS` |
 | Handoff target: "~3–6 µs" | Design goal | `spec/00-architecture.md` §1 |
 
@@ -236,13 +283,10 @@ These haven't been measured and are needed before Pylon's latency can
 be claimed:
 
 - The engine's sweep time, by number of VMs.
-- Kick to `PARKED`, and revocation to recipient running, between real
-  VMs, with and without `scx_pylon` (step S6,
-  [#53](https://github.com/CMKL-APEX/pylon/issues/53)). `pylond` now
-  records revocation-to-`PARKED` latency per VM
-  (`pylon_vm_park_latency_microseconds`), but no run has been recorded
-  yet.
-- Wake latency of a parked vCPU in a real VM.
+- Handoff latency without `scx_pylon`, and on an Intel host (above:
+  AMD, with `scx_pylon`).
+- Why the VMM takes 40–60 µs after a signal exit
+  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
 - For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
   guest throughput against the `eventfd` park, and halt-polling
   settings (spec 08 P3,

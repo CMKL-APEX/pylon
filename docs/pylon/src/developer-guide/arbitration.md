@@ -320,6 +320,7 @@ even when the kernel reads it.
 | `forced_preempt_count` | `VmHandle` | Phase 2, when a deadline passes |
 | `handoff_without_park_count` | `VmHandle` | Phase 2 |
 | `park_latency` (histogram, µs) | `VmHandle` | Phase 2, when a donor parks |
+| `wake_latency`, `handoff_latency` (histograms, µs) | `VmHandle` | Phase 2, the first sweep an assigned vCPU is seen running: since the assignment, and since the revocation request if there was one |
 | `woken_shared_usec`, `woken_unowned_usec` | `VmHandle` | Phase 1: time vCPUs spent woken, while the VM owned a core or none |
 
 The slot's own `forced_preempt_count` belongs to the VMM, which
