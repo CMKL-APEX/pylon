@@ -15,6 +15,8 @@ struct CpusConfig {
     max_vcpus: u32,
     topology: Option<CpuTopology>,
     kvm_hyperv: bool,
+    // x86-64 only.
+    kvm_hint_realtime: bool,
     max_phys_bits: u8,
     affinity: Option<Vec<CpuAffinity>>,
     features: CpuFeatures,
@@ -27,7 +29,7 @@ struct CpusConfig {
 ```
 
 ```
---cpus boot=<boot_vcpus>,max=<max_vcpus>,topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,affinity=<list_of_vcpus_with_their_associated_cpuset>,features=<list_of_features_to_enable>,nested=on|off,core_scheduling=vm|vcpu|off,profile=host|path:<file>,x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]
+--cpus boot=<boot_vcpus>,max=<max_vcpus>,topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,kvm_hyperv=on|off,kvm_hint_realtime=on|off,max_phys_bits=<maximum_number_of_physical_bits>,affinity=<list_of_vcpus_with_their_associated_cpuset>,features=<list_of_features_to_enable>,nested=on|off,core_scheduling=vm|vcpu|off,profile=host|path:<file>,x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]
 ```
 
 ### `boot`
@@ -35,9 +37,8 @@ struct CpusConfig {
 Number of vCPUs present at boot time.
 
 This option allows defining a specific number of vCPUs to be present at the
-time the VM is started. This option is mandatory when using the `--cpus`
-parameter. If `--cpus` is not specified, this option takes the default value
-of `1`, starting the VM with a single vCPU.
+time the VM is started. If this option is not specified, it takes the
+default value of `1`, starting the VM with a single vCPU.
 
 Value is an unsigned integer of 32 bits.
 
@@ -122,6 +123,27 @@ _Example_
 --cpus kvm_hyperv=on
 ```
 
+### `kvm_hint_realtime`
+
+Advertise `KVM_HINTS_REALTIME` (`EDX` bit 0 of CPUID leaf `0x4000_0001`) to
+the guest. This tells the guest that every vCPU runs on a dedicated host CPU,
+like QEMU's `kvm-hint-dedicated`. A Linux guest then disables the paravirtual
+spinlock, TLB flush and scheduler yield paths and can enable the
+`cpuidle-haltpoll` driver, which lowers idle wake-up latency at the cost of
+busy-polling.
+
+Only enable this option when each vCPU is pinned to its own host CPU, for
+example with `affinity`, and nothing else runs there. It is available on
+x86-64 with KVM only and cannot be combined with `kvm_hyperv`.
+
+By default this option is turned off.
+
+_Example_
+
+```
+--cpus boot=4,affinity=[0@[8],1@[9],2@[10],3@[11]],kvm_hint_realtime=on
+```
+
 ### `max_phys_bits`
 
 Maximum size for guest's addressable space.
@@ -130,7 +152,7 @@ This option defines the maximum number of physical bits for all vCPUs, which
 sets a limit for the size of the guest's addressable space. This is mainly
 useful for debugging purposes.
 
-The value is an unsigned integer of 8 bits.
+The value is an unsigned integer of 8 bits. It must be between 32 and 64, inclusive.
 
 _Example_
 
@@ -172,12 +194,12 @@ Multiple values can be provided to define each list. Each value is a
 platform-native unsigned integer (`usize`).
 
 For instance, if one needs to run vCPU 0 on host CPUs from 0 to 4, the syntax
-using `-` will help define a contiguous range with `affinity=0@[0-4]`. The
-same example could also be described with `affinity=0@[0,1,2,3,4]`.
+using `-` will help define a contiguous range with `affinity=[0@[0-4]]`. The
+same example could also be described with `affinity=[0@[0,1,2,3,4]]`.
 
 A combination of both `-` and `,` separators is useful when one might need to
 describe a list containing host CPUs from 0 to 99 and the host CPU 255, as it
-could simply be described with `affinity=0@[0-99,255]`.
+could simply be described with `affinity=[0@[0-99,255]]`.
 
 As soon as one tries to describe a list of values, `[` and `]` must be used to
 demarcate the list.
@@ -201,7 +223,8 @@ Set of CPU features to enable.
 This option allows the user to enable a set of CPU features that are disabled
 by default otherwise.
 
-The currently available feature set is: `amx`.
+The currently available feature set is: `amx`. It is available on x86-64 only,
+and other architectures reject any feature.
 
 The `amx` feature will enable the x86 extension adding hardware units for
 matrix operations (int and float dot products). The goal of the extension is to
@@ -253,8 +276,9 @@ Three modes are available:
   the cost of performance.
 - `off`: No core scheduling is applied.
 
-On kernels older than 5.14 (which lack `PR_SCHED_CORE` support), the
-option silently has no effect.
+If the host kernel is built without `CONFIG_SCHED_CORE`, the option has no
+effect and Cloud Hypervisor logs a warning. On hosts without SMT, the option
+silently has no effect.
 
 _Example_
 

@@ -10,18 +10,21 @@ CID is a 32-bit context identifier describing the source or destination. In comb
 
 The table below depicts the well known CID values:
 
-| CID | Description |
-|-----|-------------|
-| -1  | Random CID | 
-|  0  | Hypervisor | 
-|  1  | Loopback | 
-|  2  | Host | 
+| CID | Description                |
+|-----|----------------------------|
+| -1  | Any CID (`VMADDR_CID_ANY`) |
+|  0  | Hypervisor                 |
+|  1  | Loopback                   |
+|  2  | Host                       |
+
+These values cannot be used as the guest CID in `--vsock cid=<cid>`.
 
 ## Prerequisites
 
 ### Kernel Requirements
 
-Host kernel: CONFIG_VHOST_VSOCK
+Host kernel: no VSOCK support is required, because the device is emulated in
+userspace and exposed on the host through UNIX sockets.
 
 Guest kernel: CONFIG_VIRTIO_VSOCKETS
 
@@ -76,7 +79,7 @@ From the guest:
 
 ## Links
 
-- [virtio-vsock in QEMU, Firecracker and Linux: Status, Performance and Challenges](https://kvmforum2019.sched.com/event/TmwK)
+- [virtio-vsock in QEMU, Firecracker and Linux: Status, Performance and Challenges](https://stefano-garzarella.github.io/posts/2019-11-08-kvmforum-2019-vsock/)
 - [Leveraging virtio-vsock in the cloud and containers](https://archive.fosdem.org/2021/schedule/event/vai_virtio_vsock/)
 - [VSOCK man page](https://manpages.ubuntu.com/manpages/focal/man7/vsock.7.html)
 - [https://stefano-garzarella.github.io/posts/2020-02-20-vsock-nested-vms-loopback/](https://stefano-garzarella.github.io/posts/2020-02-20-vsock-nested-vms-loopback/)

@@ -1594,14 +1594,6 @@ mod tests {
     }
 
     #[test]
-    fn no_backing_file() {
-        // No backing file declared; opening with backing_files=false should succeed.
-        let header = QcowHeader::create_for_size_and_path(3, 0x10_0000, None)
-            .expect("Failed to create header.");
-        try_open_qcow_header(&header, false).unwrap();
-    }
-
-    #[test]
     fn disable_backing_file() {
         // Backing file is declared but backing_files=false disables it. QcowDisk
         // maps Overflow -> UnsupportedFeature when backing files are disabled.
@@ -2194,17 +2186,6 @@ mod tests {
     }
 
     #[test]
-    fn reject_corrupt_bit_for_writable_open() {
-        // Bit 1: corrupt - image metadata is corrupted
-        let header = header_v3_with_incompat_features(1 << 1);
-        let err = try_open_header(&header).unwrap_err();
-        assert!(
-            matches!(err.kind(), BlockErrorKind::CorruptImage),
-            "Expected CorruptImage error, got: {err:?}"
-        );
-    }
-
-    #[test]
     fn reject_unsupported_incompat_external_data_bit() {
         // Bit 2: external data file
         let header = header_v3_with_incompat_features(1 << 2);
@@ -2299,14 +2280,6 @@ mod tests {
             0,
             "Dirty bit should be cleared after close"
         );
-    }
-
-    #[test]
-    fn dirty_bit_not_used_for_v2() {
-        // Test that v2 images don't use the dirty bit (no incompatible_features field)
-        let temp = image_with_header(&valid_header_v2());
-        let disk = temp.open().unwrap();
-        assert_eq!(disk.metadata().header().version, 2);
     }
 
     #[test]

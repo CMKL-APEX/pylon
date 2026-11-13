@@ -65,7 +65,7 @@ use devices::iommu::iommufd::Error as IommufdIommuError;
 #[cfg(target_arch = "aarch64")]
 use devices::iommu::iommufd::Smmuv3Iommufd;
 #[cfg(feature = "ivshmem")]
-use devices::ivshmem::{IVSHMEM_DATA_BAR_IDX, IvshmemError, IvshmemOps};
+use devices::ivshmem::{IVSHMEM_DATA_BAR_IDX, IvshmemError};
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::Pl011;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -121,14 +121,12 @@ use virtio_devices::{
     balloon, mem, net, transport, vdpa, vhost_user, vsock,
 };
 use vm_allocator::page_size::get_page_size;
-use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
+use vm_allocator::{AddressAllocator, GuestRegionError, InterruptAllocError, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptRemapping, LegacyIrqGroupConfig, MsiIrqGroupConfig,
 };
-use vm_device::{Bus, BusDevice, BusDeviceSync, Resource, UserspaceMapping};
-#[cfg(any(feature = "ivshmem", not(target_arch = "riscv64")))]
-use vm_memory::bitmap::AtomicBitmap;
+use vm_device::{Bus, BusDevice, BusDeviceSync, Resource};
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryRegion, GuestUsize, MmapRegion, VolatileMemory, mmap,
@@ -145,7 +143,10 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::console_devices::{ConsoleInfo, ConsoleTransport};
-use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
+use crate::cpu::{
+    ACPI_CPU_HOTPLUG_CONTROLLER_SNAPSHOT_ID, AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE,
+    CpuManager,
+};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::locked_unix_listener::LockedUnixListener;
@@ -160,7 +161,7 @@ use crate::util::flatten_error_chain_to_string;
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
-    ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
+    ConsoleOutput, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, IommuType, NetConfig,
     PciDeviceCommonConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig,
     VsockConfig,
@@ -437,6 +438,10 @@ pub enum DeviceManagerError {
     /// Error from a memory manager operation
     #[error("Error from a memory manager operation")]
     MemoryManager(#[source] MemoryManagerError),
+
+    /// Failed to register a guest region.
+    #[error("Failed to register a guest region")]
+    RegisterGuestRegion(#[source] GuestRegionError),
 
     /// Failed to create new interrupt source group.
     #[error("Failed to create new interrupt source group")]
@@ -993,10 +998,6 @@ pub struct DeviceManager {
     #[cfg(not(target_arch = "riscv64"))]
     vmgenid_device: Option<Arc<Mutex<devices::VmGenIdDevice>>>,
 
-    // VM Generation ID memory slot, removed in Drop
-    #[cfg(not(target_arch = "riscv64"))]
-    vmgenid_mapping: Option<UserspaceMapping>,
-
     // VM configuration
     config: Arc<Mutex<VmConfig>>,
 
@@ -1274,8 +1275,10 @@ impl DeviceManager {
             }
         }
 
-        let start_of_mmio64_area = memory_manager.lock().unwrap().start_of_device_area().0;
-        let end_of_mmio64_area = memory_manager.lock().unwrap().end_of_device_area().0;
+        let (start_of_mmio64_area, end_of_mmio64_area) = {
+            let mm = memory_manager.lock().unwrap();
+            (mm.start_of_device_area().0, mm.end_of_device_area().0)
+        };
         let pci_mmio64_allocators = create_mmio_allocators(
             start_of_mmio64_area,
             end_of_mmio64_area,
@@ -1343,9 +1346,17 @@ impl DeviceManager {
             )?);
         }
 
-        let acpi_cpu_hotplug_controller =
-            AcpiCpuHotplugController::new(&cpu_manager.lock().unwrap());
+        let acpi_cpu_hotplug_controller = AcpiCpuHotplugController::new(
+            &cpu_manager.lock().unwrap(),
+            state_from_id(snapshot, ACPI_CPU_HOTPLUG_CONTROLLER_SNAPSHOT_ID)
+                .map_err(DeviceManagerError::RestoreGetState)?,
+        );
         let acpi_cpu_hotplug_controller = Arc::new(Mutex::new(acpi_cpu_hotplug_controller));
+        let id = ACPI_CPU_HOTPLUG_CONTROLLER_SNAPSHOT_ID.to_string();
+        device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, acpi_cpu_hotplug_controller));
 
         if dynamic {
             let acpi_address = address_manager
@@ -1371,16 +1382,10 @@ impl DeviceManager {
         if let Some(rate_limit_groups_cfg) = config.lock().unwrap().rate_limit_groups.as_ref() {
             for rate_limit_group_cfg in rate_limit_groups_cfg {
                 let rate_limit_cfg = rate_limit_group_cfg.rate_limiter_config;
-                let bw = rate_limit_cfg.bandwidth.unwrap_or_default();
-                let ops = rate_limit_cfg.ops.unwrap_or_default();
                 let mut rate_limit_group = RateLimiterGroup::new(
                     &rate_limit_group_cfg.id,
-                    bw.size,
-                    bw.one_time_burst.unwrap_or(0),
-                    bw.refill_time,
-                    ops.size,
-                    ops.one_time_burst.unwrap_or(0),
-                    ops.refill_time,
+                    rate_limit_cfg.bandwidth.and_then(|b| b.token_bucket()),
+                    rate_limit_cfg.ops.and_then(|o| o.token_bucket()),
                 )
                 .map_err(DeviceManagerError::RateLimiterGroupCreate)?;
 
@@ -1411,8 +1416,6 @@ impl DeviceManager {
             acpi_tad_device: None,
             #[cfg(not(target_arch = "riscv64"))]
             vmgenid_device: None,
-            #[cfg(not(target_arch = "riscv64"))]
-            vmgenid_mapping: None,
             config,
             memory_manager,
             cpu_manager,
@@ -1539,6 +1542,7 @@ impl DeviceManager {
             self.reset_evt
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
+            snapshot,
         )?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1553,6 +1557,7 @@ impl DeviceManager {
                 self.guest_exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
+                snapshot,
             )?;
         }
 
@@ -1607,10 +1612,20 @@ impl DeviceManager {
     }
 
     #[cfg(feature = "fw_cfg")]
-    pub fn create_fw_cfg_device(&mut self) -> Result<(), DeviceManagerError> {
+    pub fn create_fw_cfg_device(
+        &mut self,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<(), DeviceManagerError> {
         let fw_cfg = Arc::new(Mutex::new(legacy::FwCfg::new(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
+            state_from_id(snapshot, legacy::fw_cfg::FW_CFG_SNAPSHOT_ID)
+                .map_err(DeviceManagerError::RestoreGetState)?,
         )));
+        let id = legacy::fw_cfg::FW_CFG_SNAPSHOT_ID.to_string();
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, fw_cfg));
 
         self.fw_cfg = Some(Arc::clone(&fw_cfg));
 
@@ -2017,44 +2032,28 @@ impl DeviceManager {
             .allocate_platform_mmio_addresses(restored, region_size, Some(region_size))
             .ok_or(DeviceManagerError::AllocateMmioAddress)?;
 
-        let region: Arc<MmapRegion<AtomicBitmap>> = Arc::new(
-            MemoryManager::create_ram_region_raw(
-                &None,
-                0,
-                region_size as usize,
-                false,
-                false,
-                false,
-                None,
-                None,
-                None,
-                false,
-            )
-            .map_err(DeviceManagerError::MemoryManager)?,
-        );
-
-        // SAFETY: the region outlives the mapping, which Drop removes.
-        let mem_slot = unsafe {
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .create_userspace_mapping(
-                    address.0,
-                    region.len(),
-                    region.as_ptr(),
-                    false,
-                    false,
-                    false,
-                    hypervisor::MemoryVisibility::Shared,
-                )
-                .map_err(DeviceManagerError::MemoryManager)?
-        };
-        self.vmgenid_mapping = Some(UserspaceMapping {
-            mem_slot,
-            addr: address,
-            mapping: Arc::clone(&region),
-            mergeable: false,
-        });
+        let region = MemoryManager::create_ram_region(
+            &None,
+            0,
+            address,
+            region_size as usize,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            Arc::clone(&self.address_manager.vm),
+            Arc::clone(self.memory_manager.lock().unwrap().memory_slot_allocator()),
+            false,
+            false,
+            hypervisor::MemoryVisibility::Shared,
+        )
+        .map_err(DeviceManagerError::MemoryManager)?;
+        region
+            .register()
+            .map_err(DeviceManagerError::RegisterGuestRegion)?;
 
         let device = Arc::new(Mutex::new(
             devices::VmGenIdDevice::new(address, region).map_err(DeviceManagerError::VmGenId)?,
@@ -2075,6 +2074,7 @@ impl DeviceManager {
         interrupt_manager: &dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>,
         reset_evt: EventFd,
         guest_exit_evt: EventFd,
+        snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Option<Arc<Mutex<devices::AcpiGedDevice>>>> {
         let vcpus_kill_signalled =
             Arc::clone(self.cpu_manager.lock().unwrap().vcpus_kill_signalled());
@@ -2138,7 +2138,14 @@ impl DeviceManager {
             interrupt_group,
             ged_irq,
             ged_address,
+            state_from_id(snapshot, acpi::ACPI_GED_SNAPSHOT_ID)
+                .map_err(DeviceManagerError::RestoreGetState)?,
         )));
+        let id = acpi::ACPI_GED_SNAPSHOT_ID.to_string();
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, ged_device));
         self.address_manager
             .mmio_bus
             .insert(
@@ -2150,7 +2157,15 @@ impl DeviceManager {
         self.bus_devices
             .push(Arc::clone(&ged_device) as Arc<dyn BusDeviceSync>);
 
-        let pm_timer_device = Arc::new(Mutex::new(devices::AcpiPmTimerDevice::new()));
+        let pm_timer_device = Arc::new(Mutex::new(devices::AcpiPmTimerDevice::new(
+            state_from_id(snapshot, acpi::ACPI_PM_TIMER_SNAPSHOT_ID)
+                .map_err(DeviceManagerError::RestoreGetState)?,
+        )));
+        let id = acpi::ACPI_PM_TIMER_SNAPSHOT_ID.to_string();
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, pm_timer_device));
 
         self.bus_devices
             .push(Arc::clone(&pm_timer_device) as Arc<dyn BusDeviceSync>);
@@ -2179,7 +2194,11 @@ impl DeviceManager {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn add_legacy_devices(&mut self, reset_evt: EventFd) -> DeviceManagerResult<()> {
+    fn add_legacy_devices(
+        &mut self,
+        reset_evt: EventFd,
+        snapshot: Option<&Snapshot>,
+    ) -> DeviceManagerResult<()> {
         let vcpus_kill_signalled =
             Arc::clone(self.cpu_manager.lock().unwrap().vcpus_kill_signalled());
         // Add a shutdown device (i8042)
@@ -2215,7 +2234,15 @@ impl DeviceManager {
                 mem_above_4g,
                 reset_evt,
                 vcpus_kill_signalled,
+                state_from_id(snapshot, legacy::CMOS_SNAPSHOT_ID)
+                    .map_err(DeviceManagerError::RestoreGetState)?,
             )));
+
+            let id = legacy::CMOS_SNAPSHOT_ID.to_string();
+            self.device_tree
+                .lock()
+                .unwrap()
+                .insert(id.clone(), device_node!(id, cmos));
 
             self.bus_devices
                 .push(Arc::clone(&cmos) as Arc<dyn BusDeviceSync>);
@@ -2263,7 +2290,15 @@ impl DeviceManager {
             .allocate_irq()
             .unwrap();
 
-        let rtc_device = Arc::new(Mutex::new(legacy::Rtc::new()));
+        let rtc_device = Arc::new(Mutex::new(legacy::Rtc::new(
+            state_from_id(snapshot, legacy::RTC_SNAPSHOT_ID)
+                .map_err(DeviceManagerError::RestoreGetState)?,
+        )));
+        let id = legacy::RTC_SNAPSHOT_ID.to_string();
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, rtc_device));
 
         self.bus_devices
             .push(Arc::clone(&rtc_device) as Arc<dyn BusDeviceSync>);
@@ -2684,13 +2719,11 @@ impl DeviceManager {
             .insert(id.clone(), device_node!(id, virtio_console_device));
 
         // Only provide a resizer (for SIGWINCH handling) if the console is attached to the TTY
-        Ok(
-            if matches!(console_config.common.mode, ConsoleOutputMode::Tty) {
-                Some(console_resizer)
-            } else {
-                None
-            },
-        )
+        Ok(if matches!(console_config.output, ConsoleOutput::Tty) {
+            Some(console_resizer)
+        } else {
+            None
+        })
     }
 
     /// Adds all devices that behave like a console with respect to the VM
@@ -2949,16 +2982,10 @@ impl DeviceManager {
                 if let Some(rate_limiter_cfg) = disk_cfg.rate_limiter_config.as_ref() {
                     // Create an anonymous RateLimiterGroup that is dropped when the Disk
                     // is dropped.
-                    let bw = rate_limiter_cfg.bandwidth.unwrap_or_default();
-                    let ops = rate_limiter_cfg.ops.unwrap_or_default();
                     let mut rate_limit_group = RateLimiterGroup::new(
                         disk_cfg.pci_common.id.as_ref().unwrap(),
-                        bw.size,
-                        bw.one_time_burst.unwrap_or(0),
-                        bw.refill_time,
-                        ops.size,
-                        ops.one_time_burst.unwrap_or(0),
-                        ops.refill_time,
+                        rate_limiter_cfg.bandwidth.and_then(|b| b.token_bucket()),
+                        rate_limiter_cfg.ops.and_then(|o| o.token_bucket()),
                     )
                     .map_err(DeviceManagerError::RateLimiterGroupCreate)?;
 
@@ -3055,6 +3082,15 @@ impl DeviceManager {
         let mut block_devices = self.config.lock().unwrap().disks.take();
         if let Some(disk_list_cfg) = &mut block_devices {
             for disk_cfg in disk_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&disk_cfg.pci_common)
+                {
+                    continue;
+                }
                 let device = self.make_virtio_block_device(disk_cfg, false, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3231,6 +3267,15 @@ impl DeviceManager {
         let mut net_devices = self.config.lock().unwrap().net.take();
         if let Some(net_list_cfg) = &mut net_devices {
             for net_cfg in net_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&net_cfg.pci_common)
+                {
+                    continue;
+                }
                 let device = self.make_virtio_net_device(net_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3395,6 +3440,15 @@ impl DeviceManager {
         let mut generic_vhost_user_devices = self.config.lock().unwrap().generic_vhost_user.clone();
         if let Some(generic_vhost_user_list_cfg) = &mut generic_vhost_user_devices {
             for generic_vhost_user_cfg in generic_vhost_user_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&generic_vhost_user_cfg.pci_common)
+                {
+                    continue;
+                }
                 let device =
                     self.make_generic_vhost_user_device(generic_vhost_user_cfg, snapshot)?;
                 self.virtio_devices.push(device);
@@ -3462,6 +3516,15 @@ impl DeviceManager {
         let mut fs_devices = self.config.lock().unwrap().fs.take();
         if let Some(fs_list_cfg) = &mut fs_devices {
             for fs_cfg in fs_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&fs_cfg.pci_common)
+                {
+                    continue;
+                }
                 let device = self.make_virtio_fs_device(fs_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3591,32 +3654,20 @@ impl DeviceManager {
                 },
         )
         .map_err(DeviceManagerError::NewMmapRegion)?;
-        let host_addr = mmap_region.as_ptr();
-
-        // SAFETY: host_addr points to region_size bytes of mmap-allocated memory.
-        let mem_slot = unsafe {
-            let region_size = region_size.try_into().unwrap();
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .create_userspace_mapping(
-                    region_base,
-                    region_size,
-                    host_addr,
-                    false,
-                    false,
-                    false,
-                    hypervisor::MemoryVisibility::Shared,
-                )
-                .map_err(DeviceManagerError::MemoryManager)
-        }?;
-
-        let mapping = UserspaceMapping {
-            mem_slot,
-            addr: GuestAddress(region_base),
-            mapping: Arc::new(mmap_region),
-            mergeable: false,
-        };
+        let mapping = GuestRegion::from_mmap(
+            mmap_region,
+            GuestAddress(region_base),
+            Arc::clone(&self.address_manager.vm),
+            Arc::clone(self.memory_manager.lock().unwrap().memory_slot_allocator()),
+            false,
+            false,
+            false,
+            hypervisor::MemoryVisibility::Shared,
+        )
+        .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        mapping
+            .register()
+            .map_err(DeviceManagerError::RegisterGuestRegion)?;
 
         let virtio_pmem_device = Arc::new(Mutex::new(
             virtio_devices::Pmem::new(
@@ -3657,6 +3708,15 @@ impl DeviceManager {
         let mut pmem_devices = self.config.lock().unwrap().pmem.take();
         if let Some(pmem_list_cfg) = &mut pmem_devices {
             for pmem_cfg in pmem_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&pmem_cfg.pci_common)
+                {
+                    continue;
+                }
                 let device = self.make_virtio_pmem_device(pmem_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3727,7 +3787,14 @@ impl DeviceManager {
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<()> {
         let mut vsock = self.config.lock().unwrap().vsock.take();
-        if let Some(vsock_cfg) = &mut vsock {
+        if let Some(vsock_cfg) = &mut vsock
+            && (snapshot.is_none()
+                || self
+                    .device_tree
+                    .lock()
+                    .unwrap()
+                    .has_pci_device(&vsock_cfg.pci_common))
+        {
             let device = self.make_virtio_vsock_device(vsock_cfg, snapshot)?;
             self.virtio_devices.push(device);
         }
@@ -3993,6 +4060,15 @@ impl DeviceManager {
         let mut vdpa_devices = self.config.lock().unwrap().vdpa.take();
         if let Some(vdpa_list_cfg) = &mut vdpa_devices {
             for vdpa_cfg in vdpa_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&vdpa_cfg.pci_common)
+                {
+                    continue;
+                }
                 let device = self.make_vdpa_device(vdpa_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -4185,27 +4261,14 @@ impl DeviceManager {
         let index = self.smmuv3s.len();
         let smmuv3_id = format!("{SMMUV3_DEVICE_NAME}_{index}");
 
-        let event_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
-        let gerror_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
-        let sync_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
+        let (event_irq, gerror_irq, sync_irq) = {
+            let mut allocator = self.address_manager.allocator.lock().unwrap();
+            (
+                allocator.allocate_irq().unwrap(),
+                allocator.allocate_irq().unwrap(),
+                allocator.allocate_irq().unwrap(),
+            )
+        };
 
         let interrupts = Smmuv3Interrupts {
             event: interrupt_manager
@@ -4632,14 +4695,15 @@ impl DeviceManager {
             resources,
         )?;
 
-        vfio_pci_device
-            .lock()
-            .unwrap()
-            .map_mmio_regions()
-            .map_err(DeviceManagerError::VfioMapRegion)?;
+        {
+            let mut vfio_pci_device = vfio_pci_device.lock().unwrap();
+            vfio_pci_device
+                .map_mmio_regions()
+                .map_err(DeviceManagerError::VfioMapRegion)?;
 
-        for mmio_region in vfio_pci_device.lock().unwrap().mmio_regions() {
-            self.mmio_regions.lock().unwrap().push(mmio_region);
+            for mmio_region in vfio_pci_device.mmio_regions() {
+                self.mmio_regions.lock().unwrap().push(mmio_region);
+            }
         }
 
         let mut node = device_node!(vfio_name, vfio_pci_device);
@@ -4769,6 +4833,15 @@ impl DeviceManager {
 
         if let Some(device_list_cfg) = &mut devices {
             for device_cfg in device_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&device_cfg.pci_common)
+                {
+                    continue;
+                }
                 let (device_id, _) = self.add_passthrough_device(device_cfg, snapshot)?;
                 if device_cfg.pci_common.iommu.attached() && self.iommu_device.is_some() {
                     iommu_attached_device_ids.push(device_id);
@@ -4908,6 +4981,15 @@ impl DeviceManager {
 
         if let Some(device_list_cfg) = &mut user_devices {
             for device_cfg in device_list_cfg.iter_mut() {
+                if snapshot.is_some()
+                    && !self
+                        .device_tree
+                        .lock()
+                        .unwrap()
+                        .has_pci_device(&device_cfg.pci_common)
+                {
+                    continue;
+                }
                 let (_device_id, _id) = self.add_vfio_user_device(device_cfg, snapshot)?;
             }
         }
@@ -5180,15 +5262,11 @@ impl DeviceManager {
         )?;
         let snapshot = snapshot_from_id(snapshot, id.as_str());
 
-        let ivshmem_ops = Arc::new(Mutex::new(IvshmemHandler {
-            memory_manager: Arc::clone(&self.memory_manager),
-        }));
         let ivshmem_device = Arc::new(Mutex::new(
             devices::IvshmemDevice::new(
                 id.clone(),
                 pci_device_bdf,
                 ivshmem_cfg.size as u64,
-                Arc::clone(&ivshmem_ops) as Arc<Mutex<dyn IvshmemOps>>,
                 snapshot,
             )
             .map_err(DeviceManagerError::IvshmemCreate)?,
@@ -5204,12 +5282,34 @@ impl DeviceManager {
             .find(|bar| bar.idx() == IVSHMEM_DATA_BAR_IDX)
             .unwrap()
             .addr();
-        let (region, mapping) = ivshmem_ops
-            .lock()
-            .unwrap()
-            .map_ram_region(start_addr, ivshmem_cfg.size, Some(ivshmem_cfg.path.clone()))
-            .map_err(DeviceManagerError::IvshmemCreate)?;
-        ivshmem_device.lock().unwrap().set_region(region, mapping);
+        let mapping = MemoryManager::create_ram_region_raw(
+            &Some(ivshmem_cfg.path.clone()),
+            0,
+            ivshmem_cfg.size,
+            false,
+            true,
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+        .map_err(DeviceManagerError::MemoryManager)?;
+        let region = GuestRegion::from_mmap(
+            mapping,
+            GuestAddress(start_addr),
+            Arc::clone(&self.address_manager.vm),
+            Arc::clone(self.memory_manager.lock().unwrap().memory_slot_allocator()),
+            false,
+            false,
+            false,
+            hypervisor::MemoryVisibility::Shared,
+        )
+        .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        region
+            .register()
+            .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        ivshmem_device.lock().unwrap().set_region(region);
 
         let mut node = device_node!(id, ivshmem_device);
         node.resources = new_resources;
@@ -5485,15 +5585,6 @@ impl DeviceManager {
     }
 
     pub fn remove_device(&mut self, id: &str) -> DeviceManagerResult<()> {
-        // The node can be directly a PCI node in case the 'id' refers to a
-        // VFIO device or a virtio-pci one.
-        // In case the 'id' refers to a virtio device, we must find the PCI
-        // node by looking at the parent.
-        let device_tree = self.device_tree.lock().unwrap();
-        let node = device_tree
-            .get(id)
-            .ok_or_else(|| DeviceManagerError::UnknownDeviceId(id.to_string()))?;
-
         // Release advisory locks by dropping all references.
         // Linux automatically releases all locks of that file if the last open FD is closed.
         {
@@ -5510,6 +5601,19 @@ impl DeviceManager {
                 let _ = self.block_devices.swap_remove(index);
             }
         }
+
+        // The node can be directly a PCI node in case the 'id' refers to a
+        // VFIO device or a virtio-pci one.
+        // In case the 'id' refers to a virtio device, we must find the PCI
+        // node by looking at the parent.
+        let device_tree = self.device_tree.lock().unwrap();
+        let Some(node) = device_tree.get(id) else {
+            return if self.config.lock().unwrap().remove_device(id) {
+                Ok(())
+            } else {
+                Err(DeviceManagerError::UnknownDeviceId(id.to_string()))
+            };
+        };
 
         let pci_device_node = if node.pci_bdf.is_some() && node.pci_device_handle.is_some() {
             node
@@ -6192,85 +6296,6 @@ impl DeviceManager {
     }
 }
 
-#[cfg(feature = "ivshmem")]
-struct IvshmemHandler {
-    memory_manager: Arc<Mutex<MemoryManager>>,
-}
-
-#[cfg(feature = "ivshmem")]
-impl IvshmemOps for IvshmemHandler {
-    fn map_ram_region(
-        &mut self,
-        start_addr: u64,
-        size: usize,
-        backing_file: Option<PathBuf>,
-    ) -> Result<(Arc<MmapRegion<AtomicBitmap>>, UserspaceMapping), IvshmemError> {
-        info!("Creating ivshmem mem region at 0x{start_addr:x}");
-
-        let region = MemoryManager::create_ram_region_raw(
-            &backing_file,
-            0,
-            size,
-            false,
-            true,
-            false,
-            None,
-            None,
-            None,
-            false,
-        )
-        .map_err(|e| IvshmemError::CreateUserMemoryRegion(e.into()))?;
-        let region = Arc::new(region);
-        let mapping = self.create_userspace_mapping(start_addr, Arc::clone(&region))?;
-        Ok((region, mapping))
-    }
-
-    fn create_userspace_mapping(
-        &mut self,
-        start_addr: u64,
-        region: Arc<MmapRegion<AtomicBitmap>>,
-    ) -> Result<UserspaceMapping, IvshmemError> {
-        let mem_slot = {
-            let mut manager = self.memory_manager.lock().unwrap();
-            // SAFETY: guaranteed by MmapRegion invariants
-            unsafe {
-                manager.create_userspace_mapping(
-                    start_addr,
-                    region.len(),
-                    region.as_ptr(),
-                    false,
-                    false,
-                    false,
-                    hypervisor::MemoryVisibility::Shared,
-                )
-            }
-        }
-        .map_err(|e| IvshmemError::CreateUserspaceMapping(e.into()))?;
-        Ok(UserspaceMapping {
-            mapping: region,
-            mem_slot,
-            addr: GuestAddress(start_addr),
-            mergeable: false,
-        })
-    }
-
-    fn unmap_ram_region(&mut self, mapping: UserspaceMapping) -> Result<(), IvshmemError> {
-        let mut manager = self.memory_manager.lock().unwrap();
-        // SAFETY: UserspaceMapping is valid due to other code being correct
-        unsafe {
-            manager.remove_userspace_mapping(
-                mapping.addr.raw_value(),
-                mapping.mapping.len(),
-                mapping.mapping.as_ptr(),
-                mapping.mergeable,
-                mapping.mem_slot,
-            )
-        }
-        .map_err(|e| IvshmemError::RemoveUserspaceMapping(e.into()))?;
-        Ok(())
-    }
-}
-
 fn numa_node_id_from_memory_zone_id(numa_nodes: &NumaNodes, memory_zone_id: &str) -> Option<u32> {
     for (numa_node_id, numa_node) in numa_nodes.iter() {
         if numa_node.memory_zones.contains(&memory_zone_id.to_owned()) {
@@ -6432,8 +6457,7 @@ impl Aml for DeviceManager {
         #[cfg(target_arch = "x86_64")]
         let serial_irq = 4;
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        let serial_irq = if self.config.lock().unwrap().serial.common.mode == ConsoleOutputMode::Off
-        {
+        let serial_irq = if self.config.lock().unwrap().serial.output == ConsoleOutput::Off {
             // If serial is turned off, add a fake device with invalid irq.
             31
         } else {
@@ -6443,7 +6467,7 @@ impl Aml for DeviceManager {
                 .unwrap()
                 .irq()
         };
-        if self.config.lock().unwrap().serial.common.mode != ConsoleOutputMode::Off {
+        if self.config.lock().unwrap().serial.output != ConsoleOutput::Off {
             aml::Device::new(
                 "_SB_.COM1".into(),
                 vec![
@@ -6567,6 +6591,13 @@ impl Pausable for DeviceManager {
                 }
             }
         }
+        let mut notification = AcpiNotificationFlags::MEMORY_DEVICES_CHANGED
+            | AcpiNotificationFlags::PCI_DEVICES_CHANGED;
+        if cfg!(target_arch = "x86_64") {
+            notification |= AcpiNotificationFlags::CPU_DEVICES_CHANGED;
+        }
+        self.notify_hotplug(notification)
+            .map_err(|e| MigratableError::Resume(e.into()))?;
         Ok(())
     }
 }
@@ -6770,27 +6801,6 @@ impl Drop for DeviceManager {
         // that they are dropped and unmapped before the container is cleared.
         // See eject_device() for the device hot-unplug equivalent.
         self.mmio_regions.lock().unwrap().clear();
-
-        // Remove the VM Generation ID memory slot created in add_vmgenid_device.
-        #[cfg(not(target_arch = "riscv64"))]
-        if let Some(mapping) = self.vmgenid_mapping.take() {
-            // SAFETY: the mapping was installed in add_vmgenid_device and its
-            // region is still alive.
-            if let Err(e) = unsafe {
-                self.memory_manager
-                    .lock()
-                    .unwrap()
-                    .remove_userspace_mapping(
-                        mapping.addr.0,
-                        mapping.mapping.len(),
-                        mapping.mapping.as_ptr(),
-                        mapping.mergeable,
-                        mapping.mem_slot,
-                    )
-            } {
-                error!("Failed to remove VM Generation ID mapping: {e}");
-            }
-        }
 
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();

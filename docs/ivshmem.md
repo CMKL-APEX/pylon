@@ -12,6 +12,11 @@ Now we support setting a backend file to share data between host and guest.
 In other words, we only support ivshmem-plain and ivshmem-doorbell is not
 supported yet.
 
+## Enabling ivshmem
+
+The ivshmem device requires the `ivshmem` feature at build time. It is not
+enabled by default or in the release binaries.
+
 ## Usage
 
 `--ivshmem`, an optional argument, can be passed to enable ivshmem device.
@@ -24,7 +29,8 @@ The `size` value must be 2^n.
 
 ## Example
 
-Create a file with a size bigger than passed to `cloud-hypervisor`:
+Create a file that is at least as large as the `size` passed to
+`cloud-hypervisor`:
 
 ```
 truncate -s 1M /tmp/ivshmem.data

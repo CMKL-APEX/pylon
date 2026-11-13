@@ -16,7 +16,7 @@ use std::ptr::from_ref;
 use std::sync::mpsc::channel;
 use std::{any, cmp, env, io, num, process};
 
-use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+use clap::{ArgAction, ArgGroup, Parser, ValueEnum};
 use event_monitor::event;
 use libc::EFD_NONBLOCK;
 use log::{LevelFilter, error, info, warn};
@@ -34,15 +34,17 @@ use vmm::landlock::{Landlock, LandlockError};
 use vmm::pylon::PylonConfig;
 use vmm::seccomp_filters::{Thread, get_seccomp_filter};
 use vmm::vm::Vm;
+#[cfg(target_arch = "x86_64")]
+use vmm::vm_config::DebugConsoleConfig;
 #[cfg(feature = "fw_cfg")]
 use vmm::vm_config::FwCfgConfig;
 #[cfg(feature = "ivshmem")]
 use vmm::vm_config::IvshmemConfig;
 use vmm::vm_config::{
-    BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig,
-    LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig,
-    RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig, TpmConfig, UserDeviceConfig,
-    VdpaConfig, VmConfig, VsockConfig,
+    BalloonConfig, ConsoleConfig, CpusConfig, DeviceConfig, DiskConfig, FsConfig,
+    GenericVhostUserConfig, LandlockConfig, MemoryConfig, MemoryZoneConfig, NetConfig, NumaConfig,
+    PciSegmentConfig, PlatformConfig, PmemConfig, RateLimiterGroupConfig, RngConfig, RtcConfig,
+    SerialConfig, TpmConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use vmm::{GuestResetAction, GuestShutdownAction, vm_config};
 use vmm_sys_util::eventfd::EventFd;
@@ -219,10 +221,6 @@ enum FdTableError {
     Dup2(#[source] io::Error),
 }
 
-fn prepare_default_values() -> (String, String, String) {
-    (default_vcpus(), default_memory(), default_rng())
-}
-
 fn default_vcpus() -> String {
     format!(
         "boot={},max_phys_bits={}",
@@ -239,385 +237,509 @@ fn default_rng() -> String {
     format!("src={}", RngConfig::DEFAULT_RNG_SOURCE)
 }
 
-/// Returns all [`Arg`]s in alphabetical order. This is the order used in the
-/// `--help` output.
-fn get_cli_options_sorted(
-    default_vcpus: String,
-    default_memory: String,
-    default_rng: String,
-) -> Box<[Arg]> {
-    [
-        Arg::new("api-socket")
-            .long("api-socket")
-            .help("HTTP API socket (UNIX domain socket): path=<path> or fd=<fd>.")
-            .num_args(1)
-            .group("vmm-config"),
-        Arg::new("balloon")
-            .long("balloon")
-            .help(BalloonConfig::SYNTAX)
-            .num_args(1)
-            .group("vm-config"),
-        Arg::new("cmdline")
-            .long("cmdline")
-            .help("Kernel command line")
-            .num_args(1)
-            .group("vm-config"),
-        Arg::new("console")
-            .long("console")
-            .help(ConsoleConfig::SYNTAX)
-            .default_value("tty")
-            .group("vm-config"),
-        Arg::new("cpus")
-            .long("cpus")
-            .help(
-                "boot=<boot_vcpus>,max=<max_vcpus>,\
-                    topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,\
-                    kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,\
-                    affinity=<list_of_vcpus_with_their_associated_cpuset>,\
-                    features=<list_of_features_to_enable>,\
-                    nested=on|off,core_scheduling=vm|vcpu|off,\
-                    profile=host|path:<file>,\
-                    x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]",
-            )
-            .default_value(default_vcpus)
-            .group("vm-config"),
-        #[cfg(feature = "dbus_api")]
-        Arg::new("dbus-object-path")
-            .long("dbus-object-path")
-            .help("Object path to serve the dbus interface")
-            .num_args(1)
-            .group("vmm-config"),
-        #[cfg(feature = "dbus_api")]
-        Arg::new("dbus-service-name")
-            .long("dbus-service-name")
-            .help("Well known name of the device")
-            .num_args(1)
-            .group("vmm-config"),
-        #[cfg(feature = "dbus_api")]
-        Arg::new("dbus-system-bus")
-            .long("dbus-system-bus")
-            .action(ArgAction::SetTrue)
-            .help("Use the system bus instead of a session bus")
-            .num_args(0)
-            .group("vmm-config"),
-        #[cfg(target_arch = "x86_64")]
-        Arg::new("debug-console")
-            .long("debug-console")
-            .help("Debug console: off|pty|tty|file=<path>,iobase=<port in hex>")
-            .default_value("off,iobase=0xe9")
-            .group("vm-config"),
-        Arg::new("device")
-            .long("device")
-            .help(DeviceConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("disk")
-            .long("disk")
-            .help(DiskConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("event-monitor")
-            .long("event-monitor")
-            .help("Path to report events on: path=<path> or fd=<fd>")
-            .num_args(1)
-            .group("vmm-config"),
-        Arg::new("firmware")
-            .long("firmware")
-            .help("Path to firmware that is loaded in an architectural specific way")
-            .num_args(1)
-            .group("vm-payload"),
-        Arg::new("fs")
-            .long("fs")
-            .help(FsConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        #[cfg(feature = "fw_cfg")]
-        Arg::new("fw-cfg-config")
-            .long("fw-cfg-config")
-            .help(FwCfgConfig::SYNTAX)
-            .num_args(1)
-            .group("vm-payload"),
-        #[cfg(feature = "guest_debug")]
-        Arg::new("gdb")
-            .long("gdb")
-            .help("GDB socket (UNIX domain socket): path=<path>")
-            .num_args(1)
-            .group("vmm-config"),
-        Arg::new("generic-vhost-user")
-            .long("generic-vhost-user")
-            .help(GenericVhostUserConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("guest-reset-action")
-            .long("guest-reset-action")
-            .help(
-                "Action when the guest resets: reset the VM, exit the VMM, \
-                 or shut down the VM and keep the VMM running",
-            )
-            .num_args(1)
-            .value_parser(["reset-vm", "exit-vmm", "shutdown-vm"])
-            .default_value("reset-vm")
-            .group("vmm-config"),
-        Arg::new("guest-shutdown-action")
-            .long("guest-shutdown-action")
-            .help(
-                "Action when the guest shuts down: exit the VMM, \
-                 or shut down the VM and keep the VMM running",
-            )
-            .num_args(1)
-            .value_parser(["exit-vmm", "shutdown-vm"])
-            .default_value("exit-vmm")
-            .group("vmm-config"),
-        #[cfg(feature = "sev_snp")]
-        Arg::new("host-data")
-            .long("host-data")
-            .help("Host specific data to SEV SNP guest")
-            .num_args(1)
-            .group("vm-config"),
-        #[cfg(feature = "igvm")]
-        Arg::new("igvm")
-            .long("igvm")
-            .help("Path to IGVM file to load.")
-            .num_args(1)
-            .group("vm-payload"),
-        Arg::new("initramfs")
-            .long("initramfs")
-            .help("Path to initramfs image")
-            .num_args(1)
-            .group("vm-config"),
-        #[cfg(feature = "ivshmem")]
-        Arg::new("ivshmem")
-            .long("ivshmem")
-            .help(IvshmemConfig::SYNTAX)
-            .num_args(1)
-            .group("vm-config"),
-        Arg::new("kernel")
-            .long("kernel")
-            .help(
-                "Path to kernel to load. This may be a kernel or firmware that supports a PVH \
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliGuestResetAction {
+    /// Reset (reboot) the VM
+    ResetVm,
+    /// Exit Cloud Hypervisor
+    ExitVmm,
+    /// Shut down the VM and keep Cloud Hypervisor running
+    ShutdownVm,
+}
+
+impl From<CliGuestResetAction> for GuestResetAction {
+    fn from(action: CliGuestResetAction) -> Self {
+        match action {
+            CliGuestResetAction::ResetVm => Self::ResetVm,
+            CliGuestResetAction::ExitVmm => Self::ExitVmm,
+            CliGuestResetAction::ShutdownVm => Self::ShutdownVm,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliGuestShutdownAction {
+    /// Exit Cloud Hypervisor
+    ExitVmm,
+    /// Shut down the VM and keep Cloud Hypervisor running
+    ShutdownVm,
+}
+
+impl From<CliGuestShutdownAction> for GuestShutdownAction {
+    fn from(action: CliGuestShutdownAction) -> Self {
+        match action {
+            CliGuestShutdownAction::ExitVmm => Self::ExitVmm,
+            CliGuestShutdownAction::ShutdownVm => Self::ShutdownVm,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliSeccompAction {
+    /// Terminate Cloud Hypervisor on prohibited system calls
+    True,
+    /// Disable system call filtering
+    False,
+    /// Allow prohibited system calls but log them
+    Log,
+    /// Fail prohibited system calls with EPERM
+    Errno,
+}
+
+impl From<CliSeccompAction> for SeccompAction {
+    fn from(action: CliSeccompAction) -> Self {
+        match action {
+            CliSeccompAction::True => Self::Trap,
+            CliSeccompAction::False => Self::Allow,
+            CliSeccompAction::Log => Self::Log,
+            CliSeccompAction::Errno => Self::Errno(libc::EPERM as u32),
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "cloud-hypervisor",
+    about = "Launch a cloud-hypervisor VMM",
+    arg_required_else_help = true
+)]
+#[command(group(ArgGroup::new("vm-config").multiple(true).requires("vm-payload")))]
+#[command(group(ArgGroup::new("vmm-config").multiple(true)))]
+#[command(group(ArgGroup::new("logging").multiple(true)))]
+#[command(group(ArgGroup::new("vm-payload").multiple(true)))]
+#[group(skip)]
+struct Cli {
+    #[arg(
+        long,
+        help = "HTTP API socket (UNIX domain socket): path=<path> or fd=<fd>",
+        group = "vmm-config"
+    )]
+    api_socket: Option<String>,
+    #[arg(
+        long,
+        help = BalloonConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    balloon: Option<String>,
+    #[arg(long, help = "Kernel command line", group = "vm-config")]
+    cmdline: Option<String>,
+    #[arg(
+        long,
+        help = ConsoleConfig::SYNTAX,
+        default_value = "tty",
+        group = "vm-config",
+    )]
+    console: String,
+    #[arg(
+        long,
+        help = CpusConfig::SYNTAX,
+        default_value = default_vcpus(),
+        group = "vm-config",
+    )]
+    cpus: String,
+    #[cfg(feature = "dbus_api")]
+    #[arg(
+        long,
+        help = "Object path to serve the dbus interface",
+        group = "vmm-config"
+    )]
+    dbus_object_path: Option<String>,
+    #[cfg(feature = "dbus_api")]
+    #[arg(
+        long,
+        help = "Well known name of the dbus service",
+        group = "vmm-config"
+    )]
+    dbus_service_name: Option<String>,
+    #[cfg(feature = "dbus_api")]
+    #[arg(
+        long,
+        help = "Use the system bus instead of a session bus",
+        group = "vmm-config"
+    )]
+    dbus_system_bus: bool,
+    #[cfg(target_arch = "x86_64")]
+    #[arg(
+        long,
+        help = DebugConsoleConfig::SYNTAX,
+        default_value = "off,iobase=0xe9",
+        group = "vm-config"
+    )]
+    debug_console: String,
+    #[arg(
+        long,
+        help = DeviceConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    device: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = DiskConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    disk: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = "Path to report events on: path=<path> or fd=<fd>",
+        group = "vmm-config"
+    )]
+    event_monitor: Option<String>,
+    #[arg(
+        long,
+        help = "Path to firmware that is loaded in an architecture-specific way",
+        group = "vm-payload"
+    )]
+    firmware: Option<String>,
+    #[arg(
+        long,
+        help = FsConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    fs: Option<Vec<String>>,
+    #[cfg(feature = "fw_cfg")]
+    #[arg(
+        long,
+        help = FwCfgConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    fw_cfg_config: Option<String>,
+    #[cfg(feature = "guest_debug")]
+    #[arg(
+        long,
+        help = "GDB socket (UNIX domain socket): path=<path>",
+        group = "vmm-config"
+    )]
+    gdb: Option<String>,
+    #[arg(
+        long,
+        help = GenericVhostUserConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    generic_vhost_user: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = "Action when the guest resets",
+        default_value = "reset-vm",
+        group = "vmm-config"
+    )]
+    guest_reset_action: CliGuestResetAction,
+    #[arg(
+        long,
+        help = "Action when the guest shuts down",
+        default_value = "exit-vmm",
+        group = "vmm-config"
+    )]
+    guest_shutdown_action: CliGuestShutdownAction,
+    #[cfg(feature = "sev_snp")]
+    #[arg(
+        long,
+        help = "Host specific data to SEV SNP guest",
+        group = "vm-config"
+    )]
+    host_data: Option<String>,
+    #[cfg(feature = "igvm")]
+    #[arg(long, help = "Path to IGVM file to load", group = "vm-payload")]
+    igvm: Option<String>,
+    #[arg(long, help = "Path to initramfs image", group = "vm-config")]
+    initramfs: Option<String>,
+    #[cfg(feature = "ivshmem")]
+    #[arg(
+        long,
+        help = IvshmemConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    ivshmem: Option<String>,
+    #[arg(
+        long,
+        help = "Path to kernel to load. This may be a kernel or firmware that supports a PVH \
                 entry point (e.g. vmlinux) or architecture equivalent",
-            )
-            .num_args(1)
-            .group("vm-payload"),
-        Arg::new("landlock")
-            .long("landlock")
-            .num_args(0)
-            .help("enable/disable Landlock.")
-            .action(ArgAction::SetTrue)
-            .default_value("false")
-            .group("vmm-config"),
-        Arg::new("landlock-rules")
-            .long("landlock-rules")
-            .help(LandlockConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("log-file")
-            .long("log-file")
-            .help("Log file. Standard error is used if not specified")
-            .num_args(1)
-            .group("logging"),
-        Arg::new("log-format")
-            .long("log-format")
-            .help(
-                "Log format. Common tokens: {boottime}, {wallclock}, {glog}, \
+        group = "vm-payload"
+    )]
+    kernel: Option<String>,
+    #[arg(long, help = "Enable Landlock", group = "vmm-config")]
+    landlock: bool,
+    #[arg(
+        long,
+        help = LandlockConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    landlock_rules: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = "Log file. Standard error is used if not specified",
+        group = "logging"
+    )]
+    log_file: Option<String>,
+    #[arg(
+        long,
+        help = "Log format. Common tokens: {boottime}, {wallclock}, {glog}, \
                  {localglog}, {thread}, {level}, {location}, {msg}. See \
                  docs/logging.md for the full list (per-field date/time tokens, \
                  local-time variants, glog level letter).",
-            )
-            .num_args(1)
-            .default_value(logger::DEFAULT_FORMAT)
-            .group("logging"),
-        Arg::new("memory")
-            .long("memory")
-            .help(
-                "Memory parameters \
-                     \"size=<guest_memory_size>,mergeable=on|off,shared=on|off,\
-                     hugepages=on|off,hugepage_size=<hugepage_size>,\
-                     hotplug_method=acpi|virtio-mem,\
-                     hotplug_size=<hotpluggable_memory_size>,\
-                     hotplugged_size=<hotplugged_memory_size>,\
-                     prefault=on|off,reserve=on|off,thp=on|off\"",
-            )
-            .default_value(default_memory)
-            .group("vm-config"),
-        Arg::new("memory-zone")
-            .long("memory-zone")
-            .help(
-                "User defined memory zone parameters \
-                     \"size=<guest_memory_region_size>,file=<backing_file>,\
-                     shared=on|off,\
-                     hugepages=on|off,hugepage_size=<hugepage_size>,\
-                     host_numa_node=<node_id>,\
-                     id=<zone_identifier>,hotplug_size=<hotpluggable_memory_size>,\
-                     hotplugged_size=<hotplugged_memory_size>,\
-                     prefault=on|off,reserve=on|off\"",
-            )
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("net")
-            .long("net")
-            .help(NetConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("no-shutdown")
-            .long("no-shutdown")
-            .help(
-                "Do not exit the VMM when the guest shuts down \
-                 (deprecated: use --guest-shutdown-action=shutdown-vm)",
-            )
-            .num_args(0)
-            .action(ArgAction::SetTrue)
-            .conflicts_with("guest-shutdown-action")
-            .group("vmm-config"),
-        Arg::new("numa")
-            .long("numa")
-            .help(NumaConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("pci-segment")
-            .long("pci-segment")
-            .help(PciSegmentConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("platform")
-            .long("platform")
-            .help(PlatformConfig::syntax())
-            .num_args(1)
-            .group("vm-config"),
-        Arg::new("pmem")
-            .long("pmem")
-            .help(PmemConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        #[cfg(feature = "pvmemcontrol")]
-        Arg::new("pvmemcontrol")
-            .long("pvmemcontrol")
-            .help("Pvmemcontrol device")
-            .num_args(0)
-            .action(ArgAction::SetTrue)
-            .group("vm-config"),
-        Arg::new("pvpanic")
-            .long("pvpanic")
-            .help("Enable pvpanic device")
-            .num_args(0)
-            .action(ArgAction::SetTrue)
-            .group("vm-config"),
-        Arg::new("pylon")
-            .long("pylon")
-            .help(PylonConfig::SYNTAX)
-            .num_args(1)
-            .group("vm-config"),
-        Arg::new("rate-limit-group")
-            .long("rate-limit-group")
-            .help(RateLimiterGroupConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("restore")
-            .long("restore")
-            .help(RestoreConfig::SYNTAX)
-            .num_args(1)
-            .group("vmm-config"),
-        Arg::new("rng")
-            .long("rng")
-            .help(RngConfig::SYNTAX)
-            .default_value(default_rng)
-            .group("vm-config"),
-        Arg::new("rtc")
-            .long("rtc")
-            .help(RtcConfig::SYNTAX)
-            .num_args(0..=1)
-            .default_missing_value("")
-            .group("vm-config"),
-        Arg::new("seccomp")
-            .long("seccomp")
-            .num_args(1)
-            .value_parser(["true", "false", "log", "errno"])
-            .default_value("true"),
-        Arg::new("serial")
-            .long("serial")
-            .help(SerialConfig::SYNTAX)
-            .default_value("null")
-            .group("vm-config"),
-        Arg::new("tpm")
-            .long("tpm")
-            .num_args(1)
-            .help(TpmConfig::SYNTAX)
-            .group("vm-config"),
-        Arg::new("user-device")
-            .long("user-device")
-            .help(UserDeviceConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("v")
-            .short('v')
-            .action(ArgAction::Count)
-            .help("Sets the level of debugging output")
-            .group("logging"),
-        Arg::new("vdpa")
-            .long("vdpa")
-            .help(VdpaConfig::SYNTAX)
-            .num_args(1..)
-            .action(ArgAction::Append)
-            .group("vm-config"),
-        Arg::new("version")
-            .short('V')
-            .long("version")
-            .action(ArgAction::SetTrue)
-            .help("Print version")
-            .num_args(0),
-        Arg::new("vsock")
-            .long("vsock")
-            .help(VsockConfig::SYNTAX)
-            .num_args(1)
-            .group("vm-config"),
-        Arg::new("watchdog")
-            .long("watchdog")
-            .help("Enable virtio-watchdog")
-            .num_args(0)
-            .action(ArgAction::SetTrue)
-            .group("vm-config"),
-    ]
-    .to_vec()
-    .into_boxed_slice()
+        default_value = logger::DEFAULT_FORMAT,
+        group = "logging",
+    )]
+    log_format: String,
+    #[arg(
+        long,
+        help = MemoryConfig::SYNTAX,
+        default_value = default_memory(),
+        group = "vm-config",
+    )]
+    memory: String,
+    #[arg(
+        long,
+        help = MemoryZoneConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    memory_zone: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = NetConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    net: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = "Do not exit Cloud Hypervisor when the guest shuts down \
+                 [deprecated: use --guest-shutdown-action=shutdown-vm]",
+        conflicts_with = "guest_shutdown_action",
+        group = "vmm-config"
+    )]
+    no_shutdown: bool,
+    #[arg(
+        long,
+        help = NumaConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    numa: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = PciSegmentConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    pci_segment: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = PlatformConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    platform: Option<String>,
+    #[arg(
+        long,
+        help = PmemConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    pmem: Option<Vec<String>>,
+    #[cfg(feature = "pvmemcontrol")]
+    #[arg(long, help = "Enable pvmemcontrol device", group = "vm-config")]
+    pvmemcontrol: bool,
+    #[arg(long, help = "Enable pvpanic device", group = "vm-config")]
+    pvpanic: bool,
+    #[arg(
+        long,
+        help = PylonConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    pylon: Option<String>,
+    #[arg(
+        long,
+        help = RateLimiterGroupConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    rate_limit_group: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = RestoreConfig::SYNTAX,
+        group = "vmm-config",
+    )]
+    restore: Option<String>,
+    #[arg(
+        long,
+        help = RngConfig::SYNTAX,
+        default_value = default_rng(),
+        group = "vm-config",
+    )]
+    rng: String,
+    #[arg(
+        long,
+        help = RtcConfig::SYNTAX,
+        num_args = 0..=1,
+        default_missing_value = "",
+        group = "vm-config",
+    )]
+    rtc: Option<String>,
+    #[arg(
+        long,
+        help = "Action on prohibited system calls",
+        default_value = "true",
+        group = "vmm-config"
+    )]
+    seccomp: CliSeccompAction,
+    #[arg(
+        long,
+        help = SerialConfig::SYNTAX,
+        default_value = "null",
+        group = "vm-config",
+    )]
+    serial: String,
+    #[arg(
+        long,
+        help = TpmConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    tpm: Option<String>,
+    #[arg(
+        long,
+        help = UserDeviceConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    user_device: Option<Vec<String>>,
+    #[arg(
+        short = 'v',
+        action = ArgAction::Count,
+        help = "Increase log verbosity: -v for info, -vv for debug, -vvv for trace",
+        group = "logging",
+    )]
+    v: u8,
+    #[arg(
+        long,
+        help = VdpaConfig::SYNTAX,
+        num_args = 1..,
+        group = "vm-config",
+    )]
+    vdpa: Option<Vec<String>>,
+    #[arg(short = 'V', long, help = "Print version")]
+    version: bool,
+    #[arg(
+        long,
+        help = VsockConfig::SYNTAX,
+        group = "vm-config",
+    )]
+    vsock: Option<String>,
+    #[arg(long, help = "Enable virtio-watchdog device", group = "vm-config")]
+    watchdog: bool,
 }
 
-/// Creates the CLI definition of Cloud Hypervisor.
-fn create_app(default_vcpus: String, default_memory: String, default_rng: String) -> Command {
-    let groups = [
-        ArgGroup::new("vm-config")
-            .multiple(true)
-            .requires("vm-payload"),
-        ArgGroup::new("vmm-config").multiple(true),
-        ArgGroup::new("logging").multiple(true),
-        ArgGroup::new("vm-payload").multiple(true),
-    ];
+impl Cli {
+    /// Combines --guest-shutdown-action with the deprecated --no-shutdown.
+    fn guest_shutdown_action(&self) -> GuestShutdownAction {
+        if self.no_shutdown {
+            warn!(
+                "'--no-shutdown' is deprecated: use '--guest-shutdown-action=shutdown-vm' instead"
+            );
+            return GuestShutdownAction::ShutdownVm;
+        }
 
-    let args = get_cli_options_sorted(default_vcpus, default_memory, default_rng);
-
-    Command::new("cloud-hypervisor")
-        // 'BUILD_VERSION' is set by the build script 'build.rs' at
-        // compile time
-        .author(env!("CARGO_PKG_AUTHORS"))
-        .about("Launch a cloud-hypervisor VMM.")
-        .arg_required_else_help(true)
-        .groups(groups)
-        .args(args)
+        self.guest_shutdown_action.into()
+    }
 }
 
-fn parse_api_socket(cmd_arguments: &ArgMatches) -> Result<(Option<String>, Option<RawFd>), Error> {
-    if let Some(socket_config) = cmd_arguments.get_one::<String>("api-socket") {
+impl<'a> From<&'a Cli> for VmParams<'a> {
+    fn from(cli: &'a Cli) -> Self {
+        Self {
+            cpus: &cli.cpus,
+            memory: &cli.memory,
+            memory_zones: cli
+                .memory_zone
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            firmware: cli.firmware.as_deref(),
+            kernel: cli.kernel.as_deref(),
+            initramfs: cli.initramfs.as_deref(),
+            cmdline: cli.cmdline.as_deref(),
+            rate_limit_groups: cli
+                .rate_limit_group
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            disks: cli
+                .disk
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            net: cli
+                .net
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            rng: &cli.rng,
+            balloon: cli.balloon.as_deref(),
+            fs: cli
+                .fs
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            generic_vhost_user: cli
+                .generic_vhost_user
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            pmem: cli
+                .pmem
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            serial: &cli.serial,
+            console: &cli.console,
+            #[cfg(target_arch = "x86_64")]
+            debug_console: &cli.debug_console,
+            devices: cli
+                .device
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            user_devices: cli
+                .user_device
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            vdpa: cli
+                .vdpa
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            vsock: cli.vsock.as_deref(),
+            #[cfg(feature = "pvmemcontrol")]
+            pvmemcontrol: cli.pvmemcontrol,
+            pvpanic: cli.pvpanic,
+            numa: cli
+                .numa
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            watchdog: cli.watchdog,
+            rtc: cli.rtc.as_deref(),
+            #[cfg(feature = "guest_debug")]
+            gdb: cli.gdb.is_some(),
+            pci_segments: cli
+                .pci_segment
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            platform: cli.platform.as_deref(),
+            tpm: cli.tpm.as_deref(),
+            #[cfg(feature = "igvm")]
+            igvm: cli.igvm.as_deref(),
+            #[cfg(feature = "sev_snp")]
+            host_data: cli.host_data.as_deref(),
+            landlock_enable: cli.landlock,
+            landlock_rules: cli
+                .landlock_rules
+                .as_ref()
+                .map(|values| values.iter().map(String::as_str).collect()),
+            #[cfg(feature = "fw_cfg")]
+            fw_cfg_config: cli.fw_cfg_config.as_deref(),
+            #[cfg(feature = "ivshmem")]
+            ivshmem: cli.ivshmem.as_deref(),
+            pylon: cli.pylon.as_deref(),
+        }
+    }
+}
+
+fn parse_api_socket(cmd_arguments: &Cli) -> Result<(Option<String>, Option<RawFd>), Error> {
+    if let Some(socket_config) = cmd_arguments.api_socket.as_ref() {
         let mut parser = OptionParser::new();
         parser.add("path").add("fd");
         parser.parse(socket_config).unwrap_or_default();
@@ -631,9 +753,7 @@ fn parse_api_socket(cmd_arguments: &ArgMatches) -> Result<(Option<String>, Optio
             Ok((Some(path), None))
         } else {
             Ok((
-                cmd_arguments
-                    .get_one::<String>("api-socket")
-                    .map(|s| s.to_string()),
+                cmd_arguments.api_socket.as_ref().map(|s| s.to_string()),
                 None,
             ))
         }
@@ -642,61 +762,20 @@ fn parse_api_socket(cmd_arguments: &ArgMatches) -> Result<(Option<String>, Optio
     }
 }
 
-fn parse_shutdown_action(cmd_arguments: &ArgMatches) -> GuestShutdownAction {
-    if cmd_arguments.get_flag("no-shutdown") {
-        warn!("--no-shutdown is deprecated: use --guest-shutdown-action=shutdown-vm instead");
-        return GuestShutdownAction::ShutdownVm;
-    }
-
-    match cmd_arguments
-        .get_one::<String>("guest-shutdown-action")
-        .unwrap()
-        .as_str()
-    {
-        "exit-vmm" => GuestShutdownAction::ExitVmm,
-        "shutdown-vm" => GuestShutdownAction::ShutdownVm,
-        _ => unreachable!("Clap validates --guest-shutdown-action values"),
-    }
-}
-
-fn parse_reset_action(cmd_arguments: &ArgMatches) -> GuestResetAction {
-    match cmd_arguments
-        .get_one::<String>("guest-reset-action")
-        .unwrap()
-        .as_str()
-    {
-        "reset-vm" => GuestResetAction::ResetVm,
-        "exit-vmm" => GuestResetAction::ExitVmm,
-        "shutdown-vm" => GuestResetAction::ShutdownVm,
-        _ => unreachable!("Clap validates --guest-reset-action values"),
-    }
-}
-
-fn parse_seccomp_action(cmd_arguments: &ArgMatches) -> SeccompAction {
-    match cmd_arguments.get_one::<String>("seccomp").unwrap().as_str() {
-        "true" => SeccompAction::Trap,
-        "false" => SeccompAction::Allow,
-        "log" => SeccompAction::Log,
-        "errno" => SeccompAction::Errno(libc::EPERM as u32),
-        _ => unreachable!("Clap validates --seccomp values"),
-    }
-}
-
 fn start_vmm(
-    cmd_arguments: &ArgMatches,
+    cmd_arguments: &Cli,
     api_socket_path: &Option<String>,
     api_socket_fd: Option<RawFd>,
 ) -> Result<(), Error> {
     #[cfg(feature = "igvm")]
-    let payload_present = cmd_arguments.contains_id("kernel")
-        || cmd_arguments.contains_id("firmware")
-        || cmd_arguments.contains_id("igvm");
+    let payload_present = cmd_arguments.kernel.is_some()
+        || cmd_arguments.firmware.is_some()
+        || cmd_arguments.igvm.is_some();
     #[cfg(not(feature = "igvm"))]
-    let payload_present =
-        cmd_arguments.contains_id("kernel") || cmd_arguments.contains_id("firmware");
+    let payload_present = cmd_arguments.kernel.is_some() || cmd_arguments.firmware.is_some();
 
     let vm_config = if payload_present {
-        let vm_params = VmParams::from_arg_matches(cmd_arguments);
+        let vm_params = VmParams::from(cmd_arguments);
         // SAFETY: The CLI transfers inherited FDs before the VMM opens new FDs.
         Some(unsafe { VmConfig::parse(vm_params) }.map_err(Error::ParsingConfig)?)
     } else {
@@ -704,7 +783,8 @@ fn start_vmm(
     };
     let restore_config = if vm_config.is_none() {
         cmd_arguments
-            .get_one::<String>("restore")
+            .restore
+            .as_ref()
             // SAFETY: The CLI transfers inherited FDs before the VMM opens new FDs.
             .map(|restore| unsafe { RestoreConfig::parse(restore) })
             .transpose()
@@ -717,7 +797,7 @@ fn start_vmm(
         warn!("Error expanding FD table: {e}");
     }
 
-    let log_level = match cmd_arguments.get_count("v") {
+    let log_level = match cmd_arguments.v {
         0 => LevelFilter::Warn,
         1 => LevelFilter::Info,
         2 => LevelFilter::Debug,
@@ -725,21 +805,21 @@ fn start_vmm(
     };
 
     let log_file: Box<dyn io::Write + Send> =
-        if let Some(ref file) = cmd_arguments.get_one::<String>("log-file") {
+        if let Some(ref file) = cmd_arguments.log_file.as_ref() {
             Box::new(File::create(Path::new(file)).map_err(Error::LogFileCreation)?)
         } else {
             Box::new(io::stderr())
         };
 
-    let format = cmd_arguments.get_one::<String>("log-format").unwrap();
+    let format = &cmd_arguments.log_format;
     let logger = Logger::new(log_file, format).map_err(Error::LoggerFormat)?;
     log::set_boxed_logger(Box::new(logger))
         .map(|()| log::set_max_level(log_level))
         .map_err(Error::LoggerSetup)?;
 
-    let shutdown_action = parse_shutdown_action(cmd_arguments);
-    let reset_action = parse_reset_action(cmd_arguments);
-    let seccomp_action = parse_seccomp_action(cmd_arguments);
+    let shutdown_action = cmd_arguments.guest_shutdown_action();
+    let reset_action = GuestResetAction::from(cmd_arguments.guest_reset_action);
+    let seccomp_action = SeccompAction::from(cmd_arguments.seccomp);
 
     let (api_request_sender, api_request_receiver) = channel();
     let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
@@ -780,7 +860,7 @@ fn start_vmm(
         .map_err(Error::CreateSeccompFilter)?;
 
     #[cfg(feature = "guest_debug")]
-    let gdb_socket_path = if let Some(gdb_config) = cmd_arguments.get_one::<String>("gdb") {
+    let gdb_socket_path = if let Some(gdb_config) = cmd_arguments.gdb.as_ref() {
         let mut parser = OptionParser::new();
         parser.add("path");
         parser.parse(gdb_config).map_err(Error::ParsingGdb)?;
@@ -799,11 +879,12 @@ fn start_vmm(
     let vm_debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
 
     let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
-    let landlock_enable = cmd_arguments.get_flag("landlock");
+    let landlock_enable = cmd_arguments.landlock;
 
     #[allow(unused_mut)]
     let mut event_monitor = cmd_arguments
-        .get_one::<String>("event-monitor")
+        .event_monitor
+        .as_ref()
         .as_ref()
         .map(|monitor_config| {
             let mut parser = OptionParser::new();
@@ -840,8 +921,8 @@ fn start_vmm(
 
     #[cfg(feature = "dbus_api")]
     let dbus_options = match (
-        cmd_arguments.get_one::<String>("dbus-service-name"),
-        cmd_arguments.get_one::<String>("dbus-object-path"),
+        cmd_arguments.dbus_service_name.as_ref(),
+        cmd_arguments.dbus_object_path.as_ref(),
     ) {
         (Some(name), Some(path)) => {
             // monitor is either set (file based) or not.
@@ -853,7 +934,7 @@ fn start_vmm(
             let options = DBusApiOptions {
                 service_name: name.to_string(),
                 object_path: path.to_string(),
-                system_bus: cmd_arguments.get_flag("dbus-system-bus"),
+                system_bus: cmd_arguments.dbus_system_bus,
                 event_monitor_rx: monitor.subscribe(),
             };
 
@@ -933,7 +1014,8 @@ fn start_vmm(
     })();
 
     // Apply main thread seccomp filter after CLI parsing and initial VM create/boot
-    // have completed, and before waiting on the VMM thread.
+    // have completed, and before waiting on the VMM thread. Workers are spawned by
+    // then, so they do not inherit main's narrower filter.
     if !main_seccomp_filter.is_empty() {
         seccompiler::apply_filter(&main_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
     }
@@ -1056,13 +1138,11 @@ fn main() {
     // Ensure all created files (.e.g sockets) are only accessible by this user
     // SAFETY: trivially safe
     let _ = unsafe { libc::umask(0o077) };
+    let cmd_arguments = Cli::parse();
 
-    let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-    let cmd_arguments = create_app(default_vcpus, default_memory, default_rng).get_matches();
-
-    if cmd_arguments.get_flag("version") {
+    if cmd_arguments.version {
         println!("{} {}", env!("CARGO_BIN_NAME"), env!("BUILD_VERSION"));
-        if cmd_arguments.get_count("v") != 0 {
+        if cmd_arguments.v != 0 {
             println!("Enabled features: {:?}", vmm::feature_list());
         }
 
@@ -1103,20 +1183,28 @@ mod tests {
     use std::ptr::from_mut;
     use std::thread;
 
+    use clap::{CommandFactory, Parser};
     use vmm::config::VmParams;
     #[cfg(target_arch = "x86_64")]
     use vmm::vm_config::DebugConsoleConfig;
     use vmm::vm_config::{
-        CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
-        CpusConfig, HotplugMethod, MemoryConfig, PayloadConfig, PciDeviceCommonConfig, RngConfig,
-        SerialConfig, VmConfig,
+        ConsoleConfig, ConsoleOutput, CoreScheduling, CpuFeatures, CpusConfig, HotplugMethod,
+        MemoryConfig, PayloadConfig, PciDeviceCommonConfig, RngConfig, SerialConfig, VmConfig,
     };
 
     use crate::test_util::assert_args_sorted;
-    use crate::{
-        GuestResetAction, GuestShutdownAction, SeccompSiginfo, create_app, get_cli_options_sorted,
-        parse_reset_action, parse_shutdown_action, prepare_default_values,
-    };
+    use crate::{Cli, GuestResetAction, GuestShutdownAction, SeccompSiginfo};
+
+    #[test]
+    fn clap_cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_cli_options_sorted() {
+        let command = Cli::command();
+        assert_args_sorted(|| command.get_arguments());
+    }
 
     #[test]
     fn test_reset_action() {
@@ -1145,13 +1233,10 @@ mod tests {
         ] {
             let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
             args.extend(options);
-            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-            let matches = create_app(default_vcpus, default_memory, default_rng)
-                .try_get_matches_from(&args)
-                .unwrap();
+            let matches = Cli::try_parse_from(&args).unwrap();
             assert!(
                 matches!(
-                    (parse_reset_action(&matches), expected),
+                    (GuestResetAction::from(matches.guest_reset_action), expected),
                     (GuestResetAction::ResetVm, GuestResetAction::ResetVm)
                         | (GuestResetAction::ExitVmm, GuestResetAction::ExitVmm)
                         | (GuestResetAction::ShutdownVm, GuestResetAction::ShutdownVm)
@@ -1171,10 +1256,7 @@ mod tests {
         ] {
             let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
             args.extend(options);
-            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-            let error = create_app(default_vcpus, default_memory, default_rng)
-                .try_get_matches_from(&args)
-                .unwrap_err();
+            let error = Cli::try_parse_from(&args).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidValue);
         }
     }
@@ -1190,13 +1272,10 @@ mod tests {
         ] {
             let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
             args.extend(options);
-            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-            let matches = create_app(default_vcpus, default_memory, default_rng)
-                .try_get_matches_from(&args)
-                .unwrap();
+            let matches = Cli::try_parse_from(&args).unwrap();
             assert_eq!(
                 matches!(
-                    parse_shutdown_action(&matches),
+                    matches.guest_shutdown_action(),
                     GuestShutdownAction::ShutdownVm
                 ),
                 shutdown,
@@ -1226,10 +1305,7 @@ mod tests {
         ] {
             let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
             args.extend(options);
-            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-            let error = create_app(default_vcpus, default_memory, default_rng)
-                .try_get_matches_from(&args)
-                .unwrap_err();
+            let error = Cli::try_parse_from(&args).unwrap_err();
             assert_eq!(error.kind(), expected_error, "args: {args:?}");
         }
     }
@@ -1264,18 +1340,15 @@ mod tests {
     fn test_landlock_without_payload() {
         // A VMM that receives its VM config later through vm.create can
         // still confine its own threads.
-        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-        let cmd_arguments = create_app(default_vcpus, default_memory, default_rng)
-            .try_get_matches_from(["cloud-hypervisor", "--api-socket", "/tmp/api", "--landlock"])
-            .unwrap();
-        assert!(cmd_arguments.get_flag("landlock"));
+        let cmd_arguments =
+            Cli::try_parse_from(["cloud-hypervisor", "--api-socket", "/tmp/api", "--landlock"])
+                .unwrap();
+        assert!(cmd_arguments.landlock);
     }
 
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
-        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-        let cmd_arguments =
-            create_app(default_vcpus, default_memory, default_rng).get_matches_from(args);
-        let vm_params = VmParams::from_arg_matches(&cmd_arguments);
+        let cmd_arguments = Cli::parse_from(args);
+        let vm_params = VmParams::from(&cmd_arguments);
 
         // SAFETY: These CLI test cases supply no inherited descriptors.
         unsafe { VmConfig::parse(vm_params) }.unwrap()
@@ -1337,6 +1410,8 @@ mod tests {
                 max_vcpus: 1,
                 topology: None,
                 kvm_hyperv: false,
+                #[cfg(target_arch = "x86_64")]
+                kvm_hint_realtime: false,
                 max_phys_bits: 46,
                 affinity: None,
                 features: CpuFeatures::default(),
@@ -1384,20 +1459,10 @@ mod tests {
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                    tcp: None,
-                },
+                output: ConsoleOutput::Null,
             },
             console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    socket: None,
-                    tcp: None,
-                },
+                output: ConsoleOutput::Tty,
                 pci_common: PciDeviceCommonConfig::default(),
             },
             #[cfg(target_arch = "x86_64")]
@@ -1544,21 +1609,6 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_vm_config_kernel() {
-        [(
-            vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
-            r#"{
-                "payload": {"kernel": "/path/to/kernel"}
-            }"#,
-            true,
-        )]
-        .iter()
-        .for_each(|(cli, openapi, equal)| {
-            compare_vm_config_cli_vs_json(cli, openapi, *equal);
-        });
-    }
-
-    #[test]
     fn test_valid_vm_config_cmdline() {
         [(
             vec![
@@ -1616,25 +1666,6 @@ mod tests {
                     ]
                 }"#,
                 false,
-            ),
-            (
-                vec![
-                    "cloud-hypervisor",
-                    "--kernel",
-                    "/path/to/kernel",
-                    "--memory",
-                    "shared=true",
-                    "--disk",
-                    "vhost_user=true,socket=/tmp/sock1",
-                ],
-                r#"{
-                    "payload": {"kernel": "/path/to/kernel"},
-                    "memory" : { "shared": true, "size": 536870912 },
-                    "disks": [
-                        {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
-                    ]
-                }"#,
-                true,
             ),
             (
                 vec![
@@ -2326,16 +2357,5 @@ mod tests {
         .for_each(|(cli, openapi, equal)| {
             compare_vm_config_cli_vs_json(cli, openapi, *equal);
         });
-    }
-
-    // TODO the check for the option list being sorted could be moved into the
-    // getter itself, when the getter becomes a const function. This however
-    // needs more support by Rust (as of March 2025).
-    #[test]
-    fn test_cli_options_sorted() {
-        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-        let args = get_cli_options_sorted(default_vcpus, default_memory, default_rng);
-
-        assert_args_sorted(|| args.iter());
     }
 }

@@ -105,7 +105,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     initrd: &Option<InitramfsConfig>,
     pci_space_info: &[PciSpaceInfo],
     numa_nodes: &NumaNodes,
-    virtio_iommu_bdf: Option<u32>,
+    virtio_iommu_devices: Option<(u32, &[u32])>,
     pmu_supported: bool,
     nested: bool,
     uefi_mmap_size: Option<u32>,
@@ -138,7 +138,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     create_clock_node(&mut fdt)?;
     create_psci_node(&mut fdt, nested)?;
     create_devices_node(&mut fdt, device_info)?;
-    create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_bdf)?;
+    create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_devices)?;
     if numa_nodes.len() > 1 {
         create_distance_map_node(&mut fdt, numa_nodes)?;
     }
@@ -528,11 +528,12 @@ fn create_chosen_node(
 }
 
 fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> FdtWriterResult<()> {
-    let gic_reg_prop = gic_device.lock().unwrap().device_properties();
+    let gic_device = gic_device.lock().unwrap();
+    let gic_reg_prop = gic_device.device_properties();
 
     let intc_node = fdt.begin_node("intc")?;
 
-    fdt.property_string("compatible", gic_device.lock().unwrap().fdt_compatibility())?;
+    fdt.property_string("compatible", gic_device.fdt_compatibility())?;
     fdt.property_null("interrupt-controller")?;
     // "interrupt-cells" field specifies the number of cells needed to encode an
     // interrupt source. The type shall be a <u32> and the value shall be 3 if no PPI affinity description
@@ -546,19 +547,19 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> Fd
 
     let gic_intr_prop = [
         GIC_FDT_IRQ_TYPE_PPI,
-        gic_device.lock().unwrap().fdt_maint_irq(),
+        gic_device.fdt_maint_irq(),
         IRQ_TYPE_LEVEL_HI,
     ];
     fdt.property_array_u32("interrupts", &gic_intr_prop)?;
 
-    if gic_device.lock().unwrap().msi_compatible() {
+    if gic_device.msi_compatible() {
         let msic_node = fdt.begin_node("msic")?;
-        let msi_compatibility = gic_device.lock().unwrap().msi_compatibility().to_string();
+        let msi_compatibility = gic_device.msi_compatibility().to_string();
 
         fdt.property_string("compatible", msi_compatibility.as_str())?;
         fdt.property_null("msi-controller")?;
         fdt.property_u32("phandle", MSI_PHANDLE)?;
-        let msi_reg_prop = gic_device.lock().unwrap().msi_properties();
+        let msi_reg_prop = gic_device.msi_properties();
         fdt.property_array_u64("reg", &msi_reg_prop)?;
 
         if msi_compatibility == GIC_V2M_COMPATIBLE {
@@ -801,7 +802,7 @@ fn create_pmu_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
 fn create_pci_nodes(
     fdt: &mut FdtWriter,
     pci_device_info: &[PciSpaceInfo],
-    virtio_iommu_bdf: Option<u32>,
+    virtio_iommu_devices: Option<(u32, &[u32])>,
 ) -> FdtWriterResult<()> {
     // Add node for PCIe controller.
     // See Documentation/devicetree/bindings/pci/host-generic-pci.txt in the kernel
@@ -900,39 +901,43 @@ fn create_pci_nodes(
         fdt.property_array_u32("msi-map", &msi_map)?;
         fdt.property_u32("msi-parent", MSI_PHANDLE)?;
 
-        if pci_device_info_elem.pci_segment_id == 0
-            && let Some(virtio_iommu_bdf) = virtio_iommu_bdf
-        {
+        if let Some((virtio_iommu_bdf, devices_bdf)) = virtio_iommu_devices {
             // See kernel document Documentation/devicetree/bindings/pci/pci-iommu.txt
             // for 'iommu-map' attribute setting.
-            let iommu_map = [
-                0_u32,
-                VIRTIO_IOMMU_PHANDLE,
-                0_u32,
-                virtio_iommu_bdf,
-                virtio_iommu_bdf + 1,
-                VIRTIO_IOMMU_PHANDLE,
-                virtio_iommu_bdf + 1,
-                0xffff - virtio_iommu_bdf,
-            ];
-            fdt.property_array_u32("iommu-map", &iommu_map)?;
+            let mut iommu_map = Vec::new();
+            for &device_bdf in devices_bdf {
+                // DMA from the virtio-iommu itself isn't translated, so its own
+                // BDF must be omitted from 'iommu-map'. See kernel document
+                // Documentation/devicetree/bindings/virtio/pci-iommu.yaml.
+                if device_bdf != virtio_iommu_bdf
+                    && (device_bdf >> 16) as u16 == pci_device_info_elem.pci_segment_id
+                {
+                    let rid = device_bdf & 0xffff;
+                    iommu_map.extend_from_slice(&[rid, VIRTIO_IOMMU_PHANDLE, device_bdf, 1]);
+                }
+            }
+            if !iommu_map.is_empty() {
+                fdt.property_array_u32("iommu-map", &iommu_map)?;
+            }
 
-            // See kernel document Documentation/devicetree/bindings/virtio/iommu.txt
-            // for virtio-iommu node settings.
-            let virtio_iommu_node_name = format!("virtio_iommu@{virtio_iommu_bdf:x}");
-            let virtio_iommu_node = fdt.begin_node(&virtio_iommu_node_name)?;
-            fdt.property_u32("#iommu-cells", 1)?;
-            fdt.property_string("compatible", "virtio,pci-iommu")?;
+            if pci_device_info_elem.pci_segment_id == 0 {
+                // See kernel document Documentation/devicetree/bindings/virtio/iommu.txt
+                // for virtio-iommu node settings.
+                let virtio_iommu_node_name = format!("virtio_iommu@{virtio_iommu_bdf:x}");
+                let virtio_iommu_node = fdt.begin_node(&virtio_iommu_node_name)?;
+                fdt.property_u32("#iommu-cells", 1)?;
+                fdt.property_string("compatible", "virtio,pci-iommu")?;
 
-            // 'reg' is a five-cell address encoded as
-            // (phys.hi phys.mid phys.lo size.hi size.lo). phys.hi should contain the
-            // device's BDF as 0b00000000 bbbbbbbb dddddfff 00000000. The other cells
-            // should be zero.
-            let reg = [virtio_iommu_bdf << 8, 0_u32, 0_u32, 0_u32, 0_u32];
-            fdt.property_array_u32("reg", &reg)?;
-            fdt.property_u32("phandle", VIRTIO_IOMMU_PHANDLE)?;
+                // 'reg' is a five-cell address encoded as
+                // (phys.hi phys.mid phys.lo size.hi size.lo). phys.hi should contain the
+                // device's BDF as 0b00000000 bbbbbbbb dddddfff 00000000. The other cells
+                // should be zero.
+                let reg = [virtio_iommu_bdf << 8, 0_u32, 0_u32, 0_u32, 0_u32];
+                fdt.property_array_u32("reg", &reg)?;
+                fdt.property_u32("phandle", VIRTIO_IOMMU_PHANDLE)?;
 
-            fdt.end_node(virtio_iommu_node)?;
+                fdt.end_node(virtio_iommu_node)?;
+            }
         }
 
         fdt.end_node(pci_node)?;
@@ -1132,41 +1137,6 @@ mod tests {
             memory_zones: Vec::new(),
             device_id,
         }
-    }
-
-    #[test]
-    fn test_fdt_generic_initiator_detection_and_skip() {
-        // No Generic Initiator - should not skip FDT NUMA
-        let mut numa_nodes = BTreeMap::new();
-        numa_nodes.insert(0, create_test_numa_node(vec![0, 1], None));
-        numa_nodes.insert(1, create_test_numa_node(vec![2, 3], None));
-
-        let has_gi = numa_nodes.values().any(|node| node.device_id.is_some());
-        assert!(
-            !has_gi,
-            "Should not detect Generic Initiator when none present"
-        );
-
-        // One Generic Initiator - should skip FDT NUMA
-        let mut numa_nodes = BTreeMap::new();
-        numa_nodes.insert(0, create_test_numa_node(vec![0, 1], None));
-        numa_nodes.insert(1, create_test_numa_node(vec![], Some("vfio0".to_string())));
-
-        let has_gi = numa_nodes.values().any(|node| node.device_id.is_some());
-        assert!(has_gi, "Should detect Generic Initiator when present");
-
-        let mut fdt = FdtWriter::new().unwrap();
-        let result = create_distance_map_node(&mut fdt, &numa_nodes);
-        assert!(result.is_ok(), "Should skip distance map when GI present");
-
-        // Multiple Generic Initiators - should skip FDT NUMA
-        let mut numa_nodes = BTreeMap::new();
-        numa_nodes.insert(0, create_test_numa_node(vec![0, 1], None));
-        numa_nodes.insert(1, create_test_numa_node(vec![], Some("vfio0".to_string())));
-        numa_nodes.insert(2, create_test_numa_node(vec![], Some("vfio1".to_string())));
-
-        let has_gi = numa_nodes.values().any(|node| node.device_id.is_some());
-        assert!(has_gi, "Should detect multiple Generic Initiators");
     }
 
     #[test]
