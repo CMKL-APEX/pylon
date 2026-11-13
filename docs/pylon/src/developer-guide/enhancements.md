@@ -192,7 +192,9 @@ rejects such a VM (spec 08 §2). How it works:
   owns none, it runs on the shared vCPU queue.
 - **`pylond`.** It reads the woken bits each sweep. A vCPU woken for
   longer than 4 ms (`WOKEN_DEMAND_US`) counts as demand for a core,
-  and a VM with no core gets a zero-core wakeup then. A core given to a
+  and a VM with no core gets a zero-core wakeup then. A shorter wake, in
+  a VM that owns a core, takes only a spare core: an idle one, or one
+  held by a VM that wants none. A core given to a
   woken vCPU stays wanted until the guest agent reports again, or for
   50 ms (`WOKEN_GRANT_HOLD_US`). Woken time is metered per VM
   (`woken_shared_usec`, `woken_unowned_usec`).
@@ -235,8 +237,9 @@ These are from spec 06 §10:
   ([#65](https://github.com/CMKL-APEX/pylon/issues/65)).
 - **Q5.** How a VMM reconnects after `pylond` restarts
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
-- **Q6.** Whether 50 µs is the right last-resort bound, or whether it
-  should be per-VM policy
+- **Q6.** *Answered:* the last-resort bound is a host-wide `pylond`
+  option, `--force-handoff-us` (default 50 µs), not per-VM policy: one
+  VM's value would delay another's handoff
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
 
 ## Other planned work

@@ -140,6 +140,9 @@ pub enum Error {
     #[error("Error checking --pylon")]
     Pylon(#[source] pylon::Error),
 
+    #[error("VMs with --pylon can't change their vCPU count")]
+    PylonResize,
+
     #[error("Error spawning vCPU thread")]
     VcpuSpawn(#[source] io::Error),
 
@@ -1792,6 +1795,12 @@ impl CpuManager {
 
         if !self.dynamic {
             return Ok(false);
+        }
+
+        // `pylond` registered the VM's vCPUs once, at boot, and doesn't learn of a hot-plugged
+        // vCPU's thread or wake a removed one (spec 06 §7).
+        if pylon::global_state().is_some() {
+            return Err(Error::PylonResize);
         }
 
         if desired_vcpus < 1 {
