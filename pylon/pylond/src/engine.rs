@@ -55,6 +55,13 @@ pub const REVOKE_RESIGNAL_US: u64 = 10;
 /// guest entry costs about as long as `REVOKE_RESIGNAL_US`.
 pub const REVOKE_RESIGNAL_MAX_US: u64 = 1000;
 
+/// Interval at which `pylond` first re-signals an assigned vCPU of a VM that parks inside KVM
+/// and hasn't woken yet. The re-signal only covers a signal that landed just before the vCPU
+/// thread re-entered `KVM_RUN`; the VMM takes tens of microseconds to wake a vCPU, and a signal
+/// meanwhile only interrupts it (spec 06 S6, #53). The interval doubles with each signal, up to
+/// `REVOKE_RESIGNAL_MAX_US`.
+pub const WAKE_RESIGNAL_US: u64 = 100;
+
 /// How long a parked vCPU that KVM woke may stay runnable, sharing its VM's cores, before it
 /// counts as demand for a core of its own (`spec/08-park-in-kvm.md` §4.2).
 pub const WOKEN_DEMAND_US: u64 = 4_000;
@@ -317,6 +324,14 @@ pub struct MatrixEngine {
     /// TSC at which an assigned vCPU of a VM that parks inside KVM was last signalled to wake
     /// (0 if not, or once it left `PARKED`).
     wake_signalled_tsc: [u64; MAX_PCPUS],
+    /// TSC at which that vCPU was first signalled to wake (0 if not yet).
+    wake_first_signal_tsc: [u64; MAX_PCPUS],
+    /// TSC at which a core was assigned, until its vCPU is seen running (0 then, or if the
+    /// core left `Assigned` first). For the wake and handoff latencies (spec 06 S6).
+    wake_pending_tsc: [u64; MAX_PCPUS],
+    /// TSC of the revocation request that handed the core over, while `wake_pending_tsc` is
+    /// set (0 if the core was idle).
+    handoff_requested_tsc: [u64; MAX_PCPUS],
     /// When the vCPU a core is assigned or being handed to was picked while woken (0 if it
     /// wasn't), and the guest's `guest_heartbeat` then. The core stays wanted until the agent
     /// reports again or `WOKEN_GRANT_HOLD_US` passes (`spec/08-park-in-kvm.md` §4.2). Read only
@@ -331,6 +346,11 @@ pub struct MatrixEngine {
     host_tsc_khz: u64,
     has_timed_wait: bool,
     engine_cpu: usize,
+    /// How long a donor has to park before it is signalled (`REVOKE_GRACE_PERIOD_US` unless set).
+    revoke_grace_us: u64,
+    /// How long after the first signal the core is handed over anyway (`FORCE_HANDOFF_US`
+    /// unless set).
+    force_handoff_us: u64,
     /// SMT sibling ring: the next CPU on the same core, or the CPU itself.
     smt_next: [u16; MAX_PCPUS],
     /// Per-VM parked vCPU bitmasks shared with `scx_pylon` (`spec/08-park-in-kvm.md` §4.3).
@@ -373,6 +393,9 @@ impl MatrixEngine {
             revoke_first_signal_tsc: [0; MAX_PCPUS],
             revoke_yield_count: [0; MAX_PCPUS],
             wake_signalled_tsc: [0; MAX_PCPUS],
+            wake_first_signal_tsc: [0; MAX_PCPUS],
+            wake_pending_tsc: [0; MAX_PCPUS],
+            handoff_requested_tsc: [0; MAX_PCPUS],
             woken_grant_tsc: [0; MAX_PCPUS],
             woken_grant_heartbeat: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
@@ -384,6 +407,8 @@ impl MatrixEngine {
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
+            revoke_grace_us: REVOKE_GRACE_PERIOD_US,
+            force_handoff_us: FORCE_HANDOFF_US,
             smt_next: from_fn(|pcpu| pcpu as u16),
         }
     }
@@ -458,6 +483,14 @@ impl MatrixEngine {
     /// Sets the host CPU the polling loop pins itself to in [`Self::run`].
     pub fn set_engine_cpu(&mut self, cpu: usize) {
         self.engine_cpu = cpu;
+    }
+
+    /// Sets how long a donor has to park after a revocation request before it is signalled
+    /// (`grace_us`), and how long after the first signal its core is handed over anyway
+    /// (`force_handoff_us`).
+    pub fn set_revocation_timing(&mut self, grace_us: u64, force_handoff_us: u64) {
+        self.revoke_grace_us = grace_us;
+        self.force_handoff_us = force_handoff_us;
     }
 
     /// Pins the calling thread to the engine CPU and runs the real-time polling loop until `stop`
@@ -562,9 +595,21 @@ impl MatrixEngine {
     /// at most `REVOKE_RESIGNAL_MAX_US`, so it doubles with each signal.
     #[inline]
     fn resignal_due(first_tsc: u64, last_tsc: u64, now_tsc: u64, tsc_khz: u64) -> bool {
+        Self::resignal_due_from(REVOKE_RESIGNAL_US, first_tsc, last_tsc, now_tsc, tsc_khz)
+    }
+
+    /// Whether a signal is due again, `min_us` after the first one and then at an interval that
+    /// doubles, up to `REVOKE_RESIGNAL_MAX_US`.
+    fn resignal_due_from(
+        min_us: u64,
+        first_tsc: u64,
+        last_tsc: u64,
+        now_tsc: u64,
+        tsc_khz: u64,
+    ) -> bool {
         let interval = last_tsc.saturating_sub(first_tsc).clamp(
-            Self::us_to_cycles(REVOKE_RESIGNAL_US, tsc_khz),
-            Self::us_to_cycles(REVOKE_RESIGNAL_MAX_US, tsc_khz),
+            Self::us_to_cycles(min_us, tsc_khz),
+            Self::us_to_cycles(REVOKE_RESIGNAL_MAX_US.max(min_us), tsc_khz),
         );
         now_tsc >= last_tsc.saturating_add(interval)
     }
@@ -594,8 +639,10 @@ impl MatrixEngine {
         // A vCPU parked inside KVM only sees the wake `eventfd` after an exit
         // (`spec/08-park-in-kvm.md` §3.3).
         self.wake_signalled_tsc[pcpu] = 0;
+        self.wake_first_signal_tsc[pcpu] = 0;
         if vm.wake_by_signal() && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
             self.wake_signalled_tsc[pcpu] = now_tsc;
+            self.wake_first_signal_tsc[pcpu] = now_tsc;
         }
 
         self.core_states[pcpu] = CoreState::Assigned {
@@ -603,9 +650,52 @@ impl MatrixEngine {
             vcpu,
         };
         self.core_last_metered_tsc[pcpu] = now_tsc;
+        self.wake_pending_tsc[pcpu] = now_tsc;
+        self.handoff_requested_tsc[pcpu] = self.revoke_requested_tsc[pcpu];
         self.revoke_requested_tsc[pcpu] = 0;
         self.revoke_signalled_tsc[pcpu] = 0;
         self.revoke_first_signal_tsc[pcpu] = 0;
+    }
+
+    /// Records, the first sweep an assigned vCPU is seen running, the time since its core was
+    /// assigned and, after a revocation, since the revocation was requested
+    /// (`spec/06-guest-kick-path.md` §8 S6). The VMM writes `RUNNING` once the vCPU thread has
+    /// taken the assignment; a `PARKED` vCPU with a higher `yield_count` ran and parked again.
+    /// Each value is late by at most one sweep.
+    fn record_wake_latencies(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
+        let tsc_khz = self.host_tsc_khz;
+        let mut pcpu = 0usize;
+        while pcpu < MAX_PCPUS {
+            let assigned_tsc = self.wake_pending_tsc[pcpu];
+            if assigned_tsc != 0 {
+                let mut done = true;
+                if let CoreState::Assigned { vm_id, vcpu } = self.core_states[pcpu]
+                    && let Some(vm) = Self::find_vm(vms, vm_count, vm_id)
+                {
+                    let slot = &vm.host_page().vcpus[vcpu as usize];
+                    let running = slot.state.load(Ordering::Acquire) != VCPU_STATE_PARKED
+                        || slot.yield_count.load(Ordering::Acquire)
+                            != self.assigned_yield_count[pcpu];
+                    if running {
+                        let to_us = |since: u64| {
+                            now_tsc.saturating_sub(since).saturating_mul(1000) / tsc_khz
+                        };
+                        vm.record_wake_latency_us(to_us(assigned_tsc));
+                        let requested_tsc = self.handoff_requested_tsc[pcpu];
+                        if requested_tsc != 0 {
+                            vm.record_handoff_latency_us(to_us(requested_tsc));
+                        }
+                    } else {
+                        done = false;
+                    }
+                }
+                if done {
+                    self.wake_pending_tsc[pcpu] = 0;
+                    self.handoff_requested_tsc[pcpu] = 0;
+                }
+            }
+            pcpu += 1;
+        }
     }
 
     /// Executes one full 3-phase arbitration sweep at timestamp `now_tsc`.
@@ -632,6 +722,7 @@ impl MatrixEngine {
         self.progress_revocations_phase2(vms, vm_count, now_tsc);
         self.signal_orphaned_donors(vms, vm_count, now_tsc);
         self.signal_unwoken_recipients(vms, vm_count, now_tsc);
+        self.record_wake_latencies(vms, vm_count, now_tsc);
 
         // =====================================================================
         // Phase 3: Match Hungry VMs with Idle or Donor Cores
@@ -876,7 +967,7 @@ impl MatrixEngine {
                     } else if first_signal_tsc != 0
                         && now_tsc
                             >= first_signal_tsc
-                                .saturating_add(Self::us_to_cycles(FORCE_HANDOFF_US, tsc_khz))
+                                .saturating_add(Self::us_to_cycles(self.force_handoff_us, tsc_khz))
                     {
                         // The donor still hasn't parked; give the core away regardless and let
                         // `scx_pylon` preempt the donor thread. It parks at its next exit.
@@ -952,7 +1043,9 @@ impl MatrixEngine {
 
     /// Keeps signalling assigned vCPUs of VMs that park inside KVM while they are still
     /// `PARKED` since the assignment. A signal that lands just before the vCPU thread re-enters
-    /// `KVM_RUN` interrupts nothing, and the thread would sleep in KVM with a core assigned.
+    /// `KVM_RUN` interrupts nothing, and the thread would sleep in KVM with a core assigned. The
+    /// signals back off from `WAKE_RESIGNAL_US`: one that lands while the VMM is still waking the
+    /// vCPU only interrupts it.
     fn signal_unwoken_recipients(&mut self, vms: &[VmHandle], vm_count: usize, now_tsc: u64) {
         let mut pcpu = 0usize;
         while pcpu < MAX_PCPUS {
@@ -966,19 +1059,25 @@ impl MatrixEngine {
                 unwoken = slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
                     && slot.yield_count.load(Ordering::Acquire) == self.assigned_yield_count[pcpu];
                 let last = self.wake_signalled_tsc[pcpu];
-                if unwoken
-                    && now_tsc
-                        >= last.saturating_add(Self::us_to_cycles(
-                            REVOKE_RESIGNAL_US,
-                            self.host_tsc_khz,
-                        ))
-                    && vm.signal_vcpu(vcpu as usize).unwrap_or(false)
-                {
+                let first = self.wake_first_signal_tsc[pcpu];
+                let due = last == 0
+                    || Self::resignal_due_from(
+                        WAKE_RESIGNAL_US,
+                        first,
+                        last,
+                        now_tsc,
+                        self.host_tsc_khz,
+                    );
+                if unwoken && due && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
+                    if last == 0 {
+                        self.wake_first_signal_tsc[pcpu] = now_tsc;
+                    }
                     self.wake_signalled_tsc[pcpu] = now_tsc;
                 }
             }
             if !unwoken {
                 self.wake_signalled_tsc[pcpu] = 0;
+                self.wake_first_signal_tsc[pcpu] = 0;
             }
             pcpu += 1;
         }
@@ -1174,10 +1273,8 @@ impl MatrixEngine {
 
                 let donor_eval = self.eval_buf[donor_eval_idx];
                 let donor_vm = &vms[donor_eval.vm_idx];
-                let deadline_tsc = now_tsc.saturating_add(Self::us_to_cycles(
-                    REVOKE_GRACE_PERIOD_US,
-                    self.host_tsc_khz,
-                ));
+                let deadline_tsc = now_tsc
+                    .saturating_add(Self::us_to_cycles(self.revoke_grace_us, self.host_tsc_khz));
 
                 self.revoke_yield_count[donor_pcpu] = donor_vm.host_page().vcpus
                     [donor_vcpu as usize]
@@ -1505,6 +1602,29 @@ mod tests {
             ]
         );
         assert!(intervals[8..].iter().all(|&i| i == 3_000_000));
+    }
+
+    #[test]
+    fn wake_resignal_starts_at_its_own_floor() {
+        // At 3 GHz: 100 us is 300,000 cycles, 1 ms 3,000,000.
+        const KHZ: u64 = 3_000_000;
+        let due = |first, last, now| {
+            MatrixEngine::resignal_due_from(WAKE_RESIGNAL_US, first, last, now, KHZ)
+        };
+        let mut last = 1_000;
+        let mut sent = vec![last];
+        for now in (1_000..20_000_000).step_by(1_000) {
+            if due(1_000, last, now) {
+                last = now;
+                sent.push(now);
+            }
+        }
+        let intervals: Vec<u64> = sent.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(
+            intervals[..5],
+            [300_000, 300_000, 600_000, 1_200_000, 2_400_000]
+        );
+        assert!(intervals[5..].iter().all(|&i| i == 3_000_000));
     }
 
     #[test]

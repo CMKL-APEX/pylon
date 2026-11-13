@@ -50,8 +50,13 @@ But:
   `pylond`'s 8 µs grace period, so revocations end in a forced park.
   A longer grace makes them cooperative but gains no throughput, so the
   guest's yield has to get faster ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
-  The end-to-end latency hasn't been measured properly ([#53](https://github.com/CMKL-APEX/pylon/issues/53)), and the
-  138 µs scale-out seen in `pylon-bench` isn't explained ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
+- **Handoffs take about 100–125 µs.** On bare metal, from a revocation
+  request to the recipient vCPU running takes 100–126 µs at the median
+  ([#53](https://github.com/CMKL-APEX/pylon/issues/53); see
+  [Performance and benchmarks](developer-guide/benchmarks.md#handoff-latency-between-real-vms-measured-2026-11-13)),
+  against a 3–6 µs target. Most of it is the VMM's 40–60 µs to park or
+  wake a vCPU after a signal, which isn't explained yet
+  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
 - **No module, no cooperation.** A guest without `pv-pylon` never
   cooperates: every revocation ends in a forced park.
 

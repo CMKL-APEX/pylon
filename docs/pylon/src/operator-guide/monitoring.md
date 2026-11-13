@@ -106,6 +106,7 @@ Useful queries:
 | Cores each VM uses now | `pylon_vm_allocated_cores` |
 | Average cores per VM over 5 minutes | `rate(pylon_vm_core_microseconds_total[5m]) / 1e6` |
 | p99 revocation-to-park latency per VM | `histogram_quantile(0.99, sum by (vm_id, le) (rate(pylon_vm_park_latency_microseconds_bucket[5m])))` |
+| p99 time from a revocation to the recipient running | `histogram_quantile(0.99, sum by (vm_id, le) (rate(pylon_vm_handoff_latency_microseconds_bucket[5m])))` |
 | Cores handed over without a park | `increase(pylon_vm_handoffs_without_park_total[1h])` |
 | Woken parked vCPUs per VM, by whether it owned a core | `rate(pylon_vm_woken_vcpu_microseconds_total[5m]) / 1e6` |
 | Share of revocations that were forced | `rate(pylon_vm_forced_preemptions_total[5m]) / (rate(pylon_vm_forced_preemptions_total[5m]) + rate(pylon_vm_cooperative_yields_total[5m]))` |

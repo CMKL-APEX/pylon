@@ -17,7 +17,10 @@ use clap::Parser;
 use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
-use pylond::engine::{DEFAULT_ENGINE_CPU, MatrixEngine, calibrate_tsc_khz, default_counter_khz};
+use pylond::engine::{
+    DEFAULT_ENGINE_CPU, FORCE_HANDOFF_US, MatrixEngine, REVOKE_GRACE_PERIOD_US, calibrate_tsc_khz,
+    default_counter_khz,
+};
 use pylond::{
     BLOCKED_WRITE_LIMIT, DEFAULT_SOCKET_PATH, MAX_PCPUS, PcpuOwnerTable, VmSnapshot, VmVcpusTable,
     WriteWatch,
@@ -46,6 +49,16 @@ struct CliArgs {
     /// of the tenant CPUs in `--cores`; on a host with big and little cores, pick a big one.
     #[arg(long, default_value_t = DEFAULT_ENGINE_CPU)]
     engine_cpu: usize,
+
+    /// How long, in microseconds, a donor vCPU has to park after a revocation request before
+    /// `pylond` signals it to park by force.
+    #[arg(long, default_value_t = REVOKE_GRACE_PERIOD_US, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    revoke_grace_us: u64,
+
+    /// How long, in microseconds, after it first signals a donor that hasn't parked `pylond`
+    /// hands its core over anyway.
+    #[arg(long, default_value_t = FORCE_HANDOFF_US, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    force_handoff_us: u64,
 
     /// Optional path to a memory-mapped `pylon_pcpu_owners` backing file.
     #[arg(long)]
@@ -351,6 +364,7 @@ fn main() -> Result<()> {
     let engine_owners = Arc::clone(&pcpu_owners);
     let engine_stop = Arc::clone(&stop_flag);
     let engine_cpu = args.engine_cpu;
+    let (revoke_grace_us, force_handoff_us) = (args.revoke_grace_us, args.force_handoff_us);
     let engine_thread = thread::Builder::new()
         .name("pylond-engine".to_owned())
         .spawn(move || {
@@ -358,6 +372,7 @@ fn main() -> Result<()> {
                 .with_vm_vcpus(vm_vcpus)
                 .with_write_watch(write_watch);
             engine.set_engine_cpu(engine_cpu);
+            engine.set_revocation_timing(revoke_grace_us, force_handoff_us);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);
             }
