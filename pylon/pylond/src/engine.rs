@@ -588,6 +588,9 @@ impl MatrixEngine {
     fn is_unassigned_parked(slot: &PylonHostVcpuSlot) -> bool {
         slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
             && slot.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
+            // A vCPU whose thread hasn't started has no thread to run on a core: one past
+            // `boot_vcpus` that was never hot-plugged (spec 06 §7).
+            && slot.host_tid.load(Ordering::Acquire) != 0
     }
 
     /// Whether to re-send a kick signal first sent (or due) at `first_tsc` and last sent at
