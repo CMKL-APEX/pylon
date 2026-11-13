@@ -52,7 +52,9 @@ At start, `pylond` removes any file already at that path and creates
 the socket. `--socket-group` (a group name or GID) and `--socket-mode`
 (octal, such as `660`) set its group and permissions; without them it
 keeps `pylond`'s umask and group, which as root means only root can
-connect.
+connect. The socket appears at the path only once `pylond` accepts
+connections and has its group and mode: `pylond` creates it as
+`<path>.tmp` and renames it.
 
 `pylond` records the UID of the process that registers each VM. A
 VM's policy can be changed, and its stats read, only by that UID, by
