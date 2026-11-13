@@ -1370,11 +1370,13 @@ pub fn shutdown_all() {
 mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixListener;
+    #[cfg(feature = "kvm")]
     use std::sync::atomic::AtomicU32;
     use std::thread;
 
     use pylon_abi::VCPU_STATE_WAKING;
     use tempfile::TempDir;
+    #[cfg(feature = "kvm")]
     use vm_memory::{Address, GuestMemoryRegion};
     use vmm_sys_util::signal::register_signal_handler;
 
@@ -1394,6 +1396,7 @@ mod tests {
     }
 
     /// A memory slot allocator whose first slot is 1, after the test guest's code at slot 0.
+    #[cfg(feature = "kvm")]
     fn test_memory_slots() -> Arc<MemorySlotAllocator> {
         Arc::new(MemorySlotAllocator::new(
             Arc::new(AtomicU32::new(1)),
