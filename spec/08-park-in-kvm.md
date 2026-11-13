@@ -235,6 +235,14 @@ assigned. It records when each bit was set, by VM slot and vCPU.
   tick, so a vCPU that wakes for an IPI or a timer and halts again stays
   shared. The longest wake sets the
   VM's urgency, as `head_wait_tsc` does, weighted by its priority.
+- **Short wakes take spare cores (#52).** A vCPU that IPIs wake often
+  and briefly never reaches `WOKEN_DEMAND_US`, so with its guest's demand
+  low, its VM could run two such vCPUs on one core for a whole run while
+  other cores idled (§7.6). A VM that owns a core also wants one more
+  core per vCPU woken now, after every VM with real demand, but takes
+  only spare cores: an idle one, or one held above its floor by a VM
+  that wants no core. Nothing is revoked for it from a VM that wants
+  cores, which would trade the core back at its next report.
 - **A core given to a woken vCPU stays wanted until the agent reports.**
   Once it has the core, the vCPU no longer counts as woken, and
   `runnable_threads` doesn't show its work until the guest agent's next
@@ -277,6 +285,13 @@ assigned. It records when each bit was set, by VM slot and vCPU.
   spinlocks and TLB flush then work as on any overcommitted host.
 - A CPU never runs another VM's woken vCPU, which keeps the isolation of
   spec 03 and the SMT rules of #16.
+- **Directed yields (#52):** the kernel ends a slice only at a scheduling
+  event or the tick, so a turn lasts up to a tick (1 ms at 1000 Hz), not
+  the 100 µs slice. A woken vCPU's wake preempts the CPU's owner, often
+  while it holds a guest lock the woken vCPU then spins on. KVM's
+  pause-loop exit yields to the preempted vCPU, and `ops.yield` honours
+  that yield between vCPUs of the same VM by ending the spinner's slice
+  (§7.6).
 - **When the VM has no cores** (zero-core state), the woken bit is demand,
   as `zero_core_wakeup` is today.
 
@@ -779,6 +794,47 @@ baseline's. The p99 tail appears only when VM 2 is busy, and at the
 same ~1.9 ms as in §7.4. A tail that doesn't scale with the host
 points to a fixed bound or timeout in the wake path rather than a cost
 of the platform (#52).
+
+### 7.6 Wake-latency tail (2026-11-13, #52)
+
+Same host and method as §7.5 (two 4-vCPU Ubuntu guests, three managed
+CPUs, 150 s runs, the first 40 s dropped).
+
+**Cause.** A host trace of slow round trips with VM 2 busy: VM 1 held
+one core, and the IPI that woke vCPU 2 preempted vCPU 1 on it, still
+runnable. vCPU 2 then spun in the guest (`PAUSE` exits) for about 1 ms
+until the tick ended its slice, and only then did vCPU 1 run. Two such
+waits make the ~1.93 ms tail. `scx_pylon` had no `yield` callback, so
+KVM's directed yield from the pause-loop exit did nothing.
+
+With yields honoured, VM 2 idle ran in a slow mode in 5 of 10 runs
+(p50 320–390 µs): VM 1's ping-pong vCPUs shared one core while VM 2
+held the others and wanted none. Short wakes never reach
+`WOKEN_DEMAND_US`; on `main`, the tick-long waits made some long enough
+to get a core, which hid it.
+
+**Ping-pong round trip, µs** (p50 / p99 per run):
+
+| Build | VM 2 busy | VM 2 idle |
+|---|---|---|
+| `main` | 44 / 1,927, 41 / 1,929 | 40–62 / 66–109 (5 runs) |
+| Yields | 41 / 453, 41 / 486 | 5 of 10 runs slow: 60 / 1,903, 379 / 510, 323 / 380, … |
+| Yields and spare cores | 42 / 436, 41 / 449 | 40–80 / 68–148 (6 runs, none slow) |
+
+**Work units per 10 s, VM 1** (median of the samples; forced
+preemptions of VM 1 per run):
+
+| Build | VM 2 busy | VM 2 bursty | VM 2 idle |
+|---|---|---|---|
+| `main` | 7,904, 7,676 (365, 373) | 8,526–9,501, median 8,589 (5 runs; 267–403) | 8,613–9,564 (4 runs; 16–340) |
+| Yields and spare cores | 7,784, 7,811 (2,772, 2,337) | 7,780–9,572, median 9,528 (5 runs; 275–3,443) | 8,616, 9,597 (30, 12) |
+
+Throughput doesn't change. Forced preemptions of VM 1 rise with VM 2
+busy or bursty: VM 1's woken vCPUs take cores that went idle, and VM 2
+revokes them. The p99 of about 450 µs that remains with VM 2 busy is
+mostly the guest's pause loop before KVM exits to yield. A timer that
+ended shared turns after 100 µs cut it only to about 400 µs and cost
+13% of throughput with VM 2 busy, so it was dropped.
 
 ## 8. Alternatives Considered
 

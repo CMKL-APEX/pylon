@@ -99,8 +99,8 @@ inside KVM`
 `pylond` needs no option for it. What changes on the host:
 
 - **It needs `scx_pylon`.** `scx_pylon` runs a woken vCPU only on CPUs
-  its VM owns and reports it to `pylond`, which then gives a core to a
-  VM whose vCPU stays woken for 4 ms. `pylond` without `scx_pylon`
+  its VM owns and reports it to `pylond`, which then gives it a spare
+  core at once, and a core to a VM whose vCPU stays woken for 4 ms. `pylond` without `scx_pylon`
   rejects such a VM's registration, and logs `Rejected registration`;
   start the VM with `park=vmm` on such a host
   ([Kernel scheduling with scx_pylon](sched-ext.md)).

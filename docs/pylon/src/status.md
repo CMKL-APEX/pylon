@@ -36,8 +36,10 @@ But:
 
 - **It needs `scx_pylon`.** `pylond` without it rejects such a VM; use
   `park=vmm` there.
-- **Wake latency has a tail of about 2 ms** when another VM is busy,
-  on bare metal as nested
+- **Wake latency has a tail of about 0.45 ms** when another VM is busy
+  and two vCPUs of a VM share a core: a woken vCPU spins until KVM's
+  pause-loop exit yields to the other. It was about 1.9 ms before
+  `scx_pylon` honoured those yields
   ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
 - **aarch64 parks in the VMM by default** until parking inside KVM is
   verified there.

@@ -47,7 +47,9 @@ being scheduled.
 `--pylon park=kvm|vmm`. A parked vCPU stays
 inside `KVM_RUN`, halted, so an interrupt such as a timer or an IPI
 wakes it. A woken vCPU runs on its VM's CPUs without a core of its own,
-and stays `PARKED`. `pylond` gives it a core if it stays woken for 4 ms.
+and stays `PARKED`. `pylond` gives it a spare core at once (an idle
+one, or one a VM that wants no core holds), and any core if it stays
+woken for 4 ms.
 It is meant to run with `scx_pylon`. See [Status and
 roadmap](status.md).
 
