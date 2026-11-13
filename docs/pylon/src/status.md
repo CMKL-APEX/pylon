@@ -17,13 +17,13 @@ The detailed tracker is
 | Waking parked vCPUs | `pylond` wakes a parked vCPU when its VM has demand and a managed CPU is idle, or takes a core from another VM. |
 | Taking back idle cores | When a vCPU parks on its own, `pylond` reclaims its core. |
 | Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. Repeated signals back off up to 1 ms. |
-| Parking inside KVM | With `--pylon park=kvm`, the default on x86_64 KVM hosts, a parked vCPU halts inside KVM, so an interrupt (an IPI, a timer) wakes it. `scx_pylon` runs a woken vCPU only on its own VM's CPUs, and `pylond` gives a core to a VM whose vCPU stays woken. This removes the soft lockups of VMs that hold fewer cores than they have vCPUs. See [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
+| Parking inside KVM | With `--pylon park=kvm`, the default on KVM hosts (x86_64 and aarch64), a parked vCPU halts inside KVM, so an interrupt (an IPI, a timer) wakes it. `scx_pylon` runs a woken vCPU only on its own VM's CPUs, and `pylond` gives a core to a VM whose vCPU stays woken. This removes the soft lockups of VMs that hold fewer cores than they have vCPUs. See [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
 | Arbitration | Demand evaluation, urgency ordering and donor selection run every tick (see [The arbitration engine](developer-guide/arbitration.md)). |
 | Runtime policy | `min_cores`, `max_cores` and `priority_weight` can be changed over the control socket. `min_cores` is a floor under demand: an idle VM holds no cores. |
 | Metering | Core-microseconds, cooperative yields, forced preemptions, handoffs without park, revocation-to-park latency and woken-vCPU time per VM, over the socket and as Prometheus metrics. |
 | `scx_pylon` | Attaches to a `sched_ext` kernel and runs each managed CPU's assigned vCPU thread, keeps vCPU threads' SMT siblings apart, and shares a VM's CPUs with its woken vCPUs. `pylond` attaches it automatically when the kernel supports it. |
 | Kick device and guest module | The `pylon-kick` PCI device delivers revocations to the guest as interrupts, and the `pv-pylon` guest module parks a revoked vCPU at a safe point and reports stranded work. |
-| aarch64 hosts | `pylond`, `scx_pylon` and the VMM side build, run and have CI on aarch64 ([spec 07](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md)). |
+| aarch64 hosts | `pylond`, `scx_pylon` and the VMM side build, run and have CI on aarch64. Real guests run end to end with `scx_pylon` and parking inside KVM, at the unmanaged guest's throughput ([spec 07](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md) A-T8). |
 
 ## What doesn't work yet
 
@@ -39,8 +39,6 @@ But:
 - **Wake latency has a tail of about 2 ms** when another VM is busy,
   on bare metal as nested
   ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
-- **aarch64 parks in the VMM by default** until parking inside KVM is
-  verified there.
 
 **Cooperative revocation, within the grace period.** The parts exist
 (`pylon-kick` and `pv-pylon`), but:
@@ -88,7 +86,7 @@ But:
 ## Roadmap
 
 `v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)) made parking inside KVM a `--pylon`
-option, the default on x86_64 KVM hosts, with ABI version 3 ([#51](https://github.com/CMKL-APEX/pylon/issues/51)).
+option, the default on KVM hosts, with ABI version 3 ([#51](https://github.com/CMKL-APEX/pylon/issues/51)).
 The next release is `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
 
 | Work | Issues |
@@ -99,7 +97,7 @@ The next release is `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/mil
 | Scale to zero on network traffic. | [#57](https://github.com/CMKL-APEX/pylon/issues/57) |
 | Move the shared page into a PCI BAR; get a PCI ID. | [#59](https://github.com/CMKL-APEX/pylon/issues/59), [#64](https://github.com/CMKL-APEX/pylon/issues/64) |
 | Lifecycle: `pylond` restart, vCPU hotplug, snapshot and migration. | [#60](https://github.com/CMKL-APEX/pylon/issues/60), [#61](https://github.com/CMKL-APEX/pylon/issues/61) |
-| aarch64: a real guest end to end, and the kick path on the GICv3 ITS. | [#62](https://github.com/CMKL-APEX/pylon/issues/62), [#63](https://github.com/CMKL-APEX/pylon/issues/63) |
+| aarch64: the kick path on the GICv3 ITS. | [#63](https://github.com/CMKL-APEX/pylon/issues/63) |
 | MSHV: check that a signal-interrupted run returns cleanly. | [#65](https://github.com/CMKL-APEX/pylon/issues/65) |
 
 [Enhancements](developer-guide/enhancements.md) explains the design of

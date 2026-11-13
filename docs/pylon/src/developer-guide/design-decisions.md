@@ -44,7 +44,7 @@ until `pylond` wakes the vCPU (spec 06 open question Q2). Spec 08
 answers this for unmodified guests: with `--pylon park=kvm`, the VMM
 parks the vCPU halted inside KVM instead of on the `eventfd`, so an
 interrupt wakes it, and `scx_pylon` runs it on its own VM's CPUs. Its
-measurements (spec 08 §7.4) made it the default on x86_64 KVM hosts
+measurements (spec 08 §7.4) made it the default on x86_64 KVM hosts, and spec 07 A-T8 on aarch64
 ([Enhancements](enhancements.md#parking-inside-kvm-spec-08)).
 
 **Revisit** once spec 08's measurements (P3) show whether parking

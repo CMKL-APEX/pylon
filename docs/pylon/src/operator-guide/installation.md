@@ -34,18 +34,22 @@ beyond the table above:
   log line.
 - **The shared page is at guest address `0xFEDF_0000`**, 64 KiB aligned,
   in the 32-bit reserved hole, outside the FDT's memory node.
-- **Heterogeneous CPUs.** On a host with big and little cores, put the
-  polling engine on a big core with `pylond --engine-cpu <cpu>` (the
-  default is CPU 1) and keep it out of `--cores`. Which choice is best
-  hasn't been measured.
-- **Idle states.** A parked vCPU's core may idle deeply. The first
-  aarch64 measurements showed a 90 to 105 µs tail on vCPU wake-ups that
-  is consistent with the reference host's `LPI-1` exit latency (42 µs),
-  but the cause hasn't been confirmed: keeping cores out of deep idle
-  hasn't been tried.
+- **Heterogeneous CPUs.** On a host with big and little cores, the
+  engine's core type made no measurable difference on the reference
+  host (Cortex-X925 and Cortex-A725): guest throughput and wake latency
+  were the same with `pylond --engine-cpu` on either. Keep the engine
+  CPU out of `--cores`.
+- **Idle states.** A parked vCPU's core idles, and leaving a deep idle
+  state is most of a wake's cost. On the reference host, the p99 of a
+  forced park's wake was 531 to 732 µs without a limit and 11 to 12 µs
+  with the cores held out of deep idle (a PM QoS request of 0 on
+  `/dev/cpu_dma_latency`). Holding a request costs idle power on the
+  managed cores; whether to do it is the operator's choice, and
+  `pylond` doesn't make one.
 
-The aarch64 numbers so far are in [Benchmarks](../developer-guide/benchmarks.md).
-A booted aarch64 guest hasn't been run with Pylon yet.
+A booted aarch64 guest runs end to end, with `scx_pylon` and parking
+inside KVM. The aarch64 numbers are in
+[Benchmarks](../developer-guide/benchmarks.md).
 
 ## Download a release
 

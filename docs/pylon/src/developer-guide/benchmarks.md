@@ -1,10 +1,10 @@
 # Performance and benchmarks
 
 This page collects Pylon's performance figures: what was run, where,
-when and how, and how to run it again. There are few so far. Pylon has
-**no measurement of a real core handoff between real VMs yet**: that is
-step S6 of [Enhancements](enhancements.md#implementation-steps)
-([#53](https://github.com/CMKL-APEX/pylon/issues/53)).
+when and how, and how to run it again. There are few so far. A core
+handoff between real VMs takes about 100–125 µs at the median, against
+a 3–6 µs target: see
+[Handoff latency between real VMs](#handoff-latency-between-real-vms-measured-2026-11-13).
 
 ## How to read the numbers
 
@@ -146,6 +146,81 @@ Read the table for its order, not its values.
 **Not known yet:** the cost for a real vCPU, which `scx_pylon` places
 directly instead of through the host queue. These threads are a proxy
 for host tasks, which is the open gap below.
+
+## aarch64 with real guests (measured, 2026-11-13)
+
+Spec 07 A-T8. Two 4-vCPU Linux guests (`initial_active_vcpus=1`, the
+guest agent polling every 1 ms) on three managed cores, `pylond` with
+`scx_pylon` attached, 150 s runs with the first 40 s dropped. The loads
+are spec 08 P3's: *work* (vCPUs 1 to 3 each do a fixed unit, then sleep
+2 ms; units per 10 s) and *ping-pong* (two tasks on vCPUs 1 and 2 pass a
+byte over pipes, 1 ms apart; round trip in µs). VM 2 is bursty (every
+7 s, 100 ms of spinning on vCPUs 1 to 3), busy (spinning on every vCPU)
+or idle. The baseline is VM 1 alone, without `--pylon`, pinned to the
+same three cores. No guest ran `pv-pylon`, so every revocation was
+forced.
+
+| | |
+|---|---|
+| Host | aarch64 reference host: 20 cores (10 Cortex-X925, 10 Cortex-A725), no SMT, one NUMA node |
+| Kernel | `7.0.0-1024-nvidia`, with `sched_ext`; cpuidle `LPI-0` and `LPI-1` (133 µs exit latency) |
+| Guest | Cloud Hypervisor's pinned kernel (`ch-release-v7.2.8-20261009`) and a busybox initramfs |
+| `pylond` | `--cores 5-7 --engine-cpu 8` (X925 cores) unless noted |
+
+**Work units per 10 s, VM 1** (median of the 10 s samples; three runs):
+
+| Setup | Units per 10 s | Stalls |
+|---|---|---|
+| Baseline | 13,198, 13,155, 13,114 | none |
+| `park=kvm`, VM 2 bursty | 13,048, 13,068, 13,049 | none |
+| `park=kvm`, VM 2 idle | 13,020, 13,052, 13,053 | none |
+| `park=kvm`, VM 2 busy | 13,330, 13,326, 13,326 | none |
+| `park=vmm`, VM 2 bursty | 8,690, 8,710, 8,658 | none logged |
+| `park=vmm`, VM 2 idle | 6,662, 8,681, 6,204 | none logged |
+| `park=vmm`, VM 2 busy | stopped, 4,298, stopped | VM 1 stopped making progress |
+
+**Ping-pong round trip, µs** (p50 / p99; two runs):
+
+| Setup | Run 1 | Run 2 |
+|---|---|---|
+| Baseline | 224 / 512 | 226 / 506 |
+| Baseline, cores held out of deep idle | 10 / 12 | 10 / 12 |
+| `park=kvm`, VM 2 idle | 20 / 588 | 20 / 397 |
+| `park=kvm`, VM 2 busy | 38 / 90 | 39 / 97 |
+| `park=kvm`, VM 2 busy, cores held out of deep idle | 23 / 1,116 | 23 / 1,117 |
+| `park=kvm`, VM 2 busy, engine on an A725 core | 31 / 92 | 34 / 98 |
+| `park=vmm`, any | no samples | no samples |
+
+**Forced park of a real vCPU** (`bench_forced_park_latency_real_kvm_aarch64`,
+3,000 iterations, µs, p50 / p90 / p99):
+
+| | Request to `PARKED` | Wake to `RUNNING` |
+|---|---|---|
+| No idle limit, run 1 | 28.3 / 108.9 / 272.4 | 146.6 / 413.4 / 531.2 |
+| No idle limit, run 2 | 16.6 / 108.7 / 233.3 | 9.4 / 697.1 / 732.2 |
+| Cores held out of deep idle, run 1 | 15.2 / 17.2 / 20.3 | 9.4 / 10.2 / 11.2 |
+| Cores held out of deep idle, run 2 | 15.1 / 17.1 / 19.6 | 10.0 / 10.7 / 11.6 |
+
+"Cores held out of deep idle" is a PM QoS request of 0 on
+`/dev/cpu_dma_latency` for the whole run.
+
+**What it shows:**
+- Parking inside KVM keeps an unmodified guest at the baseline's
+  throughput, with no stall in 22 runs. Parking in the VMM strands the
+  guest's tasks on parked vCPUs: throughput falls by a third to two
+  thirds, the ping-pong never runs, and with the other VM busy VM 1
+  stops. This is why `park=kvm` is the default on aarch64 as well.
+- Idle-state exits are most of a wake's latency on this host. Holding
+  the cores out of deep idle cuts the forced-park wake's p99 from 531
+  to 732 µs to 11 to 12 µs, and the baseline ping-pong from 224 / 512
+  to 10 / 12 µs.
+- With the other VM busy and the cores held out of deep idle, the
+  ping-pong's p99 rises to about 1.1 ms, against about 0.1 ms without
+  the hold. Not explained yet; it may be the same kind of tail as the
+  x86_64 ~1.9 ms tail ([#52](https://github.com/CMKL-APEX/pylon/issues/52)).
+- The engine's core type (X925 or A725) made no measurable difference.
+- VM 1's VMM used 32 to 41% of a CPU with `park=kvm`, against 27% for
+  the baseline.
 
 ## Handoff latency between real VMs (measured, 2026-11-13)
 

@@ -1,8 +1,9 @@
 # Specification 07: aarch64 Host & Guest Support
 
-> **Status:** `DRAFT`. Tasks A-T0 to A-T7 are done: the aarch64 host side
-> builds, runs and has CI. A-T8 (end to end with a real guest, #62) is in
-> progress and A-T9 (kick path on GICv3 ITS, #63) isn't started.
+> **Status:** `DRAFT`. Tasks A-T0 to A-T8 are done: the aarch64 host side
+> builds, runs and has CI, and real guests run end to end with
+> `scx_pylon` and parking inside KVM, now the default on aarch64 too
+> (A-T8, #62). A-T9 (kick path on GICv3 ITS, #63) isn't started.
 > Tracked as **Track 6** in `spec/05-implementation-status.md`. The task board
 > in §9 is the place to claim, track and hand off work.
 
@@ -311,7 +312,7 @@ parallel.
 | A-T5 | Layout constants, overlap asserts, `FEAT_S2FWB` check | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t5-layout` (#27) | `DONE` | `cargo test -p arch`; `cargo test -p vmm --features kvm --lib pylon` | — |
 | A-T6 | `scx-pylon` arm64 build, `vmlinux.h`, live attach, guard | A-T0 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t6-scx-arm64` (#28) | `DONE` | `cargo test -p scx-pylon`; `tests/live_attach.rs` on the reference host | — |
 | A-T7 | CI for aarch64 Pylon crates | A-T2, A-T3, A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t7-ci` (#29) | `DONE` | Green `pylon-aarch64` job on a hosted arm64 runner | — |
-| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `IN_PROGRESS` (real guest under `pylond` run, see notes; kick path, `scx_pylon` under load and the idle-state test open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
+| A-T8 | aarch64 E2E + perf + book page | A-T2…A-T6 | Akkarit Sangpetch (Claude Code) | `pylon/a64-t8-bench` (#30) | `DONE` (real guests with `pylond --enable-scx` under load, `park=kvm` and `park=vmm`, the idle-state test and Q-A3 data; see notes. The cooperative path with `pv-pylon` in an aarch64 guest stays open) | `cargo test -p pylond --test e2e_pylon`; `pylon-bench --quick` | — |
 | A-T9 | Kick path on GICv3 ITS | spec 06 S4 | *Unassigned* | — | `NOT_STARTED` | Spec 06 §8 S4/S6 checks on aarch64 | — |
 
 ### 9.2 Handoffs & Questions
@@ -327,6 +328,7 @@ Issues discovered during this work that are outside its scope. Give each one
 an ID (`A-F1`, `A-F2`, …) and a pointer to evidence.
 
 - **A-F1** (A-T3, found by A-T8; fixed in the same PR as this note): the vCPU-thread seccomp filter allowed `KVM_GET_MSRS` for Pylon on x86_64 but not `KVM_GET_ONE_REG` on aarch64, so an aarch64 VM with `--pylon` died with SIGSYS (`si_syscall=29`, `ioctl`) at vCPU start. The unit tests and the real-KVM tests don't apply seccomp, which is why A-T3 missed it. Cloud Hypervisor's own filter is enforced by default.
+- **A-F3** (A-T8; fixed in the same change as the A-T8 results): with `--pylon park=kvm`, every aarch64 VM died about a second after boot with `Unexpected system event with type 0x4`. Parking inside KVM makes an aarch64 vCPU suspended (`KVM_MP_STATE_SUSPENDED`); when an interrupt arrives, arm64 KVM exits with `KVM_SYSTEM_EVENT_WAKEUP` (type 4) and keeps the vCPU suspended until userspace marks it runnable, where x86 resumes a halted vCPU by itself. The hypervisor crate treated every system event but reset and shutdown as an error. It now marks the vCPU runnable and returns `VmExit::Ignore`; `test_suspended_vcpu_wakeup_makes_it_runnable` (`hypervisor`) fails without the fix.
 - **A-F2** (fixed by the boot-park change; see the A-F2 notes in §9.4): on aarch64, vCPUs that start parked (`initial_active_vcpus` below the vCPU count) never answer their `PSCI CPU_ON`. The guest kernel waits 5 s for each secondary, prints "CPUn: failed to come online" and boots with 1 CPU (15 s for 3 secondaries); the CPUs can be onlined later with `echo 1 > /sys/devices/system/cpu/cpuN/online`, but only while `pylond` has a reason to wake the parked vCPU. So the quick start's "boots with eight vCPUs, two of them running" doesn't hold on aarch64 today. On x86_64 the same wait applies to the INIT/SIPI start-up (spec 06 Q2 notes the effect for parked vCPUs); I haven't run it there. A fix has to let the vCPU thread run far enough to answer the power-on request before it parks, or have the guest not wait.
 
 ### 9.4 Task Notes
@@ -491,6 +493,17 @@ What this does not measure: the guest never cooperates and no `pylond` decides a
 
 Not done: `pylond --enable-scx` with a VM (root), the cooperative path (needs `pv-pylon`), and the idle-state test.
 
+**End to end with real guests and `scx_pylon` (A-T8, 2026-11-13).** Kernel `7.0.0-1024-nvidia` (the host's kernel had moved on from `7.0.0-1019`; its cpuidle states are now `LPI-0` and `LPI-1`, exit latency 133 µs). Cloud Hypervisor, `pylond` and `scx_pylon` built natively from this tree; the guest kernel is the one `scripts/test_assets.yaml` pins, with a busybox initramfs holding a static `pylon-guest-agent` (1 ms polling, pinned to vCPU 0) and the spec 08 P3 loads as a small static program. Two 4-vCPU VMs, `initial_active_vcpus=1`, `min_cores=0`, `max_cores=4`; `pylond --cores 5-7 --engine-cpu 8 --enable-scx` (X925 cores), `scx_pylon` attached in every Pylon run and detached after; 150 s runs, the first 40 s dropped. Baseline: VM 1 alone without `--pylon`, pinned to cores 5-7. The guest agent runs on `/dev/mem` in these guests, which settles the A-T4 note: the guest kernel allows the mapping, and the agent's reports reach `pylond` (it parks the booted vCPUs at the first heartbeat and wakes them on demand). The harness lives in the scratch directory and is not committed. Full tables: the book's *Performance and benchmarks*, "aarch64 with real guests".
+
+- **`park=kvm` died at the first wakeup (A-F3)**, then, fixed, ran 22 runs with no soft lockup or RCU stall and every 10 s sample present. Work units per 10 s for VM 1: 13,020 to 13,330 against the baseline's 13,114 to 13,198, with VM 2 bursty, idle or busy.
+- **`park=vmm` strands the guest's tasks** on parked vCPUs (spec 06 Q2, K1): 8,658 to 8,710 units with VM 2 bursty, 6,204 to 8,681 with VM 2 idle; with VM 2 busy, VM 1 stopped making progress in 2 of 3 runs (its console fell silent, so no stall was logged), and the ping-pong, whose tasks sit on vCPUs 1 and 2, never ran in any of 8 runs. So `park=kvm` is now the default on aarch64 KVM hosts, as on x86_64.
+- **Ping-pong with `park=kvm`** (p50 / p99 µs): 20 / 397 to 588 with VM 2 idle, 38 to 39 / 90 to 97 with VM 2 busy; the baseline 224 to 226 / 506 to 512 (deep idle on its three pinned cores).
+- **Idle-state test.** A PM QoS request of 0 on `/dev/cpu_dma_latency` for the whole run: the baseline ping-pong drops to 10 / 12 µs, and the forced-park benchmark (`bench_forced_park_latency_real_kvm_aarch64`, 3,000 iterations) goes from a wake p99 of 531 to 732 µs (p90 413 to 697 µs) to 11.2 to 11.6 µs, and a park p99 of 233 to 272 µs to 19.6 to 20.3 µs. So the slow wake mode is the cores' idle-state exit, as suspected; on this kernel it is slower than the 90 to 105 µs measured on `7.0.0-1019`. One result goes the other way: with VM 2 busy and the request held, the `park=kvm` ping-pong's p99 rises to 1,116 to 1,117 µs (p50 23 µs). Not explained; it may be the kind of tail #52 tracks on x86_64.
+- **Q-A3.** With the engine on Cortex-A725 core 1 instead of X925 core 8: ping-pong 31 to 34 / 92 to 98 µs against 38 to 39 / 90 to 97, and work 13,316 to 13,320 against 13,326 to 13,330 units. No measurable difference.
+- **Revocations** were all forced (no `pv-pylon`): VM 1 counted 347 to 400 forced preemptions per run with VM 2 bursty and about 21,000 with VM 2 busy, mean revocation-to-`PARKED` 17 to 47 µs per run, with one run at 93 µs.
+
+Not done: the cooperative path in an aarch64 guest. `pv-pylon` needs the guest kernel's build tree, which the pinned guest kernel doesn't ship.
+
 #### A-F2: boot park
 **Fix.** A vCPU beyond `initial_active_vcpus` is no longer parked before its first `KVM_RUN`. The VMM sets it `RUNNING` and tags its slot `park_on_boot` (a new byte in the slot's host half, offset 34, reserved before: no version bump). `pylond`'s control plane, which already holds each VM's registered kick signal and vCPU thread IDs, asks for the park once the guest reports it is up, that is a non-zero `guest_heartbeat` (the agent's first heartbeat): once a second it sets `revoke_requested` on each tagged vCPU that is still running and signals its thread. The VMM parks a tagged vCPU at once on that request, whatever the deadline, without counting a yield or a forced park, and clears the tag. A VM without a guest agent never gets its extra vCPUs parked: it behaves as an ordinary VM, not as one with dead CPUs. The guest agent also pins itself to vCPU 0 (`--cpu`, default 0), because an agent stranded on a parked vCPU can't report the demand that would wake it.
 
@@ -515,6 +528,10 @@ Unit tests: `vmm` (`test_boot_park_waits_for_the_request_and_isn_t_a_yield`, and
   `pylon-clock` crate?
 - **Q-A3:** On heterogeneous hosts, which core class should run `pylond`'s
   engine, and should metering weight big and little cores differently?
+  *Partly answered by A-T8:* the engine on a Cortex-A725 or a Cortex-X925
+  core made no measurable difference to guest throughput or wake latency
+  on the reference host, so the default engine CPU stays. Metering
+  weights stay open.
 - **Q-A4:** *Resolved by A-T5:* it can't be detected reliably from userspace, so
   it is a documented host requirement (§4.4).
 - **Q-A5:** Should hosts without `WFXT` (before Armv8.7) be supported at all,
