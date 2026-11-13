@@ -1733,6 +1733,7 @@ impl CpuManager {
             self.vcpus_pause_signalled.store(true, Ordering::SeqCst);
             let active_vcpus = state.active_vcpus.iter().filter(|&&active| active).count();
             let barrier = Arc::new(Barrier::new(active_vcpus + 1));
+            let vcpu_start_error = Arc::new(Mutex::new(None));
             let seccomp_filter = Arc::new(
                 get_seccomp_filter(
                     &self.seccomp_action,
@@ -1742,19 +1743,37 @@ impl CpuManager {
                 .map_err(Error::CreateSeccompFilter)?,
             );
 
-            for (id, active) in state.active_vcpus.into_iter().enumerate() {
+            for (id, &active) in state.active_vcpus.iter().enumerate() {
                 if active {
                     let inserting = self.vcpu_states.lock().unwrap()[id].inserting;
                     self.start_vcpu(
                         Arc::clone(&self.vcpus[id]),
                         id as u32,
                         Arc::clone(&barrier),
+                        Arc::clone(&vcpu_start_error),
                         Arc::clone(&seccomp_filter),
                         inserting,
                     )?;
                 }
             }
             barrier.wait();
+
+            if vcpu_start_error.lock().unwrap().is_some() {
+                // As in activate_vcpus(): the threads started above see the
+                // error and return. Join them, then report it.
+                let mut vcpu_states = self.vcpu_states.lock().unwrap();
+                for (vcpu_state, _) in vcpu_states
+                    .iter_mut()
+                    .zip(&state.active_vcpus)
+                    .filter(|&(_, &active)| active)
+                {
+                    vcpu_state.inserting = false;
+                    if let Some(handle) = vcpu_state.handle.take() {
+                        handle.join().map_err(Error::ThreadCleanup)?;
+                    }
+                }
+                return Err(vcpu_start_error.lock().unwrap().take().unwrap());
+            }
             return Ok(());
         }
 
