@@ -139,7 +139,7 @@ It meters the time so far, clears the owner entry, sets the slot's
 
 ## Parking inside KVM
 
-With `--pylon park=kvm`, the default on x86_64 KVM hosts, a vCPU parks
+With `--pylon park=kvm`, the default on KVM hosts, a vCPU parks
 inside KVM instead of in the VMM
 ([spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
 The VMM halts it and returns to `KVM_RUN`, which sleeps until an
@@ -147,7 +147,8 @@ interrupt or a signal. An interrupt, such as the guest's timer, runs the
 guest again without an exit and without a core: the vCPU stays
 `PARKED`. `scx_pylon` marks such a vCPU *woken* and runs it on a CPU its
 VM owns, in turns with that CPU's owner. `pylond` reads the woken
-vCPUs, and counts one woken for 4 ms or longer as demand for a core of
+vCPUs, gives each a spare core (idle, or held by a VM that wants
+none), and counts one woken for 4 ms or longer as demand for any core of
 its own. After a
 park the guest or a revocation asked for, the VMM also makes the vCPU
 runnable, still `PARKED`, once it has been parked for 4 ms

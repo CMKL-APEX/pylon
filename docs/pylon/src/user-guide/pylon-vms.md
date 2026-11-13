@@ -86,13 +86,13 @@ demand and a managed CPU is free.
 
 ## Parking inside KVM
 
-On an x86_64 KVM host, vCPUs park inside KVM by default (`--pylon
+On a KVM host, x86_64 or aarch64, vCPUs park inside KVM by default (`--pylon
 park=kvm`). A parked vCPU stays halted in KVM, so a timer or an IPI
 wakes it. The VMM logs where its vCPUs park, at info level, when it
 registers with `pylond`. This needs `pylond` with `scx_pylon`: without it, `pylond`
 rejects the VM's registration. Use `park=vmm` to park in the VMM
 instead, for example with a guest that runs `pv-pylon` on a host
-without `scx_pylon`. aarch64 hosts default to `park=vmm`. See [The
+without `scx_pylon`. See [The
 --pylon option](../reference/pylon-option.md) and [The scx_pylon
 dispatcher](../developer-guide/scx-pylon.md).
 

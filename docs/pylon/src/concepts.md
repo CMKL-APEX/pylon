@@ -43,11 +43,13 @@ next timer fires.
 `eventfd`. To the guest, a parked vCPU looks like a vCPU that isn't
 being scheduled.
 
-**Parking inside KVM.** The default on x86_64 KVM hosts, chosen with
+**Parking inside KVM.** The default on KVM hosts, x86_64 and aarch64, chosen with
 `--pylon park=kvm|vmm`. A parked vCPU stays
 inside `KVM_RUN`, halted, so an interrupt such as a timer or an IPI
 wakes it. A woken vCPU runs on its VM's CPUs without a core of its own,
-and stays `PARKED`. `pylond` gives it a core if it stays woken for 4 ms.
+and stays `PARKED`. `pylond` gives it a spare core at once (an idle
+one, or one a VM that wants no core holds), and any core if it stays
+woken for 4 ms.
 It is meant to run with `scx_pylon`. See [Status and
 roadmap](status.md).
 

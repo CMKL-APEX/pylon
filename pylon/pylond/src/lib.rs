@@ -2853,11 +2853,10 @@ mod tests {
         assert!(woken_grant_hold(false));
     }
 
-    /// A woken vCPU of a VM that owns a core shares that core until it has been woken for
-    /// `WOKEN_DEMAND_US`. Then it asks for a core of its own and gets the idle one. Its time is
-    /// metered as shared (spec 08 §4.2).
+    /// A woken vCPU of a VM that owns a core takes an idle core at once, however short its wake
+    /// (#52): sharing would make it wait for turns on every wake.
     #[test]
-    fn test_plane2_long_woken_vcpu_gets_a_core_of_its_own() {
+    fn test_plane2_woken_vcpu_takes_an_idle_core_at_once() {
         let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
         let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
@@ -2885,24 +2884,133 @@ mod tests {
             .store(VCPU_STATE_RUNNING, Ordering::Release);
         page.telemetry.runnable_threads.store(0, Ordering::Release);
 
-        // vCPU 3 wakes. At 3 GHz, 4 ms is 12,000,000 cycles.
+        // vCPU 3 wakes, and gets the idle core in the same sweep.
         entry.woken.store(1 << 3, Ordering::Release);
         engine.poll_once(2_000);
-        engine.poll_once(6_002_000);
-        assert_eq!(engine.core_state(7), CoreState::Idle);
-        assert_eq!(handle.woken_shared_usec(), 2_000);
-        assert_eq!(handle.woken_unowned_usec(), 0);
-
-        engine.poll_once(12_002_000);
         assert_eq!(
             engine.core_state(7),
             CoreState::Assigned { vm_id: 81, vcpu: 3 }
         );
-        assert_eq!(handle.woken_shared_usec(), 4_000);
 
         // Once it has a core, its bit no longer counts.
-        engine.poll_once(15_002_000);
-        assert_eq!(handle.woken_shared_usec(), 4_000);
+        engine.poll_once(3_002_000);
+        assert_eq!(handle.woken_shared_usec(), 0);
+        assert_eq!(handle.woken_unowned_usec(), 0);
+    }
+
+    /// With no idle core, a woken vCPU shares its VM's core until it has been woken for
+    /// `WOKEN_DEMAND_US`: a short wake takes no core from another VM. Its time is metered as
+    /// shared (spec 08 §4.2).
+    #[test]
+    fn test_plane2_short_woken_vcpu_takes_no_core_from_another_vm() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
+            .with_vm_vcpus(Arc::clone(&vm_vcpus));
+
+        let mut rig = build_test_vm(81, 4, 1, 4, 1);
+        let handle = parks_in_kvm(&mut rig);
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+        let mut other_rig = build_test_vm(82, 1, 1, 1, 1);
+        let other = parks_in_kvm(&mut other_rig);
+        ControlPlane::publish_vm_handle(&snapshot, other.clone());
+        let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
+
+        // Each VM gets a core for one runnable thread, and runs.
+        handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        other
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        engine.poll_once(1_000);
+        let core_of = |engine: &MatrixEngine, vm_id| {
+            [6, 7].into_iter().find(|&pcpu| {
+                matches!(engine.core_state(pcpu), CoreState::Assigned { vm_id: v, .. } if v == vm_id)
+            })
+        };
+        let other_core = core_of(&engine, 82).expect("VM 82 has a core");
+        assert!(core_of(&engine, 81).is_some());
+        handle.host_page().vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        other.host_page().vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+
+        // vCPU 3 of VM 81 wakes. At 3 GHz, 4 ms is 12,000,000 cycles.
+        entry.woken.store(1 << 3, Ordering::Release);
+        engine.poll_once(2_000);
+        engine.poll_once(6_002_000);
+        assert_eq!(
+            engine.core_state(other_core),
+            CoreState::Assigned { vm_id: 82, vcpu: 0 }
+        );
+        assert_eq!(handle.woken_shared_usec(), 2_000);
+        assert_eq!(handle.woken_unowned_usec(), 0);
+    }
+
+    /// A woken vCPU takes a core from a VM that holds it above its floor and wants no core (#52).
+    #[test]
+    fn test_plane2_woken_vcpu_takes_a_core_another_vm_no_longer_wants() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let vm_vcpus = Arc::new(VmVcpusTable::new_in_memory());
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6, 7])
+            .with_vm_vcpus(Arc::clone(&vm_vcpus));
+
+        let mut rig = build_test_vm(81, 4, 1, 4, 1);
+        let handle = parks_in_kvm(&mut rig);
+        ControlPlane::publish_vm_handle(&snapshot, handle.clone());
+        let mut other_rig = build_test_vm(82, 1, 0, 1, 1);
+        let other = parks_in_kvm(&mut other_rig);
+        ControlPlane::publish_vm_handle(&snapshot, other.clone());
+        let entry = vm_vcpus.entry(handle.vm_slot()).unwrap();
+
+        handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        other
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        engine.poll_once(1_000);
+        let other_core = [6, 7]
+            .into_iter()
+            .find(|&pcpu| engine.core_state(pcpu) == CoreState::Assigned { vm_id: 82, vcpu: 0 })
+            .expect("VM 82 has a core");
+        handle.host_page().vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        other.host_page().vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+
+        // VM 82 goes idle but keeps its core, then vCPU 3 of VM 81 wakes.
+        other
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(0, Ordering::Release);
+        entry.woken.store(1 << 3, Ordering::Release);
+        engine.poll_once(2_000);
+        assert!(matches!(
+            engine.core_state(other_core),
+            CoreState::Revoking {
+                donor_vm_id: 82,
+                recipient_vm_id: 81,
+                recipient_vcpu: 3,
+                ..
+            }
+        ));
     }
 
     static WAKE_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);

@@ -115,7 +115,11 @@ reads the VM's `woken` mask from `scx_pylon`'s `pylon_vm_vcpus` map
 (by the VM's slot; without `scx_pylon`, nothing writes it), keeps the vCPUs still
 `PARKED` with no core assigned, and records when it first saw each one.
 A vCPU woken for `WOKEN_DEMAND_US` (4 ms) or longer is a *long wake*.
-The longest wake counts as waiting time, like `head_wait`.
+The longest wake counts as waiting time, like `head_wait`. A VM that
+owns a core and has no other unmet demand also wants one core per vCPU
+woken now (`spare_only`), with urgency 0, so after every other VM, and
+phase 3 gives it only spare cores: an idle one, or one held above its
+floor by a VM whose desired cores are 0 (#52).
 
 **Time bases.** Every `*_tsc` field counts host counter ticks (the TSC,
 or `CNTVCT_EL0` on aarch64). The guest writes `head_wait_tsc` and
