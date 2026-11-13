@@ -956,6 +956,35 @@ void BPF_PROG(pylon_quiescent, struct task_struct *p, u64 deq_flags)
 }
 
 /*
+ * scx_ops.yield(from, to)
+ *
+ * sched_yield() (@to is NULL) ends @from's slice, as the kernel does without
+ * this op. A directed yield to another vCPU of @from's VM ends it too. KVM
+ * yields to a preempted vCPU of the VM when a vCPU spins (a pause-loop
+ * exit): the preempted vCPU may hold the lock the spinner waits on, which
+ * is likely when a woken vCPU has just preempted another of its VM on a
+ * shared CPU (spec 08 §4.3). Without this, the spinner keeps the CPU until
+ * the next tick ends its slice, about 1 ms on a 1000 Hz host (pylon#52).
+ * Dispatch then runs the VM's next task on this CPU, as at the end of a
+ * slice; @from runs again when nothing of its VM waits.
+ */
+SEC("struct_ops/pylon_yield")
+bool BPF_PROG(pylon_yield, struct task_struct *from, struct task_struct *to)
+{
+    struct pylon_task_ctx *fctx, *tctx;
+
+    if (to) {
+        fctx = task_ctx(from);
+        tctx = task_ctx(to);
+        if (!fctx || !tctx || !fctx->dom || fctx->dom != tctx->dom) {
+            return false;
+        }
+    }
+    from->scx.slice = 0;
+    return to != NULL;
+}
+
+/*
  * scx_ops.update_idle(cpu, idle)
  *
  * An idle CPU claims nothing.
@@ -1054,6 +1083,7 @@ struct sched_ext_ops pylon_ops = {
     .dispatch = (void *)pylon_dispatch,
     .running = (void *)pylon_running,
     .quiescent = (void *)pylon_quiescent,
+    .yield = (void *)pylon_yield,
     .update_idle = (void *)pylon_update_idle,
     .init = (void *)pylon_init,
     .exit = (void *)pylon_exit,

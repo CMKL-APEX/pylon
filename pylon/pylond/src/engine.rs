@@ -238,6 +238,9 @@ struct VmDemandEval {
     desired_cores: u32,
     urgency: u64,
     zero_core_wakeup: bool,
+    /// The cores it still needs are for woken vCPUs, and may only be spare ones: idle, or held
+    /// above its floor by a VM that wants none.
+    spare_only: bool,
 }
 
 /// What the engine read from one VM's `woken` mask in a sweep.
@@ -248,6 +251,8 @@ struct WokenEval {
     long: u32,
     /// The longest current wake, in counter ticks (0 if none).
     longest_cycles: u64,
+    /// How many vCPUs still `PARKED` with no core assigned are woken now, for any time.
+    now: u32,
 }
 
 /// The engine's record of one VM slot's woken vCPUs.
@@ -283,6 +288,7 @@ impl VmDemandEval {
         desired_cores: 0,
         urgency: 0,
         zero_core_wakeup: false,
+        spare_only: false,
     };
 
     #[inline]
@@ -588,6 +594,9 @@ impl MatrixEngine {
     fn is_unassigned_parked(slot: &PylonHostVcpuSlot) -> bool {
         slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKED
             && slot.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
+            // A vCPU whose thread hasn't started has no thread to run on a core: one past
+            // `boot_vcpus` that was never hot-plugged (spec 06 §7).
+            && slot.host_tid.load(Ordering::Acquire) != 0
     }
 
     /// Whether to re-send a kick signal first sent (or due) at `first_tsc` and last sent at
@@ -879,7 +888,24 @@ impl MatrixEngine {
             // vCPU ran on it.
             let desired_cores = desired_cores.max(woken_grants);
 
-            let urgency = if zero_core_wakeup {
+            // A woken vCPU that shares its VM's cores waits for its turn on each wake, and a
+            // short wake never asks for a core of its own: a VM whose vCPUs wake often (IPIs
+            // between its tasks) would then run them on one core for as long as its demand stays
+            // low, while other cores idle or sit with VMs that want none (#52). Such a core costs
+            // no other VM anything it asked for, so each woken vCPU may take one, but only a
+            // spare one.
+            let spare_only =
+                committed_cores > 0 && desired_cores <= committed_cores && woken.now > 0;
+            let desired_cores = if spare_only {
+                (committed_cores + woken.now).min(vm.max_cores())
+            } else {
+                desired_cores
+            };
+
+            let urgency = if spare_only {
+                // After every VM with real demand.
+                0
+            } else if zero_core_wakeup {
                 u64::MAX
             } else if desired_cores > committed_cores {
                 let base_wait = head_wait.max(1);
@@ -902,6 +928,7 @@ impl MatrixEngine {
                 desired_cores,
                 urgency,
                 zero_core_wakeup,
+                spare_only,
             };
             i += 1;
         }
@@ -1145,6 +1172,7 @@ impl MatrixEngine {
                 eval.long += 1;
             }
             eval.longest_cycles = eval.longest_cycles.max(woken_for);
+            eval.now += 1;
             bits &= bits - 1;
         }
         track.mask = mask;
@@ -1488,8 +1516,14 @@ impl MatrixEngine {
                 let lower_urgency = donor_eval.urgency < recipient.urgency && within_share;
                 let above_min = donor_eval.assigned_cores > donor_eval.min_cores;
 
-                let eligible = (above_min && (over_desired || over_fair_share || lower_urgency))
-                    || (recipient.zero_core_wakeup && below_floor_allowed && lower_urgency);
+                // A VM that wants some cores but fewer than it holds may want them back by the
+                // next report of its guest agent, and the two VMs would trade the core.
+                let eligible = if recipient.spare_only {
+                    above_min && donor_eval.desired_cores == 0
+                } else {
+                    (above_min && (over_desired || over_fair_share || lower_urgency))
+                        || (recipient.zero_core_wakeup && below_floor_allowed && lower_urgency)
+                };
                 // A `PARKED` vCPU on an assigned core either hasn't woken since the assignment
                 // or has given the core back, which phase 0 reclaims. Revoking it would race
                 // its wakeup.
