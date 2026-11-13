@@ -33,15 +33,17 @@ See [Status and roadmap](status.md) for what works and what doesn't.
 
 ### Highlights of this release
 
-- **vCPUs park inside KVM** by default on x86_64 KVM hosts (`--pylon
-  park=kvm`, [#51](https://github.com/CMKL-APEX/pylon/issues/51)). A
+- **vCPUs park inside KVM** by default on KVM hosts, x86_64 and aarch64
+  (`--pylon park=kvm`, [#51](https://github.com/CMKL-APEX/pylon/issues/51)). A
   parked vCPU stays halted in KVM, so a timer or an IPI wakes it. This
   removes the soft lockups and RCU stalls of guests without `pv-pylon`
   that hold fewer cores than they have vCPUs, at no throughput cost,
   nested and on bare metal
   ([spec 08 §7.4–§7.5](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md#74-p3-result-2026-11-09)).
-  `park=vmm` keeps the previous park, in the VMM; aarch64 hosts use it
-  by default.
+  `park=vmm` keeps the previous park, in the VMM.
+- **aarch64 runs real guests end to end**, with `scx_pylon` attached and
+  vCPUs parked inside KVM, after a fix to how a suspended aarch64 vCPU
+  wakes ([#62](https://github.com/CMKL-APEX/pylon/issues/62)).
 - **`pylond` refuses a VM that parks inside KVM when `scx_pylon` isn't
   attached**, and the VMM now reads `pylond`'s reply: it logs whether
   the registration was accepted, and where its vCPUs park.
@@ -111,8 +113,6 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
 - **A VM with no core isn't woken by arriving packets**
   ([#57](https://github.com/CMKL-APEX/pylon/issues/57)).
-- **A booted aarch64 guest hasn't been run with Pylon**
-  ([#62](https://github.com/CMKL-APEX/pylon/issues/62)).
 
 The next release, `v0.0.9`, is tracked on its
 [milestone](https://github.com/CMKL-APEX/pylon/milestone/2).

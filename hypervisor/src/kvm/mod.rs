@@ -2474,11 +2474,25 @@ impl cpu::Vcpu for KvmVcpu {
 
                 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 VcpuExit::SystemEvent(event_type, flags) => {
-                    use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+                    use kvm_bindings::{
+                        KVM_MP_STATE_RUNNABLE, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN,
+                        KVM_SYSTEM_EVENT_WAKEUP, kvm_mp_state,
+                    };
                     if event_type == KVM_SYSTEM_EVENT_RESET {
                         Ok(cpu::VmExit::Reset)
                     } else if event_type == KVM_SYSTEM_EVENT_SHUTDOWN {
                         Ok(cpu::VmExit::Shutdown)
+                    } else if event_type == KVM_SYSTEM_EVENT_WAKEUP {
+                        // A vCPU the VMM made suspended (`KVM_MP_STATE_SUSPENDED`, as Pylon
+                        // does to park a vCPU inside KVM) got a wakeup event. KVM leaves it
+                        // suspended until userspace makes it runnable; do that, so the next
+                        // `KVM_RUN` enters the guest, as a halted x86 vCPU does on its own.
+                        self.fd
+                            .set_mp_state(kvm_mp_state {
+                                mp_state: KVM_MP_STATE_RUNNABLE,
+                            })
+                            .map_err(|e| cpu::HypervisorCpuError::SetMpState(e.into()))?;
+                        Ok(cpu::VmExit::Ignore)
                     } else {
                         Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                             "Unexpected system event with type 0x{event_type:x}, flags 0x{flags:x?}",
@@ -3913,6 +3927,38 @@ mod tests {
         sleep(Duration::from_millis(10));
         let second = vcpu.get_cntvct().unwrap();
         assert!(second > first, "{first} then {second}");
+    }
+
+    /// A suspended vCPU that gets a wakeup event exits with `KVM_SYSTEM_EVENT_WAKEUP`. `run`
+    /// makes it runnable and returns `Ignore` instead of failing: Pylon parks aarch64 vCPUs
+    /// inside KVM by suspending them, and an interrupt then wakes them this way.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_suspended_vcpu_wakeup_makes_it_runnable() {
+        use super::*;
+
+        let hypervisor = KvmHypervisor::new().unwrap();
+        let vm = hypervisor.create_vm(HypervisorVmConfig::default()).unwrap();
+        let mut vcpu = vm.create_vcpu(0, None).unwrap();
+        let mut kvi = vcpu.create_vcpu_init();
+        vm.get_preferred_target(&mut kvi).unwrap();
+        vcpu.vcpu_init(&kvi).unwrap();
+        vcpu.set_mp_state(
+            kvm_mp_state {
+                mp_state: kvm_bindings::KVM_MP_STATE_SUSPENDED,
+            }
+            .into(),
+        )
+        .unwrap();
+
+        // Without an in-kernel GIC, raising the vCPU's IRQ line (type `KVM_ARM_IRQ_TYPE_CPU`,
+        // vCPU 0, `KVM_ARM_IRQ_CPU_IRQ`: all zero) makes the suspended vCPU runnable.
+        let kvm_vm = vm.as_any().downcast_ref::<KvmVm>().unwrap();
+        kvm_vm.fd.set_irq_line(0, true).unwrap();
+
+        assert!(matches!(vcpu.run(), Ok(cpu::VmExit::Ignore)));
+        let state: kvm_mp_state = vcpu.get_mp_state().unwrap().into();
+        assert_eq!(state.mp_state, kvm_bindings::KVM_MP_STATE_RUNNABLE);
     }
 
     #[test]

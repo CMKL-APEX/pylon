@@ -3,7 +3,7 @@
 > **Status:** `DRAFT`. Prototype first (§7). P0 (§7.1), P1 (§7.2), P2
 > (§4.2, results in §7.3) and P3 (§7.4) are done. P3 decided that
 > parking inside KVM replaces the park of spec 06 on KVM. It is the
-> `--pylon park=kvm` option, the default on x86_64 KVM hosts, with ABI
+> `--pylon park=kvm` option, the default on KVM hosts, with ABI
 > version 3 (§4.4, §4.5, #51). A bare-metal run confirms the P3
 > result (§7.5).
 > Tracked as **Track 7** in `spec/05-implementation-status.md`. It answers
@@ -348,9 +348,11 @@ the VMM reads it after each exit instead (§3.3).
 
 `--pylon park=kvm|vmm` picks where a vCPU without a core waits:
 
-- **Default:** `kvm` on x86_64 when `/dev/kvm` exists, the backend the
-  VMM picks first; `vmm` elsewhere. aarch64 stays on `vmm` until V1 is
-  answered there.
+- **Default:** `kvm` on x86_64 and aarch64 when `/dev/kvm` exists, the
+  backend the VMM picks first; `vmm` elsewhere. aarch64 parks by making
+  the vCPU suspended (`KVM_MP_STATE_SUSPENDED`); KVM reports its wakeup
+  as `KVM_SYSTEM_EVENT_WAKEUP`, and the VMM makes it runnable again.
+  Measured with real guests in spec 07 A-T8.
 - **`park=kvm` on MSHV** is refused at start-up (§2).
 - **`pylond` without `scx_pylon`** rejects the registration of a VM that
   parks inside KVM (`wake_by_signal`), whose woken vCPUs would otherwise

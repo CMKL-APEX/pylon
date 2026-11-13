@@ -492,7 +492,7 @@ forced park, which is honest about the current state, and the metrics show it.
   and give `pylon-kick` a device ID under it before Pylon ships.
 - **Q2:** IPIs and TLB shootdowns aimed at a parked vCPU. **Answered for
   unmodified guests (2026-11-06)** by `spec/08-park-in-kvm.md`, the default on
-  x86_64 KVM hosts (`--pylon park=kvm`): a vCPU parks halted inside KVM, so an interrupt wakes
+  KVM hosts (`--pylon park=kvm`): a vCPU parks halted inside KVM, so an interrupt wakes
   it, and `scx_pylon` runs it on its VM's CPUs. The text below is the
   original question. *Seen
   2026-10-31:* two 4-vCPU VMs on 4 managed CPUs settled at 2 cores each.
