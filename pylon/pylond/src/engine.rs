@@ -1377,6 +1377,14 @@ impl MatrixEngine {
                     .yield_count
                     .load(Ordering::Acquire);
                 donor_vm.request_park(donor_vcpu as usize, deadline_tsc);
+                // `scx_pylon` lets the donor park without a woken vCPU's turn cutting in. The
+                // handoff writes the recipient over it.
+                let (donor_tid, donor_flags) = self.pcpu_owners.read_owner(donor_pcpu);
+                self.pcpu_owners.write_owner(
+                    donor_pcpu,
+                    donor_tid,
+                    donor_flags | PcpuOwnerFlags::REVOKING.bits(),
+                );
                 let _ =
                     self.write_vm_fd(donor_vm, || donor_vm.kick_revoke_irqfd(donor_vcpu as usize));
 

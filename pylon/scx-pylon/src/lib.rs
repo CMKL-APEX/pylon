@@ -100,6 +100,9 @@ impl PcpuOwnerFlags {
     /// The owner is a host thread, such as `pylond`'s engine, not a vCPU: it gets the CPU first
     /// but isn't SMT-isolated as a managed vCPU.
     pub const HOST: Self = Self(1 << 2);
+    /// `pylond` is taking the CPU from its owner, which parks: a woken vCPU's turn waits, so
+    /// that it doesn't preempt the owner partway through parking.
+    pub const REVOKING: Self = Self(1 << 3);
 
     /// Returns the raw `u32` representation of the flags.
     #[inline]
