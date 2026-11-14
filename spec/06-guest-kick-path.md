@@ -276,7 +276,10 @@ runs as the same UID as the VMM or holds `CAP_KILL`. Using `tgkill` instead of
 - **The signal is resent** every `REVOKE_RESIGNAL_US` (10 µs) until the donor
   parks. A signal that arrives while the vCPU thread is outside `KVM_RUN`
   (handling an exit) is consumed by the no-op handler and doesn't stop the
-  next guest entry, so a single signal can be lost.
+  next guest entry, so a single signal can be lost. It isn't resent while
+  the thread has left `KVM_RUN` since the last signal and not re-entered
+  (`kvm_run_seq`, spec 01 §2): the VMM checks for a park before it enters
+  again.
 - **`FORCE_HANDOFF_US` (50 µs) counts from the first signal.** That is
   usually the deadline. When the engine runs late, it would otherwise hand
   the core over in the same sweep that first signals the donor (spec 05
