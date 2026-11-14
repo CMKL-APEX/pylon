@@ -1,0 +1,681 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Performance and benchmarks - Pylon</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Microsecond core elasticity for Cloud Hypervisor VMs: design, enhancements and implementation">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-a742b7de.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-9d30a2a6.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Pylon</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/CMKL-APEX/pylon" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/CMKL-APEX/pylon/edit/main/docs/pylon/src/developer-guide/benchmarks.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="performance-and-benchmarks"><a class="header" href="#performance-and-benchmarks">Performance and benchmarks</a></h1>
+<p>This page collects Pylon’s performance figures: what was run, where,
+when and how, and how to run it again. There are few so far. A core
+handoff between real VMs takes about 100–125 µs at the median, against
+a 3–6 µs target: see
+<a href="#handoff-latency-between-real-vms-measured-2026-11-13">Handoff latency between real VMs</a>.</p>
+<h2 id="how-to-read-the-numbers"><a class="header" href="#how-to-read-the-numbers">How to read the numbers</a></h2>
+<ul>
+<li>Every result is from one date on one machine. It is a data point, not
+a guarantee.</li>
+<li><strong>Modelled</strong> figures come from a program that imitates part of the
+system. They show what the model predicts, not what a VM sees.</li>
+<li>Defaults and limits (the 8 µs grace period, the 1,000-cycle pause) are
+configuration, not measurements.</li>
+</ul>
+<h2 id="pylon-bench-pylon-parking-vs-modelled-acpi-hotplug"><a class="header" href="#pylon-bench-pylon-parking-vs-modelled-acpi-hotplug">pylon-bench: Pylon parking vs. modelled ACPI hotplug</a></h2>
+<p><code>pylon-bench</code> (<code>pylon/pylond/src/bin/pylon_bench.rs</code>) runs the same
+CPU-bound workload twice, scaling between 1 and 8 workers in bursts:</p>
+<ul>
+<li><strong>Pylon:</strong> worker threads stand in for vCPUs. They park and wake
+through a real shared page, a real <code>MatrixEngine</code> and <code>eventfd</code>s,
+exactly as vCPU threads would, but <strong>no VM or KVM is involved</strong>.</li>
+<li><strong>ACPI hotplug:</strong> a model of Cloud Hypervisor’s hotplug path (thread
+creation, a barrier, the <code>_SB_.PRES</code> register scan) plus <strong>fixed
+guest-side delays it injects</strong>: 2,500 µs to bring a CPU online and
+1,500 µs to take one offline, by default (<code>--acpi-bringup-us</code>,
+<code>--acpi-eject-us</code>). Those delays aren’t measured. They are estimates
+of the guest’s CPU hotplug path, and they dominate the ACPI column.</li>
+</ul>
+<h3 id="result-modelled-2026-10-29"><a class="header" href="#result-modelled-2026-10-29">Result (modelled, 2026-10-29)</a></h3>
+<p><code>cargo run --release -p pylond --bin pylon-bench</code> (defaults: 20 waves,
+1 ↔ 8 workers, 64 tasks of 25,000 iterations per wave). Both runs
+computed the same checksum.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Pylon</th><th>ACPI hotplug (model)</th></tr>
+</thead>
+<tbody>
+<tr><td>Scale-out latency, mean</td><td>138 µs</td><td>3,152 µs</td></tr>
+<tr><td>Scale-out latency, p50</td><td>136 µs</td><td>3,121 µs</td></tr>
+<tr><td>Scale-out latency, p99</td><td>173 µs</td><td>3,290 µs</td></tr>
+<tr><td>Scale-in latency, mean</td><td>30 µs</td><td>1,869 µs</td></tr>
+<tr><td>Scale-in latency, p99</td><td>44 µs</td><td>1,910 µs</td></tr>
+<tr><td>Workload wall time</td><td>70.6 ms</td><td>158.6 ms</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td>CPU</td><td>AMD EPYC 9124, 16 cores, 32 threads, 1 socket, 1 NUMA node (no <code>WAITPKG</code>: the engine used <code>PAUSE</code>)</td></tr>
+<tr><td>Memory</td><td>31,293 MiB</td></tr>
+<tr><td>Kernel</td><td>Ubuntu <code>7.0.0-42-generic</code>, with <code>scx_pylon</code> attached by a running <code>pylond</code></td></tr>
+<tr><td>Build</td><td>Release profile; <code>pylond</code> as on <code>main</code> at <code>e679f1133</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>What it does and doesn’t show.</strong> The Pylon column is the time to wake
+and park threads through the real engine and <code>eventfd</code>s on a busy host.
+Pylon’s latency budget is a few microseconds, and 138 µs is far above
+it. The reason hasn’t been investigated
+(<a href="https://github.com/CMKL-APEX/pylon/issues/54">#54</a>): thread scheduling without
+<code>scx_pylon</code> assignments for these worker threads, the engine sharing
+CPUs with the workload, and the benchmark’s own polling are all
+candidates. The ACPI column is mostly the injected delays, so the ratio
+between the columns follows from the model’s assumptions. Don’t quote it
+as a measured speed-up.</p>
+<h3 id="result-modelled-2026-10-30"><a class="header" href="#result-modelled-2026-10-30">Result (modelled, 2026-10-30)</a></h3>
+<p>The same command and defaults, run three times in a row. Every run
+computed the same checksum for both columns.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Pylon, run 1 / 2 / 3</th><th>ACPI hotplug (model), run 1 / 2 / 3</th></tr>
+</thead>
+<tbody>
+<tr><td>Scale-out latency, mean</td><td>22.4 / 26.0 / 22.2 µs</td><td>3,498 / 3,563 / 3,365 µs</td></tr>
+<tr><td>Scale-out latency, p50</td><td>21.1 / 24.8 / 18.4 µs</td><td>3,504 / 3,569 / 3,355 µs</td></tr>
+<tr><td>Scale-out latency, p99</td><td>49.3 / 39.8 / 66.8 µs</td><td>3,665 / 3,602 / 3,528 µs</td></tr>
+<tr><td>Scale-in latency, mean</td><td>1.73 / 2.75 / 1.63 µs</td><td>1,706 / 1,679 / 1,696 µs</td></tr>
+<tr><td>Scale-in latency, p99</td><td>2.44 / 17.4 / 2.05 µs</td><td>1,751 / 1,747 / 1,860 µs</td></tr>
+<tr><td>Workload wall time</td><td>14.9 / 15.0 / 14.9 ms</td><td>119.0 / 119.7 / 115.8 ms</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td>Machine</td><td>NVIDIA DGX A100</td></tr>
+<tr><td>CPU</td><td>2 × AMD EPYC 7742, 64 cores and 128 threads each, 8 NUMA nodes (no <code>WAITPKG</code>: the engine used <code>PAUSE</code>)</td></tr>
+<tr><td>Memory</td><td>1,031,823 MiB</td></tr>
+<tr><td>Kernel</td><td>Ubuntu <code>6.8.0-138-generic</code>, no <code>sched_ext</code> (so no <code>scx_pylon</code>); load average about 2</td></tr>
+<tr><td>Build</td><td>Release profile; <code>main</code> at <code>e5c3a7660</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>What it does and doesn’t show.</strong> Pylon’s scale-out is about 6× and
+its scale-in about 17× faster than on 2026-10-29. That comparison
+changes the host, the kernel and the code at once: this machine has 256
+mostly idle threads for 8 workers and the engine, and the build is 42
+commits newer. Neither run had <code>scx_pylon</code> managing the worker threads.
+Running this build on the EPYC 9124 host would separate the code from
+the host. Scale-in is now within the 3–6 µs target, and scale-out is
+still about four times over it. With 20 waves per run, each p99 is the
+run’s slowest wave.</p>
+<h3 id="scx_pylons-cost-to-the-benchmark-modelled-2026-10-30-and-2026-11-02"><a class="header" href="#scx_pylons-cost-to-the-benchmark-modelled-2026-10-30-and-2026-11-02"><code>scx_pylon</code>’s cost to the benchmark (modelled, 2026-10-30 and 2026-11-02)</a></h3>
+<p><code>scx_pylon</code> makes the Pylon column slower. The benchmark’s worker
+threads aren’t vCPUs, so to <code>scx_pylon</code> they are host tasks, and each
+wake of one goes through <code>scx_pylon</code>’s host path: <code>enqueue</code>, the shared
+host queue, then <code>dispatch</code> with its claim checks. Without <code>sched_ext</code>
+the kernel wakes them directly.</p>
+<p><strong>On the EPYC 9124 host (2026-10-30).</strong> One <code>pylon-bench</code> build from
+<code>main</code>, with sched_ext off or with <code>scx_pylon</code> from one of two commits
+attached by a test <code>pylond</code>. Means, rounded. The raw results were lost
+when the host restarted, so only these figures remain.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Configuration</th><th>Scale-out, mean</th><th>Scale-in, mean</th></tr>
+</thead>
+<tbody>
+<tr><td>sched_ext off, with or without <code>pylond</code></td><td>about 20 µs</td><td>about 2.5 µs</td></tr>
+<tr><td><code>scx_pylon</code> at <code>e679f1133</code> (the 2026-10-29 build)</td><td>about 55 µs</td><td>about 12 µs</td></tr>
+<tr><td><code>scx_pylon</code> at <code>main</code> then (after #16, #17 and #21)</td><td>about 65 µs</td><td>about 24 µs</td></tr>
+</tbody>
+</table>
+</div>
+<p>Most of the cost is <code>scx_pylon</code> itself. The rest came with #16, which
+sent every waking host thread through the host queue and <code>dispatch</code>;
+before it, the kernel’s global queue took them without calling into
+BPF. Earlier runs that day were 4 to 5 times slower in every
+configuration, sched_ext off too, because of other load on the host.</p>
+<p><strong>A fast path, tried in the dev VM (2026-11-02).</strong> The change: in
+<code>select_cpu</code>, a host task that wakes onto an idle CPU whose siblings
+allow host work is inserted on that CPU’s local queue, skipping the host
+queue and <code>dispatch</code>. Six interleaved rounds of <code>pylon-bench</code> (defaults)
+in a 16-vCPU KVM guest on the same host (kernel <code>7.0.0-38-generic</code>), one
+bench build, <code>scx_pylon</code> attached by a test <code>pylond</code> (<code>--cores 2-5</code>).
+Medians of the six runs:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Configuration</th><th>Scale-out, mean</th><th>Scale-out, p99</th><th>Scale-in, mean</th><th>Scale-in, p99</th></tr>
+</thead>
+<tbody>
+<tr><td>sched_ext off</td><td>62 µs</td><td>147 µs</td><td>4.3 µs</td><td>11 µs</td></tr>
+<tr><td><code>scx_pylon</code> at <code>4d7106ae5</code> (spec 08 P1)</td><td>108 µs</td><td>155 µs</td><td>95 µs</td><td>1,040 µs</td></tr>
+<tr><td>The same with the fast path</td><td>311 µs</td><td>3,184 µs</td><td>122 µs</td><td>1,858 µs</td></tr>
+</tbody>
+</table>
+</div>
+<p>The fast path didn’t help. Its scale-out was slower in five of the six
+rounds and about the same in the other; its scale-in was faster in some
+rounds and much slower in others. It wasn’t merged. A likely reason is
+that a task inserted this way runs a default 20 ms slice on a CPU that
+another task may want soon. The guest’s own vCPUs halt and wake through the
+host, so every figure here is noisier and higher than on the host
+itself: single runs of sched_ext off reached 252 µs out and 155 µs in.
+Read the table for its order, not its values.</p>
+<p><strong>Not known yet:</strong> the cost for a real vCPU, which <code>scx_pylon</code> places
+directly instead of through the host queue. These threads are a proxy
+for host tasks, which is the open gap below.</p>
+<h2 id="aarch64-with-real-guests-measured-2026-11-13"><a class="header" href="#aarch64-with-real-guests-measured-2026-11-13">aarch64 with real guests (measured, 2026-11-13)</a></h2>
+<p>Spec 07 A-T8. Two 4-vCPU Linux guests (<code>initial_active_vcpus=1</code>, the
+guest agent polling every 1 ms) on three managed cores, <code>pylond</code> with
+<code>scx_pylon</code> attached, 150 s runs with the first 40 s dropped. The loads
+are spec 08 P3’s: <em>work</em> (vCPUs 1 to 3 each do a fixed unit, then sleep
+2 ms; units per 10 s) and <em>ping-pong</em> (two tasks on vCPUs 1 and 2 pass a
+byte over pipes, 1 ms apart; round trip in µs). VM 2 is bursty (every
+7 s, 100 ms of spinning on vCPUs 1 to 3), busy (spinning on every vCPU)
+or idle. The baseline is VM 1 alone, without <code>--pylon</code>, pinned to the
+same three cores. No guest ran <code>pv-pylon</code>, so every revocation was
+forced.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td>Host</td><td>aarch64 reference host: 20 cores (10 Cortex-X925, 10 Cortex-A725), no SMT, one NUMA node</td></tr>
+<tr><td>Kernel</td><td><code>7.0.0-1024-nvidia</code>, with <code>sched_ext</code>; cpuidle <code>LPI-0</code> and <code>LPI-1</code> (133 µs exit latency)</td></tr>
+<tr><td>Guest</td><td>Cloud Hypervisor’s pinned kernel (<code>ch-release-v7.2.8-20261009</code>) and a busybox initramfs</td></tr>
+<tr><td><code>pylond</code></td><td><code>--cores 5-7 --engine-cpu 8</code> (X925 cores) unless noted</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Work units per 10 s, VM 1</strong> (median of the 10 s samples; three runs):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setup</th><th>Units per 10 s</th><th>Stalls</th></tr>
+</thead>
+<tbody>
+<tr><td>Baseline</td><td>13,198, 13,155, 13,114</td><td>none</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 bursty</td><td>13,048, 13,068, 13,049</td><td>none</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 idle</td><td>13,020, 13,052, 13,053</td><td>none</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 busy</td><td>13,330, 13,326, 13,326</td><td>none</td></tr>
+<tr><td><code>park=vmm</code>, VM 2 bursty</td><td>8,690, 8,710, 8,658</td><td>none logged</td></tr>
+<tr><td><code>park=vmm</code>, VM 2 idle</td><td>6,662, 8,681, 6,204</td><td>none logged</td></tr>
+<tr><td><code>park=vmm</code>, VM 2 busy</td><td>stopped, 4,298, stopped</td><td>VM 1 stopped making progress</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Ping-pong round trip, µs</strong> (p50 / p99; two runs):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setup</th><th>Run 1</th><th>Run 2</th></tr>
+</thead>
+<tbody>
+<tr><td>Baseline</td><td>224 / 512</td><td>226 / 506</td></tr>
+<tr><td>Baseline, cores held out of deep idle</td><td>10 / 12</td><td>10 / 12</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 idle</td><td>20 / 588</td><td>20 / 397</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 busy</td><td>38 / 90</td><td>39 / 97</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 busy, cores held out of deep idle</td><td>23 / 1,116</td><td>23 / 1,117</td></tr>
+<tr><td><code>park=kvm</code>, VM 2 busy, engine on an A725 core</td><td>31 / 92</td><td>34 / 98</td></tr>
+<tr><td><code>park=vmm</code>, any</td><td>no samples</td><td>no samples</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Forced park of a real vCPU</strong> (<code>bench_forced_park_latency_real_kvm_aarch64</code>,
+3,000 iterations, µs, p50 / p90 / p99):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>Request to <code>PARKED</code></th><th>Wake to <code>RUNNING</code></th></tr>
+</thead>
+<tbody>
+<tr><td>No idle limit, run 1</td><td>28.3 / 108.9 / 272.4</td><td>146.6 / 413.4 / 531.2</td></tr>
+<tr><td>No idle limit, run 2</td><td>16.6 / 108.7 / 233.3</td><td>9.4 / 697.1 / 732.2</td></tr>
+<tr><td>Cores held out of deep idle, run 1</td><td>15.2 / 17.2 / 20.3</td><td>9.4 / 10.2 / 11.2</td></tr>
+<tr><td>Cores held out of deep idle, run 2</td><td>15.1 / 17.1 / 19.6</td><td>10.0 / 10.7 / 11.6</td></tr>
+</tbody>
+</table>
+</div>
+<p>“Cores held out of deep idle” is a PM QoS request of 0 on
+<code>/dev/cpu_dma_latency</code> for the whole run.</p>
+<p><strong>What it shows:</strong></p>
+<ul>
+<li>Parking inside KVM keeps an unmodified guest at the baseline’s
+throughput, with no stall in 22 runs. Parking in the VMM strands the
+guest’s tasks on parked vCPUs: throughput falls by a third to two
+thirds, the ping-pong never runs, and with the other VM busy VM 1
+stops. This is why <code>park=kvm</code> is the default on aarch64 as well.</li>
+<li>Idle-state exits are most of a wake’s latency on this host. Holding
+the cores out of deep idle cuts the forced-park wake’s p99 from 531
+to 732 µs to 11 to 12 µs, and the baseline ping-pong from 224 / 512
+to 10 / 12 µs.</li>
+<li>With the other VM busy and the cores held out of deep idle, the
+ping-pong’s p99 rises to about 1.1 ms, against about 0.1 ms without
+the hold. Not explained yet; it may be the same kind of tail as the
+x86_64 ~1.9 ms tail (<a href="https://github.com/CMKL-APEX/pylon/issues/52">#52</a>).</li>
+<li>The engine’s core type (X925 or A725) made no measurable difference.</li>
+<li>VM 1’s VMM used 32 to 41% of a CPU with <code>park=kvm</code>, against 27% for
+the baseline.</li>
+</ul>
+<h2 id="handoff-latency-between-real-vms-measured-2026-11-13"><a class="header" href="#handoff-latency-between-real-vms-measured-2026-11-13">Handoff latency between real VMs (measured, 2026-11-13)</a></h2>
+<p>Spec 06 step S6 (<a href="https://github.com/CMKL-APEX/pylon/issues/53">#53</a>),
+from <code>pylond</code>’s latency histograms
+(<a href="../reference/metrics.html">Metrics</a>).</p>
+<p><strong>Setup:</strong> a bare-metal x86_64 host (AMD EPYC 7282, 16 cores with SMT,
+Ubuntu 7.0.0-43 kernel), <code>pylond</code> with <code>scx_pylon</code> on 3 managed CPUs.
+Two 4-vCPU Ubuntu guests park inside KVM (the default) and load
+<code>pv-pylon</code>. VM 1 runs the spec 06 S5 load (two spinners and a <code>/proc</code>
+reader on every CPU); VM 2 spins on 3 vCPUs for 100 ms every second, so
+cores move about 200 times each way per run. 150 s runs, the first 40 s
+dropped, two runs each; percentiles are read from the buckets. The
+default grace (8 µs) makes every revocation forced; a 200 µs grace
+(<code>--revoke-grace-us 200</code>) makes them cooperative.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Interval, µs (p50 / p99)</th><th>Grace 8 µs (forced)</th><th>Grace 200 µs (cooperative)</th></tr>
+</thead>
+<tbody>
+<tr><td>Revocation request → donor <code>PARKED</code></td><td>55–67 / 64–72 (a few per run: most donors hadn’t parked 50 µs after the signal)</td><td>66–82 / 79–153</td></tr>
+<tr><td>Core assigned → recipient running</td><td>38–48 / 57–140</td><td>42–47 / 59–78</td></tr>
+<tr><td>Revocation request → recipient running</td><td>100–112 / 117–205</td><td>114–126 / 137–291</td></tr>
+</tbody>
+</table>
+</div>
+<p>These are with the re-signal back-off below. The target is a handoff in
+3–6 µs and a park within the 8 µs grace; both are an order of magnitude
+off.</p>
+<p><strong>Where the time goes</strong> (from a host trace of signals, KVM exits and
+system calls):</p>
+<ul>
+<li>The signal stops the vCPU’s <code>KVM_RUN</code> within 3–6 µs.</li>
+<li>The VMM then takes 40–60 µs before it publishes <code>PARKED</code> (forced park)
+or re-enters the guest (wake). About 17 µs of it pass before the
+first signal handler returns; most of that is the trace’s own probes
+(see <a href="#profile-without-kprobes-measured-2026-11-14">the profile below</a>).</li>
+<li><code>pylond</code> re-signalled a waking vCPU every 10 µs, so several signals
+were delivered during one wake. Backing the re-signals off from
+100 µs cut wake p50 from 53–58 to 42–46 µs and p99 from 88–124 to
+59–78 µs.</li>
+<li>The VMM’s seccomp filter costs 5–10% (<code>--seccomp false</code>: wake p50
+47–61 µs, park p50 60–81 µs).</li>
+<li>Holding the cores out of deep idle (PM QoS 0) changed nothing on this
+host, unlike on the aarch64 reference host.</li>
+<li>A cooperative park takes about as long as a forced one: the guest’s
+kick-to-doorbell path (interrupt, <code>SCHED_FIFO</code> park thread, doorbell
+exit) adds up to the same 60–80 µs
+(<a href="https://github.com/CMKL-APEX/pylon/issues/74">#74</a>). Split up
+(2026-11-14, <a href="https://github.com/CMKL-APEX/pylon/blob/main/spec/09-park-by-halt.md#9-h0-result-2026-11-14">spec 09 §9</a>):
+4–32 µs from the kick to its injection, 16–64 µs in the guest to the
+doorbell, and 8–16 µs for KVM to handle the doorbell’s exit.</li>
+</ul>
+<h3 id="unmodified-guests-kicking-the-new-owners-cpu-measured-2026-11-14"><a class="header" href="#unmodified-guests-kicking-the-new-owners-cpu-measured-2026-11-14">Unmodified guests: kicking the new owner’s CPU (measured, 2026-11-14)</a></h3>
+<p><a href="https://github.com/CMKL-APEX/pylon/issues/54">#54</a>. <strong>Setup:</strong> a
+bare-metal x86_64 host (AMD EPYC 9124, 16 cores with SMT, Ubuntu
+7.0.0-42 kernel), <code>pylond</code> with <code>scx_pylon</code> on 3 managed CPUs and the
+default grace. Two 4-vCPU Ubuntu guests park inside KVM, without
+<code>pv-pylon</code>, and each spins on all 4 vCPUs, so every revocation is forced
+and parked vCPUs keep waking to share their VM’s CPUs. A script moves
+cores from one VM to the other every 50 ms by swapping their
+<code>max_cores</code> (1 and 3) over the control socket: about 590 handoffs per
+run. A host trace (signals, KVM exits, system calls, context switches
+on the managed CPUs) covered 20 s of each run.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Interval, µs (p50 / p90 / p99)</th><th>Before</th><th>Kicking the new owner’s CPU</th></tr>
+</thead>
+<tbody>
+<tr><td>Revocation request → donor <code>PARKED</code></td><td>52 / 60 / 64</td><td>52 / 60 / 64</td></tr>
+<tr><td>Core assigned → recipient running</td><td>80 / 1,408 / 2,048</td><td>40 / 56 / 1,024</td></tr>
+<tr><td>Revocation request → recipient running</td><td>144 / 1,408 / 2,304</td><td>104 / 120 / 1,152</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Where the time went:</strong> most recipients (271 of 343 in the trace)
+weren’t on a CPU when <code>pylond</code> gave them a core: they were woken vCPUs
+waiting for their turn on a CPU their VM shares. A signal doesn’t queue
+a thread that is already runnable, and <code>scx_pylon</code> doesn’t watch the
+owner table, so nothing told the new owner’s CPU. When the donor parked
+and blocked, the recipient ran within 20 µs (p50); when the donor kept
+running (an interrupt woke it inside KVM at once), the recipient waited
+for a tick, 662 µs at the median. <code>pylond</code> now kicks the CPU after each
+assignment (<code>pylon_kick_owner</code>).</p>
+<h3 id="profile-without-kprobes-measured-2026-11-14"><a class="header" href="#profile-without-kprobes-measured-2026-11-14">Profile without kprobes (measured, 2026-11-14)</a></h3>
+<p><a href="https://github.com/CMKL-APEX/pylon/issues/54">#54</a>. The setup above,
+on <code>main</code> with the kick and with <code>SIGUSR2</code> as the kick signal
+(<a href="https://github.com/CMKL-APEX/pylon/pull/99">#99</a>), one run. The
+trace used tracepoints only (signals, system calls, context switches):
+the earlier trace’s kprobes fired about 16 times between a <code>KVM_RUN</code>
+exit and the first handler’s return, and inflated it.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Interval, µs (p50 / p90 / p99)</th><th>Park (390)</th><th>Wake (390)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>KVM_RUN</code> exit → first handler’s <code>rt_sigreturn</code></td><td>8 / 11 / 26</td><td>5 / 9 / 16</td></tr>
+<tr><td><code>KVM_RUN</code> exit → next <code>KVM_RUN</code></td><td>45 / 151 / 1,951</td><td>18 / 25 / 32</td></tr>
+<tr><td>… of it in system calls</td><td>14 / 19 / 107</td><td>4 / 7 / 9</td></tr>
+<tr><td>Signal handlers run</td><td>3 / 3 / 4</td><td>1 / 1 / 2</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>pylond</code>’s histograms for the run: handoff 96 / 112 / 768 µs, wake
+36 / 52 / 704 µs, park 52 / 60 / 60 µs.</p>
+<ul>
+<li><strong>Exit to the first handler:</strong> 5–8 µs; the 17 µs above was mostly
+the probes. With them, each step (<code>get_signal</code>, building the signal
+frame, the return to user space) took 1–4 µs.</li>
+<li><strong>A park’s extra handlers:</strong> <code>pylond</code> re-sends the kick 10, 20 and
+40 µs after the first signal (<code>REVOKE_RESIGNAL_US</code>) while the donor
+hasn’t published <code>PARKED</code>. By then it has usually left <code>KVM_RUN</code> and
+is parking: 207 of 390 parks got two re-sends, 16–18 µs after the
+exit at the median, and each runs a handler. No single system call
+took over 4 µs at the median (<code>KVM_GET_MSRS</code>, <code>KVM_GET_REGS</code>,
+<code>KVM_SET_MP_STATE</code>, <code>timer_settime</code>).</li>
+<li><strong>A park’s tail:</strong> a donor that has published <code>PARKED</code> can be
+preempted by the new owner before its next <code>KVM_RUN</code>, and then waits
+about 1 ms. It is already parked, so the park latency doesn’t show it.</li>
+<li><strong>The wake and handoff tail:</strong> most signals that waited 0.2–3 ms
+for a CPU sent the vCPU to a CPU other than the one <code>pylond</code> gave it.
+<code>scx_pylon</code> kept a CPU’s woken turn after the CPU changed owner, so a
+sibling of the new owner, woken to share its VM’s old CPU, ran first
+and the new owner waited up to a tick. The new owner now takes the
+first turn (<a href="https://github.com/CMKL-APEX/pylon/pull/104">#104</a>):
+wakes slower than 200 µs in the trace fell from 7–32 per run to 0–2.</li>
+<li><strong>The rest of <code>pylond</code>’s tail:</strong> with that fixed, <code>pylond</code>’s wake
+p99 stayed at 0.2–1.2 ms, and its histograms counted more slow wakes
+than the trace showed. The trace’s slow wakes were the new owner
+sharing its CPU with a woken sibling for a 1 ms tick. The engine also
+lost its CPU to a managed vCPU thread for a full 20 ms slice, 1–2
+times per trace, which <a href="https://github.com/CMKL-APEX/pylon/pull/105">#105</a>
+fixes. That didn’t lower the tail, and neither did the kernel
+worker’s 0.7 ms runs on the engine’s CPU explain it: no handoff was
+waiting when one ended.</li>
+</ul>
+<h2 id="other-figures"><a class="header" href="#other-figures">Other figures</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Figure</th><th>Kind</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td>Grace period: 8 µs</td><td>Default (<code>--revoke-grace-us</code>)</td><td><code>REVOKE_GRACE_PERIOD_US</code>, <code>pylond/src/engine.rs</code></td></tr>
+<tr><td>Forced handoff: 50 µs after the first signal</td><td>Default (<code>--force-handoff-us</code>)</td><td><code>FORCE_HANDOFF_US</code></td></tr>
+<tr><td>Pause between sweeps: 333 ns, converted to counter ticks with the host rate (about 1,000 ticks on a 3 GHz TSC)</td><td>Default</td><td><code>SWEEP_INTERVAL_NS</code></td></tr>
+<tr><td>Handoff target: “~3–6 µs”</td><td>Design goal</td><td><code>spec/00-architecture.md</code> §1</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="gaps"><a class="header" href="#gaps">Gaps</a></h2>
+<p>These haven’t been measured and are needed before Pylon’s latency can
+be claimed:</p>
+<ul>
+<li>The engine’s sweep time, by number of VMs.</li>
+<li>Handoff latency without <code>scx_pylon</code>, and on an Intel host (above:
+AMD, with <code>scx_pylon</code>).</li>
+<li>The rest of a forced park’s 45 µs, and the slow wakes that
+<code>pylond</code>’s histograms count but a host trace doesn’t show
+(<a href="https://github.com/CMKL-APEX/pylon/issues/54">#54</a>).</li>
+<li>For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
+guest throughput against the <code>eventfd</code> park, and halt-polling
+settings (spec 08 P3,
+<a href="https://github.com/CMKL-APEX/pylon/issues/50">#50</a>). Spec 08 §7
+records stall and preemption counts from its prototype runs, not
+latencies.</li>
+<li><code>scx_pylon</code>’s cost for non-VM tasks on the host, beyond the
+benchmark’s threads above.</li>
+<li>The same <code>pylon-bench</code> run on a CPU with <code>WAITPKG</code>.</li>
+</ul>
+<p>When you add a figure, add it here with its date, hardware, build and
+command, and say whether it was measured or modelled.</p>
+<h2 id="running-the-benchmark"><a class="header" href="#running-the-benchmark">Running the benchmark</a></h2>
+<pre><code class="language-bash">cargo run --release -p pylond --bin pylon-bench            # the runs above
+cargo run --release -p pylond --bin pylon-bench -- --quick # short preset used by CI
+cargo run --release -p pylond --bin pylon-bench -- --help  # all options
+</code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../developer-guide/enhancements.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../developer-guide/contributing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../developer-guide/enhancements.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../developer-guide/contributing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
