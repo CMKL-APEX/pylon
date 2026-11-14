@@ -285,9 +285,11 @@ assigned. It records when each bit was set, by VM slot and vCPU.
     like `pylon_pcpu_owners`).
 - **Sharing:** a CPU owned by the same VM dispatches from the VM's queue
   with a short slice (proposed 100 µs). It runs the woken vCPU and its
-  own vCPU in turns. The preempted one is runnable but not running, so KVM
-  gives it steal time and `KVM_VCPU_PREEMPTED`. The guest's paravirtual
-  spinlocks and TLB flush then work as on any overcommitted host.
+  own vCPU in turns. After the CPU changes owner, the new owner takes the
+  first turn, even when it was one of the woken vCPUs. The preempted one
+  is runnable but not running, so KVM gives it steal time and
+  `KVM_VCPU_PREEMPTED`. The guest's paravirtual spinlocks and TLB flush
+  then work as on any overcommitted host.
 - A CPU never runs another VM's woken vCPU, which keeps the isolation of
   spec 03 and the SMT rules of #16.
 - **Directed yields (#52):** the kernel ends a slice only at a scheduling

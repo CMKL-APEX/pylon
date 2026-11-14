@@ -198,9 +198,12 @@ static char core_sched_fmt[] =
 
 __u32 cpu_claim[MAX_PCPUS];
 /*
- * Per CPU: set when the owner was the last managed task to run there, so the
- * next turn goes to a woken parked vCPU of its VM (spec 08 §4.3). Host tasks,
- * such as per-CPU kworkers, run between turns and don't change it.
+ * Per CPU: the thread ID of the owner when it was the last managed task to
+ * run there, else 0. The next turn goes to a woken parked vCPU of its VM
+ * (spec 08 §4.3), but only while that thread still owns the CPU: pylond often
+ * gives the CPU to one of those woken vCPUs, which then gets the first turn
+ * instead of a sibling. Host tasks, such as per-CPU kworkers, run between
+ * turns and don't change it.
  */
 __u32 woken_turn[MAX_PCPUS];
 
@@ -381,21 +384,25 @@ static __always_inline __u16 owner_slot(s32 cpu)
     return slot ? (__u16)(slot - 1) : VM_SLOT_NONE;
 }
 
-/* Whether the next turn on @cpu goes to a woken parked vCPU. */
-static __always_inline bool is_woken_turn(s32 cpu)
+/*
+ * Whether the next turn on @cpu goes to a woken parked vCPU: its owner, @tid,
+ * ran last.
+ */
+static __always_inline bool is_woken_turn(s32 cpu, __u32 tid)
 {
     /* Unsigned, as in read_claim(). */
     __u32 i = (__u32)cpu;
 
-    return i < MAX_PCPUS && *(volatile __u32 *)&woken_turn[pcpu_index(i)];
+    return i < MAX_PCPUS && tid != 0 && *(volatile __u32 *)&woken_turn[pcpu_index(i)] == tid;
 }
 
-static __always_inline void set_woken_turn(s32 cpu, bool turn)
+/* Records that @tid, @cpu's owner, ran there, or that a woken vCPU did (0). */
+static __always_inline void set_woken_turn(s32 cpu, __u32 tid)
 {
     __u32 i = (__u32)cpu;
 
     if (i < MAX_PCPUS) {
-        *(volatile __u32 *)&woken_turn[pcpu_index(i)] = turn;
+        *(volatile __u32 *)&woken_turn[pcpu_index(i)] = tid;
     }
 }
 
@@ -700,16 +707,15 @@ static bool dispatch_owner_from(s32 cpu, __u32 tid, u64 dsq, u64 slice)
 }
 
 /*
- * Dispatches this pCPU's owner with @slice if it is queued, and moves any
+ * Dispatches this pCPU's owner, @tid, with @slice if it is queued, and moves any
  * other task left on the owner queue (its ownership changed) to the queue it
  * now belongs on. Returns true if the owner was dispatched. The owner can
  * also wait on the vCPU queue or its VM's queue, where it was before it got
  * this pCPU; @prev, if it is the owner, waits on neither.
  */
-static bool dispatch_owner(s32 cpu, struct task_struct *prev, u64 slice)
+static bool dispatch_owner(s32 cpu, __u32 tid, struct task_struct *prev, u64 slice)
 {
     struct task_struct *p;
-    __u32 tid = owner_tid(cpu);
     bool dispatched = false;
 
     bpf_for_each(scx_dsq, p, (u64)cpu, 0) {
@@ -869,15 +875,16 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
      * when nothing else of its VM waits.
      */
     __u16 slot = owner_slot(cpu);
+    __u32 owner = owner_tid(cpu);
     bool prev_woken = slot < MAX_VM_SLOTS && woken_prev(prev, cpu, slot);
     bool share = slot < MAX_VM_SLOTS &&
                  (scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) > 0 || prev_woken);
     u64 owner_slice = share ? PYLON_SHARE_SLICE : PYLON_OWNER_SLICE;
 
-    if (share && is_woken_turn(cpu) && dispatch_woken(cpu, slot)) {
+    if (share && is_woken_turn(cpu, owner) && dispatch_woken(cpu, slot)) {
         return;
     }
-    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu, prev, owner_slice)) {
+    if (cpu >= 0 && cpu < MAX_PCPUS && dispatch_owner(cpu, owner, prev, owner_slice)) {
         return;
     }
     if (prev && owns_cpu(prev, cpu) && keep_prev(prev, cpu, owner_slice)) {
@@ -919,7 +926,7 @@ void BPF_PROG(pylon_running, struct task_struct *p)
 
     /* The owner hands the next turn to a woken vCPU, and that vCPU back. */
     if (claim != CLAIM_HOST) {
-        set_woken_turn(cpu, owns_cpu(p, cpu));
+        set_woken_turn(cpu, owns_cpu(p, cpu) ? (__u32)p->pid : 0);
     }
 
     if (claim == CLAIM_HOST && p->nr_cpus_allowed == 1) {

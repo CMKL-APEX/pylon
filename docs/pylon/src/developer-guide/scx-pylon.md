@@ -109,9 +109,13 @@ so `enqueue` kicks it to schedule again.
    - While woken vCPUs wait on the queue of the owner's VM, the owner and
      they take 100 µs turns (the owner's slice is 100 µs instead of
      20 ms while they wait). The owner entry's flags carry the VM's slot.
-     `running` records, per CPU, whether the owner or a woken vCPU ran
-     last; host tasks that run between turns, such as per-CPU kworkers,
-     don't change it.
+     `running` records, per CPU, the thread ID of the owner if it ran
+     last, or that a woken vCPU did; host tasks that run between turns,
+     such as per-CPU kworkers, don't change it. A woken vCPU's turn comes
+     only while that thread still owns the CPU, so a new owner runs
+     first. `pylond` often gives a CPU to one of the woken vCPUs, and
+     before this, the turn left by the old owner went to a sibling of
+     the new owner, which then waited up to a tick (#54).
 2. The vCPU queue, skipping threads that own another CPU. Such a
    thread's CPU is kicked if it is idle, in case it got the CPU while it
    waited here.
