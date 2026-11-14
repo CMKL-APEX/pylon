@@ -642,6 +642,7 @@ impl MatrixEngine {
             (u32::from(vm_slot) + 1) << scx_pylon::PCPU_OWNER_SLOT_SHIFT
         };
         self.pcpu_owners.write_owner(pcpu, tid, flags);
+        let _ = self.pcpu_owners.kick(pcpu);
         self.assigned_yield_count[pcpu] = host.yield_count.load(Ordering::Acquire);
         vm.set_assigned_pcpu(vcpu as usize, pcpu as u8);
         let _ = self.write_vm_fd(vm, || vm.wake_vcpu(vcpu as usize));

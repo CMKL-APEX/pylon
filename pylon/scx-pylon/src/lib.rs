@@ -7,7 +7,7 @@ use std::array::from_fn;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::mem::{offset_of, size_of};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -55,6 +55,9 @@ pub const SCHED_CORE_WATCH_PROG_NAME: &str = "pylon_sched_core_get";
 
 /// Name of the LSM program that refuses new core scheduling cookies.
 pub const COOKIE_DENY_PROG_NAME: &str = "pylon_task_prctl";
+
+/// Name of the program that kicks a pCPU after `pylond` gives it a new owner.
+pub const KICK_OWNER_PROG_NAME: &str = "pylon_kick_owner";
 
 /// Name of the `sched_ext_ops` struct_ops map inside `scx_pylon.bpf.o`.
 pub const SCX_OPS_MAP_NAME: &str = "pylon_ops";
@@ -175,6 +178,14 @@ pub enum Error {
     /// Required BPF program was not found in the embedded object.
     #[error("Missing required BPF program '{prog_name}'")]
     MissingProg { prog_name: &'static str },
+
+    /// Failed to duplicate a BPF program's file descriptor.
+    #[error("Failed to duplicate the file descriptor of BPF program '{prog_name}'")]
+    ProgFd {
+        prog_name: &'static str,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Result alias for `scx-pylon`.
@@ -398,6 +409,35 @@ impl VcpuDomainMap {
             Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => Ok(()),
             res => res.map_err(Error::Bpf),
         }
+    }
+}
+
+/// Runs `pylon_kick_owner`, which makes a pCPU schedule again so that the owner `pylond` just
+/// gave it runs there at once. It keeps its own file descriptor, so it outlives the loader.
+#[derive(Debug)]
+pub struct OwnerKick {
+    prog: OwnedFd,
+}
+
+impl OwnerKick {
+    /// Kicks `pcpu`: it preempts what it runs and picks its owner, if that waits. One
+    /// `bpf(BPF_PROG_RUN)` system call; it doesn't block.
+    pub fn kick(&self, pcpu: u32) -> io::Result<()> {
+        // struct pylon_kick_args { __s32 cpu; }
+        let mut args = pcpu as i32;
+        let mut opts = libbpf_sys::bpf_test_run_opts {
+            sz: size_of::<libbpf_sys::bpf_test_run_opts>() as _,
+            ctx_in: (&raw mut args).cast(),
+            ctx_size_in: size_of::<i32>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `prog` is a loaded `BPF_PROG_TYPE_SYSCALL` program, and `opts` points to
+        // `args`, which outlives the call and has the size `ctx_size_in` gives.
+        let ret = unsafe { libbpf_sys::bpf_prog_test_run_opts(self.prog.as_raw_fd(), &mut opts) };
+        if ret < 0 {
+            return Err(io::Error::from_raw_os_error(-ret));
+        }
+        Ok(())
     }
 }
 
@@ -654,6 +694,25 @@ impl ScxPylonUserspace {
         Ok(VcpuDomainMap { map: handle })
     }
 
+    /// Returns a handle that kicks a pCPU after `pylond` gives it a new owner.
+    pub fn owner_kick(&self) -> Result<OwnerKick> {
+        let prog = self
+            ._obj
+            .progs()
+            .find(|p| p.name() == KICK_OWNER_PROG_NAME)
+            .ok_or(Error::MissingProg {
+                prog_name: KICK_OWNER_PROG_NAME,
+            })?;
+        let prog = prog
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|source| Error::ProgFd {
+                prog_name: KICK_OWNER_PROG_NAME,
+                source,
+            })?;
+        Ok(OwnerKick { prog })
+    }
+
     /// Memory-maps `pylon_vm_vcpus` (`VM_VCPUS_MAP_BYTES`, shared). The mapping keeps the map
     /// alive, so it outlives `self`.
     pub fn vm_vcpus_mmap(&self) -> Result<MmapMut> {
@@ -745,6 +804,7 @@ mod tests {
         for prog in [
             SCHED_CORE_WATCH_PROG_NAME,
             COOKIE_DENY_PROG_NAME,
+            KICK_OWNER_PROG_NAME,
             "pylon_dispatch",
             "pylon_enqueue",
             "pylon_running",

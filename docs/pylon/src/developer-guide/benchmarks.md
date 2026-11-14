@@ -268,6 +268,46 @@ system calls):
   exit) adds up to the same 60–80 µs
   ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
 
+### Unmodified guests: kicking the new owner's CPU (measured, 2026-11-14)
+
+[#54](https://github.com/CMKL-APEX/pylon/issues/54). **Setup:** a
+bare-metal x86_64 host (AMD EPYC 9124, 16 cores with SMT, Ubuntu
+7.0.0-42 kernel), `pylond` with `scx_pylon` on 3 managed CPUs and the
+default grace. Two 4-vCPU Ubuntu guests park inside KVM, without
+`pv-pylon`, and each spins on all 4 vCPUs, so every revocation is forced
+and parked vCPUs keep waking to share their VM's CPUs. A script moves
+cores from one VM to the other every 50 ms by swapping their
+`max_cores` (1 and 3) over the control socket: about 590 handoffs per
+run. A host trace (signals, KVM exits, system calls, context switches
+on the managed CPUs) covered 20 s of each run.
+
+| Interval, µs (p50 / p90 / p99) | Before | Kicking the new owner's CPU |
+|---|---|---|
+| Revocation request → donor `PARKED` | 52 / 60 / 64 | 52 / 60 / 64 |
+| Core assigned → recipient running | 80 / 1,408 / 2,048 | 40 / 56 / 1,024 |
+| Revocation request → recipient running | 144 / 1,408 / 2,304 | 104 / 120 / 1,152 |
+
+**Where the time went:** most recipients (271 of 343 in the trace)
+weren't on a CPU when `pylond` gave them a core: they were woken vCPUs
+waiting for their turn on a CPU their VM shares. A signal doesn't queue
+a thread that is already runnable, and `scx_pylon` doesn't watch the
+owner table, so nothing told the new owner's CPU. When the donor parked
+and blocked, the recipient ran within 20 µs (p50); when the donor kept
+running (an interrupt woke it inside KVM at once), the recipient waited
+for a tick, 662 µs at the median. `pylond` now kicks the CPU after each
+assignment (`pylon_kick_owner`).
+
+Still open:
+
+- `pylond` re-sends `SIGRTMIN`, a real-time signal, while a donor
+  hasn't parked, and each one is queued: a forced park ran 5 signal
+  handlers at the median (up to 8), about 5 µs each.
+- From a donor's `KVM_RUN` exit to its next `KVM_RUN` (parked) took
+  69 µs at the median before the kick (the trace's probes add to it):
+  about 17 µs to the first handler's return, and 25 µs of `ioctl`s
+  after the last one (`KVM_GET_REGS`, `KVM_SET_MP_STATE`,
+  `KVM_GET_MSRS`) and arming the park bound.
+
 ## Other figures
 
 | Figure | Kind | Source |

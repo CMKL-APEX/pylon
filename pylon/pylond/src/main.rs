@@ -305,10 +305,14 @@ fn main() -> Result<()> {
             scx.vm_vcpus_mmap()
                 .context("failed to map scx_pylon's per-VM vCPU map")?,
         )?;
+        let kick = scx
+            .owner_kick()
+            .context("failed to open scx_pylon's owner kick")?;
         let (owner_map, link, guard_links, obj) = scx.into_parts();
         info!("scx_pylon attached successfully; kernel sched_ext is active");
         let table = PcpuOwnerTable::from_mmap(owner_map.into_mmap())
-            .context("failed to create PcpuOwnerTable from scx_pylon mmap")?;
+            .context("failed to create PcpuOwnerTable from scx_pylon mmap")?
+            .with_kick(kick);
         (
             Arc::new(table),
             Some(vcpu_domains),

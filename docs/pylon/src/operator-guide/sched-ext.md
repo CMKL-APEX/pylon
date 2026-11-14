@@ -11,6 +11,10 @@ through the host's fair scheduler.
 ID of the vCPU that owns it. `pylond` writes the table through a
 memory-mapped BPF map, with no system calls. The scheduler reads it:
 
+- **When `pylond` gives a CPU to a vCPU**, it also kicks that CPU, so
+  the CPU stops what it runs and picks the vCPU at once, even one that
+  was already waiting to run.
+
 - **When a vCPU thread wakes**, `scx_pylon` looks up the CPU that thread
   owns and queues it there. If the thread
   was last on another CPU, it kicks the owned CPU so the switch happens
