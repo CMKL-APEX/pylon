@@ -119,7 +119,11 @@ The longest wake counts as waiting time, like `head_wait`. A VM that
 owns a core and has no other unmet demand also wants one core per vCPU
 woken now (`spare_only`), with urgency 0, so after every other VM, and
 phase 3 gives it only spare cores: an idle one, or one held above its
-floor by a VM whose desired cores are 0 (#52).
+floor for at least `SPARE_CORE_TENURE_US` (1 s) by a VM whose desired
+cores are 0 (#52). Without the tenure, two idle VMs traded a spare core
+each time one of their vCPUs woke, as soon as the other's agent
+reported no demand again: about 70 forced preemptions a second with
+agents reporting every millisecond.
 
 **Time bases.** Every `*_tsc` field counts host counter ticks (the TSC,
 or `CNTVCT_EL0` on aarch64). The guest writes `head_wait_tsc` and
@@ -313,7 +317,11 @@ owns by it. It lives in one of three places:
 | Anonymous memory | Otherwise. Nothing reads it. |
 
 The engine writes it with plain atomic stores. No system call is needed
-even when the kernel reads it.
+even when the kernel reads it, but no CPU notices a new owner by itself:
+an owner that is already runnable, waiting for its turn on a CPU its VM
+shares, isn't queued again. With `scx_pylon`, `assign_pcpu` therefore
+also runs `pylon_kick_owner` (one `bpf` system call), which kicks the
+CPU so it picks its new owner at once.
 
 ## Metering and counters
 

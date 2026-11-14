@@ -35,9 +35,11 @@ Sent by the VMM at start. You don't send this by hand.
 ```
 
 `kick_signal` (optional) is the signal that interrupts a vCPU's
-`KVM_RUN` in the VMM: its `SIGRTMIN`. `pylond` sends it to a donor vCPU's
-thread when a revocation's deadline passes. It must be a real-time
-signal. Without it, `pylond` never signals the VMM. `pylond` takes the
+`KVM_RUN` in the VMM: `SIGUSR2` (12 on x86_64 and aarch64) from the
+Pylon VMM, which sent its `SIGRTMIN` up to v0.0.8-rc3. `pylond` sends
+it to a donor vCPU's thread when a revocation's deadline passes. It
+must be `SIGUSR1`, `SIGUSR2` or a real-time signal. Without it,
+`pylond` never signals the VMM. `pylond` takes the
 VMM's PID from the socket's peer credentials, not from the message.
 
 `wake_by_signal` (optional, default `false`) is sent as `true` by a VMM
@@ -71,7 +73,7 @@ drops its registration.
 `pylond` closes the connection after the response. Both sides log a
 rejection as a warning; the VM then runs without `pylond`. A registration whose JSON doesn't parse gets no response.
 A registration's `priority_weight` of 0 is stored as 1.
-| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't a real-time signal; the file isn't a `memfd` on shmem sealed with `F_SEAL_SHRINK` and `F_SEAL_GROW`, couldn't be mapped, is smaller than 16,384 bytes, or the header of its shared page or host page is invalid; a kick or wake file descriptor isn't an `eventfd`; or a pidfd for the peer couldn't be opened. |
+| `{"accepted": false, "message": "<error>"}` | `num_vcpus` isn't in 1–64; `max_cores` is 0, below `min_cores` or above `num_vcpus`; `kick_signal` isn't `SIGUSR1`, `SIGUSR2` or a real-time signal; the file isn't a `memfd` on shmem sealed with `F_SEAL_SHRINK` and `F_SEAL_GROW`, couldn't be mapped, is smaller than 16,384 bytes, or the header of its shared page or host page is invalid; a kick or wake file descriptor isn't an `eventfd`; or a pidfd for the peer couldn't be opened. |
 
 ## Stats
 

@@ -86,11 +86,12 @@ The `VmExit::Reset` hook was removed (S1).
 **Implemented (S2).** When a deadline passes, `pylond` sends
 `tgkill(vmm_pid, host_tid, kick_signal)` (spec 06 §4.4–4.5). Cloud
 Hypervisor's vCPU threads already ignore `SIGRTMIN` with a no-op
-handler, so `KVM_RUN` returns `EINTR`, the KVM backend reports
+handler, and the VMM gives them the same handler for `kick_signal`, so `KVM_RUN` returns `EINTR`, the KVM backend reports
 `VmExit::Ignore`, and the post-exit hook force-parks. Details:
 
-- The VMM sends its own `SIGRTMIN()` as `kick_signal` when it registers,
-  because the number depends on the libc. `pylond` accepts only a
+- The VMM sends `SIGUSR2` as `kick_signal` when it registers. Unlike a
+  real-time signal, it doesn't queue, so signals sent while a vCPU waits
+  to run cost one handler. `pylond` accepts `SIGUSR1`, `SIGUSR2` or a
   real-time signal, and doesn't signal a VMM that sent none.
 - `pylond` learns the VMM's PID from `SO_PEERCRED` and opens a pidfd for
   it. Before each signal it checks the process still exists, so a reused
@@ -194,7 +195,7 @@ rejects such a VM (spec 08 §2). How it works:
   longer than 4 ms (`WOKEN_DEMAND_US`) counts as demand for a core,
   and a VM with no core gets a zero-core wakeup then. A shorter wake, in
   a VM that owns a core, takes only a spare core: an idle one, or one
-  held by a VM that wants none. A core given to a
+  held for at least 1 s by a VM that wants none. A core given to a
   woken vCPU stays wanted until the guest agent reports again, or for
   50 ms (`WOKEN_GRANT_HOLD_US`). Woken time is metered per VM
   (`woken_shared_usec`, `woken_unowned_usec`).
