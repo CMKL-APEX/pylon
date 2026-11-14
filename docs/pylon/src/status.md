@@ -13,7 +13,7 @@ The detailed tracker is
 |---|---|
 | Shared page | Created per VM, mapped into the guest at a fixed address, and shared with `pylond`. Layout checked at compile time. |
 | `--pylon` option | Parsed and validated. VMs boot with only `initial_active_vcpus` running; the guest agent's first heartbeat parks the rest. |
-| Registration | The VMM registers with `pylond` at boot, passing the shared page and per-vCPU `eventfd`s, and logs whether `pylond` accepted the VM. A VM is removed when its VMM exits. |
+| Registration | The VMM registers with `pylond`, passing the shared page and per-vCPU `eventfd`s, logs whether `pylond` accepted the VM, and keeps the connection open. A VM is removed when its VMM exits. When `pylond` exits, the VM runs unmanaged, and it registers again when `pylond` is back; a VM started before `pylond` registers once it appears. |
 | Waking parked vCPUs | `pylond` wakes a parked vCPU when its VM has demand and a managed CPU is idle, or takes a core from another VM. |
 | Taking back idle cores | When a vCPU parks on its own, `pylond` reclaims its core. |
 | Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. Repeated signals back off up to 1 ms. |
@@ -81,8 +81,9 @@ But:
   address `0xFEDF_0000` instead of a PCI BAR ([#59](https://github.com/CMKL-APEX/pylon/issues/59)).
 - **Lifecycle.** Snapshot and live migration are refused with
   `--pylon` ([#61](https://github.com/CMKL-APEX/pylon/issues/61)), and so
-  is resizing the vCPUs. A `pylond` restart isn't handled: the VMM
-  registers once, at boot, and doesn't reconnect ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
+  is resizing the vCPUs ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
+  A `pylond` restart is handled: VMs run unmanaged while it is away,
+  and register again when it is back.
 - **PCI ID.** `pylon-kick` uses a provisional ID, `0x1AF4:0x10F0`, from
   QEMU's experimental range ([#64](https://github.com/CMKL-APEX/pylon/issues/64)).
 
@@ -99,7 +100,7 @@ The next release is `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/mil
 | Report critical sections from the guest. | [#56](https://github.com/CMKL-APEX/pylon/issues/56) |
 | Scale to zero on network traffic. | [#57](https://github.com/CMKL-APEX/pylon/issues/57) |
 | Move the shared page into a PCI BAR; get a PCI ID. | [#59](https://github.com/CMKL-APEX/pylon/issues/59), [#64](https://github.com/CMKL-APEX/pylon/issues/64) |
-| Lifecycle: `pylond` restart, vCPU hotplug, snapshot and migration. | [#60](https://github.com/CMKL-APEX/pylon/issues/60), [#61](https://github.com/CMKL-APEX/pylon/issues/61) |
+| Lifecycle: snapshot and migration. | [#61](https://github.com/CMKL-APEX/pylon/issues/61) |
 | aarch64: the kick path on the GICv3 ITS. | [#63](https://github.com/CMKL-APEX/pylon/issues/63) |
 | MSHV: check that a signal-interrupted run returns cleanly. | [#65](https://github.com/CMKL-APEX/pylon/issues/65) |
 

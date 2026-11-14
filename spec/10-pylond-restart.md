@@ -1,7 +1,7 @@
 # Specification 10: Surviving a `pylond` Restart
 
-> **Status:** `DRAFT`. Not started. It answers spec 06 Q5 (#60): how a
-> VMM finds out that `pylond` is gone, runs its VM without it, and
+> **Status:** `DONE` (R1–R4, #60; results in §9). It answers spec 06 Q5:
+> how a VMM finds out that `pylond` is gone, runs its VM without it, and
 > registers again when `pylond` comes back.
 
 ## 1. Motivation
@@ -230,3 +230,41 @@ one, which lists the vCPU threads again as the VMs register.
 - **`pylond` writes a heartbeat in the host page.** The VMM would have
   to watch it, and a stopped heartbeat can mean a stalled `pylond`, not
   a gone one. A closed socket can only mean it is gone.
+
+## 9. Result (2026-11-14)
+
+*As implemented:* `vmm/src/pylon_session.rs` and the `unmanaged` state
+in `vmm/src/pylon.rs`; sessions in `pylon/pylond/src/control.rs`. Two
+details the design didn't have:
+
+- **A VM is unmanaged until it registers**, not only after a session
+  ends. A guest park request in a VM that no `pylond` manages used to
+  park the vCPU for good in `park=vmm`.
+- **The session thread inherits the VMM thread's seccomp filter**,
+  which now allows `inotify_init1` and `inotify_add_watch`.
+
+*Run:* the bare-metal x86_64 host, two 4-vCPU Ubuntu guests
+(`initial_active_vcpus=1`, `work` and `steady` loads) on 3 managed CPUs.
+`pylond` was killed with `SIGKILL` 45 s after the VMs started, and
+started again 20 s later. Once with `park=vmm` and `pylond --no-scx`,
+twice with `park=kvm` and `scx_pylon`.
+
+| | `park=vmm` | `park=kvm` |
+|---|---|---|
+| VMM logs the loss after the kill | yes, both VMs | yes, both VMs; about 10 ms |
+| vCPUs that run while `pylond` is away (V1) | all 8 | all 8 |
+| Registered again after the new `pylond` listens (V2) | both | both, 6–23 ms after it listened |
+| Boot parks asked again | 3 per VM | 3 per VM |
+| Cores before the kill → after the restart (V3) | 1 / 2 → 1 / 2 | 1 / 2 → 1 / 2, and 1 / 2 → 0 / 3 with VM 1's demand at 0 |
+| Guest stalls after the kill | none | none |
+
+The `park=vmm` guests logged soft lockups 32–36 s after boot, before
+the kill: the stalls of spec 08 §1, which parking inside KVM removes.
+With `scx_pylon`, the new `pylond` took 7.4 s from start to listening,
+which is outside this spec.
+
+V4: neither side's `serde` structs deny unknown fields, so a `v0.0.8`
+`pylond` ignores `session`, and its reply has none, which the VMM takes
+as no session (§5). V5 wasn't exercised on the host: the VMM registers
+only once every started vCPU has left `PARKED`, and wakes the rest
+again every 10 ms until then (`test_losing_pylond_*` cover the wakes).

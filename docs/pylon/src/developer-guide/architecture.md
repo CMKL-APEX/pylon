@@ -56,10 +56,11 @@ Policy changes are the one exception: Plane 1 writes them straight into
    vCPU slot.
 2. **VMM → Plane 1, at memory setup.** `setup_memory_region` maps the
    same file into guest-physical memory at `gpa` as a shared memory
-   slot. Then, if `socket` exists, `register_with_daemon` sends
+   slot, and starts the `pylon-session` thread. Once `socket` exists,
+   `register_with_daemon` sends
    one message: newline-terminated JSON (`vm_id`, `num_vcpus`, `kick_signal`,
-   `min_cores`, `max_cores`, `priority_weight`, and `wake_by_signal`
-   when vCPUs park inside KVM), with the file
+   `min_cores`, `max_cores`, `priority_weight`, `session`, and
+   `wake_by_signal` when vCPUs park inside KVM), with the file
    descriptors in `SCM_RIGHTS` in this order: the page, the kick
    `eventfd`s, the wake `eventfd`s.
 3. **Plane 1.** Maps the page from the descriptor, checks the header,
@@ -67,8 +68,13 @@ Policy changes are the one exception: Plane 1 writes them straight into
    it later),
    builds a `VmHandle`, and publishes a new VM list without any old
    entry that has the same `vm_id`. It replies with
-   `{"accepted":true,...}` and closes the connection. The VMM waits up to
-   1 second for the reply and logs a rejection as a warning.
+   `{"accepted":true,"session":true,...}` and a newline, and keeps the
+   connection open as the VM's session, outside its connection limit.
+   The VMM waits up to 1 second for the reply and logs a rejection as a
+   warning. When the session ends (`pylond` exited, or removed the VM),
+   the VMM wakes every parked vCPU, runs the VM unmanaged, and registers
+   it again once a new socket appears
+   ([spec 10](https://github.com/CMKL-APEX/pylon/blob/main/spec/10-pylond-restart.md)).
 4. **VMM, vCPU threads.** Each thread stores its `gettid()` in its slot's
    `host_tid`. The VMM tags vCPUs at or above `initial_active_vcpus`
    `park_on_boot`, and leaves them running so the guest can bring them

@@ -44,6 +44,12 @@ See [Status and roadmap](status.md) for what works and what doesn't.
 - **aarch64 runs real guests end to end**, with `scx_pylon` attached and
   vCPUs parked inside KVM, after a fix to how a suspended aarch64 vCPU
   wakes ([#62](https://github.com/CMKL-APEX/pylon/issues/62)).
+- **VMs survive a `pylond` restart**
+  ([#60](https://github.com/CMKL-APEX/pylon/issues/60)). A VMM keeps its
+  registration open; when `pylond` goes away, it wakes every parked vCPU
+  and runs the VM unmanaged, and it registers again once a new `pylond`
+  listens. A VM started before `pylond` registers once it appears
+  ([Running pylond](operator-guide/pylond.md#start-order-and-restarts)).
 - **`pylond` refuses a VM that parks inside KVM when `scx_pylon` isn't
   attached**, and the VMM now reads `pylond`'s reply: it logs whether
   the registration was accepted, and where its vCPUs park.
@@ -108,8 +114,7 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   takes 80–140 µs to park after a revocation, against `pylond`'s 8 µs
   grace, so revocations end in a forced park
   ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
-- **`pylond` restarts aren't handled**: the VMM registers once and
-  doesn't reconnect. vCPU hotplug is refused for VMs with `--pylon`
+- **vCPU hotplug is refused** for VMs with `--pylon`
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
 - **A VM with no core isn't woken by arriving packets**
   ([#57](https://github.com/CMKL-APEX/pylon/issues/57)).

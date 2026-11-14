@@ -32,8 +32,9 @@ know, and one that would leave `max_cores` at `0`, `min_cores` above
 `max_cores`, or `max_cores` above the VM's vCPU count. A
 `priority_weight` of `0` is raised to `1`.
 
-Policy changes aren't saved. A VM that restarts registers again with
-the values from its `--pylon` option.
+Policy changes aren't saved. A VM that restarts, or registers again
+after `pylond` restarts, registers with the values from its `--pylon`
+option.
 
 ## Reading stats
 

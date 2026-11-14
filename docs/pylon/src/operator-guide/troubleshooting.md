@@ -6,7 +6,8 @@ Look for these lines in the VMM's log:
 
 | VMM log | Cause | Fix |
 |---|---|---|
-| `Pylon: daemon socket ... does not exist yet` | `pylond` wasn't running when the VM started. | Start `pylond` first, then restart the VM. VMs register only at start. |
+| `Pylon: pylond socket ... doesn't exist; VM ... runs unmanaged until it appears` | `pylond` wasn't running when the VM started. | Start `pylond`: the VM registers once the socket appears. |
+| `Pylon: pylond closed the session of VM ...` | `pylond` stopped, or removed the VM. | Start `pylond` again: the VM registers once a new socket appears. |
 | `Pylon: failed to register VM ... with pylond` with *Permission denied* | The VMM's user can't write to the socket. | Start `pylond` with `--socket-group` and `--socket-mode` ([Running pylond](pylond.md#the-control-socket)). |
 | neither | `socket=` is missing from `--pylon`. | Add it. |
 

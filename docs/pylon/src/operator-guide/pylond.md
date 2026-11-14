@@ -73,21 +73,38 @@ out of file descriptors, `pylond` logs the failed `accept` and tries
 again 100 ms later. At start it raises its soft limit on open files to
 the hard limit: each registered VM holds up to 129 of them.
 
-## Start order
+## Start order and restarts
 
-Start `pylond` before Pylon VMs. A VMM registers once, when it starts,
-and doesn't retry or reconnect. If `pylond` restarts, it forgets every
-VM. Running VMs keep their running vCPUs, but parked ones stay parked
-until the VMs restart. (In a VM that [parks inside KVM](#vms-that-park-inside-kvm),
-an interrupt still runs a parked vCPU, and a vCPU parked by the guest or
-a revocation runs again without a core after 4 ms.)
+`pylond` and its VMs can start in either order, and `pylond` can be
+restarted while VMs run ([spec 10](https://github.com/CMKL-APEX/pylon/blob/main/spec/10-pylond-restart.md)):
+
+- **A VM keeps its registration open.** When `pylond` exits, for any
+  reason, the VMM finds out at once. It wakes every parked vCPU and runs
+  the VM unmanaged: all its vCPUs run where the host's scheduler puts
+  them, and none park. The VMM logs `pylond closed the session of VM
+  <id>; it runs unmanaged until a pylond listens at <path> again`.
+- **A VM registers again** when a new `pylond` creates the socket. The
+  VMM watches the socket's directory, and checks the path every 5
+  seconds as well. `pylond` then parks the vCPUs beyond
+  `initial_active_vcpus`, as after the VM's boot, and gives the VM
+  cores from there.
+- **A VM that starts before `pylond`** runs unmanaged and registers
+  once the socket appears.
+
+What a restart loses: policy changed over the control socket (a VM
+registers again with its `--pylon` values), and the stats and metrics
+counters. A VMM that `pylond` refuses waits for the next new socket
+before it tries again. VMMs from `v0.0.8-rc1` and earlier register once
+and don't come back after a restart.
 
 ## Stopping
 
 `pylond` has no signal handlers of its own: `SIGTERM` and `SIGINT` end it
 immediately. The kernel then detaches `scx_pylon`, if it was attached,
-and the host's normal scheduler takes over. vCPUs that were parked stay
-parked. The socket file is left behind and removed at the next start.
+and the host's normal scheduler takes over. Each VMM sees its session
+end and runs its VM unmanaged, with every vCPU awake, until a `pylond`
+starts again ([Start order and restarts](#start-order-and-restarts)).
+The socket file is left behind and removed at the next start.
 
 ## VMs that park inside KVM
 
