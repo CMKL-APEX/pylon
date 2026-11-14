@@ -53,6 +53,9 @@ But:
   On the bare-metal x86_64 host, the kick takes 4–32 µs to reach the
   guest, and the guest then takes 16–64 µs to ask to park: kernel code
   runs that slowly on that host, in a guest or not ([spec 09 §9](https://github.com/CMKL-APEX/pylon/blob/main/spec/09-park-by-halt.md#9-h0-result-2026-11-14)).
+  So forced parks stay the default in v0.0.8. This was measured on
+  Zen 2 only, which needs some of the costliest x86 mitigations; newer
+  x86 CPUs may do better and are still to be measured.
 - **Handoffs take about 100–125 µs.** On bare metal, from a revocation
   request to the recipient vCPU running takes 100–126 µs at the median
   ([#53](https://github.com/CMKL-APEX/pylon/issues/53); see

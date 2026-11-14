@@ -3,8 +3,9 @@
 > **Status:** `DRAFT`, on hold. H0 (§9) found that the guest takes
 > 16–64 µs from the kick's injection to its park request, so a park by
 > halt can't reach the 8 µs grace either. The guest's time is ordinary
-> kernel code running slowly on this x86_64 host, not the kick path. It aims at #74: a cooperative park within
-> `pylond`'s 8 µs grace period. It builds on parking inside KVM (spec
+> kernel code running slowly on this x86_64 host (Zen 2), not the kick
+> path, so #74 is closed for v0.0.8. The spec aims at #74: a cooperative
+> park within `pylond`'s 8 µs grace period. It builds on parking inside KVM (spec
 > 08) and needs `--pylon park=kvm` and `scx_pylon`.
 
 ## 1. Motivation
@@ -330,18 +331,32 @@ Ruled out:
 So the kick path isn't slow because of `pv-pylon` or the kick: kernel
 code on this host is slow, in a guest or not. With `bpftrace`, a local
 wakeup on the host itself takes 4–16 µs. The aarch64 reference host
-parks a real vCPU in about 15 µs in all (#62). The host's mitigations
-(STIBP always on, return thunks, Safe RET) remain the main suspect; a
-run with `mitigations=off` needs a reboot of the host.
+parks a real vCPU in about 15 µs in all (#62).
+
+The host is an AMD EPYC 7282 (Zen 2), which carries nearly the heaviest
+set of x86 mitigations: return thunks for retbleed and Safe RET for
+SRSO on every kernel return, retpolines, STIBP always on, and IBPB
+before an exit to user space (VMScape). They may explain the host's own
+slowness, but they apply to host code, and the guest's time didn't move
+with its own mitigations off. A run with `mitigations=off` on the host
+wasn't made: it needs a reboot, and production keeps the mitigations
+on, so it couldn't change the outcome on this CPU.
 
 **For #74:** even parking from the kick handler, with no thread, would
 leave the injection (4–32 µs) and the handler's own 5 µs, so no
 cooperative park reaches the 8 µs grace on this x86_64 host. Forced
-parks, the default, stay.
+parks, the default, stay. #74 is closed for v0.0.8 on that result.
+
+**Measured on Zen 2 only.** Newer x86 CPUs need fewer of these
+mitigations (recent Intel parts with eIBRS have no retbleed thunks or
+retpolines; Zen 5 isn't affected by SRSO), and their kernel paths may be
+much cheaper. H0 is to be run again, with the same harness, on the x86
+hardware that is actually deployed if it is of another generation; a
+result under 8 µs there reopens this spec.
 
 **H0's exit criterion fails.** A park by halt would remove the
 doorbell's exit and the VMM's path, but `pylond` would still see
 `PARKING` 20–60 µs after the kick, against the 8 µs grace. H1 waits
 until the guest's side is understood and cut. Measuring the host's
-mitigations (a reboot) is also deferred: they don't explain the guest's
-time.
+mitigations (a reboot) is not planned: they don't explain the guest's
+time, and they stay on in production.
