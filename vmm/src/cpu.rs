@@ -1422,6 +1422,9 @@ impl CpuManager {
                     // This uses an async signal safe handler to kill the vcpu handles.
                     register_signal_handler(SIGRTMIN(), handle_signal)
                         .expect("Failed to register vcpu signal handler");
+                    // `pylond` interrupts KVM_RUN with its own signal (`pylon::KICK_SIGNAL`).
+                    register_signal_handler(pylon::KICK_SIGNAL, handle_signal)
+                        .expect("Failed to register vcpu signal handler");
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
                     // If any vCPU started with this one failed, none of them runs.
