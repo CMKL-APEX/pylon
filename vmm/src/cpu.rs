@@ -1440,6 +1440,8 @@ impl CpuManager {
                         let read_guest_timer =
                             || pylon::read_guest_tsc_deadline(vcpu.lock().unwrap().vcpu.as_ref());
                         let vcpu_for_park = &vcpu;
+                        // Looked up once: the run loop counts every `KVM_RUN` for `pylond`.
+                        let pylon_state = pylon::global_state();
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1511,8 +1513,15 @@ impl CpuManager {
                             }
 
                             let mut vcpu = vcpu.lock().unwrap();
+                            if let Some(pylon) = &pylon_state {
+                                pylon.count_kvm_run(vcpu_id);
+                            }
+                            let run = vcpu.run();
+                            if let Some(pylon) = &pylon_state {
+                                pylon.count_kvm_run(vcpu_id);
+                            }
                             // vcpu.run() returns false on a triple-fault so trigger a reset
-                            match vcpu.run() {
+                            match run {
                                 Ok(run) => match run {
                                     #[cfg(feature = "kvm")]
                                     VmExit::Debug => {

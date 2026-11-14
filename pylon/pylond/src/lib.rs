@@ -3464,6 +3464,124 @@ mod tests {
         assert!((10_000..10_000_000).contains(&tsc_khz), "{tsc_khz} kHz");
     }
 
+    static OUT_OF_GUEST_SIGNALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn count_out_of_guest_signal(_: libc::c_int) {
+        OUT_OF_GUEST_SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A donor whose thread left `KVM_RUN` after the signal (an even `kvm_run_seq` that changed)
+    /// isn't signalled again until it re-enters, and then at once.
+    #[test]
+    fn test_plane2_no_resignal_while_donor_is_out_of_the_guest() {
+        let kick_signal = libc::SIGRTMIN() + 6;
+        // SAFETY: installs a handler that only increments an atomic, which is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = zeroed();
+            action.sa_sigaction = count_out_of_guest_signal as *const () as usize;
+            assert_eq!(libc::sigaction(kick_signal, &action, ptr::null_mut()), 0);
+        }
+        let seen = || OUT_OF_GUEST_SIGNALS_SEEN.load(Ordering::SeqCst);
+        let wait_for = |at_least: u64| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while seen() < at_least {
+                assert!(Instant::now() < deadline, "vCPU thread wasn't signalled");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[6]);
+
+        let mut donor = build_test_vm(31, 1, 0, 1, 1);
+        donor.req.kick_signal = Some(kick_signal);
+        let donor_handle = VmHandle::new(
+            &donor.req,
+            donor.shm_fd.try_clone().unwrap(),
+            donor
+                .kick_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+            donor
+                .wake_fds
+                .iter()
+                .map(|fd| fd.try_clone().unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_vmm_pid(process_id() as i32)
+        .unwrap();
+        let recipient = build_test_vm(41, 1, 0, 1, 1);
+
+        // The donor's vCPU thread: a thread of this process that just sleeps.
+        let stop = Arc::new(AtomicBool::new(false));
+        let tid = Arc::new(AtomicU64::new(0));
+        let vcpu_thread = {
+            let stop = Arc::clone(&stop);
+            let tid = Arc::clone(&tid);
+            thread::spawn(move || {
+                // SAFETY: `gettid` has no preconditions.
+                tid.store(unsafe { libc::gettid() } as u64, Ordering::SeqCst);
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        while tid.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        let donor_slot = &donor_handle.host_page().vcpus[0];
+        donor_slot
+            .host_tid
+            .store(tid.load(Ordering::SeqCst) as u32, Ordering::Release);
+        donor_slot
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        // A donor keeps its core until the handover.
+        donor_slot.assigned_pcpu.store(6, Ordering::Release);
+        // In the guest.
+        donor_slot.kvm_run_seq.store(1, Ordering::Release);
+        donor_slot
+            .revoke_deadline_tsc
+            .store(1_000, Ordering::Relaxed);
+        donor_slot.revoke_requested.store(1, Ordering::Release);
+
+        ControlPlane::publish_vm_handle(&snapshot, donor_handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, recipient.handle.clone());
+        engine.set_core_state(
+            6,
+            CoreState::Revoking {
+                donor_vm_id: 31,
+                donor_vcpu: 0,
+                recipient_vm_id: 41,
+                recipient_vcpu: 0,
+                deadline_tsc: 1_000,
+            },
+        );
+
+        let before = seen();
+        engine.poll_once(1_000);
+        wait_for(before + 1);
+
+        // The signal took the thread out of `KVM_RUN`: no re-send when one is due.
+        donor_slot.kvm_run_seq.store(2, Ordering::Release);
+        engine.poll_once(1_000 + 30_000);
+        engine.poll_once(1_000 + 60_000);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(seen(), before + 1);
+
+        // It went back into the guest without parking: signalled again at once.
+        donor_slot.kvm_run_seq.store(3, Ordering::Release);
+        engine.poll_once(1_000 + 60_001);
+        wait_for(before + 2);
+        assert!(matches!(engine.core_state(6), CoreState::Revoking { .. }));
+
+        stop.store(true, Ordering::SeqCst);
+        vcpu_thread.join().unwrap();
+    }
+
     #[test]
     fn test_kick_signal_allows_user_and_realtime_signals() {
         for signal in [

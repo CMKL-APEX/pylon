@@ -914,6 +914,16 @@ impl PylonVmmState {
         slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
     }
 
+    /// Counts a `KVM_RUN` entry or return of `vcpu_id`'s thread in `kvm_run_seq`, which is odd
+    /// while the thread is in the guest. Only the vCPU's thread writes it.
+    pub fn count_kvm_run(&self, vcpu_id: u32) {
+        if let Some(host) = self.host_slot(vcpu_id) {
+            let seq = host.kvm_run_seq.load(Ordering::Relaxed);
+            host.kvm_run_seq
+                .store(seq.wrapping_add(1), Ordering::Release);
+        }
+    }
+
     /// Post-exit park handler called inside the vCPU run loop (`vmm/src/cpu.rs`) after every
     /// exit to userspace, with the vCPU lock dropped.
     ///

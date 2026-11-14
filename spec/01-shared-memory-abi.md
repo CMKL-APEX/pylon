@@ -139,7 +139,8 @@ pub struct PylonHostVcpuSlot {
     pub yield_count: AtomicU64,         // VMM, before publishing PARKED
     pub revoke_deadline_tsc: AtomicU64, // pylond, before setting revoke_requested
     pub park_timer_deadline_tsc: AtomicU64, // VMM, at park; 0 when the vCPU runs
-    pub _reserved: [u8; 32],
+    pub kvm_run_seq: AtomicU32,     // VMM, before entering and after leaving KVM_RUN
+    pub _reserved: [u8; 28],
 }
 
 #[repr(C, align(4096))]
@@ -154,6 +155,11 @@ The VMM and `pylond` act on these fields, not on the fields of the same name in 
 which each writer updates after the host slot as copies for the guest. Whether a vCPU parked, and
 whether a revocation is pending, come only from the host page, and so do the thread IDs `pylond`
 signals and writes to `scx_pylon`'s owner map.
+The vCPU thread increments `kvm_run_seq` just before it enters `KVM_RUN` and again when it
+returns, so the count is odd while the thread is in the guest. `pylond` doesn't repeat a kick
+signal to a thread whose count has changed since the last signal and is even: the thread is out
+of the guest and the VMM acts on the request before it enters again. A VMM that doesn't count
+leaves it at 0, and `pylond` repeats signals as before.
 `pylond` rejects a file smaller than `PYLON_SHM_FILE_SIZE` or with an invalid host header. The host
 page's version changes without `PYLON_ABI_VERSION`.
 
@@ -170,6 +176,7 @@ page's version changes without `PYLON_ABI_VERSION`.
 - `offset_of!(PylonVcpuSlot, guest_tsc_offset) == 56`
 - `size_of::<PylonHostVcpuSlot>() == 64`
 - `offset_of!(PylonHostVcpuSlot, host_tid) == 4`
+- `offset_of!(PylonHostVcpuSlot, kvm_run_seq) == 32`
 - `size_of::<PylonHostPage>() == 8192`
 
 ### Time bases

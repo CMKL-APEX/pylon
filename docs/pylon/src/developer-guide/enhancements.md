@@ -98,7 +98,9 @@ handler, and the VMM gives them the same handler for `kick_signal`, so `KVM_RUN`
   PID is never signalled.
 - The signal is resent, because one that arrives while the thread is
   outside `KVM_RUN` doesn't stop the next guest entry. The interval
-  starts at 10 µs and doubles with each signal, up to 1 ms.
+  starts at 10 µs and doubles with each signal, up to 1 ms. A thread
+  that has left `KVM_RUN` since the last signal isn't signalled again
+  until it re-enters (`kvm_run_seq`).
 - `pylond` hands the CPU over only once the VMM has written `PARKED`. As a
   last resort it hands it over 50 µs after the deadline, counted
   separately as a handoff without park.

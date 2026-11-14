@@ -184,6 +184,11 @@ wakes, and that doesn't count.
 
 The signal is resent because one that arrives while the vCPU thread is
 outside `KVM_RUN` (handling an exit) doesn't stop the next guest entry.
+It isn't resent while the thread has left `KVM_RUN` since the last
+signal and not re-entered: the VMM counts each entry and return in the
+host slot's `kvm_run_seq`, and acts on the request before it enters
+again. Each resend there would only run the signal handler again. This
+also holds for the signals below.
 The interval doubles because each signal also costs the guest an exit:
 a guest the VMM can't park yet, with interrupts off, needs time in the
 guest to turn them back on.

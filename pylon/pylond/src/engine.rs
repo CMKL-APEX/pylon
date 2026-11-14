@@ -330,6 +330,8 @@ pub struct MatrixEngine {
     /// TSC at which the donor was first signalled (0 if not yet). `FORCE_HANDOFF_US` counts from
     /// here, so a donor always has that long to park after a signal, even if the engine ran late.
     revoke_first_signal_tsc: [u64; MAX_PCPUS],
+    /// The donor's `kvm_run_seq` when it was last signalled (see `left_guest_since`).
+    revoke_signalled_seq: [u32; MAX_PCPUS],
     /// The donor's `yield_count` when its revocation was requested. The donor has parked for the
     /// revocation only once it is `PARKED` with a higher count: a vCPU that was just assigned is
     /// still `PARKED` until its thread wakes.
@@ -339,6 +341,8 @@ pub struct MatrixEngine {
     wake_signalled_tsc: [u64; MAX_PCPUS],
     /// TSC at which that vCPU was first signalled to wake (0 if not yet).
     wake_first_signal_tsc: [u64; MAX_PCPUS],
+    /// That vCPU's `kvm_run_seq` when it was last signalled to wake.
+    wake_signalled_seq: [u32; MAX_PCPUS],
     /// TSC at which a core was assigned, until its vCPU is seen running (0 then, or if the
     /// core left `Assigned` first). For the wake and handoff latencies (spec 06 S6).
     wake_pending_tsc: [u64; MAX_PCPUS],
@@ -356,6 +360,8 @@ pub struct MatrixEngine {
     /// When each vCPU (by VM index in the snapshot) that kept running after a handoff without park
     /// was last signalled (0 if not yet).
     orphan_signalled_tsc: [[u64; MAX_VCPUS]; MAX_TRACKED_VMS],
+    /// Each such vCPU's `kvm_run_seq` when it was last signalled.
+    orphan_signalled_seq: [[u32; MAX_VCPUS]; MAX_TRACKED_VMS],
     /// Host TSC rate, used for every VM. The rate in a VM's header is never read: the guest can
     /// write the shared page, and every `*_tsc` field counts host ticks anyway.
     host_tsc_khz: u64,
@@ -406,15 +412,18 @@ impl MatrixEngine {
             revoke_requested_tsc: [0; MAX_PCPUS],
             revoke_signalled_tsc: [0; MAX_PCPUS],
             revoke_first_signal_tsc: [0; MAX_PCPUS],
+            revoke_signalled_seq: [0; MAX_PCPUS],
             revoke_yield_count: [0; MAX_PCPUS],
             wake_signalled_tsc: [0; MAX_PCPUS],
             wake_first_signal_tsc: [0; MAX_PCPUS],
+            wake_signalled_seq: [0; MAX_PCPUS],
             wake_pending_tsc: [0; MAX_PCPUS],
             handoff_requested_tsc: [0; MAX_PCPUS],
             woken_grant_tsc: [0; MAX_PCPUS],
             woken_grant_heartbeat: [0; MAX_PCPUS],
             assigned_tsc: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
+            orphan_signalled_seq: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
             vm_vcpus: Arc::new(VmVcpusTable::new_in_memory()),
             parked_slots: 0,
             woken: Box::new([WokenTrack::EMPTY; MAX_VM_SLOTS]),
@@ -633,6 +642,16 @@ impl MatrixEngine {
         now_tsc >= last_tsc.saturating_add(interval)
     }
 
+    /// Whether `slot`'s thread has left `KVM_RUN` since a signal sent when its `kvm_run_seq` was
+    /// `signalled_seq`, and hasn't entered it again. Another signal would only interrupt the
+    /// VMM, which acts on the request before it enters again; once it does, the signal is due at
+    /// once. Never true with a VMM that doesn't count, whose `kvm_run_seq` stays 0.
+    #[inline]
+    fn left_guest_since(slot: &PylonHostVcpuSlot, signalled_seq: u32) -> bool {
+        let seq = slot.kvm_run_seq.load(Ordering::Acquire);
+        seq != signalled_seq && seq.is_multiple_of(2)
+    }
+
     /// Converts microseconds to TSC cycles at `tsc_khz`.
     #[inline]
     fn us_to_cycles(usec: u64, tsc_khz: u64) -> u64 {
@@ -661,6 +680,7 @@ impl MatrixEngine {
         // (`spec/08-park-in-kvm.md` §3.3).
         self.wake_signalled_tsc[pcpu] = 0;
         self.wake_first_signal_tsc[pcpu] = 0;
+        self.wake_signalled_seq[pcpu] = host.kvm_run_seq.load(Ordering::Acquire);
         if vm.wake_by_signal() && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
             self.wake_signalled_tsc[pcpu] = now_tsc;
             self.wake_first_signal_tsc[pcpu] = now_tsc;
@@ -985,8 +1005,18 @@ impl MatrixEngine {
                             self.revoke_first_signal_tsc[pcpu] = now_tsc;
                         }
                         if signalled_tsc == 0
-                            || Self::resignal_due(first_signal_tsc, signalled_tsc, now_tsc, tsc_khz)
+                            || (Self::resignal_due(
+                                first_signal_tsc,
+                                signalled_tsc,
+                                now_tsc,
+                                tsc_khz,
+                            ) && !Self::left_guest_since(
+                                donor_slot,
+                                self.revoke_signalled_seq[pcpu],
+                            ))
                         {
+                            self.revoke_signalled_seq[pcpu] =
+                                donor_slot.kvm_run_seq.load(Ordering::Acquire);
                             let _ = donor.signal_vcpu(donor_vcpu as usize);
                             self.revoke_signalled_tsc[pcpu] = now_tsc;
                         }
@@ -1068,9 +1098,14 @@ impl MatrixEngine {
                     && deadline != 0
                     && now_tsc >= deadline;
                 let last = &mut self.orphan_signalled_tsc[i][vcpu];
+                let last_seq = &mut self.orphan_signalled_seq[i][vcpu];
                 if !orphaned {
                     *last = 0;
-                } else if *last == 0 || Self::resignal_due(deadline, *last, now_tsc, tsc_khz) {
+                } else if *last == 0
+                    || (Self::resignal_due(deadline, *last, now_tsc, tsc_khz)
+                        && !Self::left_guest_since(slot, *last_seq))
+                {
+                    *last_seq = slot.kvm_run_seq.load(Ordering::Acquire);
                     let _ = vm.signal_vcpu(vcpu);
                     *last = now_tsc;
                 }
@@ -1100,13 +1135,16 @@ impl MatrixEngine {
                 let last = self.wake_signalled_tsc[pcpu];
                 let first = self.wake_first_signal_tsc[pcpu];
                 let due = last == 0
-                    || Self::resignal_due_from(
+                    || (Self::resignal_due_from(
                         WAKE_RESIGNAL_US,
                         first,
                         last,
                         now_tsc,
                         self.host_tsc_khz,
-                    );
+                    ) && !Self::left_guest_since(slot, self.wake_signalled_seq[pcpu]));
+                if unwoken && due {
+                    self.wake_signalled_seq[pcpu] = slot.kvm_run_seq.load(Ordering::Acquire);
+                }
                 if unwoken && due && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
                     if last == 0 {
                         self.wake_first_signal_tsc[pcpu] = now_tsc;
