@@ -2048,7 +2048,23 @@ mod tests {
     /// Accepts one registration on `listener`, replies with a session, and returns the
     /// session.
     fn accept_session(listener: &UnixListener) -> UnixStream {
-        let (stream, _) = listener.accept().unwrap();
+        // Fails, rather than hangs, if the VMM never connects.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the VMM to register"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
         let mut buf = [0u8; 512];
         let mut iov = [libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),

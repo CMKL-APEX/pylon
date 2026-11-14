@@ -45,9 +45,13 @@ pub(crate) fn spawn(
         .map(drop)
 }
 
-/// The socket's identity: a new `pylond` binds a new socket.
-fn socket_identity(path: &Path) -> Option<(u64, u64)> {
-    fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+/// The socket's identity: a new `pylond` binds a new socket. A new socket can get the inode
+/// number of the one it replaces (on `tmpfs`, for one), so its change time, which the bind and
+/// the rename into place set, tells the two apart.
+fn socket_identity(path: &Path) -> Option<(u64, u64, i64, i64)> {
+    fs::metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino(), m.ctime(), m.ctime_nsec()))
 }
 
 /// How a registration attempt ended.
@@ -119,8 +123,10 @@ fn run(state: &Weak<PylonVmmState>, socket_path: &Path, stop: &EventFd) {
                 // (`spec/10-pylond-restart.md` §6 V5).
                 vmm.wake_parked_vcpus();
                 drop(vmm);
-                if !wait_for(watch.as_ref(), stop, WAKE_RETRY_INTERVAL) {
-                    return;
+                match wait_for(watch.as_ref(), stop, WAKE_RETRY_INTERVAL) {
+                    Wait::Stop => return,
+                    Wait::Created => tried = None,
+                    Wait::Timeout => {}
                 }
                 continue;
             }
@@ -157,8 +163,12 @@ fn run(state: &Weak<PylonVmmState>, socket_path: &Path, stop: &EventFd) {
             }
         }
         drop(vmm);
-        if !wait_for(watch.as_ref(), stop, wait) {
-            return;
+        match wait_for(watch.as_ref(), stop, wait) {
+            Wait::Stop => return,
+            // The socket's name was created or moved into place: a new `pylond`, whatever
+            // its identity.
+            Wait::Created => tried = None,
+            Wait::Timeout => {}
         }
     }
 }
@@ -197,20 +207,33 @@ fn poll_in(fds: &[RawFd], timeout: Option<Duration>) -> Vec<bool> {
     pollfds.iter().map(|p| p.revents != 0).collect()
 }
 
-/// Waits up to `timeout` or until something is created in the socket's directory. Returns
-/// `false` once the VMM state is gone (`stop`).
-fn wait_for(watch: Option<&DirWatch>, stop: &EventFd, timeout: Duration) -> bool {
+/// How a wait for the socket ended.
+enum Wait {
+    /// The VMM state is gone (`stop`).
+    Stop,
+    /// A file of the socket's name was created or moved into its directory.
+    Created,
+    /// The timeout passed, or something else changed in the directory.
+    Timeout,
+}
+
+/// Waits up to `timeout` or until something is created in the socket's directory.
+fn wait_for(watch: Option<&DirWatch>, stop: &EventFd, timeout: Duration) -> Wait {
     let mut fds = vec![stop.as_raw_fd()];
     if let Some(watch) = watch {
         fds.push(watch.fd.as_raw_fd());
     }
     let ready = poll_in(&fds, Some(timeout));
+    if ready[0] {
+        return Wait::Stop;
+    }
     if ready.get(1) == Some(&true)
         && let Some(watch) = watch
+        && watch.drain()
     {
-        watch.drain();
+        return Wait::Created;
     }
-    !ready[0]
+    Wait::Timeout
 }
 
 /// Waits until `pylond` closes the session. Returns `false` once the VMM state is gone
@@ -239,6 +262,8 @@ fn wait_for_end(stream: &UnixStream, stop: &EventFd) -> bool {
 /// binds its socket under a temporary name and renames it into place.
 struct DirWatch {
     fd: OwnedFd,
+    /// The socket's file name, which the events are matched against.
+    name: Vec<u8>,
 }
 
 impl DirWatch {
@@ -247,6 +272,10 @@ impl DirWatch {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
         };
+        let name = socket_path
+            .file_name()
+            .map(|name| name.as_bytes().to_vec())
+            .unwrap_or_default();
         let dir = CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
         // SAFETY: `inotify_init1` takes flags and returns a new file descriptor or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -266,13 +295,89 @@ impl DirWatch {
         if wd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(Self { fd, name })
     }
 
-    /// Reads the pending events, which only mean "look again".
-    fn drain(&self) {
-        let mut buf = [0u8; 4096];
-        // SAFETY: `buf` is valid for `buf.len()` bytes; the fd is non-blocking.
-        while unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    /// Reads the pending events, and returns whether one names the socket.
+    fn drain(&self) -> bool {
+        // Aligned for `inotify_event`, and large enough for any one event.
+        #[repr(C, align(8))]
+        struct Buf([u8; 4096]);
+        let mut buf = Buf([0; 4096]);
+        let mut named = false;
+        loop {
+            // SAFETY: `buf` is valid for its length; the fd is non-blocking.
+            let len =
+                unsafe { libc::read(self.fd.as_raw_fd(), buf.0.as_mut_ptr().cast(), buf.0.len()) };
+            let Ok(len) = usize::try_from(len) else {
+                return named;
+            };
+            if len == 0 {
+                return named;
+            }
+            named |= events_name(&buf.0[..len], &self.name);
+        }
+    }
+}
+
+/// Whether one of the `inotify` events in `events`, as read from an inotify fd, names `name`.
+fn events_name(events: &[u8], name: &[u8]) -> bool {
+    const HEADER: usize = size_of::<libc::inotify_event>();
+    let mut at = 0;
+    while at + HEADER <= events.len() {
+        // The header's `len` field: the length of the NUL-padded name that follows it.
+        let len_at = at + HEADER - size_of::<u32>();
+        let len = u32::from_ne_bytes(events[len_at..len_at + 4].try_into().unwrap()) as usize;
+        let end = (at + HEADER + len).min(events.len());
+        let event_name = &events[at + HEADER..end];
+        let event_name = event_name.split(|&b| b == 0).next().unwrap_or_default();
+        if !name.is_empty() && event_name == name {
+            return true;
+        }
+        at += HEADER + len;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// A watch names the socket only when the socket's own name is created or moved in.
+    #[test]
+    fn test_dir_watch_reports_the_socket_by_name() {
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join("pylond.sock");
+        let watch = DirWatch::new(&sock_path).unwrap();
+        assert!(!watch.drain());
+
+        fs::write(dir.path().join("other"), b"").unwrap();
+        assert!(!watch.drain());
+
+        let tmp_path = dir.path().join("pylond.sock.tmp");
+        let _listener = UnixListener::bind(&tmp_path).unwrap();
+        assert!(!watch.drain());
+        fs::rename(&tmp_path, &sock_path).unwrap();
+        assert!(watch.drain());
+        assert!(!watch.drain());
+    }
+
+    /// A socket bound again at the same path doesn't look like the one it replaces, even if
+    /// it gets the same inode number.
+    #[test]
+    fn test_a_new_socket_has_a_new_identity() {
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join("pylond.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let old = socket_identity(&sock_path).unwrap();
+        drop(listener);
+        fs::remove_file(&sock_path).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        assert_ne!(socket_identity(&sock_path), Some(old));
     }
 }
