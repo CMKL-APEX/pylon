@@ -9,7 +9,7 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val, zeroed};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{PermissionsExt, chown};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
@@ -315,15 +315,20 @@ impl ControlPlane {
         let (exited, alive): (Vec<VmHandle>, Vec<VmHandle>) = current
             .iter()
             .cloned()
-            .partition(|vm| vm.vmm_exited() == Some(true) || vm.is_faulty());
+            .partition(|vm| vm.vmm_exited() == Some(true) || vm.is_faulty() || vm.session_closed());
         for vm in &exited {
             if vm.is_faulty() {
                 warn!(
                     "A write to an eventfd of VM {} blocked; removed its registration",
                     vm.vm_id()
                 );
-            } else {
+            } else if vm.vmm_exited() == Some(true) {
                 info!("VMM of VM {} exited; removed its registration", vm.vm_id());
+            } else {
+                info!(
+                    "VMM of VM {} closed its session; removed its registration",
+                    vm.vm_id()
+                );
             }
         }
         if !exited.is_empty() {
@@ -493,6 +498,13 @@ async fn handle_client_connection(
                 .and_then(|handle| match peer_uid {
                     Some(uid) => handle.with_owner_uid(uid),
                     None => Ok(handle),
+                })
+                .and_then(|handle| {
+                    if !req.session {
+                        return Ok(handle);
+                    }
+                    let session = stream.as_fd().try_clone_to_owned().map_err(Error::Io)?;
+                    handle.with_session(session)
                 });
             // A `vm_id` stays taken while the VMM that registered it runs: replacing it would
             // leave that VM unmanaged. Plane 1 runs on one thread, and nothing below awaits,
@@ -526,6 +538,7 @@ async fn handle_client_connection(
                     VmRegistrationResponse {
                         accepted: true,
                         message: "registered".to_owned(),
+                        session: req.session,
                     }
                 }
                 Err(err) => {
@@ -534,6 +547,7 @@ async fn handle_client_connection(
                     VmRegistrationResponse {
                         accepted: false,
                         message: err.to_string(),
+                        session: false,
                     }
                 }
             }
@@ -543,6 +557,7 @@ async fn handle_client_connection(
             VmRegistrationResponse {
                 accepted: false,
                 message,
+                session: false,
             }
         };
 
@@ -576,7 +591,9 @@ async fn send_json_response_async<T: serde::Serialize>(
     stream: &UnixStream,
     resp: &T,
 ) -> Result<(), Error> {
-    let encoded = serde_json::to_vec(resp).map_err(Error::Json)?;
+    let mut encoded = serde_json::to_vec(resp).map_err(Error::Json)?;
+    // A VMM with a session reads the reply up to here, as the connection stays open.
+    encoded.push(b'\n');
     let mut written = 0usize;
     while written < encoded.len() {
         stream.ready(Interest::WRITABLE).await.map_err(Error::Io)?;
@@ -983,6 +1000,7 @@ mod tests {
             priority_weight: 1,
             kick_signal: None,
             wake_by_signal: false,
+            session: false,
         };
         // One FD instead of three: rejected, but the reply is still sent.
         let payload = serde_json::to_vec(&req).unwrap();
@@ -1069,6 +1087,91 @@ mod tests {
         let (resp, registered) = register(&rig, false).await;
         assert!(resp.accepted, "{}", resp.message);
         assert_eq!(registered, 1);
+    }
+
+    /// A VMM that asks for a session keeps its connection after the reply: `pylond` removes
+    /// the VM once the VMM closes it, and the VMM sees end of file once `pylond` lets the VM
+    /// go.
+    #[tokio::test]
+    async fn a_session_lasts_as_long_as_the_registration() {
+        let mut rig = build_test_vm(1, 1, 0, 1, 1);
+        rig.req.session = true;
+        let (vmm, daemon) = StdUnixStream::pair().unwrap();
+        let mut fds = vec![rig.shm_fd.as_raw_fd()];
+        fds.extend(rig.kick_fds.iter().map(AsRawFd::as_raw_fd));
+        fds.extend(rig.wake_fds.iter().map(AsRawFd::as_raw_fd));
+        let payload = serde_json::to_vec(&rig.req).unwrap();
+        send_msg_with_fds(vmm.as_raw_fd(), &payload, &fds).unwrap();
+
+        daemon.set_nonblocking(true).unwrap();
+        let daemon = UnixStream::from_std(daemon).unwrap();
+        let snapshot = Arc::new(VmSnapshot::from_pointee(Vec::new()));
+        handle_client_connection(daemon, Arc::clone(&snapshot), false)
+            .await
+            .unwrap();
+
+        // The reply is one line, and the connection outlives the task that served it.
+        let mut reader = io::BufReader::new(vmm.try_clone().unwrap());
+        let mut line = String::new();
+        io::BufRead::read_line(&mut reader, &mut line).unwrap();
+        let resp: VmRegistrationResponse = serde_json::from_str(&line).unwrap();
+        assert!(resp.accepted && resp.session, "{resp:?}");
+        assert!(line.ends_with('\n'));
+        assert!(!snapshot.load()[0].session_closed());
+        assert_eq!(ControlPlane::remove_exited_vms(&snapshot), 0);
+
+        // Removing the VM closes the session.
+        let vm = snapshot.load()[0].clone();
+        snapshot.store(Arc::new(Vec::new()));
+        drop(vm);
+        vmm.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+
+        // A VMM closing its end removes the VM.
+        let (resp, registered, vmm) = register_with_session(&rig).await;
+        assert!(resp.session);
+        assert_eq!(registered.load().len(), 1);
+        drop(vmm);
+        assert!(registered.load()[0].session_closed());
+        assert_eq!(ControlPlane::remove_exited_vms(&registered), 1);
+        assert!(registered.load().is_empty());
+    }
+
+    /// Registers `rig`'s VM with a session and returns the reply, the registered VMs and the
+    /// VMM's end of the session.
+    async fn register_with_session(
+        rig: &TestVmRig,
+    ) -> (VmRegistrationResponse, Arc<VmSnapshot>, StdUnixStream) {
+        let (vmm, daemon) = StdUnixStream::pair().unwrap();
+        let mut fds = vec![rig.shm_fd.as_raw_fd()];
+        fds.extend(rig.kick_fds.iter().map(AsRawFd::as_raw_fd));
+        fds.extend(rig.wake_fds.iter().map(AsRawFd::as_raw_fd));
+        let payload = serde_json::to_vec(&rig.req).unwrap();
+        send_msg_with_fds(vmm.as_raw_fd(), &payload, &fds).unwrap();
+
+        daemon.set_nonblocking(true).unwrap();
+        let daemon = UnixStream::from_std(daemon).unwrap();
+        let snapshot = Arc::new(VmSnapshot::from_pointee(Vec::new()));
+        handle_client_connection(daemon, Arc::clone(&snapshot), false)
+            .await
+            .unwrap();
+        let mut line = String::new();
+        io::BufRead::read_line(&mut io::BufReader::new(&vmm), &mut line).unwrap();
+        (serde_json::from_str(&line).unwrap(), snapshot, vmm)
+    }
+
+    /// A VMM that doesn't ask for a session (`v0.0.8`) gets today's reply, without
+    /// `session`, and the connection closes after it.
+    #[tokio::test]
+    async fn a_registration_without_a_session_closes_after_the_reply() {
+        let rig = build_test_vm(1, 1, 0, 1, 1);
+        let (resp, registered) = register(&rig, false).await;
+        assert!(resp.accepted && !resp.session, "{resp:?}");
+        assert_eq!(registered, 1);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("session"), "{json}");
     }
 
     /// vCPU `vcpu` of the VM in slot `vm_slot`, whose VMM is `pid`.

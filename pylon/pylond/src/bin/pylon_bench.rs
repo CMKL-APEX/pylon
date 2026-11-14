@@ -337,6 +337,7 @@ fn run_pylon_elastic_benchmark(
         priority_weight: 100,
         kick_signal: None,
         wake_by_signal: false,
+        session: false,
     };
     let vm_handle = VmHandle::new(
         &req,
