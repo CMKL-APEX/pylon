@@ -254,7 +254,8 @@ system calls):
 - The signal stops the vCPU's `KVM_RUN` within 3–6 µs.
 - The VMM then takes 40–60 µs before it publishes `PARKED` (forced park)
   or re-enters the guest (wake). About 17 µs of it pass before the
-  first signal handler returns, and aren't explained yet.
+  first signal handler returns; most of that is the trace's own probes
+  (see [the profile below](#profile-without-kprobes-measured-2026-11-14)).
 - `pylond` re-signalled a waking vCPU every 10 µs, so several signals
   were delivered during one wake. Backing the re-signals off from
   100 µs cut wake p50 from 53–58 to 42–46 µs and p99 from 88–124 to
@@ -300,16 +301,41 @@ running (an interrupt woke it inside KVM at once), the recipient waited
 for a tick, 662 µs at the median. `pylond` now kicks the CPU after each
 assignment (`pylon_kick_owner`).
 
-Still open:
+### Profile without kprobes (measured, 2026-11-14)
 
-- `pylond` re-sends `SIGRTMIN`, a real-time signal, while a donor
-  hasn't parked, and each one is queued: a forced park ran 5 signal
-  handlers at the median (up to 8), about 5 µs each.
-- From a donor's `KVM_RUN` exit to its next `KVM_RUN` (parked) took
-  69 µs at the median before the kick (the trace's probes add to it):
-  about 17 µs to the first handler's return, and 25 µs of `ioctl`s
-  after the last one (`KVM_GET_REGS`, `KVM_SET_MP_STATE`,
-  `KVM_GET_MSRS`) and arming the park bound.
+[#54](https://github.com/CMKL-APEX/pylon/issues/54). The setup above,
+on `main` with the kick and with `SIGUSR2` as the kick signal
+([#99](https://github.com/CMKL-APEX/pylon/pull/99)), one run. The
+trace used tracepoints only (signals, system calls, context switches):
+the earlier trace's kprobes fired about 16 times between a `KVM_RUN`
+exit and the first handler's return, and inflated it.
+
+| Interval, µs (p50 / p90 / p99) | Park (390) | Wake (390) |
+|---|---|---|
+| `KVM_RUN` exit → first handler's `rt_sigreturn` | 8 / 11 / 26 | 5 / 9 / 16 |
+| `KVM_RUN` exit → next `KVM_RUN` | 45 / 151 / 1,951 | 18 / 25 / 32 |
+| … of it in system calls | 14 / 19 / 107 | 4 / 7 / 9 |
+| Signal handlers run | 3 / 3 / 4 | 1 / 1 / 2 |
+
+`pylond`'s histograms for the run: handoff 96 / 112 / 768 µs, wake
+36 / 52 / 704 µs, park 52 / 60 / 60 µs.
+
+- **Exit to the first handler:** 5–8 µs; the 17 µs above was mostly
+  the probes. With them, each step (`get_signal`, building the signal
+  frame, the return to user space) took 1–4 µs.
+- **A park's extra handlers:** `pylond` re-sends the kick 10, 20 and
+  40 µs after the first signal (`REVOKE_RESIGNAL_US`) while the donor
+  hasn't published `PARKED`. By then it has usually left `KVM_RUN` and
+  is parking: 207 of 390 parks got two re-sends, 16–18 µs after the
+  exit at the median, and each runs a handler. No single system call
+  took over 4 µs at the median (`KVM_GET_MSRS`, `KVM_GET_REGS`,
+  `KVM_SET_MP_STATE`, `timer_settime`).
+- **A park's tail:** a donor that has published `PARKED` can be
+  preempted by the new owner before its next `KVM_RUN`, and then waits
+  about 1 ms. It is already parked, so the park latency doesn't show it.
+- **The wake and handoff tail:** of the signals that waited
+  0.1–3 ms for a CPU, the longest 8 all waited for other vCPUs of the
+  same VM, which shared the CPU in 1 ms slices.
 
 ## Other figures
 
@@ -328,8 +354,8 @@ be claimed:
 - The engine's sweep time, by number of VMs.
 - Handoff latency without `scx_pylon`, and on an Intel host (above:
   AMD, with `scx_pylon`).
-- Why the VMM takes 40–60 µs after a signal exit
-  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
+- The rest of a forced park's 45 µs, and the 1 ms wake tail behind a
+  VM's own vCPUs ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
 - For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
   guest throughput against the `eventfd` park, and halt-polling
   settings (spec 08 P3,
