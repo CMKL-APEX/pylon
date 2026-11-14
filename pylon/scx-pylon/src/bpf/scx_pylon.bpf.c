@@ -1007,6 +1007,29 @@ void BPF_PROG(pylon_exit, struct scx_exit_info *info)
  * scx_pylon then takes until the next dispatch and the kernel's disable
  * work, so this narrows the window but doesn't close it.
  */
+/* Argument of pylon_kick_owner */
+struct pylon_kick_args {
+    __s32 cpu;
+};
+
+/*
+ * Run by pylond (BPF_PROG_RUN) after it gives @args->cpu to a new owner.
+ * pylond writes the owner into the mmapped map, which no CPU watches, and a
+ * new owner that is already runnable isn't enqueued again: without a kick,
+ * @args->cpu would keep running the previous owner, or a vCPU sharing it,
+ * until that blocks or its slice ends.
+ */
+SEC("syscall")
+int pylon_kick_owner(struct pylon_kick_args *args)
+{
+    s32 cpu = args->cpu;
+
+    if (cpu >= 0 && cpu < MAX_PCPUS) {
+        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+    }
+    return 0;
+}
+
 SEC("fentry/sched_core_get")
 int BPF_PROG(pylon_sched_core_get)
 {
