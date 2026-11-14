@@ -50,8 +50,11 @@ place: it happens before the VM exists, and before the VMM installs its
 logger, so nothing logged there shows. Registration with `pylond`
 therefore waits for `setup_memory_region`.
 
-The registration message carries `kick_signal`: the VMM's own
-`SIGRTMIN()`, the signal its vCPU threads have a no-op handler for.
+The registration message carries `kick_signal`: `SIGUSR2`
+(`pylon::KICK_SIGNAL`), for which `vmm/src/cpu.rs` gives vCPU threads
+a no-op handler, as for its own `SIGRTMIN`. A standard signal that is
+already pending isn't queued again, so the signals `pylond` sends while
+a vCPU waits to run cost one handler, not one each.
 `pylond` sends it to a donor vCPU whose revocation deadline has passed.
 With park in KVM, the message also carries `wake_by_signal: true`
 ([Control socket protocol](../reference/control-socket.md#registration)).
@@ -250,7 +253,7 @@ row of the park decision table, cooperative and forced parks, the guest
 counter offset and timer conversion, parking inside KVM (with a fake
 `KvmParkOp` callback), and daemon registration over a real socket. A second real-KVM
 test runs a guest that never agrees to park, sends its vCPU thread
-`SIGRTMIN` with `tgkill` as `pylond` does, and checks that `KVM_RUN`
+`KICK_SIGNAL` with `tgkill` as `pylond` does, and checks that `KVM_RUN`
 returns and the VMM force-parks the vCPU. One test boots a minimal real-mode KVM guest that reads and writes
 the shared page and parks cooperatively by writing `PARKING` and
 executing `HLT`. Without an in-kernel irqchip, `HLT` exits to

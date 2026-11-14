@@ -318,7 +318,7 @@ struct DaemonRegistrationPayload {
     min_cores: u32,
     max_cores: u32,
     priority_weight: u32,
-    /// The signal that interrupts a vCPU's `KVM_RUN` here (`SIGRTMIN`, as installed in
+    /// The signal that interrupts a vCPU's `KVM_RUN` here (`KICK_SIGNAL`, as installed in
     /// `vmm/src/cpu.rs`). `pylond` sends it to a donor vCPU whose revocation deadline has
     /// passed, so the post-exit hook force-parks it (`spec/06-guest-kick-path.md` §4.4).
     kick_signal: i32,
@@ -364,6 +364,12 @@ struct ParkBound {
     /// vCPU's own thread uses it.
     deadline: Mutex<Option<Instant>>,
 }
+
+/// The signal `pylond` sends a vCPU thread to interrupt its `KVM_RUN` (`kick_signal`).
+/// `vmm/src/cpu.rs` installs a no-op handler for it. It is a standard signal, unlike the
+/// `SIGRTMIN` that pauses vCPUs: one that is pending isn't queued again, so the signals
+/// `pylond` sends while a vCPU waits to run cost one handler, not one each.
+pub const KICK_SIGNAL: i32 = libc::SIGUSR2;
 
 /// A POSIX timer that sends `SIGRTMIN`, the signal that interrupts `KVM_RUN` (installed in
 /// `vmm/src/cpu.rs`), to the thread that created it.
@@ -589,7 +595,7 @@ impl PylonVmmState {
             min_cores: self.config.min_cores,
             max_cores: self.config.max_cores.unwrap_or(self.max_vcpus),
             priority_weight: self.config.priority_weight,
-            kick_signal: SIGRTMIN(),
+            kick_signal: KICK_SIGNAL,
             wake_by_signal: self.config.park == PylonPark::Kvm,
         };
         let mut json_bytes =
@@ -2040,7 +2046,7 @@ mod tests {
         assert_eq!(msg.min_cores, 1);
         assert_eq!(msg.max_cores, 2);
         assert_eq!(msg.priority_weight, 150);
-        assert_eq!(msg.kick_signal, SIGRTMIN());
+        assert_eq!(msg.kick_signal, KICK_SIGNAL);
         assert!(!msg.wake_by_signal);
         // 1 shm_fd + 2 kick_eventfds + 2 wake_eventfds = 5 FDs
         assert_eq!(fds_read, 5);
@@ -2164,7 +2170,7 @@ mod tests {
         let state_vcpu = Arc::clone(&state);
         let vcpu_thread = thread::spawn(move || {
             // As in `vmm/src/cpu.rs`: a no-op handler, so the signal only interrupts KVM_RUN.
-            register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
+            register_signal_handler(KICK_SIGNAL, handle_signal).unwrap();
             let mut vcpu = vm
                 .create_vcpu(0, None, Default::default())
                 .expect("failed to create KVM vCPU 0");
@@ -2228,13 +2234,13 @@ mod tests {
                 break;
             }
             // SAFETY: `tgkill` signals thread `tid` of this process; the vCPU thread has a
-            // handler installed for `SIGRTMIN`.
+            // handler installed for `KICK_SIGNAL`.
             unsafe {
                 libc::syscall(
                     libc::SYS_tgkill,
                     libc::getpid(),
                     tid as libc::pid_t,
-                    SIGRTMIN(),
+                    KICK_SIGNAL,
                 );
             }
             thread::sleep(Duration::from_millis(2));
@@ -2312,7 +2318,7 @@ mod tests {
             let (state_vcpu, stop_vcpu) = (Arc::clone(&state), Arc::clone(&stop));
             let thread = thread::spawn(move || {
                 // As in `vmm/src/cpu.rs`: a no-op handler, so the signal only interrupts KVM_RUN.
-                register_signal_handler(SIGRTMIN(), handle_signal).unwrap();
+                register_signal_handler(KICK_SIGNAL, handle_signal).unwrap();
                 let _guest_mem = guest_mem;
                 let mut vcpu = vm
                     .create_vcpu(0, None)
@@ -2362,9 +2368,9 @@ mod tests {
         /// Sends the kick signal, as `pylond` does for a revocation.
         fn kick(&self) {
             // SAFETY: `tgkill` signals thread `tid` of this process; the vCPU thread has a
-            // handler installed for `SIGRTMIN`.
+            // handler installed for `KICK_SIGNAL`.
             unsafe {
-                libc::syscall(libc::SYS_tgkill, libc::getpid(), self.tid, SIGRTMIN());
+                libc::syscall(libc::SYS_tgkill, libc::getpid(), self.tid, KICK_SIGNAL);
             }
         }
 
