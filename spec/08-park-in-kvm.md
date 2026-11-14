@@ -242,7 +242,12 @@ assigned. It records when each bit was set, by VM slot and vCPU.
   core per vCPU woken now, after every VM with real demand, but takes
   only spare cores: an idle one, or one held above its floor by a VM
   that wants no core. Nothing is revoked for it from a VM that wants
-  cores, which would trade the core back at its next report.
+  cores, which would trade the core back at its next report. A VM that
+  wants none would too, the next time one of its own vCPUs woke: two idle
+  VMs whose agents reported every millisecond traded one spare core about
+  70 times a second, each move a forced
+  preemption. So a held core is spare only once its VM has had it for
+  `SPARE_CORE_TENURE_US` (1 s).
 - **A core given to a woken vCPU stays wanted until the agent reports.**
   Once it has the core, the vCPU no longer counts as woken, and
   `runnable_threads` doesn't show its work until the guest agent's next
