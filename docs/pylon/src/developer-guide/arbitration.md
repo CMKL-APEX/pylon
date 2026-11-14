@@ -309,7 +309,11 @@ owns by it. It lives in one of three places:
 | Anonymous memory | Otherwise. Nothing reads it. |
 
 The engine writes it with plain atomic stores. No system call is needed
-even when the kernel reads it.
+even when the kernel reads it, but no CPU notices a new owner by itself:
+an owner that is already runnable, waiting for its turn on a CPU its VM
+shares, isn't queued again. With `scx_pylon`, `assign_pcpu` therefore
+also runs `pylon_kick_owner` (one `bpf` system call), which kicks the
+CPU so it picks its new owner at once.
 
 ## Metering and counters
 

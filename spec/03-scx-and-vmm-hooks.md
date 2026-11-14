@@ -29,6 +29,8 @@ struct {
   The owner of a pCPU goes on that pCPU's queue (DSQ id = CPU) with a 20 ms slice and preempts whatever runs there. That includes a donor vCPU whose `target_tid` was replaced. Other managed vCPU threads go on a shared vCPU queue. Tasks with migration disabled, and host tasks allowed on only one CPU, go on that CPU's local queue; the kernel runs them before asking `dispatch`, so a pinned kworker waits at most one owner slice and the stall watchdog doesn't fire. Other tasks go on a host queue.
 - **`scx_ops.dispatch(cpu, prev)`:**
   Run the pCPU's owner if it is queued. Otherwise take a task from the vCPU queue or the host queue, but only one that the SMT isolation rules below allow.
+- **`pylon_kick_owner` (`SEC("syscall")`):**
+  `pylond` runs it (`BPF_PROG_RUN`) after it writes a new owner, to kick that pCPU with `SCX_KICK_PREEMPT`. The map write alone reaches no CPU, and an owner that is already runnable (a woken vCPU sharing its VM's CPU) isn't enqueued again, so without the kick the pCPU kept the donor or a sharing vCPU until that blocked or a tick ended its slice (#54).
 
 ### SMT Isolation
 
