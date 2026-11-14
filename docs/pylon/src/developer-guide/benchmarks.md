@@ -333,9 +333,19 @@ exit and the first handler's return, and inflated it.
 - **A park's tail:** a donor that has published `PARKED` can be
   preempted by the new owner before its next `KVM_RUN`, and then waits
   about 1 ms. It is already parked, so the park latency doesn't show it.
-- **The wake and handoff tail:** of the signals that waited
-  0.1–3 ms for a CPU, the longest 8 all waited for other vCPUs of the
-  same VM, which shared the CPU in 1 ms slices.
+- **The wake and handoff tail:** most signals that waited 0.2–3 ms
+  for a CPU sent the vCPU to a CPU other than the one `pylond` gave it.
+  `scx_pylon` kept a CPU's woken turn after the CPU changed owner, so a
+  sibling of the new owner, woken to share its VM's old CPU, ran first
+  and the new owner waited up to a tick. The new owner now takes the
+  first turn ([#104](https://github.com/CMKL-APEX/pylon/pull/104)):
+  wakes slower than 200 µs in the trace fell from 7–32 per run to 0–2.
+- **The rest of `pylond`'s tail:** with that fixed, `pylond`'s wake
+  p99 stayed at 0.7–1.2 ms, but the trace showed no slow wakes. The
+  engine itself was off its CPU: `scx_pylon` ran managed vCPU threads
+  there for a full 20 ms slice, 1–2 times per trace, and a kernel
+  worker took it for about 0.7 ms a dozen times. No sweeps run while
+  the engine waits, and the histograms count that wait.
 
 ## Other figures
 
@@ -354,8 +364,9 @@ be claimed:
 - The engine's sweep time, by number of VMs.
 - Handoff latency without `scx_pylon`, and on an Intel host (above:
   AMD, with `scx_pylon`).
-- The rest of a forced park's 45 µs, and the 1 ms wake tail behind a
-  VM's own vCPUs ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
+- The rest of a forced park's 45 µs, and the handoff tail with the
+  engine kept on its CPU
+  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
 - For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
   guest throughput against the `eventfd` park, and halt-polling
   settings (spec 08 P3,
