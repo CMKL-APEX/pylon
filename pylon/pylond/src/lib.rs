@@ -151,6 +151,7 @@ impl PcpuOwnerStorage {
 #[derive(Debug)]
 pub struct PcpuOwnerTable {
     storage: PcpuOwnerStorage,
+    kick: Option<scx_pylon::OwnerKick>,
 }
 
 impl PcpuOwnerTable {
@@ -160,6 +161,7 @@ impl PcpuOwnerTable {
             Box::new(from_fn(|_| PcpuOwnerEntry::new()));
         Self {
             storage: PcpuOwnerStorage::Heap(entries),
+            kick: None,
         }
     }
 
@@ -174,7 +176,26 @@ impl PcpuOwnerTable {
         }
         Ok(Self {
             storage: PcpuOwnerStorage::Mmap(mmap),
+            kick: None,
         })
+    }
+
+    /// Kicks each pCPU given a new owner with `kick` (see [`Self::kick`]).
+    #[must_use]
+    pub fn with_kick(mut self, kick: scx_pylon::OwnerKick) -> Self {
+        self.kick = Some(kick);
+        self
+    }
+
+    /// Makes `pcpu_id` schedule again, so the owner just written runs there at once: an owner
+    /// that is already runnable isn't enqueued again, and `scx_pylon` doesn't watch the table.
+    /// Does nothing without `scx_pylon`.
+    #[inline]
+    pub fn kick(&self, pcpu_id: usize) -> io::Result<()> {
+        match &self.kick {
+            Some(kick) => kick.kick(pcpu_id as u32),
+            None => Ok(()),
+        }
     }
 
     /// Writes `target_tid` and `flags` for `pcpu_id` without any syscalls.
