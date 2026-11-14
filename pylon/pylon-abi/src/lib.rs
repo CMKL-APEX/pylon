@@ -434,7 +434,12 @@ pub struct PylonHostVcpuSlot {
     /// Host counter value at which the guest's timer on this vCPU was due when the VMM parked
     /// it, or 0 (see `PylonVcpuSlot::park_timer_deadline_tsc`). Written by the VMM.
     pub park_timer_deadline_tsc: AtomicU64,
-    pub _reserved: [u8; 32],
+    /// Incremented by the VMM just before the vCPU thread enters `KVM_RUN` and again when it
+    /// returns, so it is odd while the thread is in the guest. `pylond` holds back a repeated
+    /// kick signal while the thread is out of the guest since the last one: the signal would
+    /// only interrupt the VMM. Stays 0 with a VMM that doesn't count.
+    pub kvm_run_seq: AtomicU32,
+    pub _reserved: [u8; 28],
 }
 
 impl PylonHostVcpuSlot {
@@ -450,7 +455,8 @@ impl PylonHostVcpuSlot {
             yield_count: AtomicU64::new(0),
             revoke_deadline_tsc: AtomicU64::new(0),
             park_timer_deadline_tsc: AtomicU64::new(0),
-            _reserved: [0u8; 32],
+            kvm_run_seq: AtomicU32::new(0),
+            _reserved: [0u8; 28],
         }
     }
 
@@ -465,6 +471,7 @@ impl PylonHostVcpuSlot {
         self.yield_count.store(0, Ordering::Release);
         self.revoke_deadline_tsc.store(0, Ordering::Release);
         self.park_timer_deadline_tsc.store(0, Ordering::Release);
+        self.kvm_run_seq.store(0, Ordering::Release);
     }
 }
 
@@ -520,6 +527,7 @@ const _: () = {
     assert!(align_of::<PylonHostVcpuSlot>() == 64);
     assert!(offset_of!(PylonHostVcpuSlot, host_tid) == 4);
     assert!(offset_of!(PylonHostVcpuSlot, park_timer_deadline_tsc) == 24);
+    assert!(offset_of!(PylonHostVcpuSlot, kvm_run_seq) == 32);
     assert!(size_of::<PylonHostPage>() == PYLON_HOST_PAGE_SIZE);
     assert!(align_of::<PylonHostPage>() == 4096);
     assert!(offset_of!(PylonHostPage, vcpus) == 64);
