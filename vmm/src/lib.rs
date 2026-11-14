@@ -102,6 +102,7 @@ mod pci_segment;
 mod prefault;
 pub mod pylon;
 pub mod pylon_kick;
+mod pylon_session;
 pub mod seccomp_filters;
 mod serial_manager;
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]

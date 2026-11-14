@@ -236,8 +236,11 @@ These are from spec 06 §10:
   ([#56](https://github.com/CMKL-APEX/pylon/issues/56)).
 - **Q4.** Whether MSHV reports a signal-interrupted run the way KVM does
   ([#65](https://github.com/CMKL-APEX/pylon/issues/65)).
-- **Q5.** How a VMM reconnects after `pylond` restarts
-  ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
+- **Q5.** *Answered:* how a VMM reconnects after `pylond` restarts.
+  It keeps its registration open as a session, runs the VM unmanaged
+  while `pylond` is away, and registers again when it is back
+  ([spec 10](https://github.com/CMKL-APEX/pylon/blob/main/spec/10-pylond-restart.md),
+  [#60](https://github.com/CMKL-APEX/pylon/issues/60)).
 - **Q6.** *Answered:* the last-resort bound is a host-wide `pylond`
   option, `--force-handoff-us` (default 50 µs), not per-VM policy: one
   VM's value would delay another's handoff
@@ -249,7 +252,6 @@ These are from spec 06 §10:
 |---|---|
 | Move the shared page into the `pylon-kick` BAR | Removes the fixed address (spec 06 §9, [#59](https://github.com/CMKL-APEX/pylon/issues/59)). |
 | Receive doorbell | A host-side producer for `host_rx_doorbell`, so packets wake a zero-core VM (K1, [#57](https://github.com/CMKL-APEX/pylon/issues/57)). |
-| Reconnect | Let a VMM register again after `pylond` restarts (Q5, [#60](https://github.com/CMKL-APEX/pylon/issues/60)). |
 | Lifecycle | Snapshot, restore and migration with `--pylon`. They are refused today, through the `pylon-kick` device (spec 06 §7); supporting them is [#61](https://github.com/CMKL-APEX/pylon/issues/61). |
 | aarch64 | Done for the host side (spec 07, A-T0 to A-T7): a counter abstraction, `WFET`, the guest timer, the shared page's address in the aarch64 layout, an arm64 `scx_pylon` and CI. Open: a booted aarch64 guest run end to end (A-T8, in progress, [#62](https://github.com/CMKL-APEX/pylon/issues/62)) and the kick device on the GICv3 ITS (A-T9, not started, [#63](https://github.com/CMKL-APEX/pylon/issues/63)). |
 | `scx_pylon` lookup | A thread-ID-to-CPU map, so `select_cpu` doesn't scan all 256 entries. |

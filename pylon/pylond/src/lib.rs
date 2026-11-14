@@ -338,6 +338,11 @@ pub struct VmRegistrationRequest {
     /// assigns a core, and again until the vCPU leaves `PARKED`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_by_signal: bool,
+    /// Asks `pylond` to keep the connection open for as long as the VM is registered
+    /// (`spec/10-pylond-restart.md` §3.1). The VMM then reads the end of the session as
+    /// `pylond` going away, and `pylond` reads it as the VMM going away.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session: bool,
 }
 
 /// Whether a VMM may register `signal` as its `kick_signal`: one whose default action a VMM
@@ -348,11 +353,15 @@ fn is_kick_signal(signal: i32) -> bool {
         || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signal)
 }
 
-/// JSON response returned by `pylond` after processing a `VmRegistrationRequest`.
+/// JSON response returned by `pylond` after processing a `VmRegistrationRequest`, followed by
+/// a newline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRegistrationResponse {
     pub accepted: bool,
     pub message: String,
+    /// Set when `pylond` accepted the VM and keeps the connection open as its session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session: bool,
 }
 
 /// JSON payload sent over `/run/pylon/pylond.sock` to update a running VM's elastic policy.
@@ -456,6 +465,10 @@ struct VmHandleInner {
     /// referring to that process, so a reused PID is never signalled.
     vmm_pid: i32,
     vmm_pidfd: Option<OwnedFd>,
+    /// `pylond`'s end of the registration connection, kept open while the VM is registered
+    /// when the VMM asked for a session. Dropping the last handle closes it, which tells the
+    /// VMM that `pylond` no longer manages the VM.
+    session: Option<OwnedFd>,
     /// The registering peer's UID from `SO_PEERCRED`, if known. Only that UID, root and
     /// `pylond`'s own UID may change the VM's policy or read its stats.
     owner_uid: Option<u32>,
@@ -553,6 +566,7 @@ impl VmHandle {
                 wake_by_signal: req.wake_by_signal,
                 vmm_pid: 0,
                 vmm_pidfd: None,
+                session: None,
                 owner_uid: None,
                 shm_mmap,
                 kick_irqfds,
@@ -762,6 +776,46 @@ impl VmHandle {
         })?;
         inner.owner_uid = Some(uid);
         Ok(self)
+    }
+
+    /// Keeps `session`, `pylond`'s end of the registration connection, open for as long as
+    /// the VM is registered (`spec/10-pylond-restart.md` §3.1).
+    pub fn with_session(mut self, session: OwnedFd) -> Result<Self, Error> {
+        let vm_id = self.inner.vm_id;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::InvalidRegistration {
+            vm_id,
+            reason: "VM handle is already shared".to_owned(),
+        })?;
+        inner.session = Some(session);
+        Ok(self)
+    }
+
+    /// Whether the VMM closed its end of the VM's session. `false` for a VM without one.
+    pub fn session_closed(&self) -> bool {
+        let Some(session) = &self.inner.session else {
+            return false;
+        };
+        let mut byte = 0u8;
+        // SAFETY: `recv` writes at most one byte into `byte`, which outlives the call. With
+        // `MSG_PEEK | MSG_DONTWAIT` it neither consumes data nor blocks.
+        let ret = unsafe {
+            libc::recv(
+                session.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        match ret {
+            // End of file: the VMM closed the socket.
+            0 => true,
+            // The VMM sends nothing over a session; anything it sent doesn't end it.
+            1.. => false,
+            _ => !matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ),
+        }
     }
 
     /// The UID of the peer that registered this VM, if known.
@@ -1505,6 +1559,7 @@ mod tests {
             priority_weight,
             kick_signal: None,
             wake_by_signal: false,
+            session: false,
         };
         let shm_fd = create_memfd_shared_page(vm_id, num_vcpus, TEST_TSC_KHZ);
         let mut kick_fds = Vec::with_capacity(num_vcpus as usize);

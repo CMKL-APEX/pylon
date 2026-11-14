@@ -39,7 +39,7 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::SIGRTMIN;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::GuestRegion;
+use crate::{GuestRegion, pylon_session};
 
 // The shared page's address is declared in the architecture's layout and in the ABI crate, which
 // can't see each other, so check here that they agree.
@@ -137,6 +137,10 @@ pub enum Error {
     #[error("Failed to register Pylon user memory region with hypervisor")]
     CreateUserMemoryRegion(#[source] GuestRegionError),
 
+    /// Failed to connect to the `pylond` Unix domain socket.
+    #[error("Failed to connect to pylond")]
+    DaemonConnect(#[source] io::Error),
+
     /// Failed to register the VM with the `pylond` Unix domain socket.
     #[error("Failed to register VM with pylond daemon")]
     DaemonRegister(#[source] io::Error),
@@ -149,12 +153,15 @@ pub enum Error {
 /// How long the VMM waits for `pylond`'s reply to its registration.
 const DAEMON_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// `pylond`'s reply to a registration (`VmRegistrationResponse` in `pylond`), sent before it
-/// closes the connection.
+/// `pylond`'s reply to a registration (`VmRegistrationResponse` in `pylond`), ended by a
+/// newline (or, from `pylond` 0.0.8, by closing the connection).
 #[derive(Debug, Deserialize)]
 struct DaemonRegistrationReply {
     accepted: bool,
     message: String,
+    /// Set when `pylond` keeps the connection open as the VM's session.
+    #[serde(default)]
+    session: bool,
 }
 
 /// Where a vCPU without a core waits (`--pylon park=`).
@@ -327,6 +334,10 @@ struct DaemonRegistrationPayload {
     /// (`spec/08-park-in-kvm.md` §3.3).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     wake_by_signal: bool,
+    /// Asks `pylond` to keep the connection open while the VM is registered
+    /// (`spec/10-pylond-restart.md` §3.1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    session: bool,
 }
 
 /// VMM-side Pylon runtime state managing the shared memory file (the 8,192-byte `PylonSharedPage`
@@ -351,6 +362,11 @@ pub struct PylonVmmState {
     /// One per vCPU: the bound on how long it stays parked inside KVM (§3.6).
     park_bounds: Vec<ParkBound>,
     shutting_down: AtomicBool,
+    /// Set while no `pylond` manages the VM: before it registers, and after its session ends
+    /// (`spec/10-pylond-restart.md` §3.2). The VMM then parks no vCPU.
+    unmanaged: AtomicBool,
+    /// Wakes the session thread when the state is dropped.
+    session_stop: Arc<EventFd>,
     /// Set once `register` has run, so that a VM rebooted in the same process registers once.
     registered: AtomicBool,
 }
@@ -449,6 +465,7 @@ unsafe impl Sync for PylonVmmState {}
 
 impl Drop for PylonVmmState {
     fn drop(&mut self) {
+        let _ = self.session_stop.write(1);
         // SAFETY: `self.shared_page` was created via `libc::mmap` with length `PYLON_SHM_FILE_SIZE`
         // in `PylonVmmState::new` and remains valid until `Drop`.
         unsafe {
@@ -545,18 +562,22 @@ impl PylonVmmState {
             parked_in_kvm: (0..num_vcpus).map(|_| AtomicBool::new(false)).collect(),
             park_bounds: (0..num_vcpus).map(|_| ParkBound::default()).collect(),
             shutting_down: AtomicBool::new(false),
+            unmanaged: AtomicBool::new(true),
+            session_stop: Arc::new(EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdCreate)?),
             registered: AtomicBool::new(false),
         });
 
         Ok(state)
     }
 
-    /// Registers the VM with `pylond` if `socket=` is set, once per process.
+    /// Registers the VM with `pylond` if `socket=` is set, once per process, from the
+    /// `pylon-session` thread, which also registers it again after a `pylond` restart
+    /// (`spec/10-pylond-restart.md`).
     ///
     /// Not part of `new`, which runs while the command line is parsed, before the logger is
     /// installed: a failed registration has to show in the VMM's log.
-    pub fn register(&self) {
-        let Some(socket_path) = &self.config.socket else {
+    pub fn register(self: &Arc<Self>) {
+        let Some(socket_path) = self.config.socket.clone() else {
             return;
         };
         if self.registered.swap(true, Ordering::AcqRel) {
@@ -564,31 +585,121 @@ impl PylonVmmState {
         }
         if !socket_path.exists() {
             warn!(
-                "Pylon: pylond socket {socket_path:?} doesn't exist; VM {} runs unmanaged",
+                "Pylon: pylond socket {socket_path:?} doesn't exist; VM {} runs unmanaged \
+                 until it appears",
                 self.config.vm_id
             );
-            return;
         }
-        match self.register_with_daemon(socket_path) {
-            Ok(()) => info!(
-                "Pylon: registered VM {} with pylond, parking vCPUs {}",
-                self.config.vm_id,
-                match self.config.park {
-                    PylonPark::Kvm => "inside KVM",
-                    PylonPark::Vmm => "in the VMM",
-                }
-            ),
-            Err(e) => warn!(
-                "Pylon: failed to register VM {} with pylond at {socket_path:?}: {e}",
+        if let Err(e) = pylon_session::spawn(
+            Arc::downgrade(self),
+            socket_path,
+            Arc::clone(&self.session_stop),
+        ) {
+            warn!(
+                "Pylon: failed to start the pylond session thread; VM {} runs unmanaged: {e}",
                 self.config.vm_id
-            ),
+            );
+        }
+    }
+
+    /// Where vCPUs park, for logs.
+    pub(crate) fn park_location(&self) -> &'static str {
+        match self.config.park {
+            PylonPark::Kvm => "inside KVM",
+            PylonPark::Vmm => "in the VMM",
+        }
+    }
+
+    /// Whether `pylond` manages the VM (`spec/10-pylond-restart.md` §3.2).
+    pub fn is_managed(&self) -> bool {
+        !self.unmanaged.load(Ordering::SeqCst)
+    }
+
+    /// Lets vCPUs park again, just before the VM registers.
+    pub(crate) fn set_managed(&self) {
+        self.unmanaged.store(false, Ordering::SeqCst);
+    }
+
+    /// Makes the VM unmanaged: no vCPU parks, pending revocations are dropped, and every
+    /// parked vCPU is woken to run under the host's scheduler (`spec/10-pylond-restart.md`
+    /// §3.2). Returns whether it was managed.
+    pub(crate) fn set_unmanaged(&self) -> bool {
+        let was_managed = !self.unmanaged.swap(true, Ordering::SeqCst);
+        for vcpu_id in 0..self.max_vcpus {
+            if let (Some(slot), Some(host)) = (self.vcpu_slot(vcpu_id), self.host_slot(vcpu_id)) {
+                host.revoke_requested.store(0, Ordering::Release);
+                slot.revoke_requested.store(0, Ordering::Release);
+            }
+        }
+        self.wake_parked_vcpus();
+        was_managed
+    }
+
+    /// Wakes every started vCPU that is still `PARKED`, as `pylond` would give it a core:
+    /// its wake `EventFd` for a park in the VMM, its thread's signal for a park inside KVM.
+    /// The vCPU then sees the VM unmanaged and runs.
+    pub(crate) fn wake_parked_vcpus(&self) {
+        for vcpu_id in 0..self.max_vcpus {
+            let Some(host) = self.host_slot(vcpu_id) else {
+                continue;
+            };
+            let tid = host.host_tid.load(Ordering::Acquire);
+            if tid == 0 || host.state.load(Ordering::Acquire) != VCPU_STATE_PARKED {
+                continue;
+            }
+            match self.config.park {
+                PylonPark::Vmm => {
+                    let _ = self.wake_vcpu(vcpu_id);
+                }
+                PylonPark::Kvm => signal_own_thread(tid),
+            }
+        }
+    }
+
+    /// Whether every started vCPU runs, none parked.
+    pub(crate) fn all_vcpus_running(&self) -> bool {
+        self.host_page()
+            .vcpus
+            .iter()
+            .take(self.max_vcpus as usize)
+            .filter(|host| host.host_tid.load(Ordering::Acquire) != 0)
+            .all(|host| host.state.load(Ordering::Acquire) != VCPU_STATE_PARKED)
+    }
+
+    /// Prepares the slots of an unmanaged VM, whose vCPUs all run, for a new registration,
+    /// as at boot: no core, no revocation, and the vCPUs beyond `initial_active_vcpus` tagged
+    /// `park_on_boot`, which `pylond` parks first (`spec/10-pylond-restart.md` §3.4). A wake
+    /// left in an `EventFd` by an earlier `pylond` would end the next park at once, so they
+    /// are emptied.
+    pub(crate) fn reset_for_registration(&self) {
+        for vcpu_id in 0..self.max_vcpus {
+            let (Some(slot), Some(host)) = (self.vcpu_slot(vcpu_id), self.host_slot(vcpu_id))
+            else {
+                continue;
+            };
+            drain_eventfd(&self.wake_eventfds[vcpu_id as usize]);
+            host.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+            slot.assigned_pcpu.store(PCPU_UNASSIGNED, Ordering::Release);
+            host.revoke_requested.store(0, Ordering::Release);
+            slot.revoke_requested.store(0, Ordering::Release);
+            if host.host_tid.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let park_on_boot = u8::from(vcpu_id >= self.initial_active_vcpus);
+            host.park_on_boot.store(park_on_boot, Ordering::Release);
+            slot.park_on_boot.store(park_on_boot, Ordering::Release);
         }
     }
 
     /// Connects to `pylond` over Unix domain socket and transmits VM registration metadata
     /// along with `shm_fd`, per-vCPU `kick_eventfds`, and per-vCPU `wake_eventfds` via `SCM_RIGHTS`.
-    pub fn register_with_daemon(&self, socket_path: &Path) -> result::Result<(), Error> {
-        let stream = UnixStream::connect(socket_path).map_err(Error::DaemonRegister)?;
+    /// Returns the connection when `pylond` keeps it open as the VM's session, or `None` when
+    /// it doesn't (`pylond` 0.0.8).
+    pub fn register_with_daemon(
+        &self,
+        socket_path: &Path,
+    ) -> result::Result<Option<UnixStream>, Error> {
+        let stream = UnixStream::connect(socket_path).map_err(Error::DaemonConnect)?;
         let payload = DaemonRegistrationPayload {
             vm_id: self.config.vm_id,
             num_vcpus: self.max_vcpus,
@@ -597,6 +708,7 @@ impl PylonVmmState {
             priority_weight: self.config.priority_weight,
             kick_signal: KICK_SIGNAL,
             wake_by_signal: self.config.park == PylonPark::Kvm,
+            session: true,
         };
         let mut json_bytes =
             serde_json::to_vec(&payload).map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
@@ -618,16 +730,31 @@ impl PylonVmmState {
         stream
             .set_read_timeout(Some(DAEMON_REPLY_TIMEOUT))
             .map_err(Error::DaemonRegister)?;
+        // The reply ends with a newline, or, from `pylond` 0.0.8, when it closes the
+        // connection. Read a byte at a time: nothing follows it over a session.
         let mut reply = Vec::new();
-        (&stream)
-            .read_to_end(&mut reply)
-            .map_err(Error::DaemonRegister)?;
+        let mut byte = [0u8; 1];
+        loop {
+            match (&stream).read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => reply.push(byte[0]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::DaemonRegister(e)),
+            }
+        }
         let reply: DaemonRegistrationReply = serde_json::from_slice(&reply)
             .map_err(|e| Error::DaemonRegister(io::Error::other(e)))?;
         if !reply.accepted {
             return Err(Error::DaemonRejected(reply.message));
         }
-        Ok(())
+        if !reply.session {
+            return Ok(None);
+        }
+        stream
+            .set_read_timeout(None)
+            .map_err(Error::DaemonRegister)?;
+        Ok(Some(stream))
     }
 
     /// Maps the 8,192-byte shared page, the start of the shared memory `memfd`, into guest
@@ -830,6 +957,28 @@ impl PylonVmmState {
         };
         let parked_in_kvm = &self.parked_in_kvm[vcpu_id as usize];
 
+        // Without `pylond`, nothing parks, and a vCPU parked inside KVM runs again
+        // (`spec/10-pylond-restart.md` §3.2). A guest's park request is undone, so the guest
+        // sees its vCPU running.
+        if self.unmanaged.load(Ordering::SeqCst) {
+            if slot.state.load(Ordering::Acquire) == VCPU_STATE_PARKING {
+                slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            }
+            if !parked_in_kvm.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.stop_park_bound(vcpu_id);
+            if !vcpu_op(KvmParkOp::Run) {
+                warn!("Pylon: failed to make parked vCPU {vcpu_id} runnable");
+            }
+            parked_in_kvm.store(false, Ordering::Relaxed);
+            host.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
+            slot.park_timer_deadline_tsc.store(0, Ordering::Relaxed);
+            host.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            return true;
+        }
+
         if parked_in_kvm.load(Ordering::Relaxed) {
             // Parked inside KVM: an exit (an interrupt-woken guest, or `pylond`'s signal) only
             // ends the park once `pylond` assigned a core (`spec/08-park-in-kvm.md` §3.3).
@@ -974,7 +1123,8 @@ impl PylonVmmState {
             return;
         };
 
-        while !self.shutting_down.load(Ordering::Acquire) {
+        while !self.shutting_down.load(Ordering::Acquire) && !self.unmanaged.load(Ordering::SeqCst)
+        {
             match wake_evt.read() {
                 Ok(_) => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1080,6 +1230,40 @@ fn park_decision(state: u8, revoke_requested: u8, deadline_tsc: u64, now_tsc: u6
         ParkDecision::Forced
     } else {
         ParkDecision::Continue
+    }
+}
+
+/// Sends `SIGRTMIN`, which interrupts `KVM_RUN` (`vmm/src/cpu.rs`), to thread `tid` of this
+/// process.
+fn signal_own_thread(tid: u32) {
+    // SAFETY: `getpid` has no preconditions, and `tgkill` only signals `tid` if it is a
+    // thread of this process, whose `SIGRTMIN` handler does nothing.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::getpid(),
+            tid as libc::pid_t,
+            SIGRTMIN(),
+        )
+    };
+    if ret != 0 {
+        warn!(
+            "Pylon: failed to signal vCPU thread {tid}: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// Empties `evt` without blocking, whether or not it is non-blocking.
+fn drain_eventfd(evt: &EventFd) {
+    let mut pollfd = libc::pollfd {
+        fd: evt.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` is valid for the call, which waits for nothing (timeout 0).
+    if unsafe { libc::poll(&mut pollfd, 1, 0) } == 1 && pollfd.revents & libc::POLLIN != 0 {
+        let _ = evt.read();
     }
 }
 
@@ -1378,7 +1562,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     #[cfg(feature = "kvm")]
     use std::sync::atomic::AtomicU32;
-    use std::thread;
+    use std::{fs, thread};
 
     use pylon_abi::VCPU_STATE_WAKING;
     use tempfile::TempDir;
@@ -1498,6 +1682,7 @@ mod tests {
         let cfg = PylonConfig::parse("park=vmm,vm_id=77,initial_active_vcpus=2").unwrap();
 
         let state = PylonVmmState::new(&cfg, 2, 4).unwrap();
+        state.set_managed();
         let file_meta = state.shm_file.metadata().unwrap();
         assert_eq!(file_meta.len(), PYLON_SHM_FILE_SIZE as u64);
         // SAFETY: `F_GET_SEALS` only reads the seals of a valid file descriptor.
@@ -1535,6 +1720,7 @@ mod tests {
         let cfg = PylonConfig::parse("park=vmm,initial_active_vcpus=1").unwrap();
 
         let state = PylonVmmState::new(&cfg, 1, 2).unwrap();
+        state.set_managed();
 
         // vCPU 0 is < initial_active_vcpus (1), so it should register TID and enter RUNNING immediately.
         let state_vcpu0 = Arc::clone(&state);
@@ -1569,6 +1755,7 @@ mod tests {
     fn test_boot_park_waits_for_the_request_and_isn_t_a_yield() {
         let cfg = PylonConfig::parse("park=vmm,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.set_managed();
         state.on_vcpu_thread_start(1, || None);
         let slot1 = state.vcpu_slot(1).unwrap();
 
@@ -1667,6 +1854,7 @@ mod tests {
     fn running_vcpu0_state() -> Arc<PylonVmmState> {
         let cfg = PylonConfig::parse("park=vmm").unwrap();
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.set_managed();
         state.on_vcpu_thread_start(0, || None);
         assert_eq!(
             state.vcpu_slot(0).unwrap().state.load(Ordering::Acquire),
@@ -1683,6 +1871,7 @@ mod tests {
         let mut cfg = PylonConfig::parse("park=vmm").unwrap();
         cfg.park = PylonPark::Kvm;
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.set_managed();
         state.on_vcpu_thread_start(0, || None);
         state
     }
@@ -1734,6 +1923,210 @@ mod tests {
         assert_eq!(ops, [KvmParkOp::Run]);
         assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
         assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Without `pylond`, nothing parks: neither a guest request, which is undone, nor a
+    /// revocation (`spec/10-pylond-restart.md` §3.2).
+    #[test]
+    fn test_unmanaged_vm_parks_no_vcpu() {
+        let state = running_vcpu0_state();
+        assert!(state.set_unmanaged());
+        let slot0 = state.vcpu_slot(0).unwrap();
+
+        slot0.state.store(VCPU_STATE_PARKING, Ordering::Release);
+        assert!(!state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+
+        request_park(&state, 0, 0);
+        assert!(!state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        assert_eq!(slot0.yield_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Losing `pylond` wakes a vCPU parked in the VMM, which runs on.
+    #[test]
+    fn test_losing_pylond_wakes_a_vcpu_parked_in_the_vmm() {
+        let state = running_vcpu0_state();
+        let slot0 = state.vcpu_slot(0).unwrap();
+        request_park(&state, 0, 0);
+        let worker = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || state.check_and_park_vcpu(0, || None, |_| false))
+        };
+        for _ in 0..200 {
+            if slot0.state.load(Ordering::Acquire) == VCPU_STATE_PARKED {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+        assert!(!state.all_vcpus_running());
+
+        assert!(state.set_unmanaged());
+        assert!(worker.join().unwrap());
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        assert!(state.all_vcpus_running());
+    }
+
+    /// Losing `pylond` signals a vCPU parked inside KVM, whose next exit makes it runnable
+    /// without a core assignment, and stops its bound.
+    #[test]
+    fn test_losing_pylond_runs_a_vcpu_parked_inside_kvm() {
+        let state = running_vcpu0_state_parking_in_kvm();
+        state.set_managed();
+        let slot0 = state.vcpu_slot(0).unwrap();
+        request_park(&state, 0, 0);
+        assert!(state.check_and_park_vcpu(0, || None, |_| true));
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_PARKED);
+
+        // vCPU 0 is this thread, whose `SIGRTMIN` handler does nothing.
+        assert!(state.set_unmanaged());
+        let mut ops = Vec::new();
+        assert!(state.check_and_park_vcpu(
+            0,
+            || None,
+            |op| {
+                ops.push(op);
+                true
+            }
+        ));
+        assert_eq!(ops, [KvmParkOp::Run]);
+        assert_eq!(slot0.state.load(Ordering::Acquire), VCPU_STATE_RUNNING);
+        assert!(
+            !state.park_bounds[0]
+                .timer
+                .get()
+                .is_some_and(ThreadTimer::is_armed)
+        );
+        assert!(state.all_vcpus_running());
+    }
+
+    /// Before registering again, the slots look as at boot: no core, no revocation, the vCPUs
+    /// beyond `initial_active_vcpus` tagged for their boot park, and no wake left over.
+    #[test]
+    fn test_reset_for_registration_starts_the_slots_over() {
+        let cfg = PylonConfig::parse("park=vmm,initial_active_vcpus=1").unwrap();
+        let state = PylonVmmState::new(&cfg, 3, 3).unwrap();
+        state.on_vcpu_thread_start(0, || None);
+        state.on_vcpu_thread_start(1, || None);
+        for vcpu_id in 0..2 {
+            let host = state.host_slot(vcpu_id).unwrap();
+            host.park_on_boot.store(0, Ordering::Release);
+            host.assigned_pcpu.store(5, Ordering::Release);
+            host.revoke_requested.store(1, Ordering::Release);
+            state.wake_vcpu(vcpu_id).unwrap();
+        }
+
+        state.reset_for_registration();
+        for vcpu_id in 0..3 {
+            let host = state.host_slot(vcpu_id).unwrap();
+            let slot = state.vcpu_slot(vcpu_id).unwrap();
+            assert_eq!(host.assigned_pcpu.load(Ordering::Acquire), PCPU_UNASSIGNED);
+            assert_eq!(slot.assigned_pcpu.load(Ordering::Acquire), PCPU_UNASSIGNED);
+            assert_eq!(host.revoke_requested.load(Ordering::Acquire), 0);
+            drain_eventfd(&state.wake_eventfds[vcpu_id as usize]);
+        }
+        // vCPU 1 has a thread and is beyond `initial_active_vcpus`; vCPU 2 has no thread.
+        let boot_park = |vcpu_id| {
+            state
+                .host_slot(vcpu_id)
+                .unwrap()
+                .park_on_boot
+                .load(Ordering::Acquire)
+        };
+        assert_eq!((boot_park(0), boot_park(1), boot_park(2)), (0, 1, 0));
+        // The wakes written above are gone: a blocking read would hang, so poll instead.
+        let mut pollfd = libc::pollfd {
+            fd: state.wake_eventfds[1].as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is valid for the call, which doesn't wait.
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 0);
+    }
+
+    /// Accepts one registration on `listener`, replies with a session, and returns the
+    /// session.
+    fn accept_session(listener: &UnixListener) -> UnixStream {
+        // Fails, rather than hangs, if the VMM never connects.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the VMM to register"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        let mut buf = [0u8; 512];
+        let mut iov = [libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        }];
+        let mut fds = [0i32; 8];
+        // SAFETY: `iov` points to `buf` and `fds` has room for 8 FDs.
+        let (bytes_read, fds_read) = unsafe { stream.recv_with_fds(&mut iov, &mut fds) }.unwrap();
+        for &fd in &fds[..fds_read] {
+            // SAFETY: closing file descriptors received in this test.
+            unsafe { libc::close(fd) };
+        }
+        let msg: DaemonRegistrationPayload = serde_json::from_slice(&buf[..bytes_read]).unwrap();
+        assert!(msg.session);
+        (&stream)
+            .write_all(b"{\"accepted\":true,\"message\":\"ok\",\"session\":true}\n")
+            .unwrap();
+        stream
+    }
+
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The VM is managed while its session lasts, unmanaged once `pylond` closes it, and
+    /// registers again when a new `pylond` binds the socket (`spec/10-pylond-restart.md`).
+    /// A VMM that started before `pylond` registers once it appears.
+    #[test]
+    fn test_session_ends_and_the_vm_registers_again() {
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join("pylond.sock");
+        let cfg = PylonConfig::parse(&format!("park=vmm,socket={},vm_id=97", sock_path.display()))
+            .unwrap();
+        let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+        state.on_vcpu_thread_start(0, || None);
+        state.register();
+        assert!(!state.is_managed());
+
+        // `pylond` starts after the VMM, binding and renaming as it does.
+        let tmp_path = dir.path().join("pylond.sock.tmp");
+        let listener = UnixListener::bind(&tmp_path).unwrap();
+        fs::rename(&tmp_path, &sock_path).unwrap();
+        let session = accept_session(&listener);
+        wait_until("the VM is managed", || state.is_managed());
+
+        // `pylond` goes away.
+        drop(session);
+        drop(listener);
+        wait_until("the VM is unmanaged", || !state.is_managed());
+
+        // A new `pylond` binds a new socket at the same path.
+        fs::remove_file(&sock_path).unwrap();
+        let listener = UnixListener::bind(&tmp_path).unwrap();
+        fs::rename(&tmp_path, &sock_path).unwrap();
+        let session = accept_session(&listener);
+        wait_until("the VM is managed again", || state.is_managed());
+        drop(session);
+        wait_until("the VM is unmanaged again", || !state.is_managed());
     }
 
     #[test]
@@ -2039,6 +2432,7 @@ mod tests {
 
         // Creating the state doesn't register; `register` does.
         let state = PylonVmmState::new(&cfg, 2, 2).unwrap();
+        state.set_managed();
         state.register();
         let (msg, fds_read, listener) = server.join().unwrap();
         assert_eq!(msg.vm_id, 99);
@@ -2071,6 +2465,7 @@ mod tests {
         );
         let cfg = PylonConfig::parse("park=kvm,vm_id=98").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+        state.set_managed();
 
         let err = state.register_with_daemon(&sock_path).unwrap_err();
         let (msg, _, _) = server.join().unwrap();
@@ -2088,6 +2483,7 @@ mod tests {
         let cfg =
             PylonConfig::parse("park=vmm,gpa=0x8000,vm_id=44,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+        state.set_managed();
 
         let Ok(hv) = hypervisor::new() else {
             eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
@@ -2132,6 +2528,7 @@ mod tests {
         let cfg =
             PylonConfig::parse("park=vmm,gpa=0x8000,vm_id=43,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+        state.set_managed();
 
         let Ok(hv) = hypervisor::new() else {
             eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");
@@ -2284,6 +2681,7 @@ mod tests {
             ))
             .unwrap();
             let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+            state.set_managed();
             let vm = hv
                 .create_vm(HypervisorVmConfig::default())
                 .expect("failed to create KVM VM");
@@ -2527,6 +2925,7 @@ mod tests {
         let cfg =
             PylonConfig::parse("park=vmm,gpa=0x8000,vm_id=42,initial_active_vcpus=1").unwrap();
         let state = PylonVmmState::new(&cfg, 1, 1).unwrap();
+        state.set_managed();
 
         let Ok(hv) = hypervisor::new() else {
             eprintln!("Skipping real KVM VM test because /dev/kvm is not accessible");

@@ -784,6 +784,10 @@ fn vmm_thread_rules(
         (libc::SYS_getsockname, vec![]),
         (libc::SYS_gettimeofday, vec![]),
         (libc::SYS_getuid, vec![]),
+        // Pylon's session thread (`vmm/src/pylon_session.rs`), which inherits this filter,
+        // watches the `pylond` socket's directory for a new socket.
+        (libc::SYS_inotify_add_watch, vec![]),
+        (libc::SYS_inotify_init1, vec![]),
         (
             libc::SYS_ioctl,
             create_vmm_ioctl_seccomp_rule(hypervisor_type)?,
