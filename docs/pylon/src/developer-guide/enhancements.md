@@ -195,7 +195,7 @@ rejects such a VM (spec 08 §2). How it works:
   longer than 4 ms (`WOKEN_DEMAND_US`) counts as demand for a core,
   and a VM with no core gets a zero-core wakeup then. A shorter wake, in
   a VM that owns a core, takes only a spare core: an idle one, or one
-  held by a VM that wants none. A core given to a
+  held for at least 1 s by a VM that wants none. A core given to a
   woken vCPU stays wanted until the guest agent reports again, or for
   50 ms (`WOKEN_GRANT_HOLD_US`). Woken time is metered per VM
   (`woken_shared_usec`, `woken_unowned_usec`).

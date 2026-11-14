@@ -71,6 +71,13 @@ pub const WOKEN_DEMAND_US: u64 = 4_000;
 /// without one gets the same bound.
 pub const WOKEN_GRANT_HOLD_US: u64 = 50_000;
 
+/// How long a VM must have held a core before a VM that only wants a spare core for a woken
+/// vCPU may take it (`spare_only`). Two idle VMs whose vCPUs wake for interrupts would otherwise
+/// trade a spare core each time one of them woke, as soon as the other's guest agent reported no
+/// demand again, each move a forced preemption: about 70 a second with agents reporting every
+/// millisecond.
+pub const SPARE_CORE_TENURE_US: u64 = 1_000_000;
+
 /// How often a VM woken from zero cores may take a core from a donor at its `min_cores`. The
 /// wakeup's urgency comes from timers and telemetry the guest writes, so without a limit a
 /// guest that parks and wakes again and again would keep taking cores below other VMs' floor.
@@ -344,6 +351,8 @@ pub struct MatrixEngine {
     /// while the core is `Assigned` or `Revoking`.
     woken_grant_tsc: [u64; MAX_PCPUS],
     woken_grant_heartbeat: [u64; MAX_PCPUS],
+    /// When each core was last assigned. Read only while it is `Assigned`.
+    assigned_tsc: [u64; MAX_PCPUS],
     /// When each vCPU (by VM index in the snapshot) that kept running after a handoff without park
     /// was last signalled (0 if not yet).
     orphan_signalled_tsc: [[u64; MAX_VCPUS]; MAX_TRACKED_VMS],
@@ -404,6 +413,7 @@ impl MatrixEngine {
             handoff_requested_tsc: [0; MAX_PCPUS],
             woken_grant_tsc: [0; MAX_PCPUS],
             woken_grant_heartbeat: [0; MAX_PCPUS],
+            assigned_tsc: [0; MAX_PCPUS],
             orphan_signalled_tsc: [[0; MAX_VCPUS]; MAX_TRACKED_VMS],
             vm_vcpus: Arc::new(VmVcpusTable::new_in_memory()),
             parked_slots: 0,
@@ -643,6 +653,7 @@ impl MatrixEngine {
         };
         self.pcpu_owners.write_owner(pcpu, tid, flags);
         let _ = self.pcpu_owners.kick(pcpu);
+        self.assigned_tsc[pcpu] = now_tsc;
         self.assigned_yield_count[pcpu] = host.yield_count.load(Ordering::Acquire);
         vm.set_assigned_pcpu(vcpu as usize, pcpu as u8);
         let _ = self.write_vm_fd(vm, || vm.wake_vcpu(vcpu as usize));
@@ -1291,8 +1302,8 @@ impl MatrixEngine {
                 // 2. Preemption Path: Select an over-allocated or lower-urgency donor core.
                 let below_floor_allowed = recipient_eval.zero_core_wakeup
                     && Self::floor_preempt_ready(recipient_vm, now_tsc, self.host_tsc_khz);
-                let Some((donor_pcpu, donor_eval_idx, donor_vcpu, at_floor)) =
-                    self.select_donor_pcpu(vms, vm_count, recipient_eval, below_floor_allowed)
+                let Some((donor_pcpu, donor_eval_idx, donor_vcpu, at_floor)) = self
+                    .select_donor_pcpu(vms, vm_count, recipient_eval, below_floor_allowed, now_tsc)
                 else {
                     break;
                 };
@@ -1485,7 +1496,9 @@ impl MatrixEngine {
         vm_count: usize,
         recipient: VmDemandEval,
         below_floor_allowed: bool,
+        now_tsc: u64,
     ) -> Option<(usize, usize, u8, bool)> {
+        let spare_tenure = Self::us_to_cycles(SPARE_CORE_TENURE_US, self.host_tsc_khz);
         let mut best: Option<(usize, usize, u8, bool, bool, u64, bool)> = None;
 
         let mut pcpu = 0usize;
@@ -1518,9 +1531,13 @@ impl MatrixEngine {
                 let above_min = donor_eval.assigned_cores > donor_eval.min_cores;
 
                 // A VM that wants some cores but fewer than it holds may want them back by the
-                // next report of its guest agent, and the two VMs would trade the core.
+                // next report of its guest agent, and the two VMs would trade the core. So may
+                // one that wants none, as soon as one of its vCPUs wakes: only a core it has held
+                // for `SPARE_CORE_TENURE_US` counts as spare.
                 let eligible = if recipient.spare_only {
-                    above_min && donor_eval.desired_cores == 0
+                    above_min
+                        && donor_eval.desired_cores == 0
+                        && now_tsc.saturating_sub(self.assigned_tsc[pcpu]) >= spare_tenure
                 } else {
                     (above_min && (over_desired || over_fair_share || lower_urgency))
                         || (recipient.zero_core_wakeup && below_floor_allowed && lower_urgency)

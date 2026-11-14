@@ -1427,7 +1427,8 @@ mod tests {
     use super::*;
     use crate::control::{ControlPlane, send_policy_update, send_registration};
     use crate::engine::{
-        MatrixEngine, calibrate_tsc_khz, detect_timed_wait, pause_cycles, read_tsc,
+        MatrixEngine, SPARE_CORE_TENURE_US, calibrate_tsc_khz, detect_timed_wait, pause_cycles,
+        read_tsc,
     };
 
     /// Counter rate of the test VMs' pages and engines: tick values in the tests assume it, and
@@ -3034,7 +3035,14 @@ mod tests {
             .runnable_threads
             .store(0, Ordering::Release);
         entry.woken.store(1 << 3, Ordering::Release);
+        // Not before VM 82 has held the core for `SPARE_CORE_TENURE_US`.
         engine.poll_once(2_000);
+        assert_eq!(
+            engine.core_state(other_core),
+            CoreState::Assigned { vm_id: 82, vcpu: 0 }
+        );
+        let tenure = SPARE_CORE_TENURE_US * TEST_TSC_KHZ / 1000;
+        engine.poll_once(1_000 + tenure);
         assert!(matches!(
             engine.core_state(other_core),
             CoreState::Revoking {
