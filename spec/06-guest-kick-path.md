@@ -109,7 +109,7 @@ wake recipient
 ```
 
 **Forced path:** if `now >= deadline_tsc` and `state != PARKED`, `pylond` sends
-`tgkill(vmm_pid, host_tid, SIGRTMIN)` (§4.4). `KVM_RUN` returns `EINTR`, which
+`tgkill(vmm_pid, host_tid, kick_signal)` (§4.4). `KVM_RUN` returns `EINTR`, which
 the KVM backend maps to `VmExit::Ignore` (`hypervisor/src/kvm/mod.rs`). The
 post-exit hook then sees the expired deadline and force-parks.
 
@@ -227,19 +227,24 @@ The forced exit comes from `pylond`, as follows. The control plane records the
 VMM's PID from `SO_PEERCRED` on the registration socket (tokio
 `UnixStream::peer_cred()`). On deadline expiry, Plane 2 calls
 `tgkill(vmm_pid, host_tid, kick_signal)`. Cloud Hypervisor already installs a
-no-op `SIGRTMIN` handler on vCPU threads (`vmm/src/cpu.rs` `handle_signal`), so
-this interrupts `KVM_RUN` without other side effects. Requirements: `pylond`
+no-op `SIGRTMIN` handler on vCPU threads (`vmm/src/cpu.rs` `handle_signal`);
+the VMM installs the same handler for `kick_signal`, so this interrupts
+`KVM_RUN` without other side effects. Requirements: `pylond`
 runs as the same UID as the VMM or holds `CAP_KILL`. Using `tgkill` instead of
 `tkill` only signals `host_tid` if it is a thread of `vmm_pid`.
 
 *As implemented (S2):*
 
-- **The VMM names the signal.** `SIGRTMIN` depends on the libc (glibc and musl
-  reserve different numbers of real-time signals), and a real-time signal
-  without a handler terminates the process. So the VMM sends its own
-  `SIGRTMIN()` as `kick_signal` in the registration message. `pylond`
-  rejects a registration whose `kick_signal` isn't a real-time signal, and
-  never signals a VMM that didn't send one (an older VMM).
+- **The VMM names the signal.** A signal without a handler terminates the
+  process, so the VMM sends the one it handles as `kick_signal` in the
+  registration message. `pylond` rejects a registration whose `kick_signal`
+  isn't `SIGUSR1`, `SIGUSR2` or a real-time signal, and never signals a VMM
+  that didn't send one (an older VMM).
+- **A standard signal (#54).** The VMM sent its `SIGRTMIN()` until
+  2026-11-14. Real-time signals queue: each one `pylond` sent again while a
+  donor waited for a CPU was delivered on its own, and a forced park ran 5
+  handlers at the median. It now sends `SIGUSR2`, which is pending at most
+  once, so one handler runs however many were sent.
 - **PID reuse.** At registration, `pylond` opens a pidfd for the peer PID
   (`VmHandle::with_vmm_pid`). Before each `tgkill`, it checks with
   `pidfd_send_signal(pidfd, 0)` that the process still exists, so a PID
