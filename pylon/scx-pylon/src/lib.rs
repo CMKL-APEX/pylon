@@ -97,6 +97,9 @@ impl PcpuOwnerFlags {
     pub const ACTIVE: Self = Self(1 << 0);
     /// Immediate preemption requested for a replaced donor vCPU.
     pub const PREEMPT: Self = Self(1 << 1);
+    /// The owner is a host thread, such as `pylond`'s engine, not a vCPU: it gets the CPU first
+    /// but isn't SMT-isolated as a managed vCPU.
+    pub const HOST: Self = Self(1 << 2);
 
     /// Returns the raw `u32` representation of the flags.
     #[inline]

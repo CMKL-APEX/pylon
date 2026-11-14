@@ -3456,6 +3456,42 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_owns_its_cpu_while_it_runs() {
+        // SAFETY: `sched_getcpu` has no preconditions.
+        let cpu = unsafe { libc::sched_getcpu() };
+        assert!(cpu >= 0, "sched_getcpu failed");
+        let cpu = cpu as usize;
+        if cpu >= MAX_PCPUS {
+            return;
+        }
+
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = test_engine(snapshot, Arc::clone(&pcpu_owners), &[]);
+        engine.set_engine_cpu(cpu);
+        let stop = Arc::new(AtomicBool::new(false));
+        let engine_stop = Arc::clone(&stop);
+        let engine_thread = thread::spawn(move || {
+            // SAFETY: `gettid` takes no arguments and can't fail.
+            let tid = unsafe { libc::gettid() } as u32;
+            engine.run(&engine_stop).map(|()| tid)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pcpu_owners.read_owner(cpu).0 == 0 {
+            assert!(Instant::now() < deadline, "the engine never took CPU {cpu}");
+            thread::yield_now();
+        }
+        let (owner, flags) = pcpu_owners.read_owner(cpu);
+        assert_eq!(flags, scx_pylon::PcpuOwnerFlags::HOST.bits());
+
+        stop.store(true, Ordering::Relaxed);
+        let tid = engine_thread.join().unwrap().unwrap();
+        assert_eq!(owner, tid);
+        assert_eq!(pcpu_owners.read_owner(cpu), (0, 0));
+    }
+
+    #[test]
     fn test_calibrated_tsc_rate_is_plausible() {
         let tsc_khz =
             calibrate_tsc_khz(Duration::from_millis(20)).expect("this architecture has a counter");

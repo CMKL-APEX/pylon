@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use log::{info, warn};
 use pylon_abi::clock::{architectural_counter_khz, read_counter};
 use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonHostVcpuSlot, VCPU_STATE_PARKED};
+use scx_pylon::PcpuOwnerFlags;
 
 use crate::{
     CoreState, Error, MAX_PCPUS, MAX_VM_SLOTS, PcpuOwnerTable, VM_SLOT_NONE, VmHandle, VmSnapshot,
@@ -512,8 +513,22 @@ impl MatrixEngine {
     /// Pins the calling thread to the engine CPU and runs the real-time polling loop until `stop`
     /// is set.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), Error> {
-        if let Err(err) = pin_current_thread_to_core(self.engine_cpu) {
-            warn!("Plane 2 could not pin to CPU {}: {err}", self.engine_cpu);
+        let pinned = match pin_current_thread_to_core(self.engine_cpu) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("Plane 2 could not pin to CPU {}: {err}", self.engine_cpu);
+                false
+            }
+        };
+        // Owning its CPU keeps the engine there under `scx_pylon`: otherwise, each time its slice
+        // ends, a queued vCPU thread takes the CPU for a whole slice (20 ms), and no sweeps run.
+        let owns_cpu =
+            pinned && self.engine_cpu < MAX_PCPUS && !self.managed_pcpus[self.engine_cpu];
+        if owns_cpu {
+            // SAFETY: `gettid` takes no arguments and can't fail.
+            let tid = unsafe { libc::gettid() } as u32;
+            self.pcpu_owners
+                .write_owner(self.engine_cpu, tid, PcpuOwnerFlags::HOST.bits());
         }
         if let Some(watch) = &self.write_watch {
             watch.bind_current_thread();
@@ -528,6 +543,9 @@ impl MatrixEngine {
             let now_tsc = read_tsc();
             self.poll_once(now_tsc);
             pause_cycles(now_tsc, sweep_cycles, self.has_timed_wait);
+        }
+        if owns_cpu {
+            self.pcpu_owners.write_owner(self.engine_cpu, 0, 0);
         }
         Ok(())
     }
