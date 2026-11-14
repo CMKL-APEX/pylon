@@ -51,8 +51,8 @@ But:
   A longer grace makes them cooperative but gains no throughput, so the
   guest's yield has to get faster ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
   On the bare-metal x86_64 host, the kick takes 4–32 µs to reach the
-  guest, and the guest then takes 16–64 µs to ask to park, for reasons
-  not yet known ([spec 09 §9](https://github.com/CMKL-APEX/pylon/blob/main/spec/09-park-by-halt.md#9-h0-result-2026-11-14)).
+  guest, and the guest then takes 16–64 µs to ask to park: kernel code
+  runs that slowly on that host, in a guest or not ([spec 09 §9](https://github.com/CMKL-APEX/pylon/blob/main/spec/09-park-by-halt.md#9-h0-result-2026-11-14)).
 - **Handoffs take about 100–125 µs.** On bare metal, from a revocation
   request to the recipient vCPU running takes 100–126 µs at the median
   ([#53](https://github.com/CMKL-APEX/pylon/issues/53); see

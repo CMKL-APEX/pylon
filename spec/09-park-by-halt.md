@@ -2,8 +2,8 @@
 
 > **Status:** `DRAFT`, on hold. H0 (§9) found that the guest takes
 > 16–64 µs from the kick's injection to its park request, so a park by
-> halt can't reach the 8 µs grace either; H1 waits until the guest's
-> time is understood. It aims at #74: a cooperative park within
+> halt can't reach the 8 µs grace either. The guest's time is ordinary
+> kernel code running slowly on this x86_64 host, not the kick path. It aims at #74: a cooperative park within
 > `pylond`'s 8 µs grace period. It builds on parking inside KVM (spec
 > 08) and needs `--pylon park=kvm` and `scx_pylon`.
 
@@ -298,10 +298,46 @@ It doesn't change with:
 - `mitigations=off` on the guest's command line, so it isn't the
   guest's own mitigations.
 
-Where those µs go is open. Ubuntu 7.0's kernel preempts lazily
-(`PREEMPT_LAZY`), but a `SCHED_FIFO` wakeup still preempts at once.
-The next step is tracing inside the guest (the kick handler, the park
-thread's wakeup and run).
+**Inside the guest.** A second run traced the guest kernel itself
+(`ftrace` events in VM 1, with the guest TSC as the clock, for 20 s;
+the host saw no extra exits). From the kick handler's entry to
+`pv_pylon_park`, over 35 kicks:
+
+| Step | p50 | p90 |
+|---|---|---|
+| Kick handler (most of it waking the park thread) | 4.9 µs | 5.9 µs |
+| Handler exit → switch to the park thread | ≈4 µs | |
+| Switch → `pv_pylon_park` | 3.8 µs | 4.6 µs |
+| Handler entry → `pv_pylon_park` | 12.7 µs | 15.0 µs (one at 85 µs) |
+
+The rest of the 16–32 µs the host sees is the guest's interrupt entry
+and the doorbell write after `pv_pylon_park`. Nothing waits: the steps
+are slow in themselves, and so is everything else the guest kernel
+does. Every wakeup in the trace takes about 2.8 µs from `sched_waking`
+to `sched_wakeup` (p50, 13,000 wakeups, kick or not), and a timer
+interrupt about 5 µs. Event tracing adds about 0.2 µs per event.
+
+Ruled out:
+
+| Suspect | Test | Result |
+|---|---|---|
+| Kernel work holding off the park thread | `steady` (user-space spinner) instead of `coop` | same |
+| The guest's mitigations | `mitigations=off` in the guest | same |
+| Nested-paging TLB misses | guest memory prefaulted, all of it on huge pages (one third without) | same |
+| CPU frequency | managed CPUs at 3.2 GHz during the run | — |
+| Exits during the path | host trace: 1–3 per kick, 0–4 µs | — |
+
+So the kick path isn't slow because of `pv-pylon` or the kick: kernel
+code on this host is slow, in a guest or not. With `bpftrace`, a local
+wakeup on the host itself takes 4–16 µs. The aarch64 reference host
+parks a real vCPU in about 15 µs in all (#62). The host's mitigations
+(STIBP always on, return thunks, Safe RET) remain the main suspect; a
+run with `mitigations=off` needs a reboot of the host.
+
+**For #74:** even parking from the kick handler, with no thread, would
+leave the injection (4–32 µs) and the handler's own 5 µs, so no
+cooperative park reaches the 8 µs grace on this x86_64 host. Forced
+parks, the default, stay.
 
 **H0's exit criterion fails.** A park by halt would remove the
 doorbell's exit and the VMM's path, but `pylond` would still see
