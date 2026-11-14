@@ -305,9 +305,11 @@ pub struct VmRegistrationRequest {
     pub min_cores: u32,
     pub max_cores: u32,
     pub priority_weight: u32,
-    /// Signal that interrupts a vCPU's `KVM_RUN` in the registering VMM (its `SIGRTMIN`, which
-    /// depends on the VMM's libc). `pylond` sends it when a revocation's deadline passes
-    /// (`spec/06-guest-kick-path.md` §4.4). Without it, `pylond` never signals the VMM.
+    /// Signal that interrupts a vCPU's `KVM_RUN` in the registering VMM: `SIGUSR1`, `SIGUSR2`
+    /// or a real-time signal. The Pylon VMM sends `SIGUSR2`, a standard signal, so that the
+    /// signals `pylond` sends again while a vCPU waits to run don't queue up. `pylond` sends it
+    /// when a revocation's deadline passes (`spec/06-guest-kick-path.md` §4.4). Without it,
+    /// `pylond` never signals the VMM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kick_signal: Option<i32>,
     /// Set by a VMM that parks vCPUs inside KVM (`spec/08-park-in-kvm.md`). The wake `eventfd`
@@ -315,6 +317,14 @@ pub struct VmRegistrationRequest {
     /// assigns a core, and again until the vCPU leaves `PARKED`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_by_signal: bool,
+}
+
+/// Whether a VMM may register `signal` as its `kick_signal`: one whose default action a VMM
+/// replaces with a handler, so that `pylond` can't stop or kill it by sending one.
+fn is_kick_signal(signal: i32) -> bool {
+    signal == libc::SIGUSR1
+        || signal == libc::SIGUSR2
+        || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signal)
 }
 
 /// JSON response returned by `pylond` after processing a `VmRegistrationRequest`.
@@ -468,11 +478,13 @@ impl VmHandle {
             });
         }
         if let Some(signal) = req.kick_signal
-            && !(libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signal)
+            && !is_kick_signal(signal)
         {
             return Err(Error::InvalidRegistration {
                 vm_id: req.vm_id,
-                reason: format!("kick_signal {signal} is not a real-time signal"),
+                reason: format!(
+                    "kick_signal {signal} is not SIGUSR1, SIGUSR2 or a real-time signal"
+                ),
             });
         }
         let expected_vcpus = req.num_vcpus as usize;
@@ -3369,7 +3381,28 @@ mod tests {
     }
 
     #[test]
-    fn test_registration_rejects_non_realtime_kick_signal() {
+    fn test_kick_signal_allows_user_and_realtime_signals() {
+        for signal in [
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGRTMIN(),
+            libc::SIGRTMAX(),
+        ] {
+            assert!(is_kick_signal(signal), "{signal}");
+        }
+        for signal in [
+            0,
+            libc::SIGKILL,
+            libc::SIGSTOP,
+            libc::SIGTERM,
+            libc::SIGSEGV,
+        ] {
+            assert!(!is_kick_signal(signal), "{signal}");
+        }
+    }
+
+    #[test]
+    fn test_registration_rejects_other_kick_signals() {
         let mut rig = build_test_vm(50, 1, 0, 1, 1);
         rig.req.kick_signal = Some(libc::SIGKILL);
         let err = VmHandle::new(
