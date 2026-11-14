@@ -33,8 +33,14 @@ struct {
 uses it as its `PcpuOwnerTable`, so an owner change is two atomic
 stores: `flags`, then `target_tid` with `Release`. Bits 16–31 of
 `flags` hold the owner's VM slot plus one (0 if unknown), so the BPF
-program can find the CPUs a VM owns. The `ACTIVE` and `PREEMPT` bits are
-defined but not used.
+program can find the CPUs a VM owns. The `HOST` bit (bit 2) marks an
+owner that is a host thread, not a vCPU: `pylond`'s engine owns its
+CPU, so it gets the CPU first, but `scx_pylon` doesn't tag it as a
+managed vCPU, and its SMT siblings still run host tasks. Without it, a
+queued vCPU thread took the engine's CPU for a whole slice each time
+the engine's slice ended
+([#54](https://github.com/CMKL-APEX/pylon/issues/54)). The `ACTIVE` and
+`PREEMPT` bits are defined but not used.
 
 Four more maps:
 

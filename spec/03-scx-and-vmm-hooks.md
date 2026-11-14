@@ -23,6 +23,7 @@ struct {
 } pylon_pcpu_owners SEC(".maps");
 ```
 
+- **Host owners:** `pylond`'s engine writes its own thread as the owner of its CPU, with the `HOST` flag (bit 2), while it runs and clears the entry when it stops. It gets its CPU first, as any owner does, so a queued vCPU thread no longer takes the CPU for a whole slice when the engine's slice ends (#54). With `HOST` set, the owner isn't tagged as a managed vCPU, so its claim stays a host claim and its SMT siblings still run host tasks. Like a pinned host task, it doesn't yield to a vCPU on a sibling.
 - **`scx_ops.select_cpu(p, prev_cpu, wake_flags)`:**
   If task `p->pid` matches a `target_tid` in `pylon_pcpu_owners`, return that assigned `pCPU`. `enqueue` puts it on that pCPU's owner queue.
 - **`scx_ops.enqueue(p, enq_flags)`:**

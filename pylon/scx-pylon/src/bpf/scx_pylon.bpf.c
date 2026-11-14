@@ -89,6 +89,11 @@
 /* Flags in struct pcpu_owner_entry */
 #define PCPU_OWNER_FLAG_ACTIVE (1U << 0)
 #define PCPU_OWNER_FLAG_PREEMPT (1U << 1)
+/*
+ * The owner is a host thread, not a vCPU: pylond's engine owns its own CPU,
+ * so it gets that CPU first, but it isn't SMT-isolated as a managed vCPU.
+ */
+#define PCPU_OWNER_FLAG_HOST (1U << 2)
 /* Bits 16-31 of the flags: the owner's VM slot plus one, or 0 if unknown */
 #define PCPU_OWNER_SLOT_SHIFT 16
 
@@ -298,9 +303,15 @@ static __always_inline __u32 task_claim(struct task_struct *p)
     return tctx && tctx->dom ? tctx->dom : CLAIM_HOST;
 }
 
-/* Marks @p as a managed vCPU thread that owns @cpu. */
+/* Marks @p as a managed vCPU thread that owns @cpu, unless it is a host owner. */
 static __always_inline void mark_owner(struct task_struct *p, s32 cpu)
 {
+    __u32 key = (__u32)cpu;
+    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
+    if (entry && (entry->flags & PCPU_OWNER_FLAG_HOST)) {
+        return;
+    }
+
     struct pylon_task_ctx *tctx =
         bpf_task_storage_get(&pylon_task_ctx, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (tctx) {
@@ -450,10 +461,12 @@ static void set_claim(s32 cpu, __u32 claim)
  * claim beats a host claim, and between two managed VMs the lower-numbered
  * CPU wins. A pinned host task can't be moved away, so a managed claim
  * yields to it, unless it is the pCPU's @owner: an owner that yielded to a
- * busy pinned task would wait until the watchdog fired. Host and pinned
- * claims don't conflict. Only `running` sets a pinned claim, without checking
- * siblings, so among claims that are checked the order is total, and two
- * siblings never both back off.
+ * busy pinned task would wait until the watchdog fired. A host @owner
+ * (PCPU_OWNER_FLAG_HOST, pylond's engine) doesn't yield either: it is pinned,
+ * and used to run from the local queue whatever its siblings ran. Host and
+ * pinned claims don't conflict. Only `running` sets a pinned claim, without
+ * checking siblings, so among other claims that are checked the order is
+ * total, and two siblings never both back off.
  */
 static __always_inline bool yields_to(s32 cpu, __u32 claim, s32 sib, __u32 other, bool owner)
 {
@@ -461,7 +474,7 @@ static __always_inline bool yields_to(s32 cpu, __u32 claim, s32 sib, __u32 other
         return false;
     }
     if (claim == CLAIM_HOST || claim == CLAIM_PINNED) {
-        return other != CLAIM_HOST && other != CLAIM_PINNED;
+        return !owner && other != CLAIM_HOST && other != CLAIM_PINNED;
     }
     if (other == CLAIM_HOST) {
         return false;

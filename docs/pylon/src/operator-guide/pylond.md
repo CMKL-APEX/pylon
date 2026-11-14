@@ -35,7 +35,8 @@ option is in the [pylond reference](../reference/pylond.md).
 - Keep other work off the engine CPU, for example with the kernel's
   `isolcpus=` or `nohz_full=` boot options, or a cgroup `cpuset` that
   excludes it. Any interruption of the engine delays every handoff on
-  the host.
+  the host. With `scx_pylon`, the engine owns its CPU, so vCPU threads
+  don't run there, but kernel threads bound to that CPU still do.
 - If pinning fails, `pylond` logs a warning and keeps running unpinned.
 
 `pylond` doesn't stop other processes from running on the managed CPUs.
