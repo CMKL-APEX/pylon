@@ -341,14 +341,23 @@ exit and the first handler's return, and inflated it.
   first turn ([#104](https://github.com/CMKL-APEX/pylon/pull/104)):
   wakes slower than 200 µs in the trace fell from 7–32 per run to 0–2.
 - **The rest of `pylond`'s tail:** with that fixed, `pylond`'s wake
-  p99 stayed at 0.2–1.2 ms, and its histograms counted more slow wakes
-  than the trace showed. The trace's slow wakes were the new owner
-  sharing its CPU with a woken sibling for a 1 ms tick. The engine also
-  lost its CPU to a managed vCPU thread for a full 20 ms slice, 1–2
-  times per trace, which [#105](https://github.com/CMKL-APEX/pylon/pull/105)
-  fixes. That didn't lower the tail, and neither did the kernel
-  worker's 0.7 ms runs on the engine's CPU explain it: no handoff was
-  waiting when one ended.
+  p99 stayed at 0.2–1.2 ms. `pylond` records a wake when the VMM
+  publishes `RUNNING`, after the `KVM_RUN` exit, the wake `eventfd`
+  read and `KVM_SET_MP_STATE`. Measured that way in the trace, the slow
+  wakes match the histograms. The new owner left the guest 12–20 µs
+  after the signal, and then a woken sibling of its VM, queued to share
+  the CPU, preempted it at once and ran guest code for a whole tick,
+  about 1 ms: the 100 µs share slice only ended at the tick. `scx_pylon`
+  now lets a turn run 100 µs before a woken vCPU takes the CPU, and a
+  timer ends each shared turn after 100 µs
+  ([#107](https://github.com/CMKL-APEX/pylon/pull/107)). In two runs
+  each against `main`, wakes over 0.5 ms in the trace went from 7–9 to
+  0, `pylond`'s wake p99 from 896–1,152 µs to 160 µs, its handoff p99
+  from 960–1,152 µs to 208 µs, and the median turn from 1,000 µs to
+  115 µs. The shared CPUs switch about 8 times as often (about 305,000
+  switches per 20 s against 37,000). Separately, the engine lost its
+  CPU to a vCPU thread for 20 ms, 1–2 times per trace, which
+  [#105](https://github.com/CMKL-APEX/pylon/pull/105) fixes.
 
 ## Other figures
 
@@ -367,9 +376,9 @@ be claimed:
 - The engine's sweep time, by number of VMs.
 - Handoff latency without `scx_pylon`, and on an Intel host (above:
   AMD, with `scx_pylon`).
-- The rest of a forced park's 45 µs, and the slow wakes that
-  `pylond`'s histograms count but a host trace doesn't show
-  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
+- The rest of a forced park's 45 µs
+  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)), and what 100 µs
+  turns cost guest throughput on a shared CPU.
 - For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
   guest throughput against the `eventfd` park, and halt-polling
   settings (spec 08 P3,
