@@ -45,6 +45,9 @@
  */
 #define PYLON_SHARE_SLICE 100000ULL /* 100 us */
 
+/* bpf_timer clock, from include/uapi/linux/time.h */
+#define CLOCK_MONOTONIC 1
+
 /* sched_ext kick flags */
 #define SCX_KICK_IDLE (1ULL << 0)
 #define SCX_KICK_PREEMPT (1ULL << 1)
@@ -79,6 +82,7 @@
 #define PR_SCHED_CORE_GET 0
 
 #define EPERM 1
+#define ENOENT 2
 #define ENODEV 19
 
 /* Values of pylon_guard.deny: what a request for a cookie gets */
@@ -211,6 +215,24 @@ __u32 cpu_claim[MAX_PCPUS];
  * turns and don't change it.
  */
 __u32 woken_turn[MAX_PCPUS];
+/* Per CPU: when the task that runs there started, in bpf_ktime_get_ns() time. */
+__u64 turn_start[MAX_PCPUS];
+
+/*
+ * Per CPU: ends a shared turn after PYLON_SHARE_SLICE. The kernel checks a
+ * slice only at the tick, so without it a 100 us turn lasted about 1 ms
+ * (#54).
+ */
+struct share_timer {
+    struct bpf_timer timer;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_PCPUS);
+    __type(key, __u32);
+    __type(value, struct share_timer);
+} pylon_share_timers SEC(".maps");
 
 _Static_assert((MAX_PCPUS & (MAX_PCPUS - 1)) == 0, "pcpu_index() masks with MAX_PCPUS - 1");
 
@@ -417,6 +439,46 @@ static __always_inline void set_woken_turn(s32 cpu, __u32 tid)
     }
 }
 
+/* How long the task that runs on @cpu has run, in ns. */
+static __always_inline u64 turn_ran(s32 cpu)
+{
+    __u32 i = (__u32)cpu;
+
+    if (i >= MAX_PCPUS) {
+        return 0;
+    }
+    return bpf_ktime_get_ns() - *(volatile __u64 *)&turn_start[pcpu_index(i)];
+}
+
+/* Kicks @cpu, ending its turn, in @ns. */
+static __always_inline void end_turn_in(s32 cpu, u64 ns)
+{
+    __u32 key = (__u32)cpu;
+    struct share_timer *t = bpf_map_lookup_elem(&pylon_share_timers, &key);
+
+    if (t) {
+        bpf_timer_start(&t->timer, ns, 0);
+    }
+}
+
+/*
+ * Timer callback: ends the turn on CPU @key once it has lasted
+ * PYLON_SHARE_SLICE. A timer started for an earlier turn starts again for the
+ * rest of the current one.
+ */
+static int end_turn(void *map, int *key, struct share_timer *t)
+{
+    s32 cpu = *key;
+    u64 ran = turn_ran(cpu);
+
+    if (ran < PYLON_SHARE_SLICE) {
+        bpf_timer_start(&t->timer, PYLON_SHARE_SLICE - ran, 0);
+        return 0;
+    }
+    scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+    return 0;
+}
+
 static __always_inline __u32 read_claim(s32 cpu)
 {
     /* Unsigned: clang folds a signed check, and the verifier then sees an
@@ -573,6 +635,24 @@ static void kick_preempt(const struct task_struct *p, s32 cpu, u64 enq_flags)
 }
 
 /*
+ * Asks @cpu, which @p's VM owns, to give woken @p a turn. The task running
+ * there finishes a PYLON_SHARE_SLICE turn first: preempting it at once cut a
+ * new owner off about 15 us after it left the guest, before it could publish
+ * RUNNING, and the woken vCPU then kept the CPU for a tick (#54). An idle
+ * CPU, or a task that has run that long already, is kicked now.
+ */
+static void kick_shared(const struct task_struct *p, s32 cpu, u64 enq_flags)
+{
+    u64 ran = turn_ran(cpu);
+
+    if (read_claim(cpu) == CLAIM_NONE || ran >= PYLON_SHARE_SLICE) {
+        kick_preempt(p, cpu, enq_flags);
+    } else {
+        end_turn_in(cpu, PYLON_SHARE_SLICE - ran);
+    }
+}
+
+/*
  * A CPU that @slot's VM owns and @p may run on, or -1. A woken parked vCPU
  * of that VM shares it with the owner (spec 08 §4.3).
  */
@@ -659,7 +739,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
         set_woken(tctx, true);
         if (shared >= 0) {
             scx_bpf_dsq_insert(p, PYLON_VM_DSQ + tctx->slot, PYLON_SHARE_SLICE, enq_flags);
-            kick_preempt(p, shared, enq_flags);
+            kick_shared(p, shared, enq_flags);
         } else {
             scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
             if (fenced(cpu, tctx->dom, false)) {
@@ -936,10 +1016,21 @@ void BPF_PROG(pylon_running, struct task_struct *p)
     __u32 claim = task_claim(p);
 
     s32 cpu = scx_bpf_task_cpu(p);
+    __u32 i = (__u32)cpu;
 
-    /* The owner hands the next turn to a woken vCPU, and that vCPU back. */
+    if (i < MAX_PCPUS) {
+        *(volatile __u64 *)&turn_start[pcpu_index(i)] = bpf_ktime_get_ns();
+    }
+
+    /*
+     * The owner hands the next turn to a woken vCPU, and that vCPU back. A
+     * shared turn ends on the timer, not at the next tick.
+     */
     if (claim != CLAIM_HOST) {
         set_woken_turn(cpu, owns_cpu(p, cpu) ? (__u32)p->pid : 0);
+        if (p->scx.slice <= PYLON_SHARE_SLICE) {
+            end_turn_in(cpu, p->scx.slice);
+        }
     }
 
     if (claim == CLAIM_HOST && p->nr_cpus_allowed == 1) {
@@ -1021,7 +1112,7 @@ SEC("struct_ops.s/pylon_init")
 s32 BPF_PROG(pylon_init)
 {
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
-    s32 ret;
+    s32 ret, i;
 
     if (nr_cpus > MAX_PCPUS) {
         nr_cpus = MAX_PCPUS;
@@ -1041,6 +1132,22 @@ s32 BPF_PROG(pylon_init)
     ret = scx_bpf_create_dsq(PYLON_VCPU_DSQ, -1);
     if (ret) {
         return ret;
+    }
+    bpf_for(i, 0, MAX_PCPUS) {
+        __u32 key = (__u32)i;
+        struct share_timer *t = bpf_map_lookup_elem(&pylon_share_timers, &key);
+
+        if (!t) {
+            return -ENOENT;
+        }
+        ret = bpf_timer_init(&t->timer, &pylon_share_timers, CLOCK_MONOTONIC);
+        if (ret) {
+            return ret;
+        }
+        ret = bpf_timer_set_callback(&t->timer, end_turn);
+        if (ret) {
+            return ret;
+        }
     }
     return scx_bpf_create_dsq(PYLON_HOST_DSQ, -1);
 }

@@ -84,7 +84,11 @@ has booted).
   is what preempts a donor whose CPU was given to a recipient.
 - A parked vCPU that KVM woke goes on its VM's queue
   (`PYLON_VM_DSQ` + slot) with a 100 µs slice, if its VM owns a CPU it
-  may run on, and that CPU is kicked. If its VM owns none, it goes on
+  may run on. That CPU is kicked once its current task has run 100 µs:
+  at once if it already has or the CPU is idle, otherwise by the CPU's
+  turn timer (below). Kicking at once cut a new owner off about 15 µs
+  after it left the guest, before it published `RUNNING`, for a whole
+  turn (#54). If its VM owns none, it goes on
   the vCPU queue instead. This applies to VMs that park inside KVM
   (`--pylon park=kvm`, [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md)).
   `enqueue` recognises such a vCPU by its bit in `parked`, and sets its
@@ -121,7 +125,11 @@ so `enqueue` kicks it to schedule again.
      only while that thread still owns the CPU, so a new owner runs
      first. `pylond` often gives a CPU to one of the woken vCPUs, and
      before this, the turn left by the old owner went to a sibling of
-     the new owner, which then waited up to a tick (#54).
+     the new owner, which then waited up to a tick (#54). The kernel
+     checks a slice only at the tick, so `running` also starts a
+     per-CPU BPF timer (`pylon_share_timers`) for each turn of 100 µs or
+     less, and the timer kicks the CPU when the turn is over. Without
+     it, a 100 µs turn lasted about 1 ms.
 2. The vCPU queue, skipping threads that own another CPU. Such a
    thread's CPU is kicked if it is idle, in case it got the CPU while it
    waited here.
