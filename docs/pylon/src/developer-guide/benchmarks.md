@@ -266,7 +266,10 @@ system calls):
 - A cooperative park takes about as long as a forced one: the guest's
   kick-to-doorbell path (interrupt, `SCHED_FIFO` park thread, doorbell
   exit) adds up to the same 60–80 µs
-  ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
+  ([#74](https://github.com/CMKL-APEX/pylon/issues/74)). Split up
+  (2026-11-14, [spec 09 §9](https://github.com/CMKL-APEX/pylon/blob/main/spec/09-park-by-halt.md#9-h0-result-2026-11-14)):
+  4–32 µs from the kick to its injection, 16–64 µs in the guest to the
+  doorbell, and 8–16 µs for KVM to handle the doorbell's exit.
 
 ### Unmodified guests: kicking the new owner's CPU (measured, 2026-11-14)
 
