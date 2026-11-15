@@ -695,6 +695,22 @@ static s32 vm_owned_cpu(struct task_struct *p, __u16 slot)
 }
 
 /*
+ * The CPU on which @p, a vCPU thread without a pCPU of its own, shares its
+ * VM's pCPUs in turns, or -1 if its VM owns none or @p owns a pCPU. Such a
+ * thread is a donor whose pCPU was handed over before it parked. On the vCPU
+ * queue, any CPU could run it, unmanaged ones too, for a whole 20 ms slice:
+ * once it parks inside KVM, KVM goes on running the guest whenever an
+ * interrupt is pending, and the thread keeps the CPU.
+ */
+static s32 coreless_vcpu_cpu(struct task_struct *p, const struct pylon_task_ctx *tctx)
+{
+    if (!tctx->dom || tctx->slot == VM_SLOT_NONE || owns_cpu(p, tctx->owned_cpu)) {
+        return -1;
+    }
+    return vm_owned_cpu(p, tctx->slot);
+}
+
+/*
  * scx_ops.select_cpu(p, prev_cpu, wake_flags)
  *
  * If task p->pid matches a target_tid in pylon_pcpu_owners, return that
@@ -730,18 +746,20 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
  * scx_ops.enqueue(p, enq_flags)
  *
  * The owner of a pCPU goes on that pCPU's queue and preempts whatever runs
- * there. Other managed vCPU threads go on the vCPU queue and wake their own
- * pCPU if they own one. A task that can't migrate stays on its CPU, as does
- * a host task allowed on only one CPU: on the host queue, it would wait
- * behind that CPU's owner, or behind a sibling's claim, until the watchdog
- * fires. Both run whatever the siblings run. Everything else goes on the host
- * queue.
+ * there. A vCPU thread without a pCPU of its own shares its VM's pCPUs in
+ * turns while the VM owns one. Other managed vCPU threads go on the vCPU
+ * queue and wake their own pCPU if they own one. A task that can't migrate
+ * stays on its CPU, as does a host task allowed on only one CPU: on the host
+ * queue, it would wait behind that CPU's owner, or behind a sibling's claim,
+ * until the watchdog fires. Both run whatever the siblings run. Everything
+ * else goes on the host queue.
  */
 SEC("struct_ops/pylon_enqueue")
 void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
 {
     s32 cpu = scx_bpf_task_cpu(p);
     struct pylon_task_ctx *tctx;
+    s32 shared;
 
     if (is_migration_disabled(p)) {
         /* Short and pinned: it runs whatever the siblings run. */
@@ -760,8 +778,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
          * bit tells pylond it wants to run. A VM that owns no CPU has nowhere
          * to share, so its vCPU runs as any other managed vCPU.
          */
-        s32 shared = vm_owned_cpu(p, tctx->slot);
-
+        shared = vm_owned_cpu(p, tctx->slot);
         set_woken(tctx, true);
         if (shared >= 0) {
             scx_bpf_dsq_insert(p, PYLON_VM_DSQ + tctx->slot, PYLON_SHARE_SLICE, enq_flags);
@@ -772,6 +789,10 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
                 kick_idle_cpu(p, tctx->dom);
             }
         }
+    } else if (tctx && (shared = coreless_vcpu_cpu(p, tctx)) >= 0) {
+        /* A running vCPU without a CPU: it shares its VM's, as a woken one does. */
+        scx_bpf_dsq_insert(p, PYLON_VM_DSQ + tctx->slot, PYLON_SHARE_SLICE, enq_flags);
+        kick_shared(p, shared, enq_flags);
     } else if (tctx) {
         scx_bpf_dsq_insert(p, PYLON_VCPU_DSQ, SCX_SLICE_DFL, enq_flags);
         if (owns_cpu(p, tctx->owned_cpu)) {
@@ -828,7 +849,7 @@ static bool dispatch_owner_from(s32 cpu, __u32 tid, u64 dsq, u64 slice)
 /*
  * Dispatches this pCPU's owner, @tid, with @slice if it is queued, and moves any
  * other task left on the owner queue (its ownership changed) to the queue it
- * now belongs on. Returns true if the owner was dispatched. The owner can
+ * now belongs on: its VM's queue for a vCPU without a pCPU whose VM owns one. Returns true if the owner was dispatched. The owner can
  * also wait on the vCPU queue or its VM's queue, where it was before it got
  * this pCPU; @prev, if it is the owner, waits on neither.
  */
@@ -846,6 +867,17 @@ static bool dispatch_owner(s32 cpu, __u32 tid, struct task_struct *prev, u64 sli
             continue;
         }
         if ((__u32)p->pid != tid) {
+            struct pylon_task_ctx *tctx = task_ctx(p);
+            s32 shared;
+
+            /* A donor left here when its pCPU was handed over. */
+            if (tctx && (shared = coreless_vcpu_cpu(p, tctx)) >= 0) {
+                scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, PYLON_SHARE_SLICE);
+                if (scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, PYLON_VM_DSQ + tctx->slot, 0)) {
+                    kick_shared(p, shared, 0);
+                }
+                continue;
+            }
             u64 dsq = task_claim(p) == CLAIM_HOST ? PYLON_HOST_DSQ : PYLON_VCPU_DSQ;
             scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, dsq, 0);
         }
