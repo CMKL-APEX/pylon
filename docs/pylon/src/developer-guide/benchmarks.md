@@ -388,18 +388,18 @@ a VM that wants every CPU, a ping-pong every millisecond.
 | Host | Bare-metal AMD EPYC 9124, 16 cores with SMT; CPUs 2–4 for the VMs, `pylond`'s engine on CPU 1 |
 | Kernel | Ubuntu `7.0.0-42-generic`, with `sched_ext` |
 | Guest | Ubuntu 26.04 cloud image, 4 vCPUs, 2 GiB; `pylon-guest-agent` every 1 ms on Pylon, no `pv-pylon` |
-| Pylon | `main` at 6aacf80b8; `--pylon initial_active_vcpus=1,min_cores=1,max_cores=3,priority_weight=100` for both VMs |
+| Pylon | `main` at 6aacf80b8, and at 7992b5ebd (with #110 and #112) in the last column; `--pylon initial_active_vcpus=1,min_cores=1,max_cores=3,priority_weight=100` for both VMs |
 | Upstream | Cloud Hypervisor at ac3702ec5 (the fork point) |
 
 **Both VMs' work, against upstream's** (two runs; the 1 ms turns and
-rotation builds one run):
+rotation builds one run; 7992b5ebd one run, five for the spinlock):
 
-| Load | Upstream | Dedicated | Pylon | Pylon, 1 ms turns | Pylon, rotation |
-|---|---|---|---|---|---|
-| Counting | 2,743 M/s | 0.99× | 0.84× | 0.97× | 0.93× |
-| Spinlock | 2.52 M/s | 1.00× | 0.82× | 0.97× | 0.84× |
-| Barrier | 3.3 k rounds/s | 1.63× | **3.32×** | 1.25× | 3.20× |
-| Pipes | 422 k/s | 0.99× | 0.77× | 0.98× | 0.86× |
+| Load | Upstream | Dedicated | Pylon | Pylon, 1 ms turns | Pylon, rotation | Pylon, 7992b5ebd |
+|---|---|---|---|---|---|---|
+| Counting | 2,743 M/s | 0.99× | 0.84× | 0.97× | 0.93× | 0.83× |
+| Spinlock | 2.52 M/s | 1.00× | 0.82× | 0.97× | 0.84× | 0.82× |
+| Barrier | 3.3 k rounds/s | 1.63× | **3.32×** | 1.25× | 3.20× | 3.20× |
+| Pipes | 422 k/s | 0.99× | 0.77× | 0.98× | 0.86× | 0.78× |
 
 **Ping-pong round trip next to a busy VM** (p50 / p99 / p99.9, µs) and
 the busy VM's counting:
@@ -438,8 +438,17 @@ logged a lockup.
   rotation build
   ([#110](https://github.com/CMKL-APEX/pylon/pull/110)) moves the core
   above an even split every 10 ms, which evens the VMs out, but their
-  threads then used 3.05–3.33 CPUs: some vCPU time ran outside the
-  managed CPUs.
+  threads then used 3.05–3.33 CPUs. Each move is a forced preemption,
+  and after a handoff without park `scx_pylon` let the donor run on any
+  CPU for a 20 ms slice
+  ([#112](https://github.com/CMKL-APEX/pylon/pull/112) fixes that).
+- With both (7992b5ebd), the VMs' threads use exactly the three CPUs,
+  split 1.5 to 1.5 where both VMs want every core, and the work is back
+  to the first Pylon column: the rotation's gain in the rotation build came from the extra
+  CPU time. In one spinlock run out of five, the rotation stopped at a
+  1 to 2 split after 20–30 s
+  ([#113](https://github.com/CMKL-APEX/pylon/issues/113)). The
+  ping-pong's p99 was 315 µs.
 
 ## Other figures
 
