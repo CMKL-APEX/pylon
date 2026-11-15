@@ -448,6 +448,9 @@ struct VmHandleInner {
     /// Host counter value when a zero-core wakeup of this VM last took a core from a donor at
     /// its `min_cores`, or 0. Written by Plane 2 only.
     floor_preempt_tsc: AtomicU64,
+    /// Host counter value when this VM last took a core from a VM that wanted it as much (see
+    /// `SHARE_ROTATION_US`), or 0. Written by Plane 2 only.
+    share_gain_tsc: AtomicU64,
     /// Set when a write to one of the VM's `eventfd`s blocked until `WriteWatch` interrupted
     /// it. `pylond` writes to none of them again, and Plane 1 drops the VM.
     faulty: AtomicBool,
@@ -558,6 +561,7 @@ impl VmHandle {
                 woken_shared_usec: AtomicU64::new(0),
                 woken_unowned_usec: AtomicU64::new(0),
                 floor_preempt_tsc: AtomicU64::new(0),
+                share_gain_tsc: AtomicU64::new(0),
                 faulty: AtomicBool::new(false),
                 park_latency: LatencyHistogram::default(),
                 wake_latency: LatencyHistogram::default(),
@@ -695,6 +699,18 @@ impl VmHandle {
         self.inner
             .floor_preempt_tsc
             .store(now_tsc, Ordering::Relaxed);
+    }
+
+    /// When this VM last took a core from a VM that wanted it as much.
+    #[inline]
+    pub fn share_gain_tsc(&self) -> u64 {
+        self.inner.share_gain_tsc.load(Ordering::Relaxed)
+    }
+
+    /// Records that this VM took a core from a VM that wanted it as much.
+    #[inline]
+    pub fn set_share_gain_tsc(&self, now_tsc: u64) {
+        self.inner.share_gain_tsc.store(now_tsc, Ordering::Relaxed);
     }
 
     /// Adds `usec` of woken vCPU time, shared on the VM's own cores if `owned`.
@@ -1481,8 +1497,8 @@ mod tests {
     use super::*;
     use crate::control::{ControlPlane, send_policy_update, send_registration};
     use crate::engine::{
-        MatrixEngine, SPARE_CORE_TENURE_US, calibrate_tsc_khz, detect_timed_wait, pause_cycles,
-        read_tsc,
+        MatrixEngine, SHARE_ROTATION_US, SPARE_CORE_TENURE_US, calibrate_tsc_khz,
+        detect_timed_wait, pause_cycles, read_tsc,
     };
 
     /// Counter rate of the test VMs' pages and engines: tick values in the tests assume it, and
@@ -2508,6 +2524,80 @@ mod tests {
         assert_eq!(revocations_between_two_hungry_vms(100, 100), 0);
         // Twice the weight is worth a third core.
         assert_eq!(revocations_between_two_hungry_vms(200, 100), 1);
+    }
+
+    /// Two VMs that both want every core of three: the uneven split rotates. The VM with one
+    /// core takes one of the other's, keeps it for `SHARE_ROTATION_US`, and then gives it back.
+    #[test]
+    fn test_plane2_uneven_split_rotates() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let cores = [20, 21, 22];
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &cores);
+        let a = build_test_vm(80, 4, 1, 3, 100);
+        let b = build_test_vm(90, 4, 1, 3, 100);
+        ControlPlane::publish_vm_handle(&snapshot, a.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, b.handle.clone());
+
+        // A takes two cores, then B the third.
+        for (rig, runnable, now) in [(&a, 2, 1_000), (&b, 1, 2_000)] {
+            let page = rig.handle.shared_page();
+            page.telemetry
+                .runnable_threads
+                .store(runnable, Ordering::Release);
+            engine.poll_once(now);
+            for slot in &rig.handle.host_page().vcpus[..runnable as usize] {
+                slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            }
+        }
+        let revoking = |engine: &MatrixEngine| {
+            cores
+                .iter()
+                .find_map(|&pcpu| match engine.core_state(pcpu) {
+                    CoreState::Revoking {
+                        donor_vm_id,
+                        donor_vcpu,
+                        recipient_vm_id,
+                        ..
+                    } => Some((donor_vm_id, donor_vcpu, recipient_vm_id)),
+                    _ => None,
+                })
+        };
+        let hand_over = |engine: &mut MatrixEngine, donor: &TestVmRig, vcpu: u8, now: u64| {
+            let slot = &donor.handle.host_page().vcpus[vcpu as usize];
+            slot.revoke_requested.store(0, Ordering::Release);
+            slot.yield_count.fetch_add(1, Ordering::Relaxed);
+            slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+            engine.poll_once(now);
+        };
+
+        // Both want all three. A's backlog is older, so it stays the more urgent, but B may take
+        // the core above an even split.
+        for (rig, head_wait) in [(&a, 1_000), (&b, 2_500)] {
+            let telemetry = &rig.handle.shared_page().telemetry;
+            telemetry.runnable_threads.store(4, Ordering::Release);
+            telemetry.head_wait_tsc.store(head_wait, Ordering::Release);
+        }
+        let start = 3_000;
+        engine.poll_once(start);
+        let Some((80, vcpu, 90)) = revoking(&engine) else {
+            panic!("B didn't take a core from A: {:?}", revoking(&engine));
+        };
+        hand_over(&mut engine, &a, vcpu, start + 1_000);
+        for slot in &b.handle.host_page().vcpus {
+            if slot.assigned_pcpu.load(Ordering::Acquire) != PCPU_UNASSIGNED {
+                slot.state.store(VCPU_STATE_RUNNING, Ordering::Release);
+            }
+        }
+
+        // B keeps it while it is held, although A is more urgent.
+        let hold = SHARE_ROTATION_US * TEST_TSC_KHZ / 1000;
+        engine.poll_once(start + hold - 1);
+        assert_eq!(revoking(&engine), None);
+
+        // Then A takes it back.
+        engine.poll_once(start + hold);
+        assert!(matches!(revoking(&engine), Some((90, _, 80))));
     }
 
     /// Clones `fds`, for a second `VmHandle::new` on a rig's file descriptors.

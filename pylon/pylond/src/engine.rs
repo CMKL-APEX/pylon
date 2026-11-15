@@ -86,6 +86,13 @@ pub const SPARE_CORE_TENURE_US: u64 = 1_000_000;
 /// guest that parks and wakes again and again would keep taking cores below other VMs' floor.
 pub const FLOOR_PREEMPT_INTERVAL_US: u64 = 10_000;
 
+/// How long a VM keeps a core it took from a VM that wanted it as much. Two VMs that both want
+/// more than their share would otherwise keep an uneven split for good: with three cores and
+/// equal weights, one has two and the other one, and neither rule that moves a core applies.
+/// After this long, the core above the even split moves to the other VM, so the split rotates.
+/// Each move is a forced preemption, so at 10 ms the handoffs cost about 1% of the core.
+pub const SHARE_ROTATION_US: u64 = 10_000;
+
 /// Delay between polling sweeps in nanoseconds (~1000 cycles on a 3 GHz core). The engine turns it
 /// into counter ticks with the host rate, so it doesn't depend on the counter's frequency.
 pub const SWEEP_INTERVAL_NS: u64 = 333;
@@ -251,6 +258,19 @@ struct VmDemandEval {
     /// The cores it still needs are for woken vCPUs, and may only be spare ones: idle, or held
     /// above its floor by a VM that wants none.
     spare_only: bool,
+}
+
+/// The core `select_donor_pcpu` picked to revoke, and why.
+#[derive(Debug, Clone, Copy)]
+struct DonorPick {
+    pcpu: usize,
+    eval_idx: usize,
+    vcpu: u8,
+    /// The donor is at its `min_cores`.
+    at_floor: bool,
+    /// The donor wants the core and holds no more than its share, so the recipient keeps it
+    /// for `SHARE_ROTATION_US`.
+    share_move: bool,
 }
 
 /// What the engine read from one VM's `woken` mask in a sweep.
@@ -1397,13 +1417,27 @@ impl MatrixEngine {
                 // 2. Preemption Path: Select an over-allocated or lower-urgency donor core.
                 let below_floor_allowed = recipient_eval.zero_core_wakeup
                     && Self::floor_preempt_ready(recipient_vm, now_tsc, self.host_tsc_khz);
-                let Some((donor_pcpu, donor_eval_idx, donor_vcpu, at_floor)) = self
-                    .select_donor_pcpu(vms, vm_count, recipient_eval, below_floor_allowed, now_tsc)
+                let Some(DonorPick {
+                    pcpu: donor_pcpu,
+                    eval_idx: donor_eval_idx,
+                    vcpu: donor_vcpu,
+                    at_floor,
+                    share_move,
+                }) = self.select_donor_pcpu(
+                    vms,
+                    vm_count,
+                    recipient_eval,
+                    below_floor_allowed,
+                    now_tsc,
+                )
                 else {
                     break;
                 };
                 if at_floor {
                     recipient_vm.set_floor_preempt_tsc(now_tsc);
+                }
+                if share_move {
+                    recipient_vm.set_share_gain_tsc(now_tsc.max(1));
                 }
 
                 let donor_eval = self.eval_buf[donor_eval_idx];
@@ -1590,9 +1624,9 @@ impl MatrixEngine {
                 >= last.saturating_add(Self::us_to_cycles(FLOOR_PREEMPT_INTERVAL_US, tsc_khz))
     }
 
-    /// Selects the best donor `(pcpu, donor_eval_idx, donor_vcpu, at_floor)` to preempt for
-    /// `recipient`, preferring donor vCPUs with `in_critical_section == 0`. A donor at its
-    /// `min_cores` (`at_floor`) is eligible only if `below_floor_allowed`.
+    /// Selects the best donor core to preempt for `recipient`, preferring donor vCPUs with
+    /// `in_critical_section == 0`. A donor at its `min_cores` is eligible only if
+    /// `below_floor_allowed`.
     fn select_donor_pcpu(
         &self,
         vms: &[VmHandle],
@@ -1600,9 +1634,11 @@ impl MatrixEngine {
         recipient: VmDemandEval,
         below_floor_allowed: bool,
         now_tsc: u64,
-    ) -> Option<(usize, usize, u8, bool)> {
+    ) -> Option<DonorPick> {
         let spare_tenure = Self::us_to_cycles(SPARE_CORE_TENURE_US, self.host_tsc_khz);
-        let mut best: Option<(usize, usize, u8, bool, bool, u64, bool)> = None;
+        let share_hold = Self::us_to_cycles(SHARE_ROTATION_US, self.host_tsc_khz);
+        // The pick, and what ranks it: not in a critical section, over desired, urgency.
+        let mut best: Option<(DonorPick, bool, bool, u64)> = None;
 
         let mut pcpu = 0usize;
         while pcpu < MAX_PCPUS {
@@ -1630,7 +1666,14 @@ impl MatrixEngine {
                 let recipient_weight = u64::from(vms[recipient.vm_idx].priority_weight().max(1));
                 let within_share = u64::from(recipient.committed_cores() + 1) * donor_weight
                     <= u64::from(donor_eval.assigned_cores) * recipient_weight;
-                let lower_urgency = donor_eval.urgency < recipient.urgency && within_share;
+                // A core the donor took from a VM that wanted it as much stays for
+                // `SHARE_ROTATION_US`. After that, it may go to any VM that wants more and would
+                // still have no more than the donor's share: the split above an even one rotates.
+                let donor_vm = &vms[donor_eval.vm_idx];
+                let share_gain = donor_vm.share_gain_tsc();
+                let donor_held = share_gain != 0 && now_tsc.saturating_sub(share_gain) < share_hold;
+                let shareable = within_share && !donor_held;
+                let lower_urgency = donor_eval.urgency < recipient.urgency && shareable;
                 let above_min = donor_eval.assigned_cores > donor_eval.min_cores;
 
                 // A VM that wants some cores but fewer than it holds may want them back by the
@@ -1642,13 +1685,13 @@ impl MatrixEngine {
                         && donor_eval.desired_cores == 0
                         && now_tsc.saturating_sub(self.assigned_tsc[pcpu]) >= spare_tenure
                 } else {
-                    (above_min && (over_desired || over_fair_share || lower_urgency))
+                    (above_min && (over_desired || over_fair_share || shareable))
                         || (recipient.zero_core_wakeup && below_floor_allowed && lower_urgency)
                 };
+                let share_move = !over_desired && !over_fair_share;
                 // A `PARKED` vCPU on an assigned core either hasn't woken since the assignment
                 // or has given the core back, which phase 0 reclaims. Revoking it would race
                 // its wakeup.
-                let donor_vm = &vms[donor_eval.vm_idx];
                 let donor_running = donor_vm.host_page().vcpus[donor_vcpu as usize]
                     .state
                     .load(Ordering::Acquire)
@@ -1663,7 +1706,7 @@ impl MatrixEngine {
 
                     let replace = match best {
                         None => true,
-                        Some((_, _, _, best_not_in_cs, best_over_desired, best_urgency, _)) => {
+                        Some((_, best_not_in_cs, best_over_desired, best_urgency)) => {
                             if not_in_cs != best_not_in_cs {
                                 not_in_cs
                             } else if over_desired != best_over_desired {
@@ -1675,22 +1718,21 @@ impl MatrixEngine {
                     };
 
                     if replace {
-                        best = Some((
+                        let pick = DonorPick {
                             pcpu,
-                            donor_eval_idx,
-                            donor_vcpu,
-                            not_in_cs,
-                            over_desired,
-                            donor_eval.urgency,
-                            !above_min,
-                        ));
+                            eval_idx: donor_eval_idx,
+                            vcpu: donor_vcpu,
+                            at_floor: !above_min,
+                            share_move,
+                        };
+                        best = Some((pick, not_in_cs, over_desired, donor_eval.urgency));
                     }
                 }
             }
             pcpu += 1;
         }
 
-        best.map(|(pcpu, eval_idx, vcpu, _, _, _, at_floor)| (pcpu, eval_idx, vcpu, at_floor))
+        best.map(|(pick, ..)| pick)
     }
 
     #[inline]
