@@ -289,7 +289,10 @@ assigned. It records when each bit was set, by VM slot and vCPU.
   first turn, even when it was one of the woken vCPUs. A woken vCPU
   doesn't preempt a turn that has run less than the slice: it waits for
   the rest of it, so a new owner can finish waking first (#54). A
-  per-CPU BPF timer ends each turn when its slice runs out. The
+  per-CPU BPF timer ends each turn when its slice runs out. An owner
+  that `pylond` is revoking (`REVOKING` in its owner entry) keeps its
+  turn until it parks or the CPU is handed over, so a woken vCPU doesn't
+  delay the park. The
   preempted one is runnable but not running, so KVM gives it steal time
   and `KVM_VCPU_PREEMPTED`. The guest's paravirtual spinlocks and TLB
   flush then work as on any overcommitted host.
