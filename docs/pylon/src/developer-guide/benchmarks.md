@@ -438,8 +438,10 @@ logged a lockup.
   rotation build
   ([#110](https://github.com/CMKL-APEX/pylon/pull/110)) moves the core
   above an even split every 10 ms, which evens the VMs out, but their
-  threads then used 3.05–3.33 CPUs: some vCPU time ran outside the
-  managed CPUs.
+  threads then used 3.05–3.33 CPUs. Each move is a forced preemption,
+  and after a handoff without park `scx_pylon` let the donor run on any
+  CPU for a 20 ms slice
+  ([#112](https://github.com/CMKL-APEX/pylon/pull/112) fixes that).
 
 ## Other figures
 
