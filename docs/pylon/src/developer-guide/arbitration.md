@@ -211,7 +211,10 @@ through a pidfd that the VMM process still exists before each
 Handing the CPU over unassigns the donor (`assigned_pcpu`), writes the
 recipient's thread ID (and its VM's slot, in the flags) to the CPU's
 owner entry, sets the recipient slot's `assigned_pcpu`, writes its wake
-`eventfd`, and marks the CPU `Assigned` to the recipient. For a VM that
+`eventfd`, and marks the CPU `Assigned` to the recipient. A recipient
+that already runs isn't woken: the VMM doesn't drain the wake `eventfd`
+when a vCPU parks, so the wake would end its next park at once.
+`scx_pylon` moves its thread to the CPU the next time it is queued. For a VM that
 parks inside KVM, the wake `eventfd` alone doesn't reach the thread
 asleep in `KVM_RUN`, so the engine also sends `kick_signal`. Each sweep
 sends it again, at most every `REVOKE_RESIGNAL_US` (10 µs), while the
@@ -231,7 +234,12 @@ The engine sorts the demand records by urgency, highest first (an
 in-place insertion sort over at most 64 entries). Then, for each VM in
 that order, while it needs more cores (desired minus committed):
 
-1. **Pick a vCPU.** The lowest set bit of `stranded_work_bitmap` whose
+1. **Pick a vCPU.** A vCPU that runs without a core: one the VMM
+   started running (`initial_active_vcpus`, or every vCPU after
+   `pylond` restarts) that no revocation or boot park is taking off its
+   CPU. Its thread runs on CPUs `pylond` doesn't manage until it has a
+   core, so it gets the VM's first one. Else the lowest set bit of
+   `stranded_work_bitmap` whose
    vCPU is free (clearing that bit): the guest tasks queued on it can't
    run until it has a core. Else the longest-woken free vCPU: it is
    already running, so it needs no wake-up. Else the lowest-numbered

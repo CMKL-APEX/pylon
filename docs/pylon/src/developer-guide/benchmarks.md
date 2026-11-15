@@ -14,6 +14,13 @@ a 3–6 µs target: see
   system. They show what the model predicts, not what a VM sees.
 - Defaults and limits (the 8 µs grace period, the 1,000-cycle pause) are
   configuration, not measurements.
+- In every real-guest run before 2026-11-15, each VM's boot vCPU
+  (`initial_active_vcpus`) ran outside the managed cores, on host CPUs
+  `pylond` doesn't manage, for the VM's whole life. A busy VM used one
+  more CPU than its cores: two busy 4-vCPU VMs on three managed CPUs
+  used 5. Comparisons between Pylon builds are still like for like;
+  comparisons with a baseline pinned to the managed cores aren't. From
+  then on, a VM's first core goes to that vCPU.
 
 ## pylon-bench: Pylon parking vs. modelled ACPI hotplug
 
