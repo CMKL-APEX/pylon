@@ -99,6 +99,14 @@ has booted).
   `enqueue` recognises such a vCPU by its bit in `parked`, and sets its
   bit in `woken`. The bit is cleared when the vCPU is enqueued as an
   owner, and by `quiescent` when it stops being runnable.
+- A running vCPU thread without a CPU of its own, such as a donor whose
+  CPU was handed over before it parked, goes on its VM's queue the same
+  way, if its VM owns a CPU it may run on. It doesn't set its `woken`
+  bit. `dispatch` moves a donor still waiting on the owner queue of the
+  CPU it lost there too. On the vCPU queue, any CPU could run it,
+  unmanaged ones included, with a 20 ms slice: a donor that parked there
+  went on running the guest for the rest of the slice whenever an
+  interrupt was pending.
 - Another vCPU thread with a domain goes on the vCPU queue. If it owns
   a CPU elsewhere, that CPU is kicked.
 - A host task allowed on only one CPU, such as a per-CPU kworker, goes
