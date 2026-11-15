@@ -50,6 +50,18 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   and runs the VM unmanaged, and it registers again once a new `pylond`
   listens. A VM started before `pylond` registers once it appears
   ([Running pylond](operator-guide/pylond.md#start-order-and-restarts)).
+- **Busy VMs share an odd core** ([#110](https://github.com/CMKL-APEX/pylon/pull/110)).
+  When two VMs with equal weights both want every core, the core above
+  an even split moves between them every 10 ms, instead of staying with
+  the VM that took it first. A VM's vCPUs beyond its cores share them
+  in 100 µs turns.
+- **Measured against upstream Cloud Hypervisor under overcommit**
+  ([#111](https://github.com/CMKL-APEX/pylon/pull/111)). With two
+  4-vCPU VMs on three CPUs, Pylon does 3.2 times upstream's work at a
+  spinning barrier, and cuts a ping-pong's p99 next to a busy VM from
+  about 4.7 ms to 0.3 ms. Loads whose threads don't wait on each other
+  do 17–22% less (see Known limits and
+  [Performance and benchmarks](developer-guide/benchmarks.md#pylon-against-upstream-cloud-hypervisor-under-overcommit-measured-2026-11-15)).
 - **`pylond` refuses a VM that parks inside KVM when `scx_pylon` isn't
   attached**, and the VMM now reads `pylond`'s reply: it logs whether
   the registration was accepted, and where its vCPUs park.
@@ -96,7 +108,9 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   all of them together.
 - **Update the VMM and `pylond` together.** Besides the shared page, the
   VMM's shared memory now holds a host page with its own version (3),
-  which `pylond` requires. The guest side is unaffected.
+  which `pylond` requires. The guest side is unaffected. The VMM also
+  interrupts a vCPU with `SIGUSR2` instead of `SIGRTMIN` now, which
+  `pylond` from `v0.0.8-rc3` and earlier refuses.
 - **`--pylon shm=<path>`** is gone, and the VMM refuses a command line
   that has it: remove it. Every `--pylon` key is now optional.
 - **`PYLON_PARK_IN_KVM`** is gone; use `--pylon park=kvm|vmm`.
@@ -116,6 +130,13 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   ([#74](https://github.com/CMKL-APEX/pylon/issues/74)).
 - **vCPU hotplug is refused** for VMs with `--pylon`
   ([#60](https://github.com/CMKL-APEX/pylon/issues/60)).
+- **Overcommit costs loads that don't wait on each other 17–22%** of
+  their work against upstream Cloud Hypervisor sharing the same CPUs:
+  the 100 µs turns that win at a barrier cost them elsewhere. 1 ms turns
+  cost under 3%, but give up most of the barrier's gain.
+- **The odd core's rotation sometimes stops** at a 1 to 2 split, in 1
+  of 15 benchmark runs
+  ([#113](https://github.com/CMKL-APEX/pylon/issues/113)).
 - **A VM with no core isn't woken by arriving packets**
   ([#57](https://github.com/CMKL-APEX/pylon/issues/57)).
 

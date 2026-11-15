@@ -18,7 +18,7 @@ The detailed tracker is
 | Taking back idle cores | When a vCPU parks on its own, `pylond` reclaims its core. |
 | Forced revocation | When a donor misses its 8 µs deadline, `pylond` signals its vCPU thread, the VMM parks it, and the core moves. Repeated signals back off up to 1 ms. |
 | Parking inside KVM | With `--pylon park=kvm`, the default on KVM hosts (x86_64 and aarch64), a parked vCPU halts inside KVM, so an interrupt (an IPI, a timer) wakes it. `scx_pylon` runs a woken vCPU only on its own VM's CPUs, and `pylond` gives a core to a VM whose vCPU stays woken. This removes the soft lockups of VMs that hold fewer cores than they have vCPUs. See [spec 08](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md). |
-| Arbitration | Demand evaluation, urgency ordering and donor selection run every tick (see [The arbitration engine](developer-guide/arbitration.md)). |
+| Arbitration | Demand evaluation, urgency ordering and donor selection run every tick (see [The arbitration engine](developer-guide/arbitration.md)). Two VMs that both want every core split an odd core by moving it every 10 ms. |
 | Runtime policy | `min_cores`, `max_cores` and `priority_weight` can be changed over the control socket. `min_cores` is a floor under demand: an idle VM holds no cores. |
 | Metering | Core-microseconds, cooperative yields, forced preemptions, handoffs without park, revocation-to-park latency and woken-vCPU time per VM, over the socket and as Prometheus metrics. |
 | `scx_pylon` | Attaches to a `sched_ext` kernel and runs each managed CPU's assigned vCPU thread, keeps vCPU threads' SMT siblings apart, and shares a VM's CPUs with its woken vCPUs. `pylond` attaches it automatically when the kernel supports it. |
@@ -63,6 +63,14 @@ But:
   against a 3–6 µs target. Most of it is the VMM's 40–60 µs to park or
   wake a vCPU after a signal, which isn't explained yet
   ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
+- **Overcommit costs loads that don't wait on each other.** Against
+  upstream Cloud Hypervisor sharing the same CPUs, Pylon does 3.2 times
+  the work at a spinning barrier, but 17–22% less with independent
+  threads, a spinlock or pipes: a VM's extra vCPUs share its cores in
+  100 µs turns, which help the barrier and cost the rest
+  ([benchmarks](developer-guide/benchmarks.md#pylon-against-upstream-cloud-hypervisor-under-overcommit-measured-2026-11-15)).
+  The rotation of an odd core between two busy VMs sometimes stops at
+  1 to 2 ([#113](https://github.com/CMKL-APEX/pylon/issues/113)).
 - **No module, no cooperation.** A guest without `pv-pylon` never
   cooperates: every revocation ends in a forced park.
 
