@@ -159,5 +159,5 @@ for _ in $(seq 60); do
     sudo grep -aq "PYLONBENCH done" serial1.log && sudo grep -aq "PYLONBENCH done" serial2.log && break
     sleep 2
 done
-result "lockups=$(sudo cat serial1.log serial2.log | grep -aciE 'soft lockup|rcu.*stall|hung task')"
+result "lockups=$(sudo cat serial1.log serial2.log | grep -a -c -i -E 'soft lockup|rcu.*stall|hung task')"
 log "finished: $(tail -2 result.txt | tr '\n' ' ')"
