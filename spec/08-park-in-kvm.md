@@ -328,6 +328,8 @@ So:
   one, in bits 16–31. `scx_pylon` finds a VM's CPUs by scanning the owner
   entries.
 - **Queues:** each slot has a DSQ, `PYLON_VM_DSQ + slot`.
+- **A running vCPU without a CPU,** such as a donor handed over before it
+  parked, shares its VM's CPUs the same way.
 - **When the VM owns no CPU,** a woken vCPU goes on the shared vCPU queue
   and runs anywhere, as in P0. Each `dispatch` also checks one VM queue
   in turn, and moves vCPUs whose VM no longer owns a CPU there, before the
