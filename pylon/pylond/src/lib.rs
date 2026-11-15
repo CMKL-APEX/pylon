@@ -2352,6 +2352,49 @@ mod tests {
         );
     }
 
+    /// A vCPU that the VMM started running (`initial_active_vcpus`) runs outside the managed
+    /// cores until it has one, so it gets the VM's first core, before a parked vCPU. It already
+    /// runs, so `pylond` doesn't wake it: a stale wake would end its next park at once.
+    #[test]
+    fn test_running_vcpu_without_a_core_gets_the_first_one() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
+
+        let vm = build_test_vm(60, 2, 0, 1, 1);
+        let page = vm.handle.host_page();
+        page.vcpus[0]
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        vm.handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, vm.handle.clone());
+
+        engine.poll_once(1_000);
+        assert_eq!(
+            engine.core_state(7),
+            CoreState::Assigned { vm_id: 60, vcpu: 0 }
+        );
+        assert_eq!(page.vcpus[0].assigned_pcpu.load(Ordering::Acquire), 7);
+        assert_eq!(
+            pcpu_owners.read_owner(7).0,
+            page.vcpus[0].host_tid.load(Ordering::Acquire)
+        );
+        let mut count = [0u8; 8];
+        // SAFETY: `count` is valid for 8 bytes, and the eventfd is non-blocking.
+        let read = unsafe {
+            libc::read(
+                vm.wake_fds[0].as_raw_fd(),
+                count.as_mut_ptr().cast(),
+                count.len(),
+            )
+        };
+        assert_eq!(read, -1, "vCPU 0 was woken");
+    }
+
     /// Two VMs with 2 cores each both want 4. Returns how many of the 4 cores the engine starts
     /// revoking when VM 80, whose backlog is older, has weight `weight_a` and VM 90 `weight_b`.
     fn revocations_between_two_hungry_vms(weight_a: u32, weight_b: u32) -> usize {
@@ -2743,6 +2786,10 @@ mod tests {
         ControlPlane::publish_vm_handle(&snapshot, vmm.handle.clone());
         let (kvm_slot, vmm_slot) = (kvm_handle.vm_slot(), vmm.handle.vm_slot());
         let parked = |slot: u16| vm_vcpus.entry(slot).unwrap().parked.load(Ordering::Acquire);
+        // vCPU 1 still runs, waiting for its boot park.
+        kvm_handle.host_page().vcpus[1]
+            .park_on_boot
+            .store(1, Ordering::Release);
         kvm_handle.host_page().vcpus[1]
             .state
             .store(VCPU_STATE_RUNNING, Ordering::Release);

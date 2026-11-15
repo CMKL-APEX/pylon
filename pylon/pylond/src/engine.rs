@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use pylon_abi::clock::{architectural_counter_khz, read_counter};
-use pylon_abi::{MAX_VCPUS, PCPU_UNASSIGNED, PylonHostVcpuSlot, VCPU_STATE_PARKED};
+use pylon_abi::{
+    MAX_VCPUS, PCPU_UNASSIGNED, PylonHostVcpuSlot, VCPU_STATE_PARKED, VCPU_STATE_RUNNING,
+};
 use scx_pylon::PcpuOwnerFlags;
 
 use crate::{
@@ -624,6 +626,25 @@ impl MatrixEngine {
             .any(|host| Self::is_unassigned_parked(host) && Self::park_timer_due(host, now_tsc))
     }
 
+    /// A vCPU of `vm` that runs without a core: one the VMM started running
+    /// (`initial_active_vcpus`, or every vCPU after `pylond` restarts) and that no revocation or
+    /// boot park is taking off its CPU. Its thread runs on CPUs `pylond` doesn't manage, outside
+    /// every VM's cores, until it gets a core of its own.
+    #[inline]
+    fn unassigned_running_vcpu(vm: &VmHandle) -> Option<u8> {
+        let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+        vm.host_page().vcpus[..num_vcpus]
+            .iter()
+            .position(|slot| {
+                slot.state.load(Ordering::Acquire) == VCPU_STATE_RUNNING
+                    && slot.assigned_pcpu.load(Ordering::Acquire) == PCPU_UNASSIGNED
+                    && slot.revoke_requested.load(Ordering::Acquire) == 0
+                    && slot.park_on_boot.load(Ordering::Acquire) == 0
+                    && slot.host_tid.load(Ordering::Acquire) != 0
+            })
+            .map(|idx| idx as u8)
+    }
+
     /// A vCPU is free to receive a core when it is parked and no core is on its way to it.
     /// `pylond` doesn't write `state` (`spec/06-guest-kick-path.md` §3), so a vCPU that was just
     /// assigned stays `PARKED` until its thread wakes; `assigned_pcpu` tells the two apart.
@@ -677,10 +698,14 @@ impl MatrixEngine {
     }
 
     /// Gives `pcpu` to `vcpu` of `vm`: publishes the owner, records the assignment, and wakes
-    /// the vCPU thread. The VMM moves the vCPU from `PARKED` to `RUNNING` when it wakes.
+    /// the vCPU thread. The VMM moves the vCPU from `PARKED` to `RUNNING` when it wakes. A vCPU
+    /// that already runs isn't woken: the VMM doesn't drain the wake `eventfd` when a vCPU
+    /// parks, so the wake would end its next park at once. `scx_pylon` moves its thread to
+    /// `pcpu` the next time it is queued.
     fn assign_pcpu(&mut self, pcpu: usize, vm: &VmHandle, vcpu: u8, now_tsc: u64) {
         let host = &vm.host_page().vcpus[vcpu as usize];
         let tid = host.host_tid.load(Ordering::Acquire);
+        let running = host.state.load(Ordering::Acquire) == VCPU_STATE_RUNNING;
         // `scx_pylon` finds the CPUs a VM owns by the slot in the flags (spec 08 §4.3).
         let vm_slot = vm.vm_slot();
         let flags = if vm_slot == VM_SLOT_NONE {
@@ -693,13 +718,15 @@ impl MatrixEngine {
         self.assigned_tsc[pcpu] = now_tsc;
         self.assigned_yield_count[pcpu] = host.yield_count.load(Ordering::Acquire);
         vm.set_assigned_pcpu(vcpu as usize, pcpu as u8);
-        let _ = self.write_vm_fd(vm, || vm.wake_vcpu(vcpu as usize));
+        if !running {
+            let _ = self.write_vm_fd(vm, || vm.wake_vcpu(vcpu as usize));
+        }
         // A vCPU parked inside KVM only sees the wake `eventfd` after an exit
         // (`spec/08-park-in-kvm.md` §3.3).
         self.wake_signalled_tsc[pcpu] = 0;
         self.wake_first_signal_tsc[pcpu] = 0;
         self.wake_signalled_seq[pcpu] = host.kvm_run_seq.load(Ordering::Acquire);
-        if vm.wake_by_signal() && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
+        if !running && vm.wake_by_signal() && vm.signal_vcpu(vcpu as usize).unwrap_or(false) {
             self.wake_signalled_tsc[pcpu] = now_tsc;
             self.wake_first_signal_tsc[pcpu] = now_tsc;
         }
@@ -709,8 +736,13 @@ impl MatrixEngine {
             vcpu,
         };
         self.core_last_metered_tsc[pcpu] = now_tsc;
-        self.wake_pending_tsc[pcpu] = now_tsc;
-        self.handoff_requested_tsc[pcpu] = self.revoke_requested_tsc[pcpu];
+        // An adopted vCPU didn't wake, so it adds no wake or handoff latency.
+        self.wake_pending_tsc[pcpu] = if running { 0 } else { now_tsc };
+        self.handoff_requested_tsc[pcpu] = if running {
+            0
+        } else {
+            self.revoke_requested_tsc[pcpu]
+        };
         self.revoke_requested_tsc[pcpu] = 0;
         self.revoke_signalled_tsc[pcpu] = 0;
         self.revoke_first_signal_tsc[pcpu] = 0;
@@ -1331,16 +1363,23 @@ impl MatrixEngine {
             while self.eval_buf[order_idx].needed_cores() > 0 {
                 let recipient_eval = self.eval_buf[order_idx];
                 let recipient_vm = &vms[recipient_eval.vm_idx];
-                // Stranded work first: those tasks wait until their vCPU runs, while a woken
-                // vCPU already runs, on cores its VM owns or on others.
-                let stranded = Self::take_stranded_vcpu(recipient_vm);
-                let woken_vcpu = if stranded.is_none() {
+                // A vCPU that runs without a core first: it runs outside the managed cores
+                // until it gets one. Then stranded work: those tasks wait until their vCPU runs,
+                // while a woken vCPU already runs, on cores its VM owns or on others.
+                let unassigned = Self::unassigned_running_vcpu(recipient_vm);
+                let stranded = if unassigned.is_none() {
+                    Self::take_stranded_vcpu(recipient_vm)
+                } else {
+                    None
+                };
+                let woken_vcpu = if unassigned.is_none() && stranded.is_none() {
                     self.longest_woken_vcpu(recipient_vm)
                 } else {
                     None
                 };
                 let woken_pick = woken_vcpu.is_some();
-                let Some(recipient_vcpu) = stranded
+                let Some(recipient_vcpu) = unassigned
+                    .or(stranded)
                     .or(woken_vcpu)
                     .or_else(|| Self::select_parked_vcpu(recipient_vm, now_tsc))
                 else {
