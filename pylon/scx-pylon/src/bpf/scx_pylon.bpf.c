@@ -98,6 +98,11 @@
  * so it gets that CPU first, but it isn't SMT-isolated as a managed vCPU.
  */
 #define PCPU_OWNER_FLAG_HOST (1U << 2)
+/*
+ * pylond is taking the CPU from its owner, which parks: a woken vCPU's turn
+ * waits, so that it doesn't preempt the owner partway through parking.
+ */
+#define PCPU_OWNER_FLAG_REVOKING (1U << 3)
 /* Bits 16-31 of the flags: the owner's VM slot plus one, or 0 if unknown */
 #define PCPU_OWNER_SLOT_SHIFT 16
 
@@ -439,6 +444,18 @@ static __always_inline void set_woken_turn(s32 cpu, __u32 tid)
     }
 }
 
+/*
+ * Whether pylond is taking @cpu from its owner. The owner then parks, and a
+ * turn for a woken vCPU of its VM would only delay that.
+ */
+static __always_inline bool is_revoking(s32 cpu)
+{
+    __u32 key = (__u32)cpu;
+    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
+
+    return entry && entry->target_tid && (entry->flags & PCPU_OWNER_FLAG_REVOKING);
+}
+
 /* How long the task that runs on @cpu has run, in ns. */
 static __always_inline u64 turn_ran(s32 cpu)
 {
@@ -464,7 +481,10 @@ static __always_inline void end_turn_in(s32 cpu, u64 ns)
 /*
  * Timer callback: ends the turn on CPU @key once it has lasted
  * PYLON_SHARE_SLICE. A timer started for an earlier turn starts again for the
- * rest of the current one.
+ * rest of the current one. An owner that pylond is taking the CPU from keeps
+ * it while it parks: preempted partway, it got the CPU back only after
+ * pylond had handed it over without the park (#54). The timer then tries
+ * again a turn later, when the CPU has a new owner or is idle.
  */
 static int end_turn(void *map, int *key, struct share_timer *t)
 {
@@ -473,6 +493,10 @@ static int end_turn(void *map, int *key, struct share_timer *t)
 
     if (ran < PYLON_SHARE_SLICE) {
         bpf_timer_start(&t->timer, PYLON_SHARE_SLICE - ran, 0);
+        return 0;
+    }
+    if (is_revoking(cpu) && is_woken_turn(cpu, owner_tid(cpu))) {
+        bpf_timer_start(&t->timer, PYLON_SHARE_SLICE, 0);
         return 0;
     }
     scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
@@ -654,14 +678,16 @@ static void kick_shared(const struct task_struct *p, s32 cpu, u64 enq_flags)
 
 /*
  * A CPU that @slot's VM owns and @p may run on, or -1. A woken parked vCPU
- * of that VM shares it with the owner (spec 08 §4.3).
+ * of that VM shares it with the owner (spec 08 §4.3). A CPU the VM is losing
+ * isn't one: its owner is parking.
  */
 static s32 vm_owned_cpu(struct task_struct *p, __u16 slot)
 {
     s32 cpu;
 
     bpf_for(cpu, 0, MAX_PCPUS) {
-        if (owner_slot(cpu) == slot && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+        if (owner_slot(cpu) == slot && !is_revoking(cpu) &&
+            bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
             return cpu;
         }
     }

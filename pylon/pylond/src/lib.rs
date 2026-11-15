@@ -2352,6 +2352,68 @@ mod tests {
         );
     }
 
+    /// While `pylond` revokes a core, the owner entry keeps the donor and carries `REVOKING`, so
+    /// `scx_pylon` lets it park without a woken vCPU's turn (#54). The handoff clears it.
+    #[test]
+    fn test_revoking_core_is_flagged_until_handoff() {
+        let snapshot: Arc<VmSnapshot> = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let pcpu_owners = Arc::new(PcpuOwnerTable::new_in_memory());
+        let mut engine = test_engine(Arc::clone(&snapshot), Arc::clone(&pcpu_owners), &[7]);
+        let revoking = scx_pylon::PcpuOwnerFlags::REVOKING.bits();
+
+        let donor = build_test_vm(60, 1, 0, 1, 1);
+        let recipient = build_test_vm(70, 1, 0, 1, 100);
+        let donor_slot = &donor.handle.host_page().vcpus[0];
+        let recipient_page = recipient.handle.shared_page();
+        donor
+            .handle
+            .shared_page()
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        ControlPlane::publish_vm_handle(&snapshot, donor.handle.clone());
+        ControlPlane::publish_vm_handle(&snapshot, recipient.handle.clone());
+
+        engine.poll_once(1_000);
+        donor_slot
+            .state
+            .store(VCPU_STATE_RUNNING, Ordering::Release);
+        let (donor_tid, donor_flags) = pcpu_owners.read_owner(7);
+        assert_eq!(donor_flags & revoking, 0);
+
+        recipient_page
+            .telemetry
+            .runnable_threads
+            .store(1, Ordering::Release);
+        recipient_page
+            .telemetry
+            .head_wait_tsc
+            .store(1_500, Ordering::Release);
+        engine.poll_once(2_000);
+        assert!(matches!(engine.core_state(7), CoreState::Revoking { .. }));
+        assert_eq!(
+            pcpu_owners.read_owner(7),
+            (donor_tid, donor_flags | revoking)
+        );
+
+        donor_slot.revoke_requested.store(0, Ordering::Release);
+        donor_slot.yield_count.fetch_add(1, Ordering::Relaxed);
+        donor_slot.state.store(VCPU_STATE_PARKED, Ordering::Release);
+        engine.poll_once(3_000);
+        assert_eq!(
+            engine.core_state(7),
+            CoreState::Assigned { vm_id: 70, vcpu: 0 }
+        );
+        let (tid, flags) = pcpu_owners.read_owner(7);
+        assert_eq!(
+            tid,
+            recipient.handle.host_page().vcpus[0]
+                .host_tid
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(flags & revoking, 0);
+    }
+
     /// Two VMs with 2 cores each both want 4. Returns how many of the 4 cores the engine starts
     /// revoking when VM 80, whose backlog is older, has weight `weight_a` and VM 90 `weight_b`.
     fn revocations_between_two_hungry_vms(weight_a: u32, weight_b: u32) -> usize {

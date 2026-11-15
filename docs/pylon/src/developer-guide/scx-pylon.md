@@ -39,8 +39,12 @@ CPU, so it gets the CPU first, but `scx_pylon` doesn't tag it as a
 managed vCPU, and its SMT siblings still run host tasks. Without it, a
 queued vCPU thread took the engine's CPU for a whole slice each time
 the engine's slice ended
-([#54](https://github.com/CMKL-APEX/pylon/issues/54)). The `ACTIVE` and
-`PREEMPT` bits are defined but not used.
+([#54](https://github.com/CMKL-APEX/pylon/issues/54)). The `REVOKING`
+bit (bit 3) marks a CPU that `pylond` is taking from its owner: from
+the revocation request until the handoff writes the new owner, a woken
+vCPU's turn doesn't preempt the owner while it parks (see the turn
+timer below). The `ACTIVE` and `PREEMPT` bits are defined but not
+used.
 
 Four more maps:
 
@@ -84,7 +88,8 @@ has booted).
   is what preempts a donor whose CPU was given to a recipient.
 - A parked vCPU that KVM woke goes on its VM's queue
   (`PYLON_VM_DSQ` + slot) with a 100 µs slice, if its VM owns a CPU it
-  may run on. That CPU is kicked once its current task has run 100 µs:
+  may run on and isn't revoking from its owner. That CPU is kicked once
+  its current task has run 100 µs:
   at once if it already has or the CPU is idle, otherwise by the CPU's
   turn timer (below). Kicking at once cut a new owner off about 15 µs
   after it left the guest, before it published `RUNNING`, for a whole
@@ -129,7 +134,10 @@ so `enqueue` kicks it to schedule again.
      checks a slice only at the tick, so `running` also starts a
      per-CPU BPF timer (`pylon_share_timers`) for each turn of 100 µs or
      less, and the timer kicks the CPU when the turn is over. Without
-     it, a 100 µs turn lasted about 1 ms.
+     it, a 100 µs turn lasted about 1 ms. While the CPU is revoking
+     and its owner runs, the timer waits another turn instead: it
+     preempted donors partway through parking, and they got the CPU
+     back only after `pylond` had handed it over without the park.
 2. The vCPU queue, skipping threads that own another CPU. Such a
    thread's CPU is kicked if it is idle, in case it got the CPU while it
    waited here.
