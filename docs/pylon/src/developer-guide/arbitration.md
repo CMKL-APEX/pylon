@@ -265,13 +265,16 @@ and donor's vCPU isn't PARKED
 and ((donor above its min_cores
         and (donor holds more than it desires
              or donor holds more than recipient's committed cores + 1
-             or (donor's urgency < recipient's urgency
-                 and (recipient's committed + 1) × donor's weight
-                     ≤ donor's cores × recipient's weight)))
+             or (shareable)))
      or (recipient is a zero-core wakeup
          and recipient took no core from a donor at its min_cores
              in the last FLOOR_PREEMPT_INTERVAL_US
-         and donor's urgency < recipient's urgency))
+         and donor's urgency < recipient's urgency
+         and shareable))
+
+shareable =
+    (recipient's committed + 1) × donor's weight ≤ donor's cores × recipient's weight
+    and donor took no core by a share move in the last SHARE_ROTATION_US
 ```
 
 A zero-core wakeup has the highest urgency, and the timers and
@@ -284,13 +287,20 @@ A `PARKED` vCPU on an assigned CPU either hasn't woken since it was
 given the CPU, or has given it back and phase 0 will reclaim it.
 Revoking it would race its wakeup.
 
-Urgency alone moves a core only while the donor keeps at least as
-many cores per unit of `priority_weight` as the recipient will have.
-Without that bound, two hungry VMs with equal weights traded a core on
-every sweep: the more urgent one took the other below an even split,
-then *more than committed + 1* gave it back. With the bound, an even
-split is final, and a VM with twice the weight ends up with two cores
-for every one.
+A core moves between two VMs that both want it only while the donor
+keeps at least as many cores per unit of `priority_weight` as the
+recipient will have. Without that bound, two hungry VMs with equal
+weights traded a core on every sweep: the more urgent one took the
+other below an even split, then *more than committed + 1* gave it back.
+With the bound, an even split is final, and a VM with twice the weight
+ends up with two cores for every one.
+
+A split that can't be even, such as three cores between two VMs with
+equal weights, rotates instead. A move that takes a core the donor
+wants and holds within its share is a *share move*: the recipient keeps
+that core for `SHARE_ROTATION_US` (10 ms), and then the other VM may
+take it back. Without the rotation, the VM that got two cores first
+kept them for good, and the other VM did about half its work.
 
 Among eligible donors, the engine prefers, in order:
 
