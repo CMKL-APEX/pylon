@@ -366,6 +366,81 @@ exit and the first handler's return, and inflated it.
   CPU to a vCPU thread for 20 ms, 1–2 times per trace, which
   [#105](https://github.com/CMKL-APEX/pylon/pull/105) fixes.
 
+## Pylon against upstream Cloud Hypervisor under overcommit (measured, 2026-11-15)
+
+The suite in `pylon/bench/overcommit/` (see its `README.md`). Two
+4-vCPU guests run on three host CPUs, under three systems:
+
+- **Pylon:** `pylond` with `scx_pylon` manages the three CPUs.
+- **Upstream:** unmodified Cloud Hypervisor, both VMs pinned to the
+  three CPUs and sharing them under the host's scheduler.
+- **Dedicated:** unmodified Cloud Hypervisor, VM 1 pinned to one CPU and
+  VM 2 to the other two. This is the split Pylon chose in every run
+  below, held still.
+
+Each guest runs a load for 150 s, measured from 40 s on. The loads are
+in `workload.c`: independent counting loops (the control), a spinlock,
+a spinning barrier, threads waking each other over pipes, and, next to
+a VM that wants every CPU, a ping-pong every millisecond.
+
+| | |
+|---|---|
+| Host | Bare-metal AMD EPYC 9124, 16 cores with SMT; CPUs 2–4 for the VMs, `pylond`'s engine on CPU 1 |
+| Kernel | Ubuntu `7.0.0-42-generic`, with `sched_ext` |
+| Guest | Ubuntu 26.04 cloud image, 4 vCPUs, 2 GiB; `pylon-guest-agent` every 1 ms on Pylon, no `pv-pylon` |
+| Pylon | `main` at 6aacf80b8; `--pylon initial_active_vcpus=1,min_cores=1,max_cores=3,priority_weight=100` for both VMs |
+| Upstream | Cloud Hypervisor at ac3702ec5 (the fork point) |
+
+**Both VMs' work, against upstream's** (two runs; the 1 ms turns and
+rotation builds one run):
+
+| Load | Upstream | Dedicated | Pylon | Pylon, 1 ms turns | Pylon, rotation |
+|---|---|---|---|---|---|
+| Counting | 2,743 M/s | 0.99× | 0.84× | 0.97× | 0.93× |
+| Spinlock | 2.52 M/s | 1.00× | 0.82× | 0.97× | 0.84× |
+| Barrier | 3.3 k rounds/s | 1.63× | **3.32×** | 1.25× | 3.20× |
+| Pipes | 422 k/s | 0.99× | 0.77× | 0.98× | 0.86× |
+
+**Ping-pong round trip next to a busy VM** (p50 / p99 / p99.9, µs) and
+the busy VM's counting:
+
+| | Run 1 | Run 2 | Busy VM |
+|---|---|---|---|
+| Upstream | 56 / 4,745 / 6,957 | 56 / 4,798 / 6,896 | 2,582 M/s |
+| Dedicated | 193 / 373 / 445 | 136 / 371 / 547 | 1,814 M/s |
+| Pylon | 71 / 330 / 364 | 156 / 232 / 324 | 1,538 M/s |
+
+The VMs' threads used the three CPUs (2.2 in the ping-pong runs, where
+VM 1 kept a core it used a fifth of), and `pylond` one more. No guest
+logged a lockup.
+
+**What it shows:**
+- Pylon wins where a guest's threads spin while they wait for each
+  other. At the barrier, both VMs do more rounds than under upstream,
+  3.3× in total, and twice what the dedicated split does. A VM's extra
+  vCPUs take 100 µs turns on its cores, where the host's scheduler
+  gives them a few milliseconds each, so a waiting round ends sooner.
+- Everywhere else, the same 100 µs turns cost 15–22% of the work. The
+  dedicated split matches upstream, so the split isn't the cost. With
+  1 ms turns (`PYLON_SHARE_SLICE`, an experimental build), Pylon comes
+  within 3% of the dedicated split, and loses most of the barrier's
+  gain. The turn length trades one for the other.
+- Next to a busy VM, Pylon cuts the ping-pong's p99 from about 4.7 ms
+  to 0.23–0.33 ms. Pinning VM 1 to a CPU of its own gives about the
+  same, 0.37 ms: the gain comes from VM 1 keeping a core. It kept it
+  because it is at its `min_cores` and wakes every millisecond, so the
+  busy VM got two CPUs and did 40% less than under upstream. Pylon would
+  give the core back to an idle VM; this load doesn't show that.
+- With equal weights, Pylon split the three cores 2 to 1 and kept that
+  split for the whole run, so one VM did about half of what the other
+  did. An urgent VM may take a core only while the other keeps its
+  weighted share (spec 05 K7), which a 2 to 1 split never allows. The
+  rotation build
+  ([#110](https://github.com/CMKL-APEX/pylon/pull/110)) moves the core
+  above an even split every 10 ms, which evens the VMs out, but their
+  threads then used 3.05–3.33 CPUs: some vCPU time ran outside the
+  managed CPUs.
+
 ## Other figures
 
 | Figure | Kind | Source |
@@ -384,8 +459,9 @@ be claimed:
 - Handoff latency without `scx_pylon`, and on an Intel host (above:
   AMD, with `scx_pylon`).
 - The rest of a forced park's 45 µs
-  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)), and what 100 µs
-  turns cost guest throughput on a shared CPU.
+  ([#54](https://github.com/CMKL-APEX/pylon/issues/54)).
+- Loads whose threads sleep instead of spinning while they wait, and
+  guests that load `pv-pylon`, in the overcommit suite.
 - For parking inside KVM: wake-to-run latency for IPIs to parked vCPUs,
   guest throughput against the `eventfd` park, and halt-polling
   settings (spec 08 P3,
