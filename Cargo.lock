@@ -1780,11 +1780,11 @@ dependencies = [
 
 [[package]]
 name = "pylon-abi"
-version = "0.0.8"
+version = "0.0.9-dev"
 
 [[package]]
 name = "pylon-guest-agent"
-version = "0.0.8"
+version = "0.0.9-dev"
 dependencies = [
  "clap",
  "env_logger",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "pylond"
-version = "0.0.8"
+version = "0.0.9-dev"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2010,7 +2010,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scx-pylon"
-version = "0.0.8"
+version = "0.0.9-dev"
 dependencies = [
  "clap",
  "env_logger",
