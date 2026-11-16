@@ -5,6 +5,9 @@ when and how, and how to run it again. There are few so far. A core
 handoff between real VMs takes about 100–125 µs at the median, against
 a 3–6 µs target: see
 [Handoff latency between real VMs](#handoff-latency-between-real-vms-measured-2026-11-13).
+For AI agents on GPUs, how many cores a VM gets matters far more than
+how fast they move: see
+[Agentic inference and fine-tuning on GPUs](#agentic-inference-and-fine-tuning-on-gpus-measured-2026-11-15).
 
 ## How to read the numbers
 
@@ -450,6 +453,104 @@ logged a lockup.
   ([#113](https://github.com/CMKL-APEX/pylon/issues/113)). The
   ping-pong's p99 was 315 µs.
 
+## Agentic inference and fine-tuning on GPUs (measured, 2026-11-15)
+
+Where a VM's time goes when it serves an AI agent, and when an agent VM
+and a fine-tuning VM share a host. This is a workload study, not a Pylon
+result: the VMs ran on Pylon's VMM **without `--pylon`**, so the host's
+scheduler placed their vCPUs. It shows what a Pylon policy would have to
+do for this workload.
+
+**Setup:** a bare-metal x86_64 GPU host (2× AMD EPYC 7742, 8 NUMA nodes,
+Ubuntu 6.17 kernel, NVIDIA HGX A100 SXM4 40GB). Two VMs on Pylon's VMM
+(built from `main`, 2026-11-15), each with one A100 passed through,
+16 vCPUs and its memory on the GPUs' NUMA node, pinned with `taskset`
+to host CPUs on that node. Guests: Ubuntu 24.04 (6.8 kernel), NVIDIA 580
+open driver, vLLM 0.33.0.
+
+- **Agent VM:** vLLM serves Qwen2.5-7B-Instruct (prefix caching on,
+  32k context). 32 agent sessions each run tasks of 8 steps: an LLM call
+  over the growing context (streamed, up to 256 tokens), then a real
+  tool run on the CPU in the same VM. A user think time (5 s mean)
+  separates tasks. Tool mixes, by weight:
+  - **light:** read a file, `rg`, one pytest file, a small pandas job,
+    one `gcc -O0` compile of SQLite;
+  - **heavy:** read a file 15, `rg` 20, the whole click test suite 30,
+    a 4M-row pandas job 15, four `gcc -O1` compiles of SQLite at once
+    (as `make -j4`) 20.
+- **Trainer VM:** continuous LoRA fine-tuning (r 16, every linear layer)
+  of Qwen2.5-1.5B-Instruct on Alpaca, bf16, batches of 4 × 2,048
+  tokens, with tokenizing, augmentation and packing in 6 DataLoader
+  workers.
+
+Each run measured 300 s after an 8-minute warm-up; the tool sequence is
+seeded, so every run replays the same mix. Guests sample `/proc/stat`,
+`/proc/schedstat` and the GPU each second; the host samples each VMM
+thread's schedstat.
+
+| Run | Host CPUs | Agent steps/min | LLM call p50 | Time to first token p50 / p99 | Agent GPU busy | Trainer tokens/s (GPU busy) |
+|---|---|---|---|---|---|---|
+| R1 light tools | agent 16 | 262 | 7.3 s | 0.19 / 0.75 s | 100% | — |
+| R2 heavy tools | agent 16 | 63 | 4.3 s | 0.30 / 0.65 s | 75% | — |
+| R3 heavy | agent 8 | 34 | 5.5 s | 0.55 / 2.66 s | 43% | — |
+| R4 heavy | agent 4 | 17 | 11.7 s | 1.08 / 2.66 s | 22% | — |
+| R5 heavy + trainer | both on the same 16 | 62 | 4.2 s | 0.30 / 0.71 s | 74% | 7,392 (99%) |
+| R6 heavy + trainer | agent 12, trainer 4 | 58 | 4.5 s | 0.38 / 0.86 s | 70% | 7,437 (100%) |
+| R7 trainer only | trainer 2 | — | — | — | — | 7,455 (100%) |
+
+**Where the time goes:**
+
+- **Light tools:** the LLM call is 91% of a step, the GPU is always
+  busy, and the VM uses 3.7 of its 16 CPUs. The GPU is the bottleneck.
+- **Heavy tools:** tools are 88% of a step (a build 62 s at the median,
+  the test suite 36 s). The VM uses all 16 CPUs, about 59 threads wait
+  for one on average, and the GPU idles a quarter of the time. CPUs are
+  the bottleneck.
+- **Throughput follows the CPUs:** 63, 34 and 17 steps a minute on 16, 8
+  and 4. Each tool runs about as many times longer as the CPUs shrink.
+- **The tools starve vLLM's engine.** On fewer CPUs its threads queue
+  behind compilers and test runners: time to first token p99 rises from
+  0.65 to 2.66 s, and an LLM call takes 11.7 s instead of 4.3 s while
+  the GPU is 22% busy.
+- **Fine-tuning needs about one CPU.** The trainer used 1.0–1.06 CPUs and
+  kept its GPU 99% busy on 2, 4 or 16 CPUs, with no time waiting for
+  data.
+- **A static split wastes CPUs.** Given 4 CPUs (R6) the trainer used
+  one, and the agent did 7% less than when both VMs shared the 16 CPUs
+  (R5), where it lost 2% against running alone (R2).
+- **The VMM's other threads** (I/O, the device model) used no measurable
+  CPU: the time is all in vCPUs.
+
+**What it means for Pylon:** the cost here is how many cores each VM
+gets, and when, not how fast a core moves. Tools run for seconds to
+minutes; a 100 µs handoff doesn't show. What would help is a policy
+that lends a VM's idle cores (the trainer's three in R6) to a VM whose
+threads queue, and keeps cores for an inference engine's threads so that
+tools can't starve it. Pylon can't yet tell those threads apart inside
+a VM.
+
+**Limits of the data:**
+
+- One run each. With heavy tools only 0–11 tasks finished in the window,
+  so per-task times are rough; the per-step figures (87–1,311 steps a
+  run) hold.
+- The tools ran in the agent's VM. Production agents often run them in
+  separate sandbox VMs, which is where moving cores between VMs would
+  matter most; that layout wasn't run.
+- LoRA fine-tuning only. Reinforcement learning runs rollouts and reward
+  code on the CPU and would need far more.
+- Another VM ran on the host throughout (about 2 CPUs' worth, not pinned
+  to these CPUs).
+
+**Guest setup needed:** with the A100s passed through, `cuInit` failed
+(`CUDA_ERROR_NOT_INITIALIZED`) until the guest set
+`options nvidia_uvm uvm_disable_hmm=1`; the image script does it. vLLM's
+FlashInfer sampler compiles kernels with `nvcc`, which the guest lacks,
+so the agent runs with `VLLM_USE_FLASHINFER_SAMPLER=0`.
+
+The harness is in `pylon/bench/agentic-ai/`; see
+[Running the GPU workload study](#running-the-gpu-workload-study).
+
 ## Other figures
 
 | Figure | Kind | Source |
@@ -480,6 +581,9 @@ be claimed:
 - `scx_pylon`'s cost for non-VM tasks on the host, beyond the
   benchmark's threads above.
 - The same `pylon-bench` run on a CPU with `WAITPKG`.
+- The GPU workload study under `pylond`: an inference VM, tool sandbox
+  VMs and a trainer, with cores lent between them, against the host
+  scheduler on the same CPUs.
 
 When you add a figure, add it here with its date, hardware, build and
 command, and say whether it was measured or modelled.
@@ -491,3 +595,27 @@ cargo run --release -p pylond --bin pylon-bench            # the runs above
 cargo run --release -p pylond --bin pylon-bench -- --quick # short preset used by CI
 cargo run --release -p pylond --bin pylon-bench -- --help  # all options
 ```
+
+## Running the GPU workload study
+
+`pylon/bench/agentic-ai/` holds the harness. It needs root, a host with
+two NVIDIA GPUs bound to `vfio-pci`, Cloud Hypervisor's `CLOUDHV.fd`
+firmware, and about 250 GB of disk (the images are sparse; about 90 GB
+is written).
+
+```bash
+cd pylon/bench/agentic-ai
+sudo ./mkimage.sh          # img/base.raw: Ubuntu 24.04, driver, vLLM, corpora
+./mkmodels.sh              # img/models.raw: the two models and the dataset
+cp img/base.raw img/agent.raw; cp img/base.raw img/trainer.raw
+export FW=/path/to/CLOUDHV.fd NUMA=7 \
+       AGENT_GPU=0000:87:00.0 TRAINER_GPU=0000:90:00.0
+sudo -E WARM=600 ./scenario.sh smoke 112-127 112-127 smoke  # checks CUDA in both VMs
+sudo -E FIRST=112 ./matrix.sh                                # R1–R7, about 2 hours
+./analyze.py out R1-light-16c R2-heavy-16c                   # JSON summaries
+```
+
+Each VM boots, runs `job/run.sh` from its job disk, and powers off;
+results land in `out/<run>/<vm>/`. `PARAMS` overrides the job's
+settings, for example `PARAMS='{"agent":{"sessions":16}}'` (the
+defaults are at the top of `job/agent.py` and `job/train.py`).
