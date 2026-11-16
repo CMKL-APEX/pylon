@@ -3,7 +3,7 @@ authors = ["The Cloud Hypervisor Authors"]
 edition.workspace = true
 name = "pylon-abi"
 rust-version.workspace = true
-version = "0.0.8-dev"
+version = "0.0.8"
 
 [features]
 default = ["clock"]
