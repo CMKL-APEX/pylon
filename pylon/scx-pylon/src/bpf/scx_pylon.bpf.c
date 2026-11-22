@@ -609,8 +609,12 @@ static void kick_siblings(s32 cpu, __u32 claim)
  * checking means two siblings claiming at once see each other. On success,
  * siblings whose claims yield to @claim are kicked so they back off. On
  * failure the claim is withdrawn. @owner is set when @cpu's owner claims it.
+ *
+ * Global, so that the verifier checks it once rather than at each call in
+ * dispatch's queue loops: inlined there, it took pylon_dispatch past the
+ * verifier's 1M-instruction limit on Linux 6.17, and to about 875k on 7.0.
  */
-static bool claim_cpu(s32 cpu, __u32 claim, bool owner)
+__noinline bool claim_cpu(s32 cpu, __u32 claim, bool owner)
 {
     if (cpu < 0 || cpu >= MAX_PCPUS) {
         return true;
