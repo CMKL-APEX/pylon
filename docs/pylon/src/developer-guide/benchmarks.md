@@ -449,7 +449,8 @@ logged a lockup.
   split 1.5 to 1.5 where both VMs want every core, and the work is back
   to the first Pylon column: the rotation's gain in the rotation build came from the extra
   CPU time. In one spinlock run out of five, the rotation stopped at a
-  1 to 2 split after 20–30 s
+  1 to 2 split after 20–30 s. Ten later spinlock runs, sampled
+  throughout, didn't reproduce it
   ([#113](https://github.com/CMKL-APEX/pylon/issues/113)). The
   ping-pong's p99 was 315 µs.
 

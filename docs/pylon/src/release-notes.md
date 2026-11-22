@@ -134,8 +134,9 @@ See [Status and roadmap](status.md) for what works and what doesn't.
   their work against upstream Cloud Hypervisor sharing the same CPUs:
   the 100 µs turns that win at a barrier cost them elsewhere. 1 ms turns
   cost under 3%, but give up most of the barrier's gain.
-- **The odd core's rotation sometimes stops** at a 1 to 2 split, in 1
-  of 15 benchmark runs
+- **The odd core's rotation stopped once** at a 1 to 2 split, in 1 of
+  15 benchmark runs. It didn't recur in 10 later runs, and the issue is
+  closed until it does
   ([#113](https://github.com/CMKL-APEX/pylon/issues/113)).
 - **A VM with no core isn't woken by arriving packets**
   ([#57](https://github.com/CMKL-APEX/pylon/issues/57)).
