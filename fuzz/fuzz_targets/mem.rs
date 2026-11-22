@@ -20,7 +20,7 @@ use virtio_devices::{
 };
 use virtio_queue::{Queue, QueueT};
 use vm_allocator::{GuestMemory, GuestRegion};
-use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
 use vm_migration::{Pausable, Snapshottable};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
@@ -121,16 +121,25 @@ impl FuzzDmaMapping {
 }
 
 impl ExternalDmaMapping for FuzzDmaMapping {
-    fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> io::Result<()> {
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
         if self.fail_on_map {
-            return Err(io::Error::other("fuzz map failure"));
+            return Err(ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            });
         }
         Ok(())
     }
 
-    fn unmap(&self, _iova: u64, _size: u64) -> io::Result<()> {
+    fn unmap(&self, iova: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
         if self.fail_on_unmap {
-            return Err(io::Error::other("fuzz unmap failure"));
+            return Err(ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            });
         }
         Ok(())
     }
@@ -274,10 +283,8 @@ fn exercise_constructor_paths(stream: &mut FuzzCursor) {
         let _ = virtio_mem.resize(MEM_SIZE as u64 + BLOCK_SIZE);
         let _ = virtio_mem.resize(BLOCK_SIZE * (1 + u64::from(stream.next_u8() % 8)));
 
-        let _ = virtio_mem.add_dma_mapping_handler(
-            VirtioMemMappingSource::Device(7),
-            Arc::new(FuzzDmaMapping::new(false, false)),
-        );
+        let dma_handler: Arc<dyn ExternalDmaMapping> = Arc::new(FuzzDmaMapping::new(false, false));
+        let _ = virtio_mem.add_dma_mapping_handler(VirtioMemMappingSource::Device(7), &dma_handler);
         let _ = virtio_mem.remove_dma_mapping_handler(&VirtioMemMappingSource::Device(7));
         let _ = virtio_mem.remove_dma_mapping_handler(&VirtioMemMappingSource::Device(8));
 
@@ -340,8 +347,8 @@ fn run_device_scenario(stream: &mut FuzzCursor, kind: ScenarioKind) -> Result<()
         ScenarioKind::UnmapFailure => FuzzDmaMapping::new(false, true),
         _ => FuzzDmaMapping::new(false, false),
     };
-    let _ = virtio_mem
-        .add_dma_mapping_handler(VirtioMemMappingSource::Container, Arc::new(dma_handler));
+    let dma_handler: Arc<dyn ExternalDmaMapping> = Arc::new(dma_handler);
+    let _ = virtio_mem.add_dma_mapping_handler(VirtioMemMappingSource::Container, &dma_handler);
 
     let guest_memory = GuestMemoryAtomic::new(mem);
 
@@ -388,11 +395,13 @@ fn run_device_scenario(stream: &mut FuzzCursor, kind: ScenarioKind) -> Result<()
     if kind == ScenarioKind::UnmapFailure {
         let source_id = u32::from(stream.next_u8());
         let source = VirtioMemMappingSource::Device(source_id);
-        let _ =
-            virtio_mem.add_dma_mapping_handler(source, Arc::new(FuzzDmaMapping::new(false, false)));
+        let handler: Arc<dyn ExternalDmaMapping> = Arc::new(FuzzDmaMapping::new(false, false));
+        let map_failing_handler: Arc<dyn ExternalDmaMapping> =
+            Arc::new(FuzzDmaMapping::new(true, false));
+        let _ = virtio_mem.add_dma_mapping_handler(source, &handler);
         let _ = virtio_mem.add_dma_mapping_handler(
             VirtioMemMappingSource::Device(source_id + 1),
-            Arc::new(FuzzDmaMapping::new(true, false)),
+            &map_failing_handler,
         );
         let _ = virtio_mem.remove_dma_mapping_handler(&VirtioMemMappingSource::Device(source_id));
     }

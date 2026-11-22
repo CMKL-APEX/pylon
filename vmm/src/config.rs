@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::mem::discriminant;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -30,6 +31,7 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
 
+use crate::external_fds::{ExternalFds, Target, UpdateFdsError};
 use crate::landlock::LandlockAccess;
 use crate::pylon;
 use crate::vm_config::*;
@@ -52,6 +54,9 @@ const MAX_SUPPORTED_CPUS: u32 = 255;
 /// Errors associated with VM configuration parameters.
 #[derive(Debug, Error)]
 pub enum Error {
+    // TODO(fd): Remove after the deprecation period for the legacy FD fields.
+    #[error("Cannot combine external_fds with legacy FD fields")]
+    MixedFdFormats,
     #[error("Inherited file descriptor {0} is specified more than once")]
     DuplicateInheritedFd(RawFd),
     #[error("Invalid inherited file descriptor")]
@@ -239,6 +244,12 @@ pub enum ValidationError {
     ConsoleTcpClientUnsupported,
     #[error("TCP console port must not be zero")]
     ConsoleTcpPortZero,
+    /// More than one new output was given for the same console
+    #[error("More than one new output given for console {0}")]
+    ConsoleOutputUpdateAmbiguous(String),
+    /// A new console output must keep the mode of the current one
+    #[error("Cannot change console output {0:?} to {1:?} with a different mode")]
+    ConsoleOutputUpdateModeMismatch(ConsoleOutput, ConsoleOutput),
     /// Boot has no vCPUs
     #[error("Number of boot vCPUs must be greater than 0")]
     CpusBootZero,
@@ -488,18 +499,6 @@ pub enum ValidationError {
     #[cfg(feature = "sev_snp")]
     #[error("Passthrough devices require --platform iommufd=on with SEV-SNP")]
     SevSnpRequiresIommufd,
-    /// Restore expects all net ids that have fds
-    #[error("Net id {0} is associated with FDs and is required")]
-    RestoreMissingRequiredNetId(String),
-    /// Number of FDs passed during Restore are incorrect to the NetConfig
-    #[error("Number of Net FDs passed for '{0}' during Restore: {1}. Expected: {2}")]
-    RestoreNetFdCountMismatch(String, usize, usize),
-    /// vfio_fds entry does not match any DeviceConfig.id in the snapshot
-    #[error("VFIO device id '{0}' in 'vfio_fds' does not match any device in the snapshot")]
-    RestoreUnknownVfioId(String),
-    /// A VFIO device has no replacement FD for the restore
-    #[error("VFIO device '{0}' needs a replacement fd in 'vfio_fds'")]
-    RestoreMissingVfioFd(String),
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
@@ -555,6 +554,8 @@ pub enum ValidationError {
     /// A memory size of 0 requires memory zones
     #[error("Memory zones are required when the memory size is 0")]
     MemoryZonesMissing,
+    #[error("Invalid file descriptors")]
+    Fd(#[from] UpdateFdsError),
 }
 
 type ValidationResult<T> = result::Result<T, ValidationError>;
@@ -1197,7 +1198,8 @@ impl MemoryConfig {
         hotplug_method=acpi|virtio-mem,\
         hotplug_size=<hotpluggable_memory_size>,\
         hotplugged_size=<hotplugged_memory_size>,\
-        prefault=on|off,reserve=on|off,thp=on|off\"";
+        prefault=on|off,reserve=on|off,thp=on|off\" \
+        (ACPI memory hotplug is deprecated: use hotplug_method=virtio-mem)";
 
     #[expect(clippy::needless_pass_by_value)]
     pub fn parse(memory: &str, memory_zones: Option<Vec<&str>>) -> Result<Self> {
@@ -2585,6 +2587,67 @@ impl ConsoleOutput {
         }
         Ok(())
     }
+
+    pub(crate) const UPDATE_OPTIONS: &[&str] = &[
+        "console_file",
+        "console_socket",
+        "console_tcp",
+        "serial_file",
+        "serial_socket",
+        "serial_tcp",
+    ];
+
+    pub(crate) fn parse_update(parser: &OptionParser, component: &str) -> Result<Option<Self>> {
+        let get_if_set = |mode: &str, missing: ValidationError| -> Result<Option<String>> {
+            let option = format!("{component}_{mode}");
+            if !parser.is_set(&option) {
+                return Ok(None);
+            }
+            parser
+                .get(&option)
+                .map(Some)
+                .ok_or(Error::Validation(missing))
+        };
+        let file = get_if_set("file", ValidationError::ConsoleFileMissing)?;
+        let socket = get_if_set("socket", ValidationError::ConsoleSocketPathMissing)?;
+        let tcp = get_if_set("tcp", ValidationError::ConsoleTcpAddressMissing)?;
+
+        let output = match (file, socket, tcp) {
+            (None, None, None) => return Ok(None),
+            (Some(file), None, None) => Self::File {
+                file: PathBuf::from(file),
+            },
+            (None, Some(socket), None) => Self::Socket {
+                socket: PathBuf::from(socket),
+            },
+            (None, None, Some(address)) => Self::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: parse_tcp_address(&address)
+                        .map_err(|source| Error::ResolveConsoleTcpAddress { address, source })?,
+                    server: true,
+                },
+            },
+            _ => {
+                return Err(Error::Validation(
+                    ValidationError::ConsoleOutputUpdateAmbiguous(component.to_owned()),
+                ));
+            }
+        };
+
+        Ok(Some(output))
+    }
+
+    fn update(&mut self, new: &Self) -> ValidationResult<()> {
+        if discriminant(self) != discriminant(new) {
+            return Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                self.clone(),
+                new.clone(),
+            ));
+        }
+        new.validate()?;
+        self.clone_from(new);
+        Ok(())
+    }
 }
 
 impl ConsoleConfig {
@@ -2831,7 +2894,7 @@ impl VdpaConfig {
 
 impl VsockConfig {
     pub const SYNTAX: &'static str = "Virtio VSOCK parameters \
-        \"cid=<context_id>,socket=<socket_path>,iommu=off|virtio,id=<device_id>,\
+        \"cid=<context_id>,socket=<socket_path>,socket_type=stream|seqpacket,iommu=off|virtio,id=<device_id>,\
         pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(vsock: &str) -> Result<Self> {
@@ -2839,6 +2902,7 @@ impl VsockConfig {
         parser
             .add("socket")
             .add("cid")
+            .add("socket_type")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(vsock).map_err(Error::ParseVsock)?;
 
@@ -2856,6 +2920,10 @@ impl VsockConfig {
             pci_common,
             cid,
             socket,
+            socket_type: parser
+                .convert("socket_type")
+                .map_err(Error::ParseVsock)?
+                .unwrap_or_default(),
         })
     }
 
@@ -3001,6 +3069,7 @@ pub enum MemoryRestoreMode {
     Copy,
     /// Restore lazily by faulting snapshot pages into guest RAM on demand.
     OnDemand,
+    OnDemandNoBackgroundFetchPages,
     /// Restore by mapping the snapshot memory file copy-on-write, sharing the
     /// page cache across VMs restored from the same snapshot.
     CopyOnWrite,
@@ -3019,6 +3088,7 @@ impl FromStr for MemoryRestoreMode {
         match s.to_lowercase().as_str() {
             "copy" => Ok(Self::Copy),
             "ondemand" => Ok(Self::OnDemand),
+            "ondemand_no_background_fetch_pages" => Ok(Self::OnDemandNoBackgroundFetchPages),
             "copyonwrite" => Ok(Self::CopyOnWrite),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
@@ -3051,10 +3121,13 @@ pub struct RestoreConfig {
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
+    /// Deprecated: use `external_fds` with network targets instead.
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    /// Deprecated: use `external_fds` with VFIO targets instead.
     #[serde(default)]
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
+    /// Deprecated: use `external_fds` with an IOMMU target instead.
     // Deserialized FDs are discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iommufd_fd: ExternalFd,
@@ -3062,29 +3135,37 @@ pub struct RestoreConfig {
     pub resume: bool,
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
+    #[serde(default)]
+    pub serial: Option<ConsoleOutput>,
+    #[serde(default)]
+    pub console: Option<ConsoleOutput>,
+    #[serde(default, flatten)]
+    pub(crate) external_fds: ExternalFds,
 }
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot.\
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
-        memory_restore_mode=copy|ondemand|copyonwrite,\
-        net_fds=<list_of_net_ids_with_their_associated_fds>,\
-        vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
-        zone_updates=<list_of_updates>\"\n\
+        memory_restore_mode=copy|ondemand|ondemand_no_background_fetch_pages|copyonwrite,\
+        external_fds=[net(<id>)@[<fd>,...],vfio(<id>)@[<fd>],iommu@[<fd>]],resume=true|false,\
+        zone_updates=<list_of_updates>,\
+        serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>,\
+        console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>\"\n\
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo)\
         \n`prefault` controls eager prefaulting for the copy-based restore path \
         (disabled by default)\
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, \
-        `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if \
-        userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the \
-        snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise)\
-        \n`net_fds` is a list of net ids with new file descriptors. \
-        Only net devices backed by FDs directly are needed as input.\
-        \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
-        e.g. vfio_fds=[vfio0@5,vfio1@6]. Required for every VFIO device. \
-        Requires `iommufd_fd` and platform `iommufd=on`.\
-        \n`iommufd_fd` is a new iommufd file descriptor for the restored VM. \
-        The one saved in the snapshot does not survive serialization.\
+        `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd \
+        support is unavailable, `memory_restore_mode=ondemand_no_background_fetch_pages` does the \
+        same without prefaulting pages in the background, and `memory_restore_mode=copyonwrite` \
+        maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise)\
+        \n`external_fds` provides replacement file descriptors. `net(<id>)` entries replace \
+        the FDs of network devices, `vfio(<id>)` entries replace VFIO cdev FDs, and `iommu` \
+        provides the iommufd FD. \
+        Do not combine `external_fds` with legacy FD fields.\
+        \n`net_fds=<list_of_net_ids_with_their_associated_fds>`, \
+        `vfio_fds=<list_of_vfio_ids_with_their_associated_fd>` and \
+        `iommufd_fd=<fd>` are deprecated; use `external_fds` instead.\
         \n`resume` controls whether the VM will be directly resumed after restore\
         \n`zone_updates` can be used to update NUMA memory zones. \
         Expects a list of elements in the form `id@host_numa_node`";
@@ -3103,8 +3184,16 @@ impl RestoreConfig {
             .add("vfio_fds")
             .add("iommufd_fd")
             .add("resume")
-            .add("zone_updates");
+            .add("zone_updates")
+            .add_all(ConsoleOutput::UPDATE_OPTIONS)
+            .add("external_fds");
         parser.parse(restore).map_err(Error::ParseRestore)?;
+
+        for field in ["net_fds", "vfio_fds", "iommufd_fd"] {
+            if parser.get(field).is_some() {
+                warn!("The '{field}' option is deprecated; use 'external_fds' instead");
+            }
+        }
 
         let source_url = parser
             .get("source_url")
@@ -3119,7 +3208,7 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
-        let net_fds = parser
+        let mut net_fds = parser
             .convert::<TupleList<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
             .map(|v| {
@@ -3141,7 +3230,7 @@ impl RestoreConfig {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        let vfio_fds = parser
+        let mut vfio_fds = parser
             .convert::<TupleList<String, u64>>("vfio_fds")
             .map_err(Error::ParseRestore)?
             .map(|v| {
@@ -3156,7 +3245,7 @@ impl RestoreConfig {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        let iommufd_fd = parser
+        let mut iommufd_fd = parser
             .convert::<RawFd>("iommufd_fd")
             .map_err(Error::ParseRestore)?
             // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
@@ -3177,6 +3266,27 @@ impl RestoreConfig {
                     .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData { id, host_numa_node })
                     .collect()
             });
+        let mut external_fds: ExternalFds = parser
+            .convert::<TupleList<Target, Vec<u64>>>("external_fds")
+            .map_err(Error::ParseRestore)?
+            .map(|v| {
+                // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+                unsafe { ExternalFds::from_cli(v) }
+            })
+            .transpose()?
+            .unwrap_or_default();
+        // TODO(fd): Remove after the deprecation period for the legacy FD fields.
+        if !external_fds.is_empty()
+            && (net_fds.is_some() || vfio_fds.is_some() || iommufd_fd.is_some())
+        {
+            return Err(Error::MixedFdFormats);
+        }
+        external_fds.import_restored_iommufd_fd(&mut iommufd_fd, false);
+        external_fds.import_restored_vfio_configs(&mut vfio_fds);
+        external_fds.import_restored_net_configs(&mut net_fds);
+
+        let serial = ConsoleOutput::parse_update(&parser, "serial")?;
+        let console = ConsoleOutput::parse_update(&parser, "console")?;
 
         Ok(RestoreConfig {
             source_url,
@@ -3187,55 +3297,25 @@ impl RestoreConfig {
             iommufd_fd,
             resume,
             zone_updates,
+            serial,
+            console,
+            external_fds,
         })
     }
 
-    // Ensure all net devices from 'VmConfig' backed by FDs have a
-    // corresponding 'RestoreNetConfig' with a matched 'id' and expected
-    // number of FDs.
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode != MemoryRestoreMode::Copy && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
 
-        if self.memory_restore_mode == MemoryRestoreMode::OnDemand {
+        if matches!(
+            self.memory_restore_mode,
+            MemoryRestoreMode::OnDemand | MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+        ) {
             vm_config.check_postcopy_incompatible_device()?;
         }
 
-        let mut restored_net_with_fds = HashMap::new();
-        for n in self.net_fds.iter().flatten() {
-            assert_eq!(
-                n.num_fds,
-                n.fds.as_ref().map_or(0, |f| f.len()),
-                "Invalid 'RestoredNetConfig' with conflicted fields."
-            );
-            if restored_net_with_fds.insert(n.id.clone(), n).is_some() {
-                return Err(ValidationError::IdentifierNotUnique(n.id.clone()));
-            }
-        }
-
-        for net_fds in vm_config.net.iter().flatten() {
-            if let Some(expected_fds) = &net_fds.fds {
-                let expected_id = net_fds
-                    .pci_common
-                    .id
-                    .as_ref()
-                    .expect("Invalid 'NetConfig' with empty 'id' for VM restore.");
-                if let Some(r) = restored_net_with_fds.remove(expected_id) {
-                    if r.num_fds != expected_fds.len() {
-                        return Err(ValidationError::RestoreNetFdCountMismatch(
-                            expected_id.clone(),
-                            r.num_fds,
-                            expected_fds.len(),
-                        ));
-                    }
-                } else {
-                    return Err(ValidationError::RestoreMissingRequiredNetId(
-                        expected_id.clone(),
-                    ));
-                }
-            }
-        }
+        vm_config.validate_fds(&self.external_fds)?;
 
         let unique_zones = self
             .zone_updates
@@ -3247,57 +3327,6 @@ impl RestoreConfig {
         }
         if unique_zones.contains("") {
             return Err(ValidationError::MemoryZoneUpdatesEmptyId);
-        }
-
-        if !restored_net_with_fds.is_empty() {
-            warn!("Ignoring unused 'net_fds' for VM restore.");
-        }
-
-        let vfio_fds = self.vfio_fds.as_deref().unwrap_or_default();
-        if !vfio_fds.is_empty() {
-            // Substituted devices become FD backed, which requires an
-            // externally supplied iommufd FD and the iommufd backend.
-            if self.iommufd_fd.is_none() {
-                return Err(ValidationError::VfioFdRequiresIommufdFd);
-            }
-            if !vm_config.platform.as_ref().is_some_and(|p| p.iommufd) {
-                return Err(ValidationError::IommufdFdRequiresIommufd);
-            }
-
-            let mut seen = HashSet::new();
-            for v in vfio_fds {
-                if !seen.insert(v.id.as_str()) {
-                    return Err(ValidationError::IdentifierNotUnique(v.id.clone()));
-                }
-            }
-
-            let known_ids: HashSet<&str> = vm_config
-                .devices
-                .iter()
-                .flatten()
-                .filter_map(|d| d.pci_common.id.as_deref())
-                .collect();
-            for v in vfio_fds {
-                if !known_ids.contains(v.id.as_str()) {
-                    return Err(ValidationError::RestoreUnknownVfioId(v.id.clone()));
-                }
-            }
-        }
-
-        // Saved paths may identify a different device on a different host and saved
-        // FDs cannot be reused.
-        let substituted: HashSet<&str> = vfio_fds.iter().map(|v| v.id.as_str()).collect();
-        for d in vm_config.devices.iter().flatten() {
-            if !d
-                .pci_common
-                .id
-                .as_deref()
-                .is_some_and(|id| substituted.contains(id))
-            {
-                return Err(ValidationError::RestoreMissingVfioFd(
-                    d.pci_common.id.clone().unwrap_or_default(),
-                ));
-            }
         }
 
         Ok(())
@@ -3411,6 +3440,20 @@ impl IvshmemConfig {
 }
 
 impl VmConfig {
+    pub(crate) fn update_console_outputs(
+        &mut self,
+        serial: Option<&ConsoleOutput>,
+        console: Option<&ConsoleOutput>,
+    ) -> ValidationResult<()> {
+        if let Some(serial) = serial {
+            self.serial.output.update(serial)?;
+        }
+        if let Some(console) = console {
+            self.console.output.update(console)?;
+        }
+        Ok(())
+    }
+
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
         id: &Option<String>,
@@ -3459,18 +3502,6 @@ impl VmConfig {
         if self.user_devices.as_ref().is_some_and(|d| !d.is_empty()) {
             return Err(ValidationError::PostcopyIncompatibleDevice(
                 "vfio-user".to_owned(),
-            ));
-        }
-        if self.disks.iter().flatten().any(|disk| disk.vhost_user)
-            || self.net.iter().flatten().any(|net| net.vhost_user)
-            || self.fs.as_ref().is_some_and(|fs| !fs.is_empty())
-            || self
-                .generic_vhost_user
-                .as_ref()
-                .is_some_and(|d| !d.is_empty())
-        {
-            return Err(ValidationError::PostcopyIncompatibleDevice(
-                "vhost-user".to_owned(),
             ));
         }
         Ok(())
@@ -4353,7 +4384,8 @@ pub(crate) fn validate_inherited_fds<'a>(configs: impl IntoIterator<Item = &'a s
             .add("fd")
             .add("iommufd_fd")
             .add("net_fds")
-            .add("vfio_fds");
+            .add("vfio_fds")
+            .add("external_fds");
         // The regular config parser reports malformed values.
         if parser.parse_subset(config).is_err() {
             continue;
@@ -4388,6 +4420,13 @@ pub(crate) fn validate_inherited_fds<'a>(configs: impl IntoIterator<Item = &'a s
         {
             fds.extend(pairs.0.into_iter().map(|Tuple(_, fd)| fd));
         }
+        if let Some(pairs) = parser
+            .convert::<TupleList<Target, Vec<u64>>>("external_fds")
+            .ok()
+            .flatten()
+        {
+            fds.extend(pairs.0.into_iter().flat_map(|Tuple(_, fds)| fds));
+        }
         for fd in fds {
             if let Ok(fd) = RawFd::try_from(fd)
                 && !seen.insert(fd)
@@ -4400,7 +4439,7 @@ pub(crate) fn validate_inherited_fds<'a>(configs: impl IntoIterator<Item = &'a s
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
     #[cfg(target_arch = "x86_64")]
@@ -4409,6 +4448,7 @@ mod tests {
     use net_util::MacAddr;
 
     use super::*;
+    use crate::external_fds::tests::{net_target, vfio_target};
     use crate::tests::test_fd;
 
     #[test]
@@ -4467,6 +4507,33 @@ mod tests {
             ));
         }
         validate_inherited_fds(["fd=[3,4]", "fd=5", "iommufd_fd=6"]).unwrap();
+    }
+
+    #[test]
+    fn test_validate_inherited_external_fds() {
+        for input in [
+            vec!["external_fds=[net(net0)@[3,3]]"],
+            vec!["external_fds=[net(net0)@[3,4],vfio(vfio0)@[3]]"],
+            vec!["external_fds=[vfio(vfio0)@[3],iommu@[3]]"],
+            vec!["net_fds=[net0@[3,4]],external_fds=[net(net1)@[3]]"],
+            vec!["vfio_fds=[vfio0@3],external_fds=[vfio(vfio1)@[3]]"],
+            vec!["iommufd_fd=3,external_fds=[iommu@[3]]"],
+            vec!["fd=3", "external_fds=[net(net0)@[3]]"],
+            vec![
+                "external_fds=[net(net0)@[3]]",
+                "external_fds=[net(net1)@[3]]",
+            ],
+        ] {
+            assert!(matches!(
+                validate_inherited_fds(input),
+                Err(Error::DuplicateInheritedFd(3))
+            ));
+        }
+        validate_inherited_fds([
+            "fd=3",
+            "net_fds=[net0@[4,5]],vfio_fds=[vfio0@6],iommufd_fd=7,external_fds=[net(net1)@[8,9],vfio(vfio1)@[10],iommu@[11]]",
+        ])
+        .unwrap();
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5702,7 +5769,7 @@ mod tests {
         Ok(())
     }
 
-    fn net_fixture() -> NetConfig {
+    pub(crate) fn net_fixture() -> NetConfig {
         NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
             tap: None,
@@ -6202,6 +6269,141 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     }
 
     #[test]
+    fn test_console_output_parse_update() {
+        let parse = |input: &str, device: &str| {
+            let mut parser = OptionParser::new();
+            parser.add_all(ConsoleOutput::UPDATE_OPTIONS);
+            parser.parse(input).unwrap();
+            ConsoleOutput::parse_update(&parser, device)
+        };
+
+        assert_eq!(parse("", "serial").unwrap(), None);
+        assert_eq!(
+            parse("serial_file=/tmp/serial.log", "serial").unwrap(),
+            Some(ConsoleOutput::File {
+                file: PathBuf::from("/tmp/serial.log"),
+            })
+        );
+        assert_eq!(
+            parse("console_socket=/tmp/console.sock", "console").unwrap(),
+            Some(ConsoleOutput::Socket {
+                socket: PathBuf::from("/tmp/console.sock"),
+            })
+        );
+        assert_eq!(
+            parse("serial_tcp=127.0.0.1:4444", "serial").unwrap(),
+            Some(ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            })
+        );
+
+        // Options of the other console must not leak into this one.
+        assert_eq!(parse("console_tcp=127.0.0.1:4444", "serial").unwrap(), None);
+        // Two outputs for different consoles are fine, two for one are not.
+        parse("serial_file=/tmp/a,console_file=/tmp/b", "serial").unwrap();
+        assert!(matches!(
+            parse("serial_file=/tmp/a,serial_tcp=127.0.0.1:4444", "serial"),
+            Err(Error::Validation(
+                ValidationError::ConsoleOutputUpdateAmbiguous(_)
+            ))
+        ));
+        assert!(matches!(
+            parse("serial_tcp=localhost:4444", "serial"),
+            Err(Error::ResolveConsoleTcpAddress { .. })
+        ));
+
+        // An option without a value must be rejected.
+        assert!(matches!(
+            parse("serial_file=", "serial"),
+            Err(Error::Validation(ValidationError::ConsoleFileMissing))
+        ));
+        assert!(matches!(
+            parse("console_socket=", "console"),
+            Err(Error::Validation(ValidationError::ConsoleSocketPathMissing))
+        ));
+        assert!(matches!(
+            parse("serial_tcp=", "serial"),
+            Err(Error::Validation(ValidationError::ConsoleTcpAddressMissing))
+        ));
+    }
+
+    #[test]
+    fn test_console_output_update() {
+        let tcp = |address: &str| ConsoleOutput::Tcp {
+            tcp: TcpConsoleConfig {
+                address: address.parse().unwrap(),
+                server: true,
+            },
+        };
+        let file = ConsoleOutput::File {
+            file: PathBuf::from("/tmp/console.log"),
+        };
+
+        let mut output = tcp("127.0.0.1:4444");
+        output
+            .update(&tcp("127.0.0.1:5555"))
+            .expect("should accept a new address in the same mode");
+        assert_eq!(output, tcp("127.0.0.1:5555"));
+
+        // Rejected updates must leave the output unchanged.
+        assert_eq!(
+            output.update(&file),
+            Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                tcp("127.0.0.1:5555"),
+                file.clone()
+            ))
+        );
+        assert_eq!(
+            output.update(&tcp("127.0.0.1:0")),
+            Err(ValidationError::ConsoleTcpPortZero)
+        );
+        assert_eq!(output, tcp("127.0.0.1:5555"));
+    }
+
+    #[test]
+    fn test_console_output_update_requires_same_mode() {
+        let outputs = [
+            ConsoleOutput::Off,
+            ConsoleOutput::Pty { file: None },
+            ConsoleOutput::Tty,
+            ConsoleOutput::File {
+                file: PathBuf::from("/tmp/console.log"),
+            },
+            ConsoleOutput::Socket {
+                socket: PathBuf::from("/tmp/console.sock"),
+            },
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            },
+            ConsoleOutput::Null,
+        ];
+
+        for (current_index, current) in outputs.iter().enumerate() {
+            for (new_index, new) in outputs.iter().enumerate() {
+                let mut output = current.clone();
+                if current_index == new_index {
+                    assert_eq!(output.update(new), Ok(()));
+                } else {
+                    assert_eq!(
+                        output.update(new),
+                        Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                            current.clone(),
+                            new.clone()
+                        ))
+                    );
+                    assert_eq!(output, *current);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_tcp_console_port_zero_validation() {
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let options = format!("tcp={address}");
@@ -6599,6 +6801,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             VsockConfig::parse("socket=/tmp/sock,cid=3")?,
             VsockConfig {
+                socket_type: SocketType::Stream,
                 pci_common: PciDeviceCommonConfig::default(),
                 cid: 3,
                 socket: PathBuf::from("/tmp/sock"),
@@ -6607,6 +6810,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             VsockConfig::parse("socket=/tmp/sock,cid=3,iommu=on")?,
             VsockConfig {
+                socket_type: SocketType::Stream,
                 pci_common: PciDeviceCommonConfig {
                     iommu: IommuType::Virtio,
                     ..Default::default()
@@ -6766,6 +6970,38 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ..Default::default()
             }
         );
+        assert_eq!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse(
+                    "source_url=/path/to/snapshot,serial_file=/tmp/s,console_socket=/tmp/c",
+                )
+            }?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                serial: Some(ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/s"),
+                }),
+                console: Some(ConsoleOutput::Socket {
+                    socket: PathBuf::from("/tmp/c"),
+                }),
+                ..Default::default()
+            }
+        );
+        assert!(matches!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse("source_url=/path/to/snapshot,serial_file=/a,serial_socket=/b")
+            },
+            Err(Error::Validation(
+                ValidationError::ConsoleOutputUpdateAmbiguous(_)
+            ))
+        ));
+        assert!(matches!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,console_tcp=localhost:1") },
+            Err(Error::ResolveConsoleTcpAddress { .. })
+        ));
         let files: [File; 6] = array::from_fn(|_| test_fd());
         let [fd0, fd1, fd2, fd3, fd4, fd5] = files.map(IntoRawFd::into_raw_fd);
         // SAFETY: The files transferred exclusive ownership to us.
@@ -6774,10 +7010,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[{fd0},{fd1}],net1@[{fd2},{fd3},{fd4},{fd5}]]"
             ))
         }?;
-        let nets = config.net_fds.as_ref().unwrap();
+        assert!(config.net_fds.is_none());
+        let nets = config.external_fds.entries();
         let fds: Vec<_> = nets
             .iter()
-            .flat_map(|net| net.fds.as_ref().unwrap())
+            .flat_map(|(_, _, fds)| fds.iter())
             .map(|fd| fd.as_ref().unwrap().as_raw_fd())
             .collect();
         assert_eq!(fds, [fd0, fd1, fd2, fd3, fd4, fd5]);
@@ -6785,18 +7022,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             config,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                net_fds: Some(vec![
-                    RestoredNetConfig {
-                        id: "net0".to_string(),
-                        num_fds: 2,
-                        fds: nets[0].fds.clone(),
-                    },
-                    RestoredNetConfig {
-                        id: "net1".to_string(),
-                        num_fds: 4,
-                        fds: nets[1].fds.clone(),
-                    }
-                ]),
+                external_fds: vec![
+                    (net_target("net0"), nets[0].2.clone()),
+                    (net_target("net1"), nets[1].2.clone()),
+                ]
+                .into(),
                 ..Default::default()
             }
         );
@@ -6808,6 +7038,19 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse(
+                    "source_url=/path/to/snapshot,memory_restore_mode=ondemand_no_background_fetch_pages",
+                )
+            }?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                memory_restore_mode: MemoryRestoreMode::OnDemandNoBackgroundFetchPages,
                 ..Default::default()
             }
         );
@@ -6840,25 +7083,22 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,vfio_fds=[vfio0@{fd0},vfio1@{fd1}],iommufd_fd={fd2}"
             ))
         }?;
-        let vfio_fds = config.vfio_fds.as_ref().unwrap();
-        assert_eq!(vfio_fds[0].fd.as_ref().unwrap().as_raw_fd(), fd0);
-        assert_eq!(vfio_fds[1].fd.as_ref().unwrap().as_raw_fd(), fd1);
-        assert_eq!(config.iommufd_fd.as_ref().unwrap().as_raw_fd(), fd2);
+        assert!(config.vfio_fds.is_none());
+        assert!(config.iommufd_fd.is_none());
+        let entries = config.external_fds.entries();
+        assert_eq!(entries[0].2[0].as_ref().unwrap().as_raw_fd(), fd0);
+        assert_eq!(entries[1].2[0].as_ref().unwrap().as_raw_fd(), fd1);
+        assert_eq!(entries[2].2[0].as_ref().unwrap().as_raw_fd(), fd2);
         assert_eq!(
             config,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                vfio_fds: Some(vec![
-                    RestoredVfioConfig {
-                        id: "vfio0".to_string(),
-                        fd: vfio_fds[0].fd.clone(),
-                    },
-                    RestoredVfioConfig {
-                        id: "vfio1".to_string(),
-                        fd: vfio_fds[1].fd.clone(),
-                    },
-                ]),
-                iommufd_fd: config.iommufd_fd.clone(),
+                external_fds: vec![
+                    (vfio_target("vfio0"), entries[0].2.clone()),
+                    (vfio_target("vfio1"), entries[1].2.clone()),
+                    (Target::Iommu, entries[2].2.clone()),
+                ]
+                .into(),
                 ..Default::default()
             }
         );
@@ -6915,6 +7155,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"OnDemandNoBackgroundFetchPages"}"#
+            )
+            .unwrap()
+            .memory_restore_mode,
+            MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
                 r#"{"source_url":"/path/to/snapshot","zone_updates":[{"id": "zone1", "host_numa_node": 1}]}"#
             )
             .unwrap()
@@ -6923,6 +7171,28 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     host_numa_node: 1,
                     id: "zone1".to_string(),
                 }],
+        );
+
+        let config = serde_json::from_str::<RestoreConfig>(
+            r#"{"source_url":"/path/to/snapshot",
+                "serial":{"mode":"Tcp","tcp":{"address":"127.0.0.1:4444"}},
+                "console":{"mode":"File","file":"/tmp/console.log"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.serial,
+            Some(ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            })
+        );
+        assert_eq!(
+            config.console,
+            Some(ConsoleOutput::File {
+                file: PathBuf::from("/tmp/console.log"),
+            })
         );
     }
 
@@ -7029,18 +7299,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: Some(vec![
-                RestoredNetConfig {
-                    id: "net0".to_string(),
-                    num_fds: 4,
-                    fds: Some(vec![fd.clone(); 4]),
-                },
-                RestoredNetConfig {
-                    id: "net1".to_string(),
-                    num_fds: 2,
-                    fds: Some(vec![fd.clone(); 2]),
-                },
-            ]),
+            external_fds: vec![
+                (net_target("net0"), vec![fd.clone(); 4]),
+                (net_target("net1"), vec![fd.clone(); 2]),
+            ]
+            .into(),
             resume: false,
             zone_updates: vec![],
             ..Default::default()
@@ -7048,59 +7311,42 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "netx".to_string(),
-            num_fds: 4,
-            fds: Some(vec![fd.clone(); 4]),
-        }]);
+        invalid_config.external_fds = vec![(net_target("netx"), vec![fd.clone(); 4])].into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net0".to_string()
-            ))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(net_target(
+                "net0"
+            ))))
         );
 
-        invalid_config.net_fds = Some(vec![
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![fd.clone(); 4]),
-            },
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![fd.clone(); 4]),
-            },
-        ]);
+        invalid_config.external_fds = vec![
+            (net_target("net0"), vec![fd.clone(); 4]),
+            (net_target("net0"), vec![fd.clone(); 4]),
+        ]
+        .into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::IdentifierNotUnique("net0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::DuplicatedTargetEntry(
+                net_target("net0")
+            )))
         );
 
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 4,
-            fds: Some(vec![fd.clone(); 4]),
-        }]);
+        invalid_config.external_fds = vec![(net_target("net0"), vec![fd.clone(); 4])].into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net1".to_string()
-            ))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(net_target(
+                "net1"
+            ))))
         );
 
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 2,
-            fds: Some(vec![fd.clone(); 2]),
-        }]);
+        invalid_config.external_fds = vec![(net_target("net0"), vec![fd.clone(); 2])].into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreNetFdCountMismatch(
-                "net0".to_string(),
-                2,
-                4
-            ))
+            Err(ValidationError::Fd(UpdateFdsError::FdAmountMismatch {
+                target: net_target("net0"),
+                expected: 4,
+                actual: 2,
+            }))
         );
 
         let another_valid_config = RestoreConfig {
@@ -7135,7 +7381,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         // It is invalid to submit more than one update for a single zone.
-        let mut invalid_config_zone_updates = valid_config.clone();
+        let mut invalid_config_zone_updates = another_valid_config.clone();
         invalid_config_zone_updates.zone_updates = vec![
             VmMemoryZoneUpdateData {
                 id: "id1".to_string(),
@@ -7152,7 +7398,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         // It is invalid to submit an update without referring to a memory zone by specifying an ID.
-        let mut invalid_config_zone_updates = valid_config.clone();
+        let mut invalid_config_zone_updates = another_valid_config.clone();
         invalid_config_zone_updates.zone_updates = vec![VmMemoryZoneUpdateData {
             id: String::new(),
             host_numa_node: 0,
@@ -7202,7 +7448,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     id: Some("vfio0".to_owned()),
                     ..Default::default()
                 },
-                path: Some(PathBuf::from("/sys/bus/pci/devices/0000:01:00.0")),
+                // recv_vm_config removes source paths before restore validation.
+                path: None,
                 fd: Default::default(),
                 x_nv_gpudirect_clique: None,
                 x_exclude_mmap_bars: Vec::new(),
@@ -7237,70 +7484,73 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            vfio_fds: Some(vec![RestoredVfioConfig {
-                id: "vfio0".to_string(),
-                fd: fd.clone(),
-            }]),
-            iommufd_fd: fd.clone(),
             resume: false,
             zone_updates: vec![],
+            external_fds: vec![
+                (vfio_target("vfio0"), vec![fd.clone()]),
+                (Target::Iommu, vec![fd.clone()]),
+            ]
+            .into(),
             ..Default::default()
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let missing_iommufd = RestoreConfig {
-            iommufd_fd: Default::default(),
+            external_fds: vec![(vfio_target("vfio0"), vec![fd.clone()])].into(),
             ..valid_config.clone()
         };
         assert_eq!(
             missing_iommufd.validate(&snapshot_vm_config),
-            Err(ValidationError::VfioFdRequiresIommufdFd)
+            Err(ValidationError::Fd(UpdateFdsError::VfioFdsWithoutIommuFd))
         );
 
         let unknown_id = RestoreConfig {
-            vfio_fds: Some(vec![RestoredVfioConfig {
-                id: "missing".to_string(),
-                fd: fd.clone(),
-            }]),
+            external_fds: vec![
+                (vfio_target("vfio0"), vec![fd.clone()]),
+                (vfio_target("missing"), vec![fd.clone()]),
+                (Target::Iommu, vec![fd.clone()]),
+            ]
+            .into(),
             ..valid_config.clone()
         };
         assert_eq!(
             unknown_id.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreUnknownVfioId("missing".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::SuperfluousFds(vec![
+                vfio_target("missing")
+            ])))
         );
 
         let duplicate_id = RestoreConfig {
-            vfio_fds: Some(vec![
-                RestoredVfioConfig {
-                    id: "vfio0".to_string(),
-                    fd: fd.clone(),
-                },
-                RestoredVfioConfig {
-                    id: "vfio0".to_string(),
-                    fd: fd.clone(),
-                },
-            ]),
+            external_fds: vec![
+                (vfio_target("vfio0"), vec![fd.clone()]),
+                (vfio_target("vfio0"), vec![fd.clone()]),
+            ]
+            .into(),
             ..valid_config.clone()
         };
         assert_eq!(
             duplicate_id.validate(&snapshot_vm_config),
-            Err(ValidationError::IdentifierNotUnique("vfio0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::DuplicatedTargetEntry(
+                vfio_target("vfio0")
+            )))
         );
 
         let no_substitution = RestoreConfig {
             vfio_fds: None,
             iommufd_fd: Default::default(),
+            external_fds: Default::default(),
             ..valid_config.clone()
         };
         assert_eq!(
             no_substitution.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingVfioFd("vfio0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(
+                vfio_target("vfio0")
+            )))
         );
 
-        // Replacing only some of the path-backed devices is insufficient.
+        // Every device requires a replacement after source paths are removed.
         let mut second_device = snapshot_vm_config.devices.as_ref().unwrap()[0].clone();
         second_device.pci_common.id = Some("vfio1".to_string());
-        second_device.path = Some(PathBuf::from("/sys/bus/pci/devices/0000:02:00.0"));
         snapshot_vm_config
             .devices
             .as_mut()
@@ -7308,17 +7558,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             .push(second_device);
         assert_eq!(
             valid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingVfioFd("vfio1".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(
+                vfio_target("vfio1")
+            )))
         );
         let mut complete_substitution = valid_config.clone();
-        complete_substitution
-            .vfio_fds
-            .as_mut()
-            .unwrap()
-            .push(RestoredVfioConfig {
-                id: "vfio1".to_string(),
-                fd: fd.clone(),
-            });
+        complete_substitution.external_fds = vec![
+            (vfio_target("vfio0"), vec![fd.clone()]),
+            (vfio_target("vfio1"), vec![fd.clone()]),
+            (Target::Iommu, vec![fd.clone()]),
+        ]
+        .into();
         complete_substitution.validate(&snapshot_vm_config).unwrap();
         snapshot_vm_config.devices.as_mut().unwrap().pop();
 
@@ -7326,18 +7576,22 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         snapshot_vm_config.devices.as_mut().unwrap()[0].fd = Default::default();
         assert_eq!(
             no_substitution.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingVfioFd("vfio0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(
+                vfio_target("vfio0")
+            )))
         );
 
         // The iommufd backend must be enabled in the snapshot config.
         snapshot_vm_config.platform = Some(platform_fixture());
         assert_eq!(
             valid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::IommufdFdRequiresIommufd)
+            Err(ValidationError::Fd(
+                UpdateFdsError::IommufdFdRequiresIommufdBackend
+            ))
         );
     }
 
-    fn platform_fixture() -> PlatformConfig {
+    pub(crate) fn platform_fixture() -> PlatformConfig {
         PlatformConfig {
             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: None,
@@ -8250,6 +8504,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..platform_fixture()
         });
         still_valid_config.vsock = Some(VsockConfig {
+            socket_type: SocketType::Stream,
             pci_common: PciDeviceCommonConfig {
                 iommu: IommuType::Virtio,
                 pci_segment: 1,
@@ -8338,6 +8593,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..platform_fixture()
         });
         invalid_config.vsock = Some(VsockConfig {
+            socket_type: SocketType::Stream,
             pci_common: PciDeviceCommonConfig {
                 pci_segment: 1,
                 ..Default::default()

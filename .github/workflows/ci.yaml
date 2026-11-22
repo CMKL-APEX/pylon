@@ -300,7 +300,8 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        rust: [nightly]
+        # Pin until https://github.com/google/zerocopy/issues/3929 is fixed.
+        rust: [nightly-2026-11-17]
         target: [x86_64-unknown-linux-gnu]
     env:
       RUSTFLAGS: -D warnings
@@ -351,7 +352,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@2611abd15acb0c2e317fb9e45855aabb8b35a414 # v1.52.1
+      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
   quality:
     name: quality
     needs: [preflight]

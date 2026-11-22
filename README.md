@@ -9,34 +9,6 @@
 
 ---
 
-- [1. What is Cloud Hypervisor?](#1-what-is-cloud-hypervisor)
-  - [Objectives](#objectives)
-    - [High Level](#high-level)
-    - [Architectures](#architectures)
-    - [Guest OS](#guest-os)
-- [2. Getting Started](#2-getting-started)
-  - [Host OS](#host-os)
-  - [Use Pre-built Binaries](#use-pre-built-binaries)
-  - [Packages](#packages)
-  - [Building from Source](#building-from-source)
-  - [Booting Linux](#booting-linux)
-    - [Firmware Booting](#firmware-booting)
-    - [Custom Kernel and Disk Image](#custom-kernel-and-disk-image)
-      - [Building your Kernel](#building-your-kernel)
-      - [Disk image](#disk-image)
-      - [Booting the guest VM](#booting-the-guest-vm)
-- [3. Status](#3-status)
-  - [Hot Plug](#hot-plug)
-  - [Device Model](#device-model)
-  - [Roadmap](#roadmap)
-- [4. Relationship with _Rust VMM_ Project](#4-relationship-with-rust-vmm-project)
-  - [Differences with Firecracker and crosvm](#differences-with-firecracker-and-crosvm)
-- [5. Community](#5-community)
-  - [Contribute](#contribute)
-  - [Slack](#slack)
-  - [Mailing list](#mailing-list)
-  - [Security issues](#security-issues)
-
 # 1. What is Cloud Hypervisor?
 
 Cloud Hypervisor is an open source Virtual Machine Monitor (VMM) that runs on
@@ -182,20 +154,8 @@ $ ./cloud-hypervisor \
 ```
 
 If access to the firmware messages or interaction with the boot loader (e.g.
-GRUB) is required then it necessary to switch to the serial console instead of
-`virtio-console`.
-
-```shell
-$ ./cloud-hypervisor \
-	--kernel ./hypervisor-fw \
-	--disk path=cloudimg-amd64.raw,image_type=raw \
-		path=/tmp/ubuntu-cloudinit.img,image_type=raw \
-	--cpus boot=4 \
-	--memory size=1024M \
-	--net "tap=,mac=12:34:56:78:90:ab,ip=192.168.249.1,mask=255.255.255.0" \
-	--serial tty \
-	--console off
-```
+GRUB) is required then enable the serial console with `--serial tty`. It is
+independent of `virtio-console`, which is enabled by default.
 
 ## Booting: `--firmware` vs `--kernel`
 
@@ -333,7 +293,8 @@ guarantees are currently made:
   two major releases to the current release ("n-2")  is guaranteed to work,
   excluding experimental features listed below. See
   [Version Compatibility](docs/live_migration.md#version-compatibility) for
-  details.
+  details. **Beware** that reliable usage in a **heterogeneous fleet** need the
+  use of a matching **CPU profile**, which are available since `v55`. 
 
 Currently the following items and experimental features are **not** guaranteed
 across updates because:

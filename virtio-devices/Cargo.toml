@@ -30,6 +30,7 @@ serial_buffer = { path = "../serial_buffer" }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 vhost = { workspace = true, features = [
+  "postcopy-frontend",
   "vhost-kern",
   "vhost-user-backend",
   "vhost-user-frontend",
@@ -49,6 +50,9 @@ vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { workspace = true }
 zerocopy = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+vhost-user-backend = { workspace = true }
 
 [lints]
 workspace = true

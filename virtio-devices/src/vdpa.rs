@@ -4,7 +4,6 @@
 //
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, result};
 
@@ -20,7 +19,7 @@ use vhost::vhost_kern::vhost_binding::{VHOST, VHOST_BACKEND_F_SUSPEND};
 use vhost::{VhostBackend, VringConfigData};
 use virtio_queue::desc::RawDescriptor;
 use virtio_queue::{Queue, QueueT};
-use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
@@ -37,6 +36,8 @@ use crate::{
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("Failed to create EventFd")]
+    CreateEventFd(#[source] io::Error),
     #[error("Failed to create vhost-vdpa")]
     CreateVhostVdpa(#[source] vhost::Error),
     #[error("Failed to map DMA range")]
@@ -191,8 +192,7 @@ impl Vdpa {
                 avail_features,
                 acked_features,
                 min_queues: num_queues,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused).map_err(Error::CreateEventFd)?
             },
             id,
             vhost: Some(vhost),
@@ -491,7 +491,7 @@ impl Pausable for Vdpa {
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
-        if !self.common.paused.load(Ordering::SeqCst) {
+        if !self.common.pause_common.pause_requested() {
             return Ok(());
         }
 
@@ -600,16 +600,17 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VdpaDmaMapping<M
 where
     M::M: GuestMemoryBackend,
 {
-    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), io::Error> {
-        let usize_size = size.try_into().unwrap();
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
         let mem = self.memory.memory();
         let guest_addr = GuestAddress(gpa);
-        let Some(user_addr) = get_host_address_range(&*mem, guest_addr, usize_size) else {
-            return Err(io::Error::other(format!(
-                "failed to convert guest address 0x{gpa:x} into \
-                     host user virtual address"
-            )));
-        };
+        let user_addr = get_host_address_range(&*mem, guest_addr, size as usize).map_err(|e| {
+            ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: e.into(),
+            }
+        })?;
 
         debug!(
             "DMA map iova 0x{:x}, gpa 0x{:x}, size 0x{:x}, host_addr 0x{:x}",
@@ -622,26 +623,25 @@ where
                 .lock()
                 .unwrap()
                 .dma_map(iova, size, user_addr, false)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "failed to map memory for vDPA device, \
-                         iova 0x{iova:x}, gpa 0x{gpa:x}, size 0x{size:x}: {e:?}"
-                    ))
+                .map_err(|e| ExternalDmaMappingError::Map {
+                    iova,
+                    gpa,
+                    size,
+                    source: e.into(),
                 })
         }
     }
 
-    fn unmap(&self, iova: u64, size: u64) -> io::Result<()> {
+    fn unmap(&self, iova: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
         debug!("DMA unmap iova 0x{iova:x} size 0x{size:x}");
         self.device
             .lock()
             .unwrap()
             .dma_unmap(iova, size)
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "failed to unmap memory for vDPA device, \
-                     iova 0x{iova:x}, size 0x{size:x}: {e:?}"
-                ))
+            .map_err(|e| ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: e.into(),
             })
     }
 }
@@ -677,7 +677,7 @@ mod tests {
         let mut vdpa = Vdpa {
             common: VirtioCommon {
                 avail_features: 1u64 << VIRTIO_F_ACCESS_PLATFORM,
-                ..Default::default()
+                ..VirtioCommon::new(false).unwrap()
             },
             id: "test".to_string(),
             vhost: None,
@@ -709,7 +709,7 @@ mod tests {
             common: VirtioCommon {
                 avail_features: 1u64 << VIRTIO_F_ACCESS_PLATFORM,
                 acked_features: 1u64 << VIRTIO_F_ACCESS_PLATFORM,
-                ..Default::default()
+                ..VirtioCommon::new(false).unwrap()
             },
             id: "test".to_string(),
             vhost: None,

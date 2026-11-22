@@ -49,6 +49,7 @@ mod common_parallel {
     use std::io::{self, SeekFrom};
     use std::net::TcpStream;
     use std::num::NonZeroU32;
+    use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3544,6 +3545,13 @@ mod common_parallel {
     }
 
     #[test]
+    fn test_virtio_vsock_seqpacket() {
+        use vmm::vm_config::SocketType;
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        _test_virtio_vsock_with_type(&guest, false, SocketType::SeqPacket);
+    }
+
+    #[test]
     fn test_virtio_vsock_hotplug() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         _test_virtio_vsock(&guest, true);
@@ -3861,6 +3869,87 @@ mod common_parallel {
                 .collect::<Vec<_>>();
             vcpu_threads.sort();
             assert_eq!(vcpu_threads, ["vcpu0", "vcpu1"]);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_snapshot_restore_pending_disk_hotplug() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+        let disk_path = dirs::home_dir().unwrap().join("workloads/blk.img");
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--api-socket", &api_socket_source])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            guest.ssh_command("test ! -b /dev/vdc").unwrap();
+
+            // Pause before adding the disk so the guest cannot consume the
+            // PCI insertion flag until after restore.
+            assert!(remote_command(&api_socket_source, "pause", None));
+            assert!(remote_command(
+                &api_socket_source,
+                "add-disk",
+                Some(&format!(
+                    "path={},id=hotplug-disk,readonly=true,image_type=raw",
+                    disk_path.display(),
+                )),
+            ));
+            assert!(remote_command(
+                &api_socket_source,
+                "snapshot",
+                Some(&format!("file://{snapshot_dir}")),
+            ));
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = temp_event_monitor_path(&guest.tmp_dir);
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args(["--event-monitor", &format!("path={event_path_restored}")])
+            .args(["--restore", &format!("source_url=file://{snapshot_dir}")])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            assert!(wait_for_latest_events_exact_str(
+                Duration::from_secs(30),
+                &["restored"],
+                &event_path_restored,
+            ));
+            assert!(remote_command(&api_socket_restored, "resume", None));
+            assert!(
+                wait_until(Duration::from_secs(20), || {
+                    guest
+                        .ssh_command("cat /sys/class/block/vdc/size 2>/dev/null || true")
+                        .is_ok_and(|size| size.trim() == "32768")
+                }),
+                "Pending disk insertion did not complete after restore",
+            );
+            guest
+                .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
+                .unwrap();
         });
 
         kill_child(&mut child);
@@ -7621,6 +7710,7 @@ mod common_parallel {
         downtime_ms: Option<u64>,
         timeout_s: Option<u64>,
         timeout_strategy: Option<TimeoutStrategy>,
+        dest_console_update: Option<String>,
     }
 
     fn start_live_migration_tcp_with_flags(
@@ -7681,6 +7771,9 @@ mod common_parallel {
         let mut receive_arg = format!("receiver_url=tcp:0.0.0.0:{migration_port}");
         if options.tls {
             receive_arg.push_str(&format!(",tls_dir={TLS_DIR}"));
+        }
+        if let Some(console_update) = &options.dest_console_update {
+            receive_arg.push_str(&format!(",{console_update}"));
         }
 
         // Start the 'receive-migration' command on the destination
@@ -8465,6 +8558,133 @@ mod common_parallel {
         handle_child_output(r, &dest_output);
     }
 
+    // Postcopy live migration with a vhost-user-blk disk. The guest fills a
+    // buffer before the migration and writes it to the disk with O_DIRECT,
+    // one page at a time, across the migration, so the backend is the first
+    // to touch the pages written once the destination runs.
+    fn _test_live_migration_tcp_postcopy_vhost_user_blk() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let blk_img = guest.tmp_dir.as_path().join("blk.img");
+        let blk_img = blk_img.to_str().unwrap();
+        assert!(exec_host_command_status(&format!("truncate -s 32M {blk_img}")).success());
+        // An absolute image path replaces the workloads directory.
+        let (mut src_blk_child, vubd_socket_path) =
+            prepare_vubd(&guest.tmp_dir, blk_img, 1, false, false);
+        let blk_params = format!("vhost_user=true,socket={vubd_socket_path}");
+
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let mut src_child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M,shared=on"])
+            .default_kernel_cmdline()
+            .default_disks()
+            .args(["--disk", blk_params.as_str()])
+            .default_net()
+            .args(["--api-socket", &src_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let dest_event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
+        dest_api_socket.push_str(".dest");
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .args([
+                "--event-monitor",
+                format!("path={dest_event_path}").as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            guest.wait_vm_boot().unwrap();
+            guest
+                .ssh_command(
+                    "sudo python3 -c 'import mmap, os, time; \
+                     m = mmap.mmap(-1, 32 << 20); \
+                     m[:] = b\"\".join(i.to_bytes(4, \"little\") * 1024 for i in range(8192)); \
+                     open(\"/tmp/filled\", \"w\").close(); \
+                     fd = os.open(\"/dev/vdc\", os.O_WRONLY | os.O_DIRECT); \
+                     v = memoryview(m)\n\
+                     for i in range(8192): os.pwrite(fd, v[i << 12:(i + 1) << 12], i << 12); time.sleep(0.002)' \
+                     > /dev/null 2>&1 & \
+                     until [ -e /tmp/filled ]; do sleep 1; done",
+                )
+                .unwrap();
+
+            thread::scope(|s| {
+                // The source's backend exits and removes the socket once the
+                // source disconnects from it during the migration.
+                let dest_blk_child = s.spawn(|| {
+                    assert!(wait_until(Duration::from_secs(60), || matches!(
+                        src_blk_child.try_wait(),
+                        Ok(Some(_))
+                    )));
+                    prepare_vubd(&guest.tmp_dir, blk_img, 1, false, false).0
+                });
+                assert!(
+                    start_live_migration_tcp_with_flags(
+                        &src_api_socket,
+                        &dest_api_socket,
+                        &dest_event_path,
+                        NonZeroU32::new(1).unwrap(),
+                        &SendMigrationOptions {
+                            postcopy: true,
+                            ..Default::default()
+                        },
+                    ),
+                    "Postcopy live migration command failed."
+                );
+                dest_blk_child.join().unwrap()
+            })
+        }));
+        let Ok(mut dest_blk_child) = r else {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occurred during postcopy live-migration",
+            );
+        };
+
+        let src_exited_ok = wait_until(Duration::from_secs(60), || {
+            matches!(src_child.try_wait(), Ok(Some(_)))
+        }) && src_child.try_wait().unwrap().is_some_and(|s| s.success());
+        if !src_exited_ok {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Source VM (postcopy) was not terminated successfully.",
+            );
+        }
+
+        let r = panic::catch_unwind(|| {
+            assert!(wait_until(Duration::from_secs(60), || {
+                let data = fs::read(blk_img).unwrap();
+                for (i, page) in data.chunks(4096).enumerate() {
+                    if page != (i as u32).to_le_bytes().repeat(1024) {
+                        return false;
+                    }
+                }
+                true
+            }));
+        });
+
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        let _ = src_child.kill();
+        let _ = src_child.wait();
+        let _ = dest_blk_child.kill();
+        let _ = dest_blk_child.wait();
+        let _ = src_blk_child.kill();
+        let _ = src_blk_child.wait();
+        handle_child_output(r, &dest_output);
+    }
+
     fn _test_live_migration_tcp_timeout(timeout_strategy: TimeoutStrategy) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -8983,6 +9203,178 @@ mod common_parallel {
         _test_live_migration_tcp_tls_one_sided(TlsOnlyOn::Receiver);
     }
 
+    const CONSOLE_MARKER: &str = "new-console-output-marker";
+    const SERIAL_DEVICE: &str = if cfg!(target_arch = "x86_64") {
+        "/dev/ttyS0"
+    } else {
+        "/dev/ttyAMA0"
+    };
+
+    fn write_console_marker(guest: &Guest, devices: &[&str]) {
+        guest
+            .ssh_command(&format!(
+                "echo {CONSOLE_MARKER} | sudo tee {}",
+                devices.join(" ")
+            ))
+            .unwrap();
+    }
+
+    /// Reads `stream` until the console marker arrives. The read timeout of
+    /// `stream` bounds the wait.
+    fn assert_stream_has_console_marker(stream: impl Read) {
+        assert!(
+            BufReader::new(stream).split(b'\n').any(|line| {
+                let line = line.expect("should receive the console marker in time");
+                String::from_utf8_lossy(&line).contains(CONSOLE_MARKER)
+            }),
+            "console stream should contain the console marker"
+        );
+    }
+
+    fn assert_file_has_console_marker(path: &Path) {
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                fs::read(path)
+                    .is_ok_and(|data| String::from_utf8_lossy(&data).contains(CONSOLE_MARKER))
+            }),
+            "{} should contain the console marker",
+            path.display()
+        );
+    }
+
+    /// Migrates `guest` over TCP with `console_update` and runs `check` on the
+    /// destination. Both VMMs run on one host, so a destination that ignores a
+    /// new TCP or socket output cannot bind the one that the source holds.
+    fn _test_live_migration_console_update(
+        guest: &Guest,
+        (serial, console): (String, String),
+        extra_args: &[&str],
+        console_update: String,
+        check: impl FnOnce() -> thread::Result<()>,
+    ) {
+        let dest_event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let dest_api_socket = format!("{src_api_socket}.dest");
+
+        let mut src_child = GuestCommand::new(guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--serial", &serial])
+            .args(["--console", &console])
+            .args(["--api-socket", &src_api_socket])
+            .args(extra_args)
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let mut dest_child = GuestCommand::new(guest)
+            .args(["--api-socket", &dest_api_socket])
+            .args(["--event-monitor", &format!("path={dest_event_path}")])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(
+                start_live_migration_tcp_with_flags(
+                    &src_api_socket,
+                    &dest_api_socket,
+                    &dest_event_path,
+                    NonZeroU32::new(1).unwrap(),
+                    &SendMigrationOptions {
+                        dest_console_update: Some(console_update),
+                        ..Default::default()
+                    },
+                ),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occurred during live-migration",
+            );
+        }
+        let _ = src_child.kill();
+        let _ = src_child.wait();
+
+        let r = check();
+
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        handle_child_output(r, &dest_output);
+    }
+
+    /// Moves a TCP serial console and a socket virtio console to new
+    /// addresses.
+    #[test]
+    fn test_live_migration_console_new_outputs() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        let old_socket = guest.tmp_dir.as_path().join("old.sock");
+        let new_socket = guest.tmp_dir.as_path().join("new.sock");
+        let new_port = get_available_port();
+
+        _test_live_migration_console_update(
+            &guest,
+            (
+                format!("tcp=127.0.0.1:{},server=on", get_available_port()),
+                format!("socket={}", old_socket.display()),
+            ),
+            &[],
+            format!(
+                "serial_tcp=127.0.0.1:{new_port},console_socket={}",
+                new_socket.display()
+            ),
+            || {
+                panic::catch_unwind(|| {
+                    let timeout = Some(Duration::from_secs(30));
+                    let tcp = TcpStream::connect(("127.0.0.1", new_port)).unwrap();
+                    tcp.set_read_timeout(timeout).unwrap();
+                    let socket = UnixStream::connect(&new_socket).unwrap();
+                    socket.set_read_timeout(timeout).unwrap();
+
+                    write_console_marker(&guest, &[SERIAL_DEVICE, "/dev/hvc0"]);
+                    assert_stream_has_console_marker(tcp);
+                    assert_stream_has_console_marker(socket);
+                })
+            },
+        );
+    }
+
+    /// A reboot creates the file output again, which under Landlock needs a
+    /// rule for the new path. The update must therefore happen before Landlock.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_live_migration_new_file_landlock_reboot() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        // Outside of the --landlock-rules path, so that only a rule for the
+        // updated output can allow the file.
+        let new_dir = TempDir::new_with_prefix("/tmp/ch-console").unwrap();
+        let new_file = new_dir.as_path().join("serial.log");
+        let old_file = guest.tmp_dir.as_path().join("serial.log");
+        let landlock_rules = format!("path={:?},access=rw", guest.tmp_dir.as_path());
+
+        _test_live_migration_console_update(
+            &guest,
+            (format!("file={}", old_file.display()), "null".to_string()),
+            &["--landlock", "--landlock-rules", &landlock_rules],
+            format!("serial_file={}", new_file.display()),
+            || {
+                panic::catch_unwind(|| {
+                    guest.reboot_linux(0);
+                    write_console_marker(&guest, &[SERIAL_DEVICE]);
+                    assert_file_has_console_marker(&new_file);
+                })
+            },
+        );
+    }
+
     #[test]
     fn test_live_migration_tcp_integrity_net() {
         _test_live_migration_tcp_integrity::<NetIntegrityStream>();
@@ -8997,6 +9389,12 @@ mod common_parallel {
     #[cfg(not(feature = "mshv"))]
     fn test_live_migration_tcp_postcopy() {
         _test_live_migration_tcp_postcopy();
+    }
+
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_live_migration_tcp_postcopy_vhost_user_blk() {
+        _test_live_migration_tcp_postcopy_vhost_user_blk();
     }
 
     #[test]
@@ -10189,6 +10587,16 @@ mod ivshmem {
     }
 
     #[test]
+    fn test_snapshot_restore_new_console_file() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                use_new_console_file: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
     fn test_snapshot_restore_with_resume() {
         snapshot_restore_common::_test_snapshot_restore(
             snapshot_restore_common::SnapshotRestoreTest {
@@ -10388,6 +10796,7 @@ mod snapshot_restore_common {
         pub memory_restore_mode: Option<&'static str>,
         pub use_prefault: bool,
         pub check_vmgenid: bool,
+        pub use_new_console_file: bool,
     }
 
     pub(crate) fn _test_snapshot_restore(cfg: SnapshotRestoreTest) {
@@ -10398,6 +10807,7 @@ mod snapshot_restore_common {
             memory_restore_mode,
             use_prefault,
             check_vmgenid,
+            use_new_console_file,
         } = cfg;
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -10437,6 +10847,21 @@ mod snapshot_restore_common {
             boot_cmdline.push_str(" acpi=on");
         }
 
+        // The source VM writes to file 1, and the restored VM to file 2.
+        let console_file = |n: u8| guest.tmp_dir.as_path().join(format!("console.{n}"));
+        let console_output = |stdout: &[u8], n: u8| {
+            if use_new_console_file {
+                read_to_string(console_file(n)).unwrap()
+            } else {
+                String::from_utf8_lossy(stdout).into_owned()
+            }
+        };
+        let console = if use_new_console_file {
+            format!("file={}", console_file(1).display())
+        } else {
+            "tty".to_string()
+        };
+
         let mut child = GuestCommand::new(&guest)
             .args(["--api-socket", &api_socket_source])
             .args(["--event-monitor", format!("path={event_path}").as_str()])
@@ -10456,6 +10881,7 @@ mod snapshot_restore_common {
             .args(["--net", net_params.as_str()])
             .args(["--vsock", format!("cid=3,socket={socket}").as_str()])
             .args(["--cmdline", &boot_cmdline])
+            .args(["--console", &console])
             .capture_output()
             .spawn()
             .unwrap();
@@ -10526,7 +10952,7 @@ mod snapshot_restore_common {
         handle_child_output(r, &output);
 
         let r = panic::catch_unwind(|| {
-            assert!(String::from_utf8_lossy(&output.stdout).contains(&console_text));
+            assert!(console_output(&output.stdout, 1).contains(&console_text));
         });
 
         handle_child_output(r, &output);
@@ -10567,6 +10993,9 @@ mod snapshot_restore_common {
         }
         if use_prefault {
             restore_params.push_str(",prefault=on");
+        }
+        if use_new_console_file {
+            restore_params.push_str(&format!(",console_file={}", console_file(2).display()));
         }
 
         // Restore the VM from the snapshot
@@ -10747,7 +11176,7 @@ mod snapshot_restore_common {
         handle_child_output(r, &output);
 
         let r = panic::catch_unwind(|| {
-            assert!(String::from_utf8_lossy(&output.stdout).contains(&console_text));
+            assert!(console_output(&output.stdout, 2).contains(&console_text));
             if use_prefault {
                 assert!(
                     String::from_utf8_lossy(&output.stderr).contains("Prefaulted 1 memory regions"),

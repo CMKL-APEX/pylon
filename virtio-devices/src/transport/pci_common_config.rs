@@ -14,6 +14,7 @@ use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use virtio_queue::{Queue, QueueT};
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
+use vm_virtio::AccessType;
 
 use super::pci_device::VIRTQ_MSI_NO_VECTOR;
 use crate::{DEVICE_FEATURES_OK, VirtioDevice};
@@ -24,8 +25,12 @@ pub const VIRTIO_PCI_COMMON_CONFIG_ID: &str = "virtio_pci_common_config";
 pub struct VirtioPciCommonConfigState {
     pub driver_status: u8,
     pub config_generation: u8,
+    #[serde(default)]
+    pub config_changed: bool,
     pub device_feature_select: u32,
     pub driver_feature_select: u32,
+    #[serde(default)]
+    pub driver_features: u64,
     pub queue_select: u16,
     pub msix_config: u16,
     pub msix_queues: Vec<u16>,
@@ -133,6 +138,9 @@ pub struct VirtioPciCommonConfig {
     pub config_changed: Arc<AtomicBool>,
     pub device_feature_select: u32,
     pub driver_feature_select: u32,
+    /// Last written driver features. A write replaces only the selected
+    /// 32-bit half.
+    pub driver_features: u64,
     pub queue_select: u16,
     pub msix_config: Arc<AtomicU16>,
     pub msix_queues: Arc<Mutex<Vec<u16>>>,
@@ -144,9 +152,10 @@ impl VirtioPciCommonConfig {
             device,
             driver_status: Arc::new(AtomicU8::new(state.driver_status)),
             config_generation: Arc::new(AtomicU8::new(state.config_generation)),
-            config_changed: Arc::new(AtomicBool::new(false)),
+            config_changed: Arc::new(AtomicBool::new(state.config_changed)),
             device_feature_select: state.device_feature_select,
             driver_feature_select: state.driver_feature_select,
+            driver_features: state.driver_features,
             queue_select: state.queue_select,
             msix_config: Arc::new(AtomicU16::new(state.msix_config)),
             msix_queues: Arc::new(Mutex::new(state.msix_queues)),
@@ -167,8 +176,10 @@ impl VirtioPciCommonConfig {
         VirtioPciCommonConfigState {
             driver_status: self.driver_status.load(Ordering::Acquire),
             config_generation: self.config_generation.load(Ordering::Acquire),
+            config_changed: self.config_changed.load(Ordering::Acquire),
             device_feature_select: self.device_feature_select,
             driver_feature_select: self.driver_feature_select,
+            driver_features: self.driver_features,
             queue_select: self.queue_select,
             msix_config: self.msix_config.load(Ordering::Acquire),
             msix_queues: self.msix_queues.lock().unwrap().clone(),
@@ -183,6 +194,7 @@ impl VirtioPciCommonConfig {
         self.config_changed.store(false, Ordering::Release);
         self.device_feature_select = 0;
         self.driver_feature_select = 0;
+        self.driver_features = 0;
         self.queue_select = 0;
         self.msix_config
             .store(VIRTQ_MSI_NO_VECTOR, Ordering::Release);
@@ -316,27 +328,33 @@ impl VirtioPciCommonConfig {
                     None
                 };
                 if let Some(access_platform) = access_platform {
-                    let desc_table = match access_platform
-                        .translate_gva(q.desc_table(), get_vring_size(VringType::Desc, q.size()))
-                    {
+                    let desc_table = match access_platform.translate_gva(
+                        q.desc_table(),
+                        get_vring_size(VringType::Desc, q.size()),
+                        AccessType::Read,
+                    ) {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate desc_table GVA: {e}");
                             return;
                         }
                     };
-                    let avail_ring = match access_platform
-                        .translate_gva(q.avail_ring(), get_vring_size(VringType::Avail, q.size()))
-                    {
+                    let avail_ring = match access_platform.translate_gva(
+                        q.avail_ring(),
+                        get_vring_size(VringType::Avail, q.size()),
+                        AccessType::Read,
+                    ) {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate avail_ring GVA: {e}");
                             return;
                         }
                     };
-                    let used_ring = match access_platform
-                        .translate_gva(q.used_ring(), get_vring_size(VringType::Used, q.size()))
-                    {
+                    let used_ring = match access_platform.translate_gva(
+                        q.used_ring(),
+                        get_vring_size(VringType::Used, q.size()),
+                        AccessType::Write,
+                    ) {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate used_ring GVA: {e}");
@@ -402,9 +420,18 @@ impl VirtioPciCommonConfig {
                     return;
                 }
                 if self.driver_feature_select < 2 {
-                    let mut locked_device = self.device.lock().unwrap();
-                    locked_device
-                        .ack_features(u64::from(value) << (self.driver_feature_select * 32));
+                    let shift = self.driver_feature_select * 32;
+                    let remaining_half = self.driver_features & !(0xffff_ffff << shift);
+                    self.driver_features = remaining_half | (u64::from(value) << shift);
+                    self.device
+                        .lock()
+                        .unwrap()
+                        .ack_features(self.driver_features);
+                } else if value != 0 {
+                    debug!(
+                        "Ignoring driver features above bit 63: select {}, value 0x{value:x}",
+                        self.driver_feature_select
+                    );
                 }
             }
             0x20 => self.with_queue_mut(queues, |q| q.set_desc_table_address(Some(value), None)),
@@ -513,6 +540,7 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(false)),
             device_feature_select: 0x0,
             driver_feature_select: 0x0,
+            driver_features: 0,
             queue_select: 0xff,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 3])),
@@ -566,6 +594,7 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(false)),
             device_feature_select: 0,
             driver_feature_select: 0,
+            driver_features: 0,
             queue_select: 0,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 1])),
@@ -595,6 +624,7 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(true)),
             device_feature_select: 1,
             driver_feature_select: 1,
+            driver_features: 0,
             queue_select: 7,
             msix_config: Arc::new(AtomicU16::new(3)),
             msix_queues: Arc::new(Mutex::new(vec![1, 2, 3])),
@@ -630,10 +660,24 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(false)),
             device_feature_select: 0,
             driver_feature_select: 0,
+            driver_features: 0,
             queue_select: 0,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 1])),
         }
+    }
+
+    #[test]
+    fn restore_preserves_pending_config_change() {
+        let mut regs = make_regs(0x10);
+        regs.config_changed.store(true, Ordering::Release);
+        let state = regs.snapshot().unwrap().to_state().unwrap();
+        let restored = VirtioPciCommonConfig::new(state, Arc::clone(&regs.device));
+
+        restored.consume_config_change();
+        assert_eq!(restored.config_generation.load(Ordering::Acquire), 0x11);
+        restored.consume_config_change();
+        assert_eq!(restored.config_generation.load(Ordering::Acquire), 0x11);
     }
 
     #[test]
@@ -737,8 +781,32 @@ mod tests {
             Ok(())
         }
         fn ack_features(&mut self, value: u64) {
-            self.0 |= value;
+            self.0 = value;
         }
+    }
+
+    #[test]
+    fn driver_feature_writes_replace_earlier_values() {
+        let device = Arc::new(Mutex::new(FeatureDevice(0)));
+        let mut regs = make_regs(0);
+        regs.device = Arc::clone(&device) as Arc<Mutex<dyn VirtioDevice>>;
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+
+        // A driver may write its features again with fewer bits before
+        // FEATURES_OK, as FreeBSD's vtnet does with hw.vtnet.lro_disable=0.
+        // Only the last write counts.
+        regs.write(0x0c, &0b11u32.to_le_bytes(), &mut queues);
+        regs.write(0x08, &1u32.to_le_bytes(), &mut queues);
+        regs.write(0x0c, &1u32.to_le_bytes(), &mut queues);
+        regs.write(0x08, &0u32.to_le_bytes(), &mut queues);
+        regs.write(0x0c, &0b10u32.to_le_bytes(), &mut queues);
+        assert_eq!(device.lock().unwrap().0, (1 << 32) | 0b10);
+
+        // After a reset, the next negotiation starts from no features, as
+        // OpenBSD's vio needs when it negotiates again without TSO.
+        regs.reset();
+        regs.write(0x0c, &0b100u32.to_le_bytes(), &mut queues);
+        assert_eq!(device.lock().unwrap().0, 0b100);
     }
 
     #[test]
