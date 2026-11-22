@@ -67,7 +67,11 @@ Four more maps:
 1. If `prev_cpu`'s owner is `p`, return `prev_cpu`.
 2. Otherwise scan all 256 entries for one owned by `p`, and return that
    CPU if found.
-3. Otherwise use `scx_bpf_select_cpu_dfl`, the default placement.
+3. Otherwise use `scx_bpf_select_cpu_dfl`, the default placement. A
+   host task for which it found an idle CPU that no sibling's claim
+   fences goes straight to that CPU's local queue. On the host queue,
+   the CPU woken for it would take the oldest task there instead, and
+   tasks queued without a wakeup were never drained (#124).
 
 A task found as an owner is marked in task-local storage with its VMM
 process's tgid: its *domain*. A vCPU thread gets its domain earlier, at
@@ -111,14 +115,17 @@ has booted).
   a CPU elsewhere, that CPU is kicked.
 - A host task allowed on only one CPU, such as a per-CPU kworker, goes
   on that CPU's local queue, and that CPU is kicked if it is idle.
-- Everything else goes on the host queue.
+- Everything else goes on the host queue, and an idle CPU it may run on
+  is kicked: a task on the host queue wakes no CPU by itself.
 
 A task with migration disabled stays on its CPU's local queue too. The
 kernel runs a CPU's local queue before it asks `dispatch` for work, so
 when the owner's slice ends, a pinned task waiting there runs first. The
 owner then gets the CPU back. With
 `SCX_ENQ_LAST`, the CPU has already decided to idle with `p` runnable,
-so `enqueue` kicks it to schedule again.
+so `enqueue` kicks it to schedule again. A host task in that case that
+no sibling's claim fences goes back on the CPU's local queue and keeps
+running, rather than waiting on the host queue while its CPU idles.
 
 **`dispatch(cpu, prev)`**, when a CPU needs work, tries in order:
 
@@ -149,7 +156,8 @@ so `enqueue` kicks it to schedule again.
 2. The vCPU queue, skipping threads that own another CPU. Such a
    thread's CPU is kicked if it is idle, in case it got the CPU while it
    waited here.
-3. The host queue.
+3. The host queue. While more tasks wait there, an idle CPU is kicked,
+   so each CPU that takes one wakes the next and a backlog drains.
 
 Each `dispatch` also checks one VM queue in turn
 (`rescue_stranded_vcpus`). If that VM no longer
@@ -174,7 +182,11 @@ task allowed on only that CPU), or a domain (tgid).
 - `dispatch` publishes the claim before checking the siblings. Two
   siblings claiming at once each see the other's claim.
 - `running` records the task actually running, and `update_idle` clears
-  the claim.
+  the claim. A CPU going idle with tasks left on its local queue is
+  kicked to pick again: the kernel puts a task preempted with slice left
+  back there without calling `enqueue`, and with core scheduling on,
+  6.17 then idled the CPU next to it for hundreds of milliseconds
+  (#124).
 - `running` also checks the siblings again. A sibling can claim after
   `dispatch` checked, and its kick can land before the new task is
   current, preempting nothing. The task would then run a whole slice
@@ -264,10 +276,24 @@ The flags are `SCX_OPS_ENQ_LAST`, `SCX_OPS_ENQ_EXITING`,
 - Two VMs on sibling threads (only possible without `pylond`'s
   placement, for example with VMs it doesn't manage) take turns badly:
   the lower-numbered CPU's VM wins for as long as its vCPU runs.
+- On a host with 256 CPUs and core scheduling on (Linux 6.17), a few
+  host tasks per 30 s still wait 100–700 ms to run; under the fair
+  scheduler none wait over about 2 ms (#126).
+- A per-CPU kworker on `pylond`'s engine CPU waits up to one owner
+  slice (20 ms) behind the pinned engine thread.
 
-None of these has been measured yet.
+Apart from the last two, none of these has been measured yet.
 
 ## Building
+
+The verifier's limit is one million instructions per program.
+`claim_cpu()` is a global (non-inlined) function so that it is
+verified once, not at every call in `dispatch`'s queue loops; inlined,
+it took `pylon_dispatch` past the limit on Linux 6.17. Keep helpers
+called inside loops global when they grow. Loading the object without
+attaching it (`open_embedded()`, then `load()`) runs the verifier
+without enabling `sched_ext`, and the verified instruction count is in
+`bpf_prog_info.verified_insns`.
 
 `build.rs` runs `clang -target bpf -O2 -g -Wall -Werror` on
 `src/bpf/scx_pylon.bpf.c`, with `libbpf-sys`'s headers and the checked-in

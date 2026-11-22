@@ -25,11 +25,11 @@ struct {
 
 - **Host owners:** `pylond`'s engine writes its own thread as the owner of its CPU, with the `HOST` flag (bit 2), while it runs and clears the entry when it stops. It gets its CPU first, as any owner does, so a queued vCPU thread no longer takes the CPU for a whole slice when the engine's slice ends (#54). With `HOST` set, the owner isn't tagged as a managed vCPU, so its claim stays a host claim and its SMT siblings still run host tasks. Like a pinned host task, it doesn't yield to a vCPU on a sibling.
 - **`scx_ops.select_cpu(p, prev_cpu, wake_flags)`:**
-  If task `p->pid` matches a `target_tid` in `pylon_pcpu_owners`, return that assigned `pCPU`. `enqueue` puts it on that pCPU's owner queue.
+  If task `p->pid` matches a `target_tid` in `pylon_pcpu_owners`, return that assigned `pCPU`. `enqueue` puts it on that pCPU's owner queue. Otherwise use the kernel's default placement; a host task for which it found an idle CPU that no sibling's claim fences goes straight to that CPU's local queue (#124).
 - **`scx_ops.enqueue(p, enq_flags)`:**
-  The owner of a pCPU goes on that pCPU's queue (DSQ id = CPU) with a 20 ms slice and preempts whatever runs there. That includes a donor vCPU whose `target_tid` was replaced. Other managed vCPU threads go on a shared vCPU queue. Tasks with migration disabled, and host tasks allowed on only one CPU, go on that CPU's local queue; the kernel runs them before asking `dispatch`, so a pinned kworker waits at most one owner slice and the stall watchdog doesn't fire. Other tasks go on a host queue.
+  The owner of a pCPU goes on that pCPU's queue (DSQ id = CPU) with a 20 ms slice and preempts whatever runs there. That includes a donor vCPU whose `target_tid` was replaced. Other managed vCPU threads go on a shared vCPU queue. Tasks with migration disabled, and host tasks allowed on only one CPU, go on that CPU's local queue; the kernel runs them before asking `dispatch`, so a pinned kworker waits at most one owner slice and the stall watchdog doesn't fire. Other tasks go on a host queue, and an idle CPU they may run on is kicked.
 - **`scx_ops.dispatch(cpu, prev)`:**
-  Run the pCPU's owner if it is queued. Otherwise take a task from the vCPU queue or the host queue, but only one that the SMT isolation rules below allow.
+  Run the pCPU's owner if it is queued. Otherwise take a task from the vCPU queue or the host queue, but only one that the SMT isolation rules below allow. A CPU that takes a host task kicks an idle CPU while more wait on the host queue, so a backlog drains (#124).
 - **`pylon_kick_owner` (`SEC("syscall")`):**
   `pylond` runs it (`BPF_PROG_RUN`) after it writes a new owner, to kick that pCPU with `SCX_KICK_PREEMPT`. The map write alone reaches no CPU, and an owner that is already runnable (a woken vCPU sharing its VM's CPU) isn't enqueued again, so without the kick the pCPU kept the donor or a sharing vCPU until that blocked or a tick ended its slice (#54).
 
