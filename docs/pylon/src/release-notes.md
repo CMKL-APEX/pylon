@@ -1,5 +1,59 @@
 # Release notes
 
+## v0.0.9 (in progress)
+
+Release candidates: `v0.0.9-rc1`, `v0.0.9-rc2`. Nothing changes in the
+shared-page ABI, the host page or the `--pylon` options, so `pylond`,
+the VMM and the guest side from v0.0.8 work with these.
+
+### Changes since v0.0.8
+
+- **Synced with upstream Cloud Hypervisor v55.0**
+  ([#118](https://github.com/CMKL-APEX/pylon/pull/118)). Upstream
+  changes some VMM options of its own, such as the syntax for restore
+  and receive-migration and some deprecated APIs; see upstream's v55.0
+  release notes.
+- **`scx_pylon` runs on more kernels.**
+  - Kernels 6.12 to 6.18 predate the `sched_ext` core-scheduling bug
+    ([#15](https://github.com/CMKL-APEX/pylon/issues/15)), so `pylond`
+    no longer guards them, and they no longer need the BPF LSM
+    ([#121](https://github.com/CMKL-APEX/pylon/pull/121)). Stock Ubuntu
+    24.04 kernels such as 6.17 ran without `scx_pylon` before.
+  - The 6.17 verifier rejected `scx_pylon` as too large
+    ([#123](https://github.com/CMKL-APEX/pylon/pull/123)).
+- **Host tasks no longer wait while CPUs idle** under `scx_pylon`
+  ([#125](https://github.com/CMKL-APEX/pylon/pull/125),
+  [#128](https://github.com/CMKL-APEX/pylon/pull/128)). On a 256-CPU
+  host, they waited for seconds and the load average climbed. Now:
+  - A woken host task goes straight to the idle CPU it found, and idle
+    CPUs are woken while host tasks queue.
+  - Host tasks get a 3 ms slice instead of 20 ms.
+  - With kernel core scheduling on, a CPU next to a task with a cookie
+    isn't picked to run another task while a better one is idle.
+  - On a 32-CPU host under a mixed load, no wakeup waits over 10 ms,
+    as under the fair scheduler (681 per 30 s before).
+- **GPU agentic-inference workload study** in
+  [Performance and benchmarks](developer-guide/benchmarks.md)
+  ([#115](https://github.com/CMKL-APEX/pylon/pull/115)).
+- **The overcommit benchmark** stops `pylond` when it aborts, and
+  refuses to run next to another `pylond`
+  ([#119](https://github.com/CMKL-APEX/pylon/pull/119)).
+
+### Known limits added
+
+- **Host tasks on Linux 6.17 with core scheduling on** still wait up to
+  a few hundred milliseconds a handful of times per 30 s; under the fair
+  scheduler, none wait over about 2 ms. On that kernel, `sched_ext` next
+  to core-scheduling cookies also logged one recoverable
+  `WARN_ON_ONCE` in `pick_task_scx()`, and loading `scx_pylon` one
+  verifier `REG INVARIANTS VIOLATION` warning. Both taint the kernel;
+  7.0 logs neither.
+- **The 3 ms host slice** costs a VM about 3% of its CPU time when host
+  work competes for its managed CPUs (the overcommit suite's `noisy`
+  load: 2.17 CPUs instead of 2.23).
+
+The known limits of v0.0.8 below still apply.
+
 ## v0.0.8
 
 The first Pylon release. Pylon is a fork of Cloud Hypervisor; the VMM
