@@ -69,8 +69,10 @@ But:
   threads, a spinlock or pipes: a VM's extra vCPUs share its cores in
   100 µs turns, which help the barrier and cost the rest
   ([benchmarks](developer-guide/benchmarks.md#pylon-against-upstream-cloud-hypervisor-under-overcommit-measured-2026-11-15)).
-  The rotation of an odd core between two busy VMs sometimes stops at
-  1 to 2 ([#113](https://github.com/CMKL-APEX/pylon/issues/113)).
+  The rotation of an odd core between two busy VMs stopped at 1 to 2 in
+  one benchmark run, and not in 10 runs since
+  ([#113](https://github.com/CMKL-APEX/pylon/issues/113), closed as not
+  reproduced).
 - **No module, no cooperation.** A guest without `pv-pylon` never
   cooperates: every revocation ends in a forced park.
 
