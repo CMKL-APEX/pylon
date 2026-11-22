@@ -95,11 +95,22 @@ for v in 1 2; do
 done
 
 [ -n "${STOP_SERVICE:-}" ] && sudo systemctl stop "$STOP_SERVICE"
+# Another pylond's engine would compete with this one's, and sched_ext's watchdog
+# then drops scx_pylon partway through the run.
+if pgrep -x pylond >/dev/null; then
+    log "ABORT: another pylond is running: $(pgrep -d ' ' -x pylond)"
+    exit 1
+fi
 if [ "$SYSTEM" = pylon ]; then
     # The logs belong to the user, so the redirects are meant to run without sudo.
     # shellcheck disable=SC2086,SC2024 # PYLOND_ARGS is a list of options
     sudo env RUST_LOG=info "$D/pylond" --socket "$D/pylond.sock" --cores "$CPUS" ${PYLOND_ARGS:-} \
         >pylond.log 2>&1 &
+    # Known before the check below, so that cleanup stops pylond on an abort too.
+    for _ in $(seq 10); do
+        PYLOND_PID=$(pgrep -f "^$D/pylond") && break
+        sleep 0.5
+    done
     for _ in $(seq 30); do
         grep -qE "scx_pylon attached|not attached|Error" pylond.log && break
         sleep 1
@@ -108,7 +119,6 @@ if [ "$SYSTEM" = pylon ]; then
         log "ABORT: scx_pylon not attached"
         exit 1
     }
-    PYLOND_PID=$(pgrep -f "^$D/pylond")
 fi
 for v in 1 2; do
     # No core scheduling, as in the earlier real-guest runs: it would keep the
