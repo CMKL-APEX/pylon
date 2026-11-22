@@ -40,6 +40,14 @@
  */
 #define PYLON_OWNER_SLICE SCX_SLICE_DFL
 /*
+ * Slice of a task that isn't a managed vCPU. A task woken onto a CPU's local
+ * queue waits for the task running there to finish its slice; with 20 ms
+ * slices, per-CPU kworkers and tasks that select_cpu found an idle CPU for
+ * (which something else then took) waited 20 ms, where the fair scheduler
+ * takes a few (#126).
+ */
+#define PYLON_HOST_SLICE 3000000ULL /* 3 ms */
+/*
  * Slice of a CPU shared between its owner and woken parked vCPUs of the same
  * VM (spec 08 §4.3). Both get it in turns while any of them waits.
  */
@@ -222,6 +230,11 @@ __u32 cpu_claim[MAX_PCPUS];
 __u32 woken_turn[MAX_PCPUS];
 /* Per CPU: when the task that runs there started, in bpf_ktime_get_ns() time. */
 __u64 turn_start[MAX_PCPUS];
+/*
+ * Whether each CPU runs a task with a kernel core scheduling cookie, as
+ * `running` last saw it. Cleared when the CPU goes idle.
+ */
+__u32 cpu_cookied[MAX_PCPUS];
 
 /*
  * Per CPU: ends a shared turn after PYLON_SHARE_SLICE. The kernel checks a
@@ -286,6 +299,17 @@ static __always_inline __u32 owner_tid(s32 cpu)
     __u32 key = (__u32)cpu;
     struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
     return entry ? entry->target_tid : 0;
+}
+
+/* Whether @cpu's owner is a host thread (PCPU_OWNER_FLAG_HOST, pylond's engine). */
+static __always_inline bool host_owner(s32 cpu)
+{
+    if (cpu < 0 || cpu >= MAX_PCPUS) {
+        return false;
+    }
+    __u32 key = (__u32)cpu;
+    struct pcpu_owner_entry *entry = bpf_map_lookup_elem(&pylon_pcpu_owners, &key);
+    return entry && (entry->flags & PCPU_OWNER_FLAG_HOST);
 }
 
 static __always_inline s32 smt_next(s32 cpu)
@@ -629,11 +653,64 @@ __noinline bool claim_cpu(s32 cpu, __u32 claim, bool owner)
     return true;
 }
 
+/*
+ * Whether an SMT sibling of @cpu runs a task with a kernel core scheduling
+ * cookie. Global, so that the verifier checks it once (see claim_cpu()).
+ */
+__noinline bool sibling_cookied(s32 cpu)
+{
+    s32 sib = cpu;
+
+    for (int i = 0; i < MAX_SMT; i++) {
+        sib = smt_next(sib);
+        if (sib == cpu) {
+            break;
+        }
+        if ((__u32)sib < MAX_PCPUS && *(volatile __u32 *)&cpu_cookied[pcpu_index(sib)]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Claims an idle CPU in @cpus, on a wholly idle core if there is one.
+ * Otherwise not one whose SMT sibling runs a task with a core scheduling
+ * cookie: with kernel core scheduling on, such a CPU is forced idle next to
+ * whatever it takes, and that task waited there for up to seconds (#126).
+ * Candidates are checked before they are claimed, so a skipped CPU stays
+ * marked idle.
+ */
+static s32 pick_idle_cpu(const struct cpumask *cpus)
+{
+    const struct cpumask *idle;
+    s32 cpu = scx_bpf_pick_idle_cpu(cpus, SCX_PICK_IDLE_CORE);
+
+    if (cpu >= 0) {
+        return cpu;
+    }
+    idle = scx_bpf_get_idle_cpumask();
+    for (int i = 0; i < MAX_SMT; i++) {
+        /* nr_cpu_ids or more when there is none. */
+        cpu = bpf_cpumask_any_and_distribute(idle, cpus);
+        if ((u32)cpu >= scx_bpf_nr_cpu_ids() || (u32)cpu >= MAX_PCPUS) {
+            cpu = -1;
+            break;
+        }
+        if (!sibling_cookied(cpu) && scx_bpf_test_and_clear_cpu_idle(cpu)) {
+            break;
+        }
+        cpu = -1;
+    }
+    scx_bpf_put_idle_cpumask(idle);
+    return cpu;
+}
+
 /* Wakes an idle CPU that may run @p when @p's own CPU can't. */
 static void kick_idle_cpu(struct task_struct *p, __u32 claim)
 {
     for (int i = 0; i < MAX_SMT; i++) {
-        s32 cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+        s32 cpu = pick_idle_cpu(p->cpus_ptr);
         if (cpu < 0) {
             return;
         }
@@ -751,7 +828,7 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
      * queue would never drain (#124).
      */
     if (is_idle && !vcpu_ctx(p) && !fenced(cpu, CLAIM_HOST, false)) {
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, PYLON_HOST_SLICE, 0);
     }
     return cpu;
 }
@@ -777,7 +854,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (is_migration_disabled(p)) {
         /* Short and pinned: it runs whatever the siblings run. */
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, PYLON_HOST_SLICE, enq_flags);
     } else if (owns_cpu(p, cpu)) {
         mark_owner(p, cpu);
         if ((tctx = task_ctx(p))) {
@@ -815,7 +892,7 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
             kick_idle_cpu(p, tctx->dom);
         }
     } else if (p->nr_cpus_allowed == 1) {
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, PYLON_HOST_SLICE, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
     } else if ((enq_flags & SCX_ENQ_LAST) && !fenced(cpu, CLAIM_HOST, false)) {
         /*
@@ -823,14 +900,14 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
          * claim stops it: it goes on running, rather than idling this CPU
          * until another takes it from the host queue (#124).
          */
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, PYLON_HOST_SLICE, enq_flags);
         return;
     } else {
         /*
          * Queued here, @p wakes no CPU: one that is idle has to be kicked,
          * or @p waits for a busy one (#124).
          */
-        scx_bpf_dsq_insert(p, PYLON_HOST_DSQ, SCX_SLICE_DFL, enq_flags);
+        scx_bpf_dsq_insert(p, PYLON_HOST_DSQ, PYLON_HOST_SLICE, enq_flags);
         kick_idle_cpu(p, CLAIM_HOST);
     }
 
@@ -1039,7 +1116,7 @@ static void kick_host_backlog(void)
         return;
     }
     idle = scx_bpf_get_idle_cpumask();
-    cpu = scx_bpf_pick_idle_cpu(idle, 0);
+    cpu = pick_idle_cpu(idle);
     scx_bpf_put_idle_cpumask(idle);
     if (cpu >= 0) {
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -1076,7 +1153,9 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
     bool prev_woken = slot < MAX_VM_SLOTS && woken_prev(prev, cpu, slot);
     bool share = slot < MAX_VM_SLOTS &&
                  (scx_bpf_dsq_nr_queued(PYLON_VM_DSQ + slot) > 0 || prev_woken);
-    u64 owner_slice = share ? PYLON_SHARE_SLICE : PYLON_OWNER_SLICE;
+    u64 owner_slice = share            ? PYLON_SHARE_SLICE
+                      : host_owner(cpu) ? PYLON_HOST_SLICE
+                                        : PYLON_OWNER_SLICE;
 
     if (share && is_woken_turn(cpu, owner) && dispatch_woken(cpu, slot)) {
         return;
@@ -1125,6 +1204,8 @@ void BPF_PROG(pylon_running, struct task_struct *p)
 
     if (i < MAX_PCPUS) {
         *(volatile __u64 *)&turn_start[pcpu_index(i)] = bpf_ktime_get_ns();
+        *(volatile __u32 *)&cpu_cookied[pcpu_index(i)] =
+            bpf_core_field_exists(p->core_cookie) && BPF_CORE_READ(p, core_cookie) != 0;
     }
 
     /*
@@ -1211,6 +1292,9 @@ void BPF_PROG(pylon_update_idle, s32 cpu, bool idle)
 {
     if (idle) {
         set_claim(cpu, CLAIM_NONE);
+        if ((__u32)cpu < MAX_PCPUS) {
+            *(volatile __u32 *)&cpu_cookied[pcpu_index(cpu)] = 0;
+        }
         /*
          * A task the kernel put back on this CPU's local queue, with slice
          * left, doesn't go through enqueue and kicks nothing. With core
