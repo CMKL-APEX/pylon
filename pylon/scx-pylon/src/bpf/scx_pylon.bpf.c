@@ -691,8 +691,9 @@ static s32 pick_idle_cpu(const struct cpumask *cpus)
     }
     idle = scx_bpf_get_idle_cpumask();
     for (int i = 0; i < MAX_SMT; i++) {
+        /* nr_cpu_ids or more when there is none. */
         cpu = bpf_cpumask_any_and_distribute(idle, cpus);
-        if (cpu >= MAX_PCPUS) {
+        if ((u32)cpu >= scx_bpf_nr_cpu_ids() || (u32)cpu >= MAX_PCPUS) {
             cpu = -1;
             break;
         }
