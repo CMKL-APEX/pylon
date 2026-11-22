@@ -633,7 +633,10 @@ components:
   schemas:
     VmmPingResponse:
       required:
+        - build_version
         - version
+        - pid
+        - features
       type: object
       properties:
         build_version:
@@ -657,6 +660,7 @@ components:
       required:
         - config
         - state
+        - memory_actual_size
       type: object
       properties:
         config:
@@ -674,6 +678,10 @@ components:
       description: Virtual Machine information
 
     DeviceNode:
+      required:
+        - id
+        - resources
+        - children
       type: object
       properties:
         id:
@@ -683,6 +691,8 @@ components:
           items:
             # Rust enum type (with data) which can't be better represented here
             type: object
+        parent:
+          type: string
         children:
           type: array
           items:
@@ -694,6 +704,12 @@ components:
       type: object
       additionalProperties:
         type: object
+        required:
+          - device_type
+        properties:
+          device_type:
+            type: string
+            description: The virtio device type, such as block or net
         additionalProperties:
           type: integer
           format: int64
@@ -921,6 +937,11 @@ components:
           type: boolean
 
     CpuTopology:
+      required:
+        - threads_per_core
+        - cores_per_die
+        - dies_per_package
+        - packages
       type: object
       properties:
         threads_per_core:
@@ -1031,13 +1052,12 @@ components:
           $ref: "#/components/schemas/CpuidValue"
 
     PciSegmentConfig:
-      required:
-        - pci_segment
       type: object
       properties:
         pci_segment:
           type: integer
           format: int16
+          default: 0
         mmio32_aperture_weight:
           type: integer
           format: int32
@@ -1155,7 +1175,11 @@ components:
           default: false
         hotplug_method:
           type: string
+          enum: ["Acpi", "VirtioMem"]
           default: "Acpi"
+          description: >-
+            ACPI memory hotplug is deprecated and will be removed in a future
+            release. Use VirtioMem instead.
         shared:
           type: boolean
           default: false
@@ -1370,6 +1394,7 @@ components:
           type: string
         vhost_mode:
           type: string
+          enum: ["Client", "Server"]
           default: "Client"
         id:
           type: string
@@ -1452,8 +1477,6 @@ components:
 
     FsConfig:
       required:
-        - num_queues
-        - queue_size
         - socket
         - tag
       type: object
@@ -1558,10 +1581,16 @@ components:
       properties:
         file:
           type: string
+          description: |
+            Required if `mode` is `File`. For `Pty`, it holds the path of the
+            PTY once the device has been created.
         socket:
           type: string
+          description: Required if `mode` is `Socket`.
         tcp:
-          $ref: "#/components/schemas/TcpConsoleConfig"
+          allOf:
+            - $ref: "#/components/schemas/TcpConsoleConfig"
+          description: Required if `mode` is `Tcp`.
         mode:
           $ref: "#/components/schemas/ConsoleMode"
         iommu:
@@ -1582,10 +1611,16 @@ components:
       properties:
         file:
           type: string
+          description: |
+            Required if `mode` is `File`. For `Pty`, it holds the path of the
+            PTY once the device has been created.
         socket:
           type: string
+          description: Required if `mode` is `Socket`.
         tcp:
-          $ref: "#/components/schemas/TcpConsoleConfig"
+          allOf:
+            - $ref: "#/components/schemas/TcpConsoleConfig"
+          description: Required if `mode` is `Tcp`.
         mode:
           $ref: "#/components/schemas/ConsoleMode"
 
@@ -1596,8 +1631,10 @@ components:
       properties:
         file:
           type: string
+          description: Required if `mode` is `File`.
         mode:
-          $ref: "#/components/schemas/ConsoleMode"
+          type: string
+          enum: ["Off", "Tty", "File", "Null"]
         iobase:
           type: integer
 
@@ -1657,7 +1694,6 @@ components:
     VdpaConfig:
       required:
         - path
-        - num_queues
       type: object
       properties:
         path:
@@ -1687,10 +1723,16 @@ components:
           type: integer
           format: int64
           minimum: 3
+          maximum: 4294967294
           description: Guest Vsock CID
         socket:
           type: string
           description: Path to UNIX domain socket, used to proxy vsock connections.
+        socket_type:
+          type: string
+          enum: [Stream, SeqPacket]
+          default: Stream
+          description: UNIX listener socket type for host initiated connections.
         iommu:
           $ref: "#/components/schemas/IommuType"
         pci_segment:
@@ -1713,7 +1755,7 @@ components:
           format: int32
         distance:
           type: integer
-          format: int32
+          format: uint8
 
     NumaConfig:
       required:
@@ -1740,7 +1782,7 @@ components:
           type: array
           items:
             type: integer
-            format: int32
+            format: uint16
         device_id:
           type: string
 
@@ -1760,6 +1802,9 @@ components:
           format: int64
 
     VmResizeDisk:
+      required:
+        - id
+        - desired_size
       type: object
       properties:
         id:
@@ -1771,6 +1816,9 @@ components:
           format: int64
 
     VmResizeZone:
+      required:
+        - id
+        - desired_ram
       type: object
       properties:
         id:
@@ -1781,18 +1829,24 @@ components:
           format: int64
 
     VmRemoveDevice:
+      required:
+        - id
       type: object
       properties:
         id:
           type: string
 
     VmSnapshotConfig:
+      required:
+        - destination_url
       type: object
       properties:
         destination_url:
           type: string
 
     VmCoredumpData:
+      required:
+        - destination_url
       type: object
       properties:
         destination_url:
@@ -1800,8 +1854,65 @@ components:
 
     MemoryRestoreMode:
       type: string
-      enum: [Copy, OnDemand, CopyOnWrite]
+      enum: [Copy, OnDemand, OnDemandNoBackgroundFetchPages, CopyOnWrite]
       default: Copy
+
+    ExternalFdTarget:
+      oneOf:
+        - type: object
+          required:
+            - Net
+          properties:
+            Net:
+              type: object
+              required:
+                - id
+              properties:
+                id:
+                  type: string
+        - type: object
+          required:
+            - Vfio
+          properties:
+            Vfio:
+              type: object
+              required:
+                - id
+              properties:
+                id:
+                  type: string
+        - type: string
+          enum: [Iommu]
+
+    RestoredNetConfig:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        num_fds:
+          type: integer
+          format: uint64
+          default: 0
+        fds:
+          type: array
+          description: Descriptor numbers in JSON are ignored; use SCM_RIGHTS.
+          items:
+            type: integer
+            format: int32
+
+    RestoredVfioConfig:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        fd:
+          type: integer
+          format: int32
+          description: The descriptor number in JSON is ignored; use SCM_RIGHTS.
 
     RestoreConfig:
       required:
@@ -1814,12 +1925,58 @@ components:
           type: boolean
         memory_restore_mode:
           $ref: "#/components/schemas/MemoryRestoreMode"
+        net_fds:
+          type: array
+          deprecated: true
+          description: >
+            Deprecated: use external_fds with Net targets instead.
+          items:
+            $ref: "#/components/schemas/RestoredNetConfig"
+        vfio_fds:
+          type: array
+          deprecated: true
+          description: >
+            Deprecated: use external_fds with Vfio targets instead.
+          items:
+            $ref: "#/components/schemas/RestoredVfioConfig"
+        iommufd_fd:
+          type: integer
+          format: int32
+          deprecated: true
+          description: >
+            Deprecated: use external_fds with an Iommu target instead.
         resume:
           type: boolean
         zone_updates:
           type: array
           items:
             $ref: "#/components/schemas/VmMemoryZoneUpdateData"
+        serial:
+          allOf:
+            - $ref: "#/components/schemas/SerialConfig"
+          description: New output of the serial console, in the mode of the snapshot.
+        console:
+          allOf:
+            - $ref: "#/components/schemas/SerialConfig"
+          description: New output of the virtio console, in the mode of the snapshot.
+        external_fds:
+          type: array
+          description: >
+            File descriptor entries and counts. The corresponding descriptors
+            must be supplied out of band via SCM_RIGHTS on the API UNIX socket.
+            Do not combine external_fds with legacy FD fields.
+          items:
+            required:
+              - target
+              - expected_fds
+            type: object
+            properties:
+              target:
+                $ref: "#/components/schemas/ExternalFdTarget"
+              expected_fds:
+                type: integer
+                format: uint64
+                description: Number of file descriptors expected for this entry.
 
     ReceiveMigrationData:
       required:
@@ -1828,6 +1985,19 @@ components:
       properties:
         receiver_url:
           type: string
+        vfio_fds:
+          type: array
+          deprecated: true
+          description: >
+            Deprecated: use external_fds with Vfio targets instead.
+          items:
+            $ref: "#/components/schemas/RestoredVfioConfig"
+        iommufd_fd:
+          type: integer
+          format: int32
+          deprecated: true
+          description: >
+            Deprecated: use external_fds with an Iommu target instead.
         tls_dir:
           type: string
           description: >
@@ -1845,6 +2015,32 @@ components:
           type: boolean
           default: true
           description: Enable the background thread for faulting all remaining pages.
+        serial:
+          allOf:
+            - $ref: "#/components/schemas/SerialConfig"
+          description: New output of the serial console, in the mode of the source VM.
+        console:
+          allOf:
+            - $ref: "#/components/schemas/SerialConfig"
+          description: New output of the virtio console, in the mode of the source VM.
+        external_fds:
+          type: array
+          description: >
+            File descriptor entries and counts. The corresponding descriptors
+            must be supplied out of band via SCM_RIGHTS on the API UNIX socket.
+            Do not combine external_fds with legacy FD fields.
+          items:
+            required:
+              - target
+              - expected_fds
+            type: object
+            properties:
+              target:
+                $ref: "#/components/schemas/ExternalFdTarget"
+              expected_fds:
+                type: integer
+                format: uint64
+                description: Number of file descriptors expected for this entry.
 
     MigrationMode:
       type: string
@@ -1952,6 +2148,8 @@ components:
         pci_device_id:
           type: integer
           format: uint8
+        id:
+          type: string
 
     LandlockConfig:
       required:

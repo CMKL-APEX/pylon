@@ -10,8 +10,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, RwLock};
 use std::{fs, io, result};
 
 use anyhow::anyhow;
@@ -44,9 +43,13 @@ use vmm_sys_util::eventfd::EventFd;
 /// - a TX queue FD;
 /// - an event queue FD; and
 /// - a backend FD.
-use super::{VsockBackend, VsockPacket};
+use super::{
+    ConnectionInfo, SocketType, VsockBackend, VsockPacket,
+    defs::uapi::{self, VIRTIO_VSOCK_F_SEQPACKET},
+};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
+use crate::thread_helper::PauseCommon;
 use crate::{
     ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
     Error as DeviceError, GuestMemory, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
@@ -100,6 +103,7 @@ pub(crate) struct VsockEpollHandler<B: VsockBackend> {
     pub backend: Arc<RwLock<B>>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
     pub backend_parked: bool,
+    pub seqpacket_negotiated: bool,
 }
 
 impl<B> VsockEpollHandler<B>
@@ -132,7 +136,27 @@ where
                 self.access_platform.as_deref(),
             ) {
                 Ok(mut pkt) => {
-                    if self.backend.write().unwrap().recv_pkt(&mut pkt).is_ok() {
+                    let received = self.backend.write().unwrap().recv_pkt(&mut pkt);
+                    if received.is_ok() {
+                        if pkt.type_() == uapi::VSOCK_TYPE_SEQPACKET && !self.seqpacket_negotiated {
+                            let (src_cid, dst_cid, src_port, dst_port) =
+                                (pkt.src_cid(), pkt.dst_cid(), pkt.src_port(), pkt.dst_port());
+                            pkt.set_src_cid(dst_cid)
+                                .set_dst_cid(src_cid)
+                                .set_src_port(dst_port)
+                                .set_dst_port(src_port)
+                                .set_op(uapi::VSOCK_OP_RST)
+                                .set_len(0)
+                                .set_flags(0);
+                            if let Err(error) = self.backend.write().unwrap().send_pkt(&pkt) {
+                                warn!(
+                                    "vsock: failed to reset unnegotiated SEQPACKET connection: {error:?}"
+                                );
+                            }
+                            self.queues[0].go_to_previous_position();
+                            continue;
+                        }
+
                         match pkt.commit_hdr(desc_chain.memory()) {
                             Ok(()) => pkt.hdr().len() as u32 + pkt.len(),
                             Err(err) => {
@@ -216,6 +240,15 @@ where
                 }
             };
 
+            if pkt.type_() == uapi::VSOCK_TYPE_SEQPACKET && !self.seqpacket_negotiated {
+                error!("vsock: dropping SEQPACKET packet without feature negotiation");
+                self.queues[1]
+                    .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                    .map_err(Error::QueueAddUsed)?;
+                used_descs = true;
+                continue;
+            }
+
             if self.backend.write().unwrap().send_pkt(&pkt).is_err() {
                 self.queues[1].go_to_previous_position();
                 break;
@@ -230,17 +263,13 @@ where
         Ok(used_descs)
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evts[0].as_raw_fd(), RX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[1].as_raw_fd(), TX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[2].as_raw_fd(), EVT_QUEUE_EVENT)?;
         helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -353,10 +382,33 @@ pub struct Vsock<B: VsockBackend> {
 pub struct VsockState {
     pub avail_features: u64,
     pub acked_features: u64,
-    #[serde(default)]
-    pub connections: Vec<(u32, u32)>,
+    #[serde(default, deserialize_with = "deserialize_connections")]
+    pub connections: Vec<ConnectionInfo>,
     #[serde(default)]
     pub local_port_last: Option<u32>,
+}
+
+fn deserialize_connections<'de, D>(deserializer: D) -> result::Result<Vec<ConnectionInfo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Connection {
+        Typed(ConnectionInfo),
+        Stream((u32, u32)),
+    }
+    Vec::<Connection>::deserialize(deserializer).map(|connections| {
+        connections
+            .into_iter()
+            .map(|connection| match connection {
+                Connection::Typed(connection) => connection,
+                Connection::Stream((local_port, peer_port)) => {
+                    (local_port, peer_port, SocketType::Stream.into())
+                }
+            })
+            .collect()
+    })
 }
 
 impl<B> Vsock<B>
@@ -387,7 +439,9 @@ where
             }
             (state.avail_features, state.acked_features, true)
         } else {
-            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
+            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+                | (1u64 << VIRTIO_F_IN_ORDER)
+                | (1u64 << VIRTIO_VSOCK_F_SEQPACKET);
 
             if access_platform_enabled {
                 avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
@@ -400,11 +454,9 @@ where
                 device_type: VirtioDeviceType::Vsock as u32,
                 avail_features,
                 acked_features,
-                paused_sync: Some(Arc::new(Barrier::new(2))),
                 queue_sizes: QUEUE_SIZES.to_vec(),
                 min_queues: NUM_QUEUES,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused)?
             },
             id,
             cid: cid.into(),
@@ -495,10 +547,8 @@ where
             backend: Arc::clone(&self.backend),
             access_platform: self.common.access_platform(),
             backend_parked: false,
+            seqpacket_negotiated: self.common.acked_features & (1 << VIRTIO_VSOCK_F_SEQPACKET) != 0,
         };
-
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
 
         self.common.spawn_worker(
             &self.id,
@@ -507,7 +557,7 @@ where
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);
@@ -516,6 +566,7 @@ where
 
     fn reset(&mut self) {
         self.common.reset();
+        self.common.acked_features = 0;
         event!("virtio-device", "reset", "id", &self.id);
     }
 
@@ -574,26 +625,22 @@ mod tests {
     #[test]
     fn test_virtio_device() {
         let mut ctx = TestContext::new();
-        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
+        let avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_F_IN_ORDER)
+            | (1u64 << VIRTIO_VSOCK_F_SEQPACKET);
         let device_features = avail_features;
         let driver_features: u64 = avail_features | 1 | (1 << 32);
         let device_pages = [
             (device_features & 0xffff_ffff) as u32,
             (device_features >> 32) as u32,
         ];
-        let driver_pages = [
-            (driver_features & 0xffff_ffff) as u32,
-            (driver_features >> 32) as u32,
-        ];
         assert_eq!(ctx.device.device_type(), VirtioDeviceType::Vsock as u32);
         assert_eq!(ctx.device.queue_max_sizes(), QUEUE_SIZES);
         assert_eq!(ctx.device.features() as u32, device_pages[0]);
         assert_eq!((ctx.device.features() >> 32) as u32, device_pages[1]);
 
-        // Ack device features, page 0.
-        ctx.device.ack_features(u64::from(driver_pages[0]));
-        // Ack device features, page 1.
-        ctx.device.ack_features(u64::from(driver_pages[1]) << 32);
+        // Ack device features.
+        ctx.device.ack_features(driver_features);
         // Check that no side effect are present, and that the acked features are exactly the same
         // as the device features.
         assert_eq!(

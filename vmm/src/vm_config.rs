@@ -25,6 +25,7 @@ use serde::de::{Error as DeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
+pub use virtio_devices::vsock::SocketType;
 
 use crate::Landlock;
 use crate::landlock::LandlockError;
@@ -919,8 +920,9 @@ impl ApplyLandlock for DeviceConfig {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
-        let device_path = fs::read_link(path).map_err(LandlockError::OpenPath)?;
-        let iommu_group = device_path.file_name();
+        let iommu_group_path =
+            fs::read_link(path.join("iommu_group")).map_err(LandlockError::OpenPath)?;
+        let iommu_group = iommu_group_path.file_name();
         let iommu_group_str = iommu_group
             .ok_or(LandlockError::InvalidPath)?
             .to_str()
@@ -974,6 +976,8 @@ pub struct VsockConfig {
     pub pci_common: PciDeviceCommonConfig,
     pub cid: u32,
     pub socket: PathBuf,
+    #[serde(default)]
+    pub socket_type: SocketType,
 }
 
 impl ApplyLandlock for VsockConfig {

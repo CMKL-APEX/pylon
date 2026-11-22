@@ -4,28 +4,28 @@
 //
 
 use std::any::Any;
-use std::os::fd::AsFd;
 use std::os::unix::prelude::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
-use hypervisor::HypervisorVmError;
 use log::{error, info};
 use thiserror::Error;
 use vfio_bindings::bindings::vfio::*;
 use vfio_ioctls::VfioIrq;
 use vfio_user::{Client, Error as VfioUserError};
-use vm_allocator::{AddressAllocator, GuestRegion, MemorySlotAllocator, SystemAllocator};
-use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_allocator::{
+    AddressAllocator, GuestRegion, GuestRegionError, MemorySlotAllocator, SystemAllocator,
+};
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_device::interrupt::{InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig};
 use vm_device::{BusDevice, Resource};
 use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemoryBackend, GuestMemoryRegion};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::mmap::MmapRegion;
 use crate::vfio::{
-    UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioCommonConfig, VfioError,
+    VFIO_COMMON_ID, Vfio, VfioBarMemoryRegion, VfioCommon, VfioCommonConfig, VfioError,
+    find_alignment,
 };
 use crate::{
     BarReprogrammingParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
@@ -46,7 +46,7 @@ pub enum VfioUserPciDeviceError {
     #[error("Client error")]
     Client(#[source] VfioUserError),
     #[error("Failed to map VFIO PCI region into guest")]
-    MapRegionGuest(#[source] HypervisorVmError),
+    MapRegionGuest(#[source] GuestRegionError),
     #[error("Missing region {0}")]
     MissingRegion(u32),
     #[error("Missing file descriptor for mappable region {0}")]
@@ -59,10 +59,6 @@ pub enum VfioUserPciDeviceError {
         size: u64,
         region_size: u64,
     },
-    #[error("Failed to DMA map")]
-    DmaMap(#[source] VfioUserError),
-    #[error("Failed to DMA unmap")]
-    DmaUnmap(#[source] VfioUserError),
     #[error("Failed to create VfioCommon")]
     CreateVfioCommon(#[source] VfioPciError),
     #[error("Other OS error")]
@@ -126,14 +122,15 @@ impl VfioUserPciDevice {
 
     /// Map all of the MMIO regions.
     pub fn map_mmio_regions(&mut self) -> Result<(), VfioUserPciDeviceError> {
-        for mmio_region in &mut self.common.mmio_regions {
-            let (region_flags, file_offset, sparse_areas) = {
+        for mmio_region in &mut self.common.bars {
+            let (region_flags, region_size, file_offset, sparse_areas) = {
                 let client = self.client.lock().unwrap();
                 let region = client
                     .region(mmio_region.index)
                     .ok_or(VfioUserPciDeviceError::MissingRegion(mmio_region.index))?;
                 (
                     region.flags,
+                    region.size,
                     region.file_offset.clone(),
                     region.sparse_areas.clone(),
                 )
@@ -151,7 +148,7 @@ impl VfioUserPciDevice {
                 let mmaps = if sparse_areas.is_empty() {
                     vec![vfio_region_sparse_mmap_area {
                         offset: 0,
-                        size: mmio_region.length,
+                        size: region_size,
                     }]
                 } else {
                     sparse_areas
@@ -161,61 +158,50 @@ impl VfioUserPciDevice {
                     .as_ref()
                     .ok_or(VfioUserPciDeviceError::MissingRegionFd(mmio_region.index))?;
 
+                // MSI-X relocation can enlarge the guest BAR beyond the
+                // backend region. Both limits must constrain the mappings.
+                let mmap_limit = region_size.min(mmio_region.length);
                 for s in mmaps.iter() {
                     // The area layout comes from the untrusted backend. Never
-                    // mmap or create a memory slot outside the BAR window.
+                    // mmap or create a memory slot outside either region.
                     if s.offset
                         .checked_add(s.size)
-                        .is_none_or(|end| end > mmio_region.length)
+                        .is_none_or(|end| end > mmap_limit)
                     {
                         return Err(VfioUserPciDeviceError::SparseAreaOutsideRegion {
                             offset: s.offset,
                             size: s.size,
-                            region_size: mmio_region.length,
+                            region_size: mmap_limit,
                         });
                     }
 
-                    let mapping = match MmapRegion::mmap(
-                        s.size,
+                    let offset = file_offset.start().checked_add(s.offset).ok_or_else(|| {
+                        VfioUserPciDeviceError::Other(io::Error::other("File offset overflows"))
+                    })?;
+                    let size = usize::try_from(s.size)
+                        .map_err(|e| VfioUserPciDeviceError::Other(io::Error::other(e)))?;
+                    let mapping = GuestRegion::from_file(
+                        vm_memory::FileOffset::from_arc(Arc::clone(file_offset.arc()), offset),
+                        size,
+                        find_alignment(size),
+                        GuestAddress(mmio_region.start.0 + s.offset),
                         prot,
-                        file_offset.file().as_fd(),
-                        file_offset.start(),
-                        s.offset,
-                    ) {
-                        Ok(mapping) => Arc::new(mapping),
-                        Err(e) => {
-                            error!(
-                                "Could not mmap sparse area (offset = 0x{:x}, size = 0x{:x}): {}",
-                                s.offset, s.size, e
-                            );
-                            return Err(VfioUserPciDeviceError::Other(e));
-                        }
+                        Arc::clone(&self.vm),
+                        Arc::clone(&self.memory_slot_allocator),
+                    )
+                    .map_err(|e| VfioUserPciDeviceError::Other(io::Error::other(e)))?;
+                    mapping
+                        .register()
+                        .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    let mapping = Arc::new(Mutex::new(mapping));
+
+                    let bar_memory_region = VfioBarMemoryRegion {
+                        offset: s.offset,
+                        region: mapping,
+                        p2p_mapping: None,
                     };
 
-                    let user_memory_region = UserMemoryRegion {
-                        slot: self.memory_slot_allocator.next_memory_slot(),
-                        start: mmio_region.start.0 + s.offset,
-                        mapping,
-                        // A vfio-user device exports no dma-buf.
-                        #[cfg(feature = "kvm")]
-                        dma_buf: None,
-                    };
-
-                    // SAFETY: validity of len and host_addr guaranteed by hypervisor::mmap::MmapRegion
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                            hypervisor::MemoryVisibility::Shared,
-                        )
-                    }
-                    .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
-
-                    mmio_region.user_memory_regions.push(user_memory_region);
+                    mmio_region.bar_memory_regions.push(bar_memory_region);
                 }
             }
         }
@@ -224,48 +210,9 @@ impl VfioUserPciDevice {
     }
 
     fn unmap_mmio_regions(&mut self) {
-        for mmio_region in self.common.mmio_regions.iter_mut() {
-            for user_memory_region in mmio_region.user_memory_regions.drain(..) {
-                // Remove region
-                // SAFETY: guaranteed by hypervisor::mmap::MmapRegion invariants
-                if let Err(e) = unsafe {
-                    self.vm.remove_user_memory_region(
-                        user_memory_region.slot,
-                        user_memory_region.start,
-                        user_memory_region.mapping.len(),
-                        user_memory_region.mapping.addr(),
-                        false,
-                    )
-                } {
-                    error!("Could not remove the userspace memory region: {e}");
-                }
-
-                self.memory_slot_allocator
-                    .free_memory_slot(user_memory_region.slot);
-                // memory will be unmapped on drop
-            }
+        for mmio_region in &mut self.common.bars {
+            mmio_region.bar_memory_regions.clear();
         }
-    }
-
-    pub fn dma_map(&mut self, region: &GuestRegion) -> Result<(), VfioUserPciDeviceError> {
-        let (fd, offset) = match region.file_offset() {
-            Some(_file_offset) => (_file_offset.file().as_raw_fd(), _file_offset.start()),
-            None => return Ok(()),
-        };
-
-        self.client
-            .lock()
-            .unwrap()
-            .dma_map(offset, region.start_addr().raw_value(), region.len(), fd)
-            .map_err(VfioUserPciDeviceError::DmaMap)
-    }
-
-    pub fn dma_unmap(&mut self, region: &GuestRegion) -> Result<(), VfioUserPciDeviceError> {
-        self.client
-            .lock()
-            .unwrap()
-            .dma_unmap(region.start_addr().raw_value(), region.len())
-            .map_err(VfioUserPciDeviceError::DmaUnmap)
     }
 }
 
@@ -438,52 +385,9 @@ impl PciDevice for VfioUserPciDevice {
 
     fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
         info!("Moving BAR {bar_idx} -> 0x{new_base:x}");
-        for mmio_region in self.common.mmio_regions.iter_mut() {
-            if mmio_region.index as usize == bar_idx {
-                let old_base = mmio_region.start.raw_value();
-                mmio_region.start = GuestAddress(new_base);
-
-                for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
-                    // Remove old region
-                    // SAFETY: only valid regions are in user_memory_regions
-                    unsafe {
-                        self.vm.remove_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                        )
-                    }
-                    .map_err(io::Error::other)?;
-
-                    // Update the user memory region with the correct start address.
-                    if new_base > old_base {
-                        user_memory_region.start += new_base - old_base;
-                    } else {
-                        user_memory_region.start -= old_base - new_base;
-                    }
-
-                    // Insert new region
-                    // SAFETY: only valid regions are in user_memory_regions
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                            hypervisor::MemoryVisibility::Shared,
-                        )
-                    }
-                    .map_err(io::Error::other)?;
-                }
-                info!("Moved bar 0x{old_base:x} -> 0x{new_base:x}");
-            }
-        }
-
-        Ok(())
+        self.common
+            .move_bar(bar_idx, new_base)
+            .map_err(io::Error::other)
     }
 
     fn id(&self) -> Option<String> {
@@ -555,45 +459,55 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VfioUserDmaMappi
 where
     M::M: GuestMemoryBackend,
 {
-    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), io::Error> {
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
         let mem = self.memory.memory();
         let guest_addr = GuestAddress(gpa);
-        let Some(region) = mem.find_region(guest_addr) else {
-            return Err(io::Error::other(format!("Region not found for 0x{gpa:x}")));
-        };
+        let region = mem
+            .find_region(guest_addr)
+            .ok_or(ExternalDmaMappingError::RegionNotFound { gpa })?;
 
         // Check that the range fits in the region.
         let region_offset = guest_addr
             .checked_offset_from(region.start_addr())
-            .ok_or_else(|| io::Error::other(format!("gpa 0x{gpa:x} below region start")))?;
+            .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa, size })?;
         let region_remaining = (region.len())
             .checked_sub(region_offset)
-            .ok_or_else(|| io::Error::other(format!("gpa 0x{gpa:x} past region end")))?;
+            .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa, size })?;
         if size > region_remaining {
-            return Err(io::Error::other(format!(
-                "DMA map (gpa 0x{gpa:x}, size 0x{size:x}) extends past region end"
-            )));
+            return Err(ExternalDmaMappingError::InvalidGuestRange { gpa, size });
         }
 
-        let file_offset = region.file_offset().ok_or_else(|| {
-            io::Error::other(format!("region for gpa 0x{gpa:x} has no backing file"))
-        })?;
-        let offset = region_offset
-            .checked_add(file_offset.start())
-            .ok_or_else(|| io::Error::other("offset overflow in DMA map"))?;
+        let file_offset = region
+            .file_offset()
+            .ok_or(ExternalDmaMappingError::MissingBackingFile { gpa })?;
+        let offset = region_offset.checked_add(file_offset.start()).ok_or(
+            ExternalDmaMappingError::FileOffsetOverflow {
+                file_offset: file_offset.start(),
+                region_offset,
+            },
+        )?;
 
         self.client
             .lock()
             .unwrap()
             .dma_map(offset, iova, size, file_offset.file().as_raw_fd())
-            .map_err(|e| io::Error::other(format!("Error mapping region: {e}")))
+            .map_err(|e| ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: e.into(),
+            })
     }
 
-    fn unmap(&self, iova: u64, size: u64) -> result::Result<(), io::Error> {
+    fn unmap(&self, iova: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
         self.client
             .lock()
             .unwrap()
             .dma_unmap(iova, size)
-            .map_err(|e| io::Error::other(format!("Error unmapping region: {e}")))
+            .map_err(|e| ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: e.into(),
+            })
     }
 }

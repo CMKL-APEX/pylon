@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -91,6 +90,7 @@ use crate::coredump::{
 };
 use crate::device_manager::{DeviceManager, DeviceManagerError};
 use crate::device_tree::DeviceTree;
+use crate::external_fds::UpdateFdsError;
 #[cfg(feature = "guest_debug")]
 use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayload};
 #[cfg(feature = "igvm")]
@@ -326,6 +326,10 @@ pub enum Error {
     /// Cannot apply NUMA memory zone updates
     #[error("Error applying memory zone updates")]
     ApplyMemoryZoneUpdate(#[source] MemoryZoneUpdateError),
+
+    /// Error updating file descriptors.
+    #[error("Error updating file descriptors")]
+    FdUpdate(#[from] UpdateFdsError),
 }
 pub type Result<T> = result::Result<T, Error>;
 
@@ -2106,7 +2110,7 @@ impl Vm {
             if let Some(new_region) = &new_region {
                 let device_manager = self.device_manager.lock().unwrap();
                 device_manager
-                    .update_memory(new_region)
+                    .add_memory_region(new_region)
                     .map_err(Error::DeviceManager)?;
 
                 match hotplug_method {
@@ -2439,7 +2443,7 @@ impl Vm {
         Ok(pci_device_info)
     }
 
-    pub fn counters(&self) -> Result<HashMap<String, HashMap<&'static str, Wrapping<u64>>>> {
+    pub fn counters(&self) -> Result<HashMap<String, HashMap<&'static str, serde_json::Value>>> {
         Ok(self.device_manager.lock().unwrap().counters())
     }
 

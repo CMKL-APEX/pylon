@@ -60,12 +60,11 @@ const VFIO_IOMMU_MAP_DMA: u64 = 0x3b71;
 const VFIO_IOMMU_UNMAP_DMA: u64 = 0x3b72;
 
 // See include/uapi/linux/iommufd.h in the kernel code.
+const IOMMU_DESTROY: u64 = 0x3b80;
 const IOMMU_IOAS_MAP: u64 = 0x3b85;
 const IOMMU_IOAS_UNMAP: u64 = 0x3b86;
 
 // See include/uapi/linux/kvm.h in the kernel code.
-#[cfg(feature = "kvm")]
-const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020_ae46;
 #[cfg(feature = "kvm")]
 const KVM_SET_USER_MEMORY_REGION2: u64 = 0x40a0_ae49;
 
@@ -107,12 +106,11 @@ fn create_virtio_iommu_ioctl_seccomp_rule() -> Vec<SeccompRule> {
 
 fn create_virtio_mem_ioctl_seccomp_rule() -> Vec<SeccompRule> {
     or![
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_DESTROY).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_MAP_DMA).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_UNMAP_DMA).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP).unwrap()],
-        #[cfg(feature = "kvm")]
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION).unwrap()],
         #[cfg(feature = "kvm")]
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION2).unwrap()],
         #[cfg(feature = "mshv")]
@@ -327,6 +325,17 @@ fn virtio_vsock_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_connect, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_ioctl, create_vsock_ioctl_seccomp_rule()),
+        (libc::SYS_recvmsg, vec![]),
+        (
+            libc::SYS_setsockopt,
+            vec![
+                SeccompRule::new(vec![
+                    Cond::new(1, ArgLen::Dword, Eq, libc::SOL_SOCKET as u64).unwrap(),
+                    Cond::new(2, ArgLen::Dword, Eq, libc::SO_PASSCRED as u64).unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_shutdown, vec![]),

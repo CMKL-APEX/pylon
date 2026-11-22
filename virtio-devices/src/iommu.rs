@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -15,14 +15,14 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
-use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_device::interrupt::{InterruptRemapping, MsiIrqSourceConfig};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
     GuestMemoryBackend, GuestMemoryError, GuestMemoryLoadGuard,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vm_virtio::AccessPlatform;
+use vm_virtio::{AccessPlatform, AccessType};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{
@@ -32,6 +32,7 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
+use crate::thread_helper::PauseCommon;
 use crate::{DmaRemapping, GuestMemory, VirtioInterrupt, VirtioInterruptType};
 
 /// Queues sizes
@@ -328,9 +329,9 @@ enum Error {
     #[error("Guest sent us invalid PROBE request")]
     InvalidProbeRequest,
     #[error("Failed to perform external mapping")]
-    ExternalMapping(#[source] io::Error),
+    ExternalMapping(#[source] ExternalDmaMappingError),
     #[error("Failed to perform external unmapping")]
-    ExternalUnmapping(#[source] io::Error),
+    ExternalUnmapping(#[source] ExternalDmaMappingError),
     #[error("Failed adding used index")]
     QueueAddUsed(#[source] virtio_queue::Error),
 }
@@ -672,6 +673,7 @@ impl Request {
                         Mapping {
                             gpa: req.phys_start,
                             size,
+                            flags: req.flags,
                         },
                     );
                 }
@@ -695,6 +697,7 @@ impl Request {
                     // Copy the value to use it as a proper reference.
                     let domain_id = req.domain;
                     let virt_start = req.virt_start;
+                    let virt_end = req.virt_end;
 
                     if let Some(domain) = mapping.domains.read().unwrap().get(&domain_id) {
                         if domain.bypass {
@@ -704,8 +707,7 @@ impl Request {
                         return Err(Error::InvalidUnmapRequestMissingDomain);
                     }
 
-                    let Some(size) = req
-                        .virt_end
+                    let Some(size) = virt_end
                         .checked_sub(virt_start)
                         .and_then(|d| d.checked_add(1))
                     else {
@@ -721,15 +723,23 @@ impl Request {
                         let Some(domain) = domains.get(&domain_id) else {
                             return Err(Error::InvalidUnmapRequestMissingDomain);
                         };
-                        for (&start, m) in domain.mappings.iter() {
-                            let Some(end) = inclusive_end(start, m.size) else {
-                                continue;
-                            };
-                            let overlaps = start <= req.virt_end && end >= req.virt_start;
-                            let split = start < req.virt_start || end > req.virt_end;
-                            if overlaps && split {
-                                return Err(Error::InvalidUnmapRequestPartialOverlap);
-                            }
+                        let split_before = domain
+                            .mappings
+                            .range(..virt_start)
+                            .next_back()
+                            .and_then(|(&start, m)| inclusive_end(start, m.size))
+                            .is_some_and(|end| end >= virt_start);
+                        if split_before {
+                            return Err(Error::InvalidUnmapRequestPartialOverlap);
+                        }
+                        let split_after = domain
+                            .mappings
+                            .range(virt_start..=virt_end)
+                            .next_back()
+                            .and_then(|(&start, m)| inclusive_end(start, m.size))
+                            .is_some_and(|end| end > virt_end);
+                        if split_after {
+                            return Err(Error::InvalidUnmapRequestPartialOverlap);
                         }
                     }
 
@@ -756,9 +766,11 @@ impl Request {
                     let Some(domain) = domains.get_mut(&domain_id) else {
                         return Err(Error::InvalidUnmapRequestMissingDomain);
                     };
-                    domain
-                        .mappings
-                        .retain(|&x, _| x < req.virt_start || x > req.virt_end);
+                    while let Some((&start, _)) =
+                        domain.mappings.range(virt_start..=virt_end).next()
+                    {
+                        domain.mappings.remove(&start);
+                    }
                 }
                 VIRTIO_IOMMU_T_PROBE => {
                     if desc_size_left != size_of::<VirtioIommuReqProbe>() {
@@ -947,14 +959,10 @@ impl IommuEpollHandler {
             })
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.request_queue_evt.as_raw_fd(), REQUEST_Q_EVENT)?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -998,6 +1006,21 @@ impl EpollHelperHandler for IommuEpollHandler {
 struct Mapping {
     gpa: u64,
     size: u64,
+    #[serde(default = "Mapping::unrestricted_flags")]
+    flags: u32,
+}
+
+impl Mapping {
+    fn unrestricted_flags() -> u32 {
+        VIRTIO_IOMMU_MAP_F_READ | VIRTIO_IOMMU_MAP_F_WRITE
+    }
+
+    fn allows(&self, access_type: AccessType) -> bool {
+        match access_type {
+            AccessType::Read => self.flags & VIRTIO_IOMMU_MAP_F_READ != 0,
+            AccessType::Write => self.flags & VIRTIO_IOMMU_MAP_F_WRITE != 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1039,16 +1062,18 @@ fn span_end(addr: u64, size: u64) -> io::Result<u64> {
 /// may cross more than one mapping as long as those mappings are adjacent in
 /// IOVA space and contiguous in GPA space, so a buffer the guest mapped with
 /// several mappings still resolves to a single physical range. Returns None
-/// when `addr` is unmapped, a gap is hit before `end`, or the covered range is
-/// not physically contiguous.
+/// when `addr` is unmapped, a gap is hit before `end`, the covered range is
+/// not physically contiguous, or a covering mapping doesn't allow
+/// `access_type`.
 fn translate_contiguous_range(
     mappings: &BTreeMap<u64, Mapping>,
     addr: u64,
     end: u64,
+    access_type: AccessType,
 ) -> Option<u64> {
     // The mapping containing `addr` is the one with the greatest start <= addr.
     let (&start_key, start) = mappings.range(..=addr).next_back()?;
-    if addr > inclusive_end(start_key, start.size)? {
+    if addr > inclusive_end(start_key, start.size)? || !start.allows(access_type) {
         return None;
     }
     let base_gpa = addr - start_key + start.gpa;
@@ -1061,7 +1086,7 @@ fn translate_contiguous_range(
         if end < covered {
             break;
         }
-        if key != covered || value.gpa != next_gpa {
+        if key != covered || value.gpa != next_gpa || !value.allows(access_type) {
             return None;
         }
         covered = key.checked_add(value.size)?;
@@ -1072,8 +1097,14 @@ fn translate_contiguous_range(
 }
 
 impl DmaRemapping for IommuMapping {
-    fn translate_gva(&self, id: u32, addr: u64, size: u64) -> io::Result<u64> {
-        debug!("Translate GVA addr 0x{addr:x} size 0x{size:x}");
+    fn translate_gva(
+        &self,
+        id: u32,
+        addr: u64,
+        size: u64,
+        access_type: AccessType,
+    ) -> io::Result<u64> {
+        debug!("Translate GVA addr 0x{addr:x} size 0x{size:x} access {access_type:?}");
         let end = span_end(addr, size)?;
         if let Some(domain_id) = self.endpoints.read().unwrap().get(&id) {
             if let Some(domain) = self.domains.read().unwrap().get(domain_id) {
@@ -1083,7 +1114,9 @@ impl DmaRemapping for IommuMapping {
                     return Ok(addr);
                 }
 
-                if let Some(new_addr) = translate_contiguous_range(&domain.mappings, addr, end) {
+                if let Some(new_addr) =
+                    translate_contiguous_range(&domain.mappings, addr, end, access_type)
+                {
                     debug!("Into GPA addr 0x{new_addr:x}");
                     return Ok(new_addr);
                 }
@@ -1093,7 +1126,7 @@ impl DmaRemapping for IommuMapping {
         }
 
         Err(io::Error::other(format!(
-            "failed to translate GVA addr 0x{addr:x} size 0x{size:x}"
+            "failed to translate GVA addr 0x{addr:x} size 0x{size:x} access {access_type:?}"
         )))
     }
 
@@ -1136,7 +1169,8 @@ impl InterruptRemapping for IommuMapping {
         let gpa = if (start..=end).contains(&addr) {
             addr
         } else {
-            self.translate_gva(dev_id, addr, size_of::<u32>() as u64)
+            // An MSI is a device write to the doorbell.
+            self.translate_gva(dev_id, addr, size_of::<u32>() as u64, AccessType::Write)
                 .ok()?
         };
 
@@ -1161,8 +1195,8 @@ impl AccessPlatformMapping {
 }
 
 impl AccessPlatform for AccessPlatformMapping {
-    fn translate_gva(&self, base: u64, size: u64) -> io::Result<u64> {
-        self.mapping.translate_gva(self.id, base, size)
+    fn translate_gva(&self, base: u64, size: u64, access_type: AccessType) -> io::Result<u64> {
+        self.mapping.translate_gva(self.id, base, size, access_type)
     }
     fn translate_gpa(&self, base: u64, size: u64) -> io::Result<u64> {
         self.mapping.translate_gpa(self.id, base, size)
@@ -1195,6 +1229,37 @@ pub struct IommuState {
     probe_size: u32,
 }
 
+fn restore_domain_mappings(entries: Vec<(u64, Mapping)>) -> io::Result<BTreeMap<u64, Mapping>> {
+    let mut mappings: BTreeMap<u64, Mapping> = BTreeMap::new();
+    for (start, m) in entries {
+        let end = inclusive_end(start, m.size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid restored IOMMU mapping: start 0x{start:x} size 0x{:x}",
+                    m.size
+                ),
+            )
+        })?;
+        if mappings
+            .range(..=end)
+            .next_back()
+            .and_then(|(&s, prev)| inclusive_end(s, prev.size))
+            .is_some_and(|prev_end| prev_end >= start)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "overlapping restored IOMMU mapping: start 0x{start:x} size 0x{:x}",
+                    m.size
+                ),
+            ));
+        }
+        mappings.insert(start, m);
+    }
+    Ok(mappings)
+}
+
 impl Iommu {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -1217,16 +1282,16 @@ impl Iommu {
                     state
                         .domains
                         .into_iter()
-                        .map(|(k, v)| {
-                            (
+                        .map(|(k, (entries, bypass))| {
+                            Ok((
                                 k,
                                 Domain {
-                                    mappings: v.0.into_iter().collect(),
-                                    bypass: v.1,
+                                    mappings: restore_domain_mappings(entries)?,
+                                    bypass,
                                 },
-                            )
+                            ))
                         })
-                        .collect(),
+                        .collect::<io::Result<BTreeMap<_, _>>>()?,
                     true,
                     Some(state.probe_size),
                 )
@@ -1287,10 +1352,8 @@ impl Iommu {
                     queue_sizes: QUEUE_SIZES.to_vec(),
                     avail_features,
                     acked_features,
-                    paused_sync: Some(Arc::new(Barrier::new(2))),
                     min_queues: NUM_QUEUES,
-                    paused: Arc::new(AtomicBool::new(paused)),
-                    ..Default::default()
+                    ..VirtioCommon::new(paused)?
                 },
                 config,
                 mapping: Arc::clone(&mapping),
@@ -1432,8 +1495,6 @@ impl VirtioDevice for Iommu {
             input_range: self.input_range,
         };
 
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
         self.common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -1441,7 +1502,7 @@ impl VirtioDevice for Iommu {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);
@@ -1481,13 +1542,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, RwLock, Weak};
+    use std::sync::{Arc, Mutex, RwLock, Weak};
 
     use seccompiler::SeccompAction;
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::QueueT;
-    use vm_device::dma_mapping::ExternalDmaMapping;
+    use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
     use vm_memory::{ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+    use vm_virtio::AccessType;
     use vm_virtio::queue::testing::VirtQueue;
     use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
@@ -1504,11 +1566,11 @@ mod tests {
     struct MockMapping;
 
     impl ExternalDmaMapping for MockMapping {
-        fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> Result<(), io::Error> {
+        fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> Result<(), ExternalDmaMappingError> {
             Ok(())
         }
 
-        fn unmap(&self, _iova: u64, _size: u64) -> Result<(), io::Error> {
+        fn unmap(&self, _iova: u64, _size: u64) -> Result<(), ExternalDmaMappingError> {
             Ok(())
         }
     }
@@ -1564,7 +1626,8 @@ mod tests {
     fn iommu_mapping(entries: &[(u64, u64, u64)]) -> IommuMapping {
         let mut mappings = BTreeMap::new();
         for &(iova, gpa, size) in entries {
-            mappings.insert(iova, Mapping { gpa, size });
+            let flags = Mapping::unrestricted_flags();
+            mappings.insert(iova, Mapping { gpa, size, flags });
         }
         let mut domains = BTreeMap::new();
         domains.insert(
@@ -1587,7 +1650,10 @@ mod tests {
     #[test]
     fn translate_within_single_mapping() {
         let m = iommu_mapping(&[(0x1000, 0x4000, 0x1000)]);
-        assert_eq!(m.translate_gva(0, 0x1200, 0x100).unwrap(), 0x4200);
+        assert_eq!(
+            m.translate_gva(0, 0x1200, 0x100, AccessType::Read).unwrap(),
+            0x4200
+        );
     }
 
     #[test]
@@ -1595,29 +1661,76 @@ mod tests {
         // A buffer mapped with two adjacent mappings that resolve to a
         // contiguous physical range translates as one range.
         let m = iommu_mapping(&[(0x1000, 0x4000, 0x1000), (0x2000, 0x5000, 0x1000)]);
-        assert_eq!(m.translate_gva(0, 0x1000, 0x2000).unwrap(), 0x4000);
+        assert_eq!(
+            m.translate_gva(0, 0x1000, 0x2000, AccessType::Read)
+                .unwrap(),
+            0x4000
+        );
         // A sub-range that straddles the boundary also resolves.
-        assert_eq!(m.translate_gva(0, 0x1f00, 0x200).unwrap(), 0x4f00);
+        assert_eq!(
+            m.translate_gva(0, 0x1f00, 0x200, AccessType::Read).unwrap(),
+            0x4f00
+        );
     }
 
     #[test]
     fn reject_spanning_noncontiguous_mappings() {
         // Adjacent in IOVA but disjoint in GPA cannot be one range.
         let m = iommu_mapping(&[(0x1000, 0x4000, 0x1000), (0x2000, 0x9000, 0x1000)]);
-        m.translate_gva(0, 0x1000, 0x2000).unwrap_err();
+        m.translate_gva(0, 0x1000, 0x2000, AccessType::Read)
+            .unwrap_err();
     }
 
     #[test]
     fn reject_span_across_iova_gap() {
         // A hole between mappings leaves part of the span unmapped.
         let m = iommu_mapping(&[(0x1000, 0x4000, 0x1000), (0x3000, 0x6000, 0x1000)]);
-        m.translate_gva(0, 0x1000, 0x2000).unwrap_err();
+        m.translate_gva(0, 0x1000, 0x2000, AccessType::Read)
+            .unwrap_err();
     }
 
     #[test]
     fn reject_unmapped_base() {
         let m = iommu_mapping(&[(0x1000, 0x4000, 0x1000)]);
-        m.translate_gva(0, 0x2500, 0x10).unwrap_err();
+        m.translate_gva(0, 0x2500, 0x10, AccessType::Read)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn device_writes_require_map_write_flag() {
+        let mapping = Arc::new(iommu_mapping(&[]));
+        for (virt_start, phys_start, flags) in [
+            (
+                0x1000,
+                0x4000,
+                super::VIRTIO_IOMMU_MAP_F_READ | super::VIRTIO_IOMMU_MAP_F_WRITE,
+            ),
+            (0x2000, 0x5000, super::VIRTIO_IOMMU_MAP_F_READ),
+        ] {
+            let request = VirtioIommuReqMap {
+                domain: 0,
+                virt_start,
+                virt_end: virt_start + 0xfff,
+                phys_start,
+                flags,
+            };
+            let (_, status) =
+                process_request(VIRTIO_IOMMU_T_MAP, request, &mapping, &BTreeMap::new());
+            assert_eq!(status, VIRTIO_IOMMU_S_OK);
+        }
+
+        let write = |addr, size| mapping.translate_gva(0, addr, size, AccessType::Write);
+        assert_eq!(write(0x1000, 0x100).unwrap(), 0x4000);
+        write(0x2000, 0x100).unwrap_err();
+        // A write spanning both mappings needs both to allow writes.
+        write(0x1f00, 0x200).unwrap_err();
+        // Both mappings allow reads.
+        assert_eq!(
+            mapping
+                .translate_gva(0, 0x1f00, 0x200, AccessType::Read)
+                .unwrap(),
+            0x4f00
+        );
     }
 
     const TAIL_LEN: usize = size_of::<VirtioIommuReqTail>();
@@ -1734,12 +1847,21 @@ mod tests {
     struct FailingMapping;
 
     impl ExternalDmaMapping for FailingMapping {
-        fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> Result<(), io::Error> {
-            Err(io::Error::other("map failed"))
+        fn map(&self, iova: u64, gpa: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
+            Err(ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            })
         }
 
-        fn unmap(&self, _iova: u64, _size: u64) -> Result<(), io::Error> {
-            Err(io::Error::other("unmap failed"))
+        fn unmap(&self, iova: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
+            Err(ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            })
         }
     }
 
@@ -1811,5 +1933,305 @@ mod tests {
         assert_eq!(len.unwrap(), 0);
         assert_eq!(status, INITIAL_STATUS);
         assert_eq!(mapping.endpoints.read().unwrap().get(&0), Some(&0));
+    }
+
+    #[test]
+    fn restore_validates_domain_mappings() {
+        let base_state = new_iommu().state();
+        let entry = |iova, gpa, size| {
+            (
+                iova,
+                Mapping {
+                    gpa,
+                    size,
+                    flags: Mapping::unrestricted_flags(),
+                },
+            )
+        };
+        let restore_entries = |entries: Vec<(u64, Mapping)>| {
+            let state = super::IommuState {
+                avail_features: base_state.avail_features,
+                acked_features: base_state.acked_features,
+                endpoints: vec![(0, 0)],
+                domains: vec![(0, (entries, false))],
+                probe_size: base_state.probe_size,
+            };
+            Iommu::new(
+                "test-iommu-restore".to_string(),
+                SeccompAction::Allow,
+                EventFd::new(EFD_NONBLOCK).unwrap(),
+                (0, 0),
+                Vec::new(),
+                64,
+                false,
+                Some(state),
+            )
+        };
+
+        // Disjoint mappings (even in unsorted order) restore cleanly.
+        let (_, restored) = restore_entries(vec![
+            entry(0x3000, 0x9000, 0x1000),
+            entry(0x1000, 0x4000, 0x2000),
+        ])
+        .unwrap();
+        assert_eq!(
+            restored
+                .translate_gva(0, 0x1000, 0x1000, AccessType::Read)
+                .unwrap(),
+            0x4000
+        );
+        assert_eq!(
+            restored
+                .translate_gva(0, 0x3000, 0x1000, AccessType::Read)
+                .unwrap(),
+            0x9000
+        );
+
+        // Zero size, u64 overflow, overlapping, and duplicate-start entries fail.
+        for bad_entries in [
+            vec![entry(0x1000, 0x4000, 0)],
+            vec![entry(u64::MAX - 0xfff, 0x4000, 0x2000)],
+            vec![entry(0x1000, 0x4000, 0x3000), entry(0x2000, 0x8000, 0x1000)],
+            vec![entry(0x2000, 0x8000, 0x1000), entry(0x1000, 0x4000, 0x1001)],
+            vec![entry(0x1000, 0x4000, 0x1000), entry(0x1000, 0x8000, 0x1000)],
+        ] {
+            let err = restore_entries(bad_entries).err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    struct UnmapRecorder {
+        unmaps: Arc<Mutex<Vec<(u32, u64, u64)>>>,
+        id: u32,
+    }
+
+    impl ExternalDmaMapping for UnmapRecorder {
+        fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> Result<(), ExternalDmaMappingError> {
+            Ok(())
+        }
+
+        fn unmap(&self, iova: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
+            self.unmaps.lock().unwrap().push((self.id, iova, size));
+            Ok(())
+        }
+    }
+
+    fn run_unmap(
+        virt_start: u64,
+        virt_end: u64,
+        mapping: &Arc<IommuMapping>,
+        ext_mapping: &BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
+    ) -> (Result<usize, Error>, u8) {
+        let request = VirtioIommuReqUnmap {
+            domain: 0,
+            virt_start,
+            virt_end,
+            ..Default::default()
+        };
+        process_request(VIRTIO_IOMMU_T_UNMAP, request, mapping, ext_mapping)
+    }
+
+    fn remaining_iovas(mapping: &IommuMapping) -> Vec<u64> {
+        mapping.domains.read().unwrap()[&0]
+            .mappings
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn unmap_exact_single_mapping() {
+        let mapping = Arc::new(iommu_mapping(&[
+            (0x1000, 0x4000, 0x1000),
+            (0x2000, 0x5000, 0x2000),
+            (0x5000, 0x8000, 0x1000),
+        ]));
+        mapping.endpoints.write().unwrap().insert(7, 0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let ext: BTreeMap<u32, Arc<dyn ExternalDmaMapping>> = BTreeMap::from([
+            (
+                0,
+                Arc::new(UnmapRecorder {
+                    unmaps: Arc::clone(&calls),
+                    id: 0,
+                }) as Arc<dyn ExternalDmaMapping>,
+            ),
+            (
+                7,
+                Arc::new(UnmapRecorder {
+                    unmaps: Arc::clone(&calls),
+                    id: 7,
+                }) as Arc<dyn ExternalDmaMapping>,
+            ),
+        ]);
+
+        let (len, status) = run_unmap(0x2000, 0x3fff, &mapping, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_OK);
+        assert_eq!(remaining_iovas(&mapping), vec![0x1000, 0x5000]);
+        mapping
+            .translate_gva(0, 0x2000, 0x1000, AccessType::Read)
+            .unwrap_err();
+        assert_eq!(
+            mapping
+                .translate_gva(0, 0x1000, 0x1000, AccessType::Read)
+                .unwrap(),
+            0x4000
+        );
+        assert_eq!(
+            mapping
+                .translate_gva(0, 0x5000, 0x1000, AccessType::Read)
+                .unwrap(),
+            0x8000
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0, 0x2000, 0x2000), (7, 0x2000, 0x2000)]
+        );
+    }
+
+    #[test]
+    fn unmap_covering_multiple_mappings() {
+        let mapping = Arc::new(iommu_mapping(&[
+            (0x1000, 0x4000, 0x1000),
+            (0x2000, 0x5000, 0x1000),
+            (0x4000, 0x6000, 0x1000),
+            (0x6000, 0x7000, 0x1000),
+        ]));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let ext: BTreeMap<u32, Arc<dyn ExternalDmaMapping>> = BTreeMap::from([(
+            0,
+            Arc::new(UnmapRecorder {
+                unmaps: Arc::clone(&calls),
+                id: 0,
+            }) as Arc<dyn ExternalDmaMapping>,
+        )]);
+
+        let (len, status) = run_unmap(0x2000, 0x4fff, &mapping, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_OK);
+        assert_eq!(remaining_iovas(&mapping), vec![0x1000, 0x6000]);
+        assert_eq!(*calls.lock().unwrap(), vec![(0, 0x2000, 0x3000)]);
+    }
+
+    #[test]
+    fn unmap_rejects_partial_overlap_without_side_effects() {
+        // Two disjoint mappings: [0x2000, 0x3fff] and [0x5000, 0x6fff].
+        let mapping = Arc::new(iommu_mapping(&[
+            (0x2000, 0x4000, 0x2000),
+            (0x5000, 0x8000, 0x2000),
+        ]));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let ext: BTreeMap<u32, Arc<dyn ExternalDmaMapping>> = BTreeMap::from([(
+            0,
+            Arc::new(UnmapRecorder {
+                unmaps: Arc::clone(&calls),
+                id: 0,
+            }) as Arc<dyn ExternalDmaMapping>,
+        )]);
+
+        for (virt_start, virt_end) in [
+            (0x2000, 0x2fff), // first half of [0x2000, 0x3fff]
+            (0x3000, 0x3fff), // second half of [0x2000, 0x3fff]
+            (0x2400, 0x2bff), // strictly inside [0x2000, 0x3fff]
+            (0x1000, 0x2fff), // overlaps start of [0x2000, 0x3fff]
+            (0x3000, 0x4fff), // overlaps end of [0x2000, 0x3fff]
+            (0x3fff, 0x4fff), // 1-byte overlap at inclusive end of [0x2000, 0x3fff]
+            (0x4000, 0x5000), // 1-byte overlap at start of [0x5000, 0x6fff]
+            (0x3000, 0x6fff), // splits [0x2000, 0x3fff] while fully covering [0x5000, 0x6fff]
+            (0x2000, 0x5fff), // fully covers [0x2000, 0x3fff] while splitting [0x5000, 0x6fff]
+            (0x3000, 0x5fff), // splits both mappings
+        ] {
+            let (len, status) = run_unmap(virt_start, virt_end, &mapping, &ext);
+            assert_eq!(
+                len.unwrap(),
+                TAIL_LEN,
+                "expected reply tail for [{virt_start:#x}, {virt_end:#x}]"
+            );
+            assert_eq!(status, VIRTIO_IOMMU_S_RANGE);
+            assert_eq!(remaining_iovas(&mapping), vec![0x2000, 0x5000]);
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn unmap_range_with_no_mappings_is_noop() {
+        let mapping = Arc::new(iommu_mapping(&[
+            (0x2000, 0x4000, 0x1000),
+            (0x5000, 0x8000, 0x1000),
+        ]));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let ext: BTreeMap<u32, Arc<dyn ExternalDmaMapping>> = BTreeMap::from([(
+            0,
+            Arc::new(UnmapRecorder {
+                unmaps: Arc::clone(&calls),
+                id: 0,
+            }) as Arc<dyn ExternalDmaMapping>,
+        )]);
+
+        for (virt_start, virt_end) in [
+            (0x0, 0xfff),     // before all mappings
+            (0x1000, 0x1fff), // adjacent before 0x2000
+            (0x3000, 0x4fff), // hole between 0x2000..=0x2fff and 0x5000..=0x5fff
+            (0x6000, 0x6fff), // adjacent after 0x5000..=0x5fff
+            (0x9000, 0x9fff), // after all mappings
+        ] {
+            let (len, status) = run_unmap(virt_start, virt_end, &mapping, &ext);
+            assert_eq!(len.unwrap(), TAIL_LEN);
+            assert_eq!(status, VIRTIO_IOMMU_S_OK);
+            assert_eq!(remaining_iovas(&mapping), vec![0x2000, 0x5000]);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 5);
+
+        let empty = Arc::new(iommu_mapping(&[]));
+        let (len, status) = run_unmap(0x0, 0xfff, &empty, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_OK);
+        assert!(remaining_iovas(&empty).is_empty());
+    }
+
+    #[test]
+    fn unmap_boundary_cases_at_zero_and_u64_max() {
+        let last_page = u64::MAX - 0xfff;
+        let mapping = Arc::new(iommu_mapping(&[
+            (0x0, 0x4000, 0x1000),
+            (last_page, 0x8000, 0x1000),
+        ]));
+        let ext = BTreeMap::new();
+
+        // Full 64-bit range [0, u64::MAX] overflows size calculation -> S_RANGE.
+        let (len, status) = run_unmap(0, u64::MAX, &mapping, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_RANGE);
+
+        // Reversed range virt_start > virt_end -> S_RANGE.
+        let (len, status) = run_unmap(0x2000, 0x1000, &mapping, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_RANGE);
+
+        // Partial overlaps at 0 and u64::MAX -> S_RANGE.
+        for (virt_start, virt_end) in [
+            (0x0, 0x7ff),
+            (0x800, 0xfff),
+            (last_page, u64::MAX - 0x800),
+            (u64::MAX - 0x7ff, u64::MAX),
+        ] {
+            let (len, status) = run_unmap(virt_start, virt_end, &mapping, &ext);
+            assert_eq!(len.unwrap(), TAIL_LEN);
+            assert_eq!(status, VIRTIO_IOMMU_S_RANGE);
+            assert_eq!(remaining_iovas(&mapping), vec![0x0, last_page]);
+        }
+
+        // Exact unmap at 0 succeeds and leaves last_page.
+        let (len, status) = run_unmap(0x0, 0xfff, &mapping, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_OK);
+        assert_eq!(remaining_iovas(&mapping), vec![last_page]);
+
+        // Exact unmap at u64::MAX succeeds and leaves domain empty.
+        let (len, status) = run_unmap(last_page, u64::MAX, &mapping, &ext);
+        assert_eq!(len.unwrap(), TAIL_LEN);
+        assert_eq!(status, VIRTIO_IOMMU_S_OK);
+        assert!(remaining_iovas(&mapping).is_empty());
     }
 }

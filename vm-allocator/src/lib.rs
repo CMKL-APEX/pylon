@@ -11,6 +11,7 @@
 //! Manages system resources that can be allocated to VMs and their devices.
 
 mod address;
+mod aligned_mapping;
 mod gsi;
 /// page size related utility functions
 pub mod page_size;

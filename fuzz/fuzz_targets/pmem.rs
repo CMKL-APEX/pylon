@@ -20,7 +20,7 @@ use vm_allocator::{GuestMemory, GuestRegion};
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic, MmapRegion};
 use vm_migration::{Pausable, Snapshottable};
-use vm_virtio::AccessPlatform;
+use vm_virtio::{AccessPlatform, AccessType};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 const MEM_SIZE: usize = 2 * 1024 * 1024;
@@ -219,7 +219,6 @@ fn exercise_device_api(pmem: &mut Pmem, cursor: &mut FuzzCursor<'_>, enable_acce
         (features & !access_platform_feature) & feature_noise
     };
     pmem.ack_features(acked_features);
-    let _ = pmem.userspace_mappings();
 
     let mut config = [0u8; size_of::<u64>() * 2];
     let config_len = 1 + (cursor.next_u8() as usize % config.len());
@@ -464,7 +463,7 @@ struct FuzzAccessPlatform {
 }
 
 impl AccessPlatform for FuzzAccessPlatform {
-    fn translate_gva(&self, base: u64, _size: u64) -> io::Result<u64> {
+    fn translate_gva(&self, base: u64, _size: u64, _access_type: AccessType) -> io::Result<u64> {
         if self.fail_on_odd && (base & 1) != 0 {
             Err(io::Error::other("fuzz gva translation failure"))
         } else {

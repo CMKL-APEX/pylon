@@ -77,6 +77,9 @@ const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 // KVM hint bits (EDX of leaf 0x4000_0001)
 const KVM_HINTS_REALTIME: u8 = 0;
 
+const SVM_FEATURES_LEAF: u32 = 0x8000_000a;
+const EXTENDED_FEATURE_IDENTIFICATION2_LEAF: u32 = 0x8000_0021;
+
 pub const _NSIG: i32 = 65;
 
 #[derive(Debug, Copy, Clone)]
@@ -98,6 +101,7 @@ pub struct CpuidConfig {
     pub kvm_hyperv: bool,
     pub kvm_hint_realtime: bool,
     pub amx: bool,
+    pub nested: bool,
     pub cpuid_overrides: Vec<CpuidOverride>,
 }
 
@@ -579,6 +583,18 @@ impl CpuidFeatureEntry {
                 feature_reg: CpuidReg::EBX,
                 compatible_check: CpuidCompatibleCheck::BitwiseSubset,
             },
+            CpuidFeatureEntry {
+                function: EXTENDED_FEATURE_IDENTIFICATION2_LEAF,
+                index: 0,
+                feature_reg: CpuidReg::ECX,
+                compatible_check: CpuidCompatibleCheck::BitwiseSubset,
+            },
+            CpuidFeatureEntry {
+                function: SVM_FEATURES_LEAF,
+                index: 0,
+                feature_reg: CpuidReg::EDX,
+                compatible_check: CpuidCompatibleCheck::BitwiseSubset,
+            },
             // KVM CPUID bits: https://www.kernel.org/doc/html/latest/virt/kvm/x86/cpuid.html
             // Leaf 0x4000_0000, EAX/EBX/ECX/EDX, KVM CPUID SIGNATURE
             CpuidFeatureEntry {
@@ -671,13 +687,87 @@ impl CpuidFeatureEntry {
     pub fn check_cpuid_compatibility(
         src_vm_cpuid: &[CpuIdEntry],
         dest_vm_cpuid: &[CpuIdEntry],
+        nested: bool,
     ) -> Result<(), Error> {
         Self::check_cpuid_compatibility_with_descriptions(
             src_vm_cpuid,
             "source VM",
             dest_vm_cpuid,
             "destination VM",
+            nested,
         )
+    }
+
+    fn extended_feature_identification2_eax_compatible(
+        src_vm_cpuid: &[CpuIdEntry],
+        src_description: &str,
+        dest_vm_cpuid: &[CpuIdEntry],
+        dest_description: &str,
+    ) -> bool {
+        // Defeatures need a superset check
+        const FS_GS_BASE_WRITE_NOT_SERIALIZING_MASK: u32 = 1 << 1;
+        const NO_SMM_CTL_MSR: u32 = 1 << 9;
+        const SUPERSET_EQ_MASK: u32 = FS_GS_BASE_WRITE_NOT_SERIALIZING_MASK | NO_SMM_CTL_MSR;
+
+        // The following require equality checks
+        const NULL_SELECT_CLEARS_BASE: u32 = 1 << 6;
+        const OPCODE_RECLAIM: u32 = 1 << 16;
+        // For now we apply caution and also require equality for the currently reserved bits
+        const RESERVED_MASK: u32 = (1 << 4) | (1 << 25) | (1 << 26);
+        const EQ_MASK: u32 = NULL_SELECT_CLEARS_BASE | OPCODE_RECLAIM | RESERVED_MASK;
+
+        // These should be ignored
+        const L2_TLB_SIZE_X32: u32 = 1 << 14;
+
+        const SUBSET_EQ_MASK: u32 = !(SUPERSET_EQ_MASK | EQ_MASK | L2_TLB_SIZE_X32);
+
+        let find_value = |entry: &CpuIdEntry| {
+            (entry.function == EXTENDED_FEATURE_IDENTIFICATION2_LEAF && entry.index == 0)
+                .then_some(entry.eax)
+        };
+        let src_vm_value = src_vm_cpuid.iter().find_map(find_value).unwrap_or(0);
+        let dest_vm_value = dest_vm_cpuid.iter().find_map(find_value).unwrap_or(0);
+        let mut compatible = true;
+
+        let log_error = |check: &str, src_val: u32, dest_val: u32, mask: u32| {
+            error!(
+                "Detected incompatible CPUID entry: leaf={EXTENDED_FEATURE_IDENTIFICATION2_LEAF:#04x} (subleaf=0), register=EAX, check_mask={mask:#04x} \
+                    compatible_check='{check}', {src_description} masked_feature='{src_val:#04x}', {dest_description} masked_feature='{dest_val:#04x}'.",
+            );
+        };
+
+        // Equality check
+        {
+            let src_value = src_vm_value & EQ_MASK;
+            let dest_value = dest_vm_value & EQ_MASK;
+            if src_value != dest_value {
+                compatible = false;
+                log_error("equality", src_value, dest_value, EQ_MASK);
+            }
+        }
+        // Superset check
+        {
+            let src_value = src_vm_value & SUPERSET_EQ_MASK;
+            let dest_value = dest_vm_value & SUPERSET_EQ_MASK;
+            let different_bits = src_value ^ dest_value;
+            let only_in_dest = dest_value & different_bits;
+            if only_in_dest != 0 {
+                compatible = false;
+                log_error("superset", src_value, dest_value, SUPERSET_EQ_MASK);
+            }
+        }
+        // Subset check
+        {
+            let src_value = src_vm_value & SUBSET_EQ_MASK;
+            let dest_value = dest_vm_value & SUBSET_EQ_MASK;
+            let different_bits = src_value ^ dest_value;
+            let only_in_src = src_value & different_bits;
+            if only_in_src != 0 {
+                compatible = false;
+                log_error("subset", src_value, dest_value, SUBSET_EQ_MASK);
+            }
+        }
+        compatible
     }
 
     /// Similar to `check_cpuid_compatibility`, but with the possibility to change
@@ -687,6 +777,7 @@ impl CpuidFeatureEntry {
         src_description: &str,
         dest_vm_cpuid: &[CpuIdEntry],
         dest_description: &str,
+        nested: bool,
     ) -> Result<(), Error> {
         let feature_entry_list = &Self::checked_feature_entry_list();
         let src_vm_features = Self::get_features_from_cpuid(src_vm_cpuid, feature_entry_list);
@@ -701,6 +792,11 @@ impl CpuidFeatureEntry {
             .enumerate()
         {
             let entry = &feature_entry_list[i];
+
+            if entry.function == SVM_FEATURES_LEAF && (!nested) {
+                // This leaf is only relevant in the case of nested virtualization
+                continue;
+            }
 
             let entry_compatible = match entry.compatible_check {
                 CpuidCompatibleCheck::BitwiseSubset => {
@@ -734,6 +830,13 @@ impl CpuidFeatureEntry {
                 compatible = false;
             }
         }
+
+        compatible &= Self::extended_feature_identification2_eax_compatible(
+            src_vm_cpuid,
+            src_description,
+            dest_vm_cpuid,
+            dest_description,
+        );
 
         if compatible {
             info!("No CPU incompatibility detected.");
@@ -837,6 +940,7 @@ pub fn generate_common_cpuid(
             "CPU Profile",
             &cpuid_host,
             "Host VM",
+            config.nested,
         )
         .map_err(|_| Error::CpuProfileCpuidIncompatibility)?;
         cpuid_profile
@@ -1863,6 +1967,47 @@ mod tests {
     }
 
     #[test]
+    fn extended_feature_identification2_zen4_to_5() {
+        let zen4_values = &[CpuIdEntry {
+            function: EXTENDED_FEATURE_IDENTIFICATION2_LEAF,
+            index: 0,
+            flags: 0,
+            eax: 0x18020367,
+            ebx: 0x00000000,
+            ecx: 0x00000000,
+            edx: 0x00000000,
+        }];
+
+        let zen5_values = &[CpuIdEntry {
+            function: EXTENDED_FEATURE_IDENTIFICATION2_LEAF,
+            index: 0,
+            flags: 0,
+            eax: 0x59120367,
+            ebx: 0x00000000,
+            ecx: 0x00000006,
+            edx: 0x00000000,
+        }];
+
+        let zen_4_to_5_compatibility =
+            CpuidFeatureEntry::extended_feature_identification2_eax_compatible(
+                zen4_values,
+                "Zen 4 src",
+                zen5_values,
+                "Zen 5 dest",
+            );
+        assert!(zen_4_to_5_compatibility);
+
+        let zen5_to_4_compatibility =
+            CpuidFeatureEntry::extended_feature_identification2_eax_compatible(
+                zen5_values,
+                "Zen 5 src",
+                zen4_values,
+                "Zen 4 dest",
+            );
+        assert!(!zen5_to_4_compatibility);
+    }
+
+    #[test]
     fn regions_base_addr() {
         let regions = arch_memory_regions();
         assert_eq!(6, regions.len());
@@ -2284,6 +2429,7 @@ mod tests {
                 kvm_hyperv: false,
                 kvm_hint_realtime,
                 amx: false,
+                nested: false,
                 cpuid_overrides: Vec::new(),
             };
             let updated = required_common_cpuid_updates(

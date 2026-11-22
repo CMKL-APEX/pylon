@@ -43,7 +43,6 @@ use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
 use log::debug;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
-use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "aarch64")]
@@ -95,9 +94,7 @@ use crate::arch::x86::{
 use crate::{ClockRestoreMode, ClockState};
 use crate::{
     CpuState, HypervisorType, HypervisorVmConfig, InterruptSourceConfig, IoEventAddress,
-    IrqRoutingEntry, MpState, StandardRegisters, USER_MEMORY_REGION_GUEST_MEMFD,
-    USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
-    UserMemoryRegion, VmOps, cpu, hypervisor, vm,
+    IrqRoutingEntry, MpState, StandardRegisters, VmOps, cpu, hypervisor, vm,
 };
 // aarch64 dependencies
 #[cfg(target_arch = "aarch64")]
@@ -118,8 +115,7 @@ pub use kvm_bindings::{
     KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
     KVM_MSI_VALID_DEVID, kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
     kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region,
-    kvm_userspace_memory_region2,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region2,
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
@@ -279,62 +275,6 @@ fn make_segment(sev_selector: SevSelector) -> Segment {
     }
 }
 
-impl From<kvm_userspace_memory_region2> for UserMemoryRegion {
-    fn from(region: kvm_userspace_memory_region2) -> Self {
-        let mut flags = USER_MEMORY_REGION_READ;
-        if region.flags & KVM_MEM_READONLY == 0 {
-            flags |= USER_MEMORY_REGION_WRITE;
-        }
-        if region.flags & KVM_MEM_LOG_DIRTY_PAGES != 0 {
-            flags |= USER_MEMORY_REGION_LOG_DIRTY;
-        }
-        if region.flags & KVM_MEM_GUEST_MEMFD != 0 {
-            flags |= USER_MEMORY_REGION_GUEST_MEMFD;
-        }
-
-        UserMemoryRegion {
-            slot: region.slot,
-            guest_phys_addr: region.guest_phys_addr,
-            memory_size: region.memory_size,
-            userspace_addr: region.userspace_addr,
-            flags,
-            guest_memfd: Some(region.guest_memfd),
-            guest_memfd_offset: Some(region.guest_memfd_offset),
-        }
-    }
-}
-
-impl From<UserMemoryRegion> for kvm_userspace_memory_region2 {
-    fn from(region: UserMemoryRegion) -> Self {
-        assert_ne!(
-            region.flags & USER_MEMORY_REGION_READ,
-            0,
-            "KVM mapped memory is always readable"
-        );
-
-        let mut flags = 0;
-        if region.flags & USER_MEMORY_REGION_WRITE == 0 {
-            flags |= KVM_MEM_READONLY;
-        }
-        if region.flags & USER_MEMORY_REGION_LOG_DIRTY != 0 {
-            flags |= KVM_MEM_LOG_DIRTY_PAGES;
-        }
-        if region.flags & USER_MEMORY_REGION_GUEST_MEMFD != 0 {
-            flags |= KVM_MEM_GUEST_MEMFD;
-        }
-
-        kvm_userspace_memory_region2 {
-            slot: region.slot,
-            guest_phys_addr: region.guest_phys_addr,
-            memory_size: region.memory_size,
-            userspace_addr: region.userspace_addr,
-            flags,
-            guest_memfd: region.guest_memfd.unwrap_or(0),
-            guest_memfd_offset: region.guest_memfd_offset.unwrap_or(0),
-            ..Default::default()
-        }
-    }
-}
 impl From<kvm_mp_state> for MpState {
     fn from(s: kvm_mp_state) -> Self {
         MpState::Kvm(s)
@@ -620,38 +560,6 @@ impl KvmVm {
     #[cfg(not(target_arch = "x86_64"))]
     fn translate_msi_ext_dest_id(address_lo: u32, address_hi: u32) -> (u32, u32) {
         (address_lo, address_hi)
-    }
-
-    /// Set user memory region to use guest_memfd when available.
-    /// guest_memfd is available on host linux kernel v6.8+
-    ///
-    /// # Safety
-    ///
-    /// `region.userspace_addr` must point to `region.memory_size` bytes of
-    /// memory that will stay mapped until the slot is removed via
-    /// `remove_user_memory_region`. The memory region must
-    /// be uniquely owned by the caller, as mapping it into the guest
-    /// effectively creates a long-lived mutable reference.
-    unsafe fn set_user_memory_region(
-        &self,
-        region: kvm_userspace_memory_region2,
-    ) -> Result<(), errno::Error> {
-        if self.memory_slots.is_some() {
-            // SAFETY: Safe as the caller guarantees that region is safe to map
-            // the guest and is non-overlapping.
-            unsafe { self.fd.set_user_memory_region2(region) }
-        } else {
-            // SAFETY: Safe because guest regions are guaranteed not to overlap.
-            unsafe {
-                self.fd.set_user_memory_region(kvm_userspace_memory_region {
-                    slot: region.slot,
-                    guest_phys_addr: region.guest_phys_addr,
-                    userspace_addr: region.userspace_addr,
-                    flags: region.flags,
-                    memory_size: region.memory_size,
-                })
-            }
-        }
     }
 }
 
@@ -1088,9 +996,10 @@ impl vm::Vm for KvmVm {
             )));
         }
 
-        // SAFETY: Safe because caller promised this is safe.
+        // SAFETY: Safe because guest regions are guaranteed not to overlap.
         unsafe {
-            self.set_user_memory_region(region)
+            self.fd
+                .set_user_memory_region2(region)
                 .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
         }
 
@@ -1109,7 +1018,7 @@ impl vm::Vm for KvmVm {
                 ..region
             };
             // SAFETY: the region was installed above and its backing is still alive.
-            if let Err(rollback) = unsafe { self.set_user_memory_region(removed) } {
+            if let Err(rollback) = unsafe { self.fd.set_user_memory_region2(removed) } {
                 error!("Failed to roll back memory slot {slot}: {rollback}");
                 process::exit(1);
             }
@@ -1172,9 +1081,10 @@ impl vm::Vm for KvmVm {
 
         // Setting the size to 0 means "remove"
         region.memory_size = 0;
-        // SAFETY: Safe because caller promised this is safe.
+        // SAFETY: Safe because guest regions are guaranteed not to overlap.
         unsafe {
-            self.set_user_memory_region(region)
+            self.fd
+                .set_user_memory_region2(region)
                 .map_err(|e| vm::HypervisorVmError::RemoveUserMemory(e.into()))?;
         }
 
@@ -1433,7 +1343,8 @@ impl vm::Vm for KvmVm {
             };
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             unsafe {
-                self.set_user_memory_region(region)
+                self.fd
+                    .set_user_memory_region2(region)
                     .map_err(|e| vm::HypervisorVmError::StartDirtyLog(e.into()))?;
             }
         }
@@ -1457,7 +1368,8 @@ impl vm::Vm for KvmVm {
             };
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             unsafe {
-                self.set_user_memory_region(region)
+                self.fd
+                    .set_user_memory_region2(region)
                     .map_err(|e| vm::HypervisorVmError::StartDirtyLog(e.into()))?;
             }
         }

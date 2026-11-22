@@ -9,14 +9,13 @@ use std::os::fd::BorrowedFd;
 #[cfg(feature = "kvm")]
 use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex};
-use std::{cmp, io, result};
+use std::{cmp, io, process, result};
 
 use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use hypervisor::HypervisorVmError;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,8 +38,11 @@ use vm_allocator::page_size::{
     align_page_size_down, align_page_size_up, get_page_size, is_4k_aligned, is_4k_multiple,
     is_page_size_aligned,
 };
-use vm_allocator::{AddressAllocator, GuestMemory, MemorySlotAllocator, SystemAllocator};
-use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_allocator::{
+    AddressAllocator, GuestMemory, GuestRegion, GuestRegionError, MemorySlotAllocator,
+    SystemAllocator,
+};
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig,
 };
@@ -53,12 +55,13 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(feature = "kvm")]
+use crate::configuration::COMMAND_REG_MEMORY_SPACE_MASK;
 use crate::configuration::{
-    COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK, PCI_EXP_FLAGS_TYPE_MASK, PCI_EXP_FLAGS_VERS_MASK,
-    PCI_EXP_FLAGS_VERS_SHIFT, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL2, PCI_EXP_TYPE_RC_END,
-    PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK, PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
+    COMMAND_REG, PCI_EXP_FLAGS_TYPE_MASK, PCI_EXP_FLAGS_VERS_MASK, PCI_EXP_FLAGS_VERS_SHIFT,
+    PCI_EXP_LNKCTL, PCI_EXP_LNKCTL2, PCI_EXP_TYPE_RC_END, PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK,
+    PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
 };
-use crate::mmap::MmapRegion;
 use crate::msi::{Error as MsiError, MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{Error as MsixError, MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
@@ -72,17 +75,34 @@ use crate::{
 pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
 pub(crate) const VFIO_MIGRATION_ID: &str = "vfio_migration";
 
+const ONE_GIB: usize = 1024 * 1024 * 1024;
+
+pub(crate) fn find_alignment(len: usize) -> usize {
+    let page_size = get_page_size() as usize;
+    if len >= ONE_GIB {
+        ONE_GIB
+    } else {
+        len.next_power_of_two().max(page_size)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VfioPciError {
+    #[error("BAR address overflows: base={base:#x}, offset={offset:#x}")]
+    BarAddressOverflow { base: u64, offset: u64 },
+    #[error("BAR range overflows: address={address:#x}, size={size:#x}")]
+    BarRangeOverflow { address: u64, size: u64 },
+    #[error("Failed to move BAR memory region")]
+    MoveBarMemoryRegion(#[source] GuestRegionError),
+    #[error("Failed to unmap peer to peer DMA")]
+    DmaUnmap(#[source] vfio_ioctls::VfioError),
     #[error("Failed to create user memory region")]
-    CreateUserMemoryRegion(#[source] HypervisorVmError),
+    CreateUserMemoryRegion(#[source] GuestRegionError),
     #[error("Failed to DMA map: {0} for device {1} (guest BDF: {2})")]
     DmaMap(#[source] vfio_ioctls::VfioError, PathBuf, PciBdf),
     #[cfg(feature = "kvm")]
     #[error("Failed to map the dma-buf of device {1:?} at {2}")]
     DmaMapFile(#[source] iommufd_ioctls::IommufdError, PathBuf, PciBdf),
-    #[error("Failed to DMA unmap: {0} for device {1} (guest BDF: {2})")]
-    DmaUnmap(#[source] vfio_ioctls::VfioError, PathBuf, PciBdf),
     #[error("Failed to enable INTx")]
     EnableIntx(#[source] VfioError),
     #[error("Failed to enable MSI")]
@@ -213,6 +233,10 @@ impl VfioMsix {
             let data = (u32::from_le_bytes(data) >> 16) as u16;
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
+        } else if offset == 3 && data.len() == 1 {
+            let data = u16::from(data[0]) << 8;
+            self.bar.set_msg_ctl(data);
+            self.cap.set_msg_ctl(data);
         }
 
         let new_enabled = self.bar.enabled();
@@ -314,31 +338,83 @@ impl Interrupt {
 }
 
 #[derive(Clone)]
-pub(crate) struct UserMemoryRegion {
-    pub slot: u32,
-    pub start: u64,
-    pub mapping: Arc<MmapRegion>,
-    #[cfg(feature = "kvm")]
-    pub dma_buf: Option<Arc<OwnedFd>>,
+pub(crate) struct VfioBarMemoryRegion {
+    pub offset: u64,
+    pub region: Arc<Mutex<GuestRegion>>,
+    pub p2p_mapping: Option<Arc<Mutex<VfioP2pMapping>>>,
 }
 
-impl UserMemoryRegion {
+pub(crate) struct VfioP2pMapping {
+    #[cfg(feature = "kvm")]
+    device: Arc<VfioDevice>,
+    vfio_ops: Arc<dyn VfioOps>,
+    device_path: PathBuf,
+    bdf: PciBdf,
+    region_index: u32,
+    mapped: bool,
+    #[cfg(feature = "kvm")]
+    dma_buf: Option<OwnedFd>,
+}
+
+impl VfioBarMemoryRegion {
+    pub(crate) fn move_region(&mut self, new_address: u64) -> Result<(), GuestRegionError> {
+        self.region
+            .lock()
+            .unwrap()
+            .move_guest_address(GuestAddress(new_address))
+    }
+
+    pub(crate) fn start(&self) -> u64 {
+        self.region.lock().unwrap().start_addr().raw_value()
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.region.lock().unwrap().size()
+    }
+
+    #[cfg(test)]
+    fn host_address(&self) -> *mut u8 {
+        self.region.lock().unwrap().as_ptr()
+    }
+
+    fn p2p_mapped(&self) -> bool {
+        self.p2p_mapping
+            .as_ref()
+            .is_some_and(|mapping| mapping.lock().unwrap().mapped)
+    }
+
+    fn map_for_p2p(&self) -> Result<(), VfioPciError> {
+        let Some(p2p_mapping) = &self.p2p_mapping else {
+            return Ok(());
+        };
+        let region = self.region.lock().unwrap();
+        p2p_mapping
+            .lock()
+            .unwrap()
+            .map_for_p2p(&region, self.offset)
+    }
+
+    fn unmap_p2p(&self) -> Result<(), vfio_ioctls::VfioError> {
+        let Some(p2p_mapping) = &self.p2p_mapping else {
+            return Ok(());
+        };
+        let region = self.region.lock().unwrap();
+        p2p_mapping.lock().unwrap().unmap_p2p(&region)
+    }
+}
+
+impl VfioP2pMapping {
     #[cfg_attr(not(feature = "kvm"), expect(unused_variables))]
-    fn map_for_p2p(
-        &mut self,
-        device: &VfioDevice,
-        vfio_ops: &Arc<dyn VfioOps>,
-        device_path: &Path,
-        bdf: PciBdf,
-        region_index: u32,
-        offset: u64,
-    ) -> Result<(), VfioPciError> {
-        let iova = self.start;
-        let length = self.mapping.len();
+    fn map_for_p2p(&mut self, region: &GuestRegion, offset: u64) -> Result<(), VfioPciError> {
+        let iova = region.start_addr().raw_value();
+        let length = region.size();
+        let region_index = self.region_index;
+        let bdf = self.bdf;
 
         #[cfg(feature = "kvm")]
-        if let Some(vfio_iommufd) = vfio_ops.as_any().downcast_ref::<VfioIommufd>()
-            && let Some(dma_buf) = device
+        if let Some(vfio_iommufd) = self.vfio_ops.as_any().downcast_ref::<VfioIommufd>()
+            && let Some(dma_buf) = self
+                .device
                 .export_dma_buf(
                     region_index,
                     &[VfioRegionDmaRange {
@@ -347,7 +423,7 @@ impl UserMemoryRegion {
                     }],
                     libc::O_RDWR as u32,
                 )
-                .map_err(|e| VfioPciError::DmaMap(e, device_path.to_path_buf(), bdf))?
+                .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), bdf))?
         {
             debug!(
                 "Mapped region {region_index} of device {bdf} at 0x{iova:x} \
@@ -357,10 +433,10 @@ impl UserMemoryRegion {
             vfio_iommufd
                 .ioas()
                 .map_file(dma_buf.as_raw_fd(), 0, length as u64, iova, true)
-                .map_err(|e| VfioPciError::DmaMapFile(e, device_path.to_path_buf(), bdf))?;
+                .map_err(|e| VfioPciError::DmaMapFile(e, self.device_path.clone(), bdf))?;
 
-            self.dma_buf = Some(Arc::new(OwnedFd::from(dma_buf)));
-
+            self.dma_buf = Some(OwnedFd::from(dma_buf));
+            self.mapped = true;
             return Ok(());
         }
 
@@ -370,60 +446,84 @@ impl UserMemoryRegion {
              available"
         );
 
-        // SAFETY: MmapRegion invariants guarantee that self.mapping.addr()
-        // points to self.mapping.len() bytes of valid memory that will only
-        // be unmapped with munmap().
-        unsafe { vfio_ops.vfio_dma_map(self.start, self.mapping.len(), self.mapping.addr()) }
-            .map_err(|e| VfioPciError::DmaMap(e, device_path.to_path_buf(), bdf))
+        // SAFETY: The region owns the host mapping, which remains alive while
+        // the BAR is DMA mapped. Teardown unmaps DMA before releasing it.
+        unsafe { self.vfio_ops.vfio_dma_map(iova, length, region.as_ptr()) }
+            .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), bdf))?;
+        self.mapped = true;
+        Ok(())
+    }
+
+    fn unmap_p2p(&mut self, region: &GuestRegion) -> Result<(), vfio_ioctls::VfioError> {
+        if self.mapped {
+            self.vfio_ops
+                .vfio_dma_unmap(region.start_addr().raw_value(), region.size())?;
+            self.mapped = false;
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone)]
-pub struct MmioRegion {
+pub struct VfioBar {
     pub start: GuestAddress,
     pub length: GuestUsize,
     pub(crate) type_: PciBarRegionType,
     pub(crate) index: u32,
-    pub(crate) user_memory_regions: Vec<UserMemoryRegion>,
+    pub(crate) bar_memory_regions: Vec<VfioBarMemoryRegion>,
 }
 
-impl MmioRegion {
+impl VfioBar {
     /// Whether the BAR can be mapped for peer to peer DMA.
     fn is_p2p_mappable(&self) -> bool {
         self.length >= get_page_size()
     }
 
-    /// Returns true if this region has the exact same memory slots as the other region.
-    pub fn has_matching_slots(&self, other: &MmioRegion) -> bool {
-        self.user_memory_regions.len() == other.user_memory_regions.len()
-            && self
-                .user_memory_regions
-                .iter()
-                .all(|u| other.user_memory_regions.iter().any(|o| o.slot == u.slot))
+    /// Whether both BAR descriptions refer to the same backing regions.
+    pub fn has_matching_mappings(&self, other: &VfioBar) -> bool {
+        self.bar_memory_regions.len() == other.bar_memory_regions.len()
+            && self.bar_memory_regions.iter().all(|u| {
+                other
+                    .bar_memory_regions
+                    .iter()
+                    .any(|o| Arc::ptr_eq(&o.region, &u.region))
+            })
     }
+}
+
+#[derive(Debug, Error)]
+enum VfioBarRangeError {
+    #[error("User mapping not found: gpa={gpa:#x}, size={size:#x}")]
+    UserMappingNotFound { gpa: u64, size: u64 },
 }
 
 /// # Safety
 ///
 /// [`Self::find_user_address`] must always either return `Err`
 /// or a pointer to `size` bytes of valid memory.
-unsafe trait MmioRegionRange {
+unsafe trait VfioBarRange {
     fn check_range(&self, guest_addr: u64, size: u64) -> bool;
-    fn find_user_address(&self, guest_addr: u64, size: u64) -> Result<*mut u8, io::Error>;
+    fn find_user_address(&self, guest_addr: u64, size: u64) -> Result<*mut u8, VfioBarRangeError>;
 }
 
 // SAFETY: See the comment in `find_user_address`.
-unsafe impl MmioRegionRange for Vec<MmioRegion> {
+unsafe impl VfioBarRange for Vec<VfioBar> {
     // Check if a guest address is within the range of mmio regions
     fn check_range(&self, guest_addr: u64, size: u64) -> bool {
         let Some(guest_addr_end) = guest_addr.checked_add(size) else {
             return false;
         };
         for region in self.iter() {
-            let Some(region_end) = region.start.raw_value().checked_add(region.length) else {
+            let start = region
+                .bar_memory_regions
+                .first()
+                .map_or(region.start.raw_value(), |entry| {
+                    entry.start() - entry.offset
+                });
+            let Some(region_end) = start.checked_add(region.length) else {
                 return false;
             };
-            if guest_addr >= region.start.raw_value() && guest_addr_end <= region_end {
+            if guest_addr >= start && guest_addr_end <= region_end {
                 return true;
             }
         }
@@ -431,12 +531,12 @@ unsafe impl MmioRegionRange for Vec<MmioRegion> {
     }
 
     // Locate the user region address for a guest address within all mmio regions
-    fn find_user_address(&self, guest_addr: u64, size: u64) -> Result<*mut u8, io::Error> {
+    fn find_user_address(&self, guest_addr: u64, size: u64) -> Result<*mut u8, VfioBarRangeError> {
         for region in self.iter() {
-            for user_region in region.user_memory_regions.iter() {
-                let mapping: &MmapRegion = &user_region.mapping;
-                let start: u64 = user_region.start;
-                let len: u64 = mapping.len().try_into().unwrap();
+            for bar_memory_region in region.bar_memory_regions.iter() {
+                let mapping = bar_memory_region.region.lock().unwrap();
+                let start = mapping.start_addr().raw_value();
+                let len = mapping.len();
                 // See if the guest address is inside the region.
                 let Some(offset_from_start) = guest_addr.checked_sub(start) else {
                     continue;
@@ -449,19 +549,19 @@ unsafe impl MmioRegionRange for Vec<MmioRegion> {
                 if size > len - offset_from_start {
                     continue;
                 }
-                // SAFETY: MmapRegion guarantees that mapping.addr points to at least
+                // SAFETY: AlignedMapping guarantees that mapping.addr points to at least
                 // mapping.len() bytes of valid memory. The checks above ensure that
                 // offset_from_start + size stays within that mapping. Also, since
                 // mapping.len() fit in usize, offset_from_start must as well, so the
                 // cast is safe.
-                return Ok(unsafe { mapping.addr().add(offset_from_start as usize) });
+                return Ok(unsafe { mapping.as_ptr().add(offset_from_start as usize) });
             }
         }
 
-        Err(io::Error::other(format!(
-            "unable to find user mapping for DMA range \
-             (gpa 0x{guest_addr:x}, size 0x{size:x})"
-        )))
+        Err(VfioBarRangeError::UserMappingNotFound {
+            gpa: guest_addr,
+            size,
+        })
     }
 }
 
@@ -804,12 +904,13 @@ impl ConfigPatch {
 
 pub(crate) struct VfioCommon {
     pub(crate) configuration: PciConfiguration,
-    pub(crate) mmio_regions: Vec<MmioRegion>,
+    pub(crate) bars: Vec<VfioBar>,
     pub(crate) interrupt: Interrupt,
     pub(crate) msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
     pub(crate) legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
     pub(crate) vfio_wrapper: Arc<dyn Vfio>,
     pub(crate) patches: HashMap<usize, ConfigPatch>,
+    pub(crate) vendor_id: u16,
     x_nv_gpudirect_clique: Option<u8>,
     x_exclude_mmap_bars: Vec<u8>,
     pub(crate) migration_flags: Option<u64>,
@@ -826,6 +927,96 @@ pub(crate) struct VfioCommonConfig {
 }
 
 impl VfioCommon {
+    pub(crate) fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), VfioPciError> {
+        for region in &mut self.bars {
+            if region.index as usize != bar_idx || region.start == GuestAddress(new_base) {
+                continue;
+            }
+            let moves = region
+                .bar_memory_regions
+                .iter()
+                .map(|bar_memory_region| {
+                    let new_address = new_base.checked_add(bar_memory_region.offset).ok_or(
+                        VfioPciError::BarAddressOverflow {
+                            base: new_base,
+                            offset: bar_memory_region.offset,
+                        },
+                    )?;
+                    let size = bar_memory_region.size() as u64;
+                    new_address
+                        .checked_add(size)
+                        .ok_or(VfioPciError::BarRangeOverflow {
+                            address: new_address,
+                            size,
+                        })?;
+                    Ok((
+                        bar_memory_region.start(),
+                        new_address,
+                        bar_memory_region.p2p_mapped(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, VfioPciError>>()?;
+            for (i, &(_, new_address, map_p2p)) in moves.iter().enumerate() {
+                let bar_memory_region = &mut region.bar_memory_regions[i];
+                let result = (|| {
+                    bar_memory_region
+                        .unmap_p2p()
+                        .map_err(VfioPciError::DmaUnmap)?;
+                    bar_memory_region
+                        .move_region(new_address)
+                        .map_err(VfioPciError::MoveBarMemoryRegion)?;
+                    if map_p2p {
+                        bar_memory_region.map_for_p2p()?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    for (bar_memory_region, &(old_address, _, was_mapped)) in region
+                        .bar_memory_regions[..=i]
+                        .iter_mut()
+                        .zip(&moves[..=i])
+                        .rev()
+                    {
+                        if bar_memory_region.start() == old_address
+                            && bar_memory_region.p2p_mapped() == was_mapped
+                            && bar_memory_region.region.lock().unwrap().is_registered()
+                        {
+                            continue;
+                        }
+                        let rollback: Result<(), VfioPciError> = (|| {
+                            bar_memory_region
+                                .unmap_p2p()
+                                .map_err(VfioPciError::DmaUnmap)?;
+                            bar_memory_region
+                                .move_region(old_address)
+                                .map_err(VfioPciError::MoveBarMemoryRegion)?;
+                            {
+                                let mapping = bar_memory_region.region.lock().unwrap();
+                                if !mapping.is_registered() {
+                                    mapping
+                                        .register()
+                                        .map_err(VfioPciError::CreateUserMemoryRegion)?;
+                                }
+                            }
+                            if was_mapped {
+                                bar_memory_region.map_for_p2p()?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(rollback) = rollback {
+                            // Continuing would leave the BAR with inconsistent mappings.
+                            error!("FATAL: Failed to restore BAR mapping: {rollback:?}");
+                            process::exit(1);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+            region.start = GuestAddress(new_base);
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
@@ -873,8 +1064,10 @@ impl VfioCommon {
             }
         };
 
+        let vendor_id = vfio_wrapper.read_config_word(PCI_CONFIG_VENDOR_ID_OFFSET);
+
         let mut vfio_common = VfioCommon {
-            mmio_regions: Vec::new(),
+            bars: Vec::new(),
             configuration,
             interrupt: Interrupt {
                 intx: None,
@@ -885,6 +1078,7 @@ impl VfioCommon {
             legacy_interrupt_group,
             vfio_wrapper,
             patches: HashMap::new(),
+            vendor_id,
             x_nv_gpudirect_clique: config.x_nv_gpudirect_clique,
             x_exclude_mmap_bars: config.x_exclude_mmap_bars,
             migration_flags,
@@ -1084,9 +1278,13 @@ impl VfioCommon {
 
             let bar_addr = match region_type {
                 PciBarRegionType::IoRegion => {
-                    // The address needs to be 4 bytes aligned.
+                    let alignment = if restored_bar_addr.is_some() {
+                        Some(4)
+                    } else {
+                        Some(region_size.max(4))
+                    };
                     allocator
-                        .allocate_io_addresses(restored_bar_addr, region_size, Some(0x4))
+                        .allocate_io_addresses(restored_bar_addr, region_size, alignment)
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
                 }
                 PciBarRegionType::Memory32BitRegion => {
@@ -1133,12 +1331,12 @@ impl VfioCommon {
             }
 
             bars.push(bar);
-            self.mmio_regions.push(MmioRegion {
+            self.bars.push(VfioBar {
                 start: bar_addr,
                 length: region_size,
                 type_: region_type,
                 index: bar_id,
-                user_memory_regions: Vec::new(),
+                bar_memory_regions: Vec::new(),
             });
 
             bar_id += 1;
@@ -1155,7 +1353,7 @@ impl VfioCommon {
         mmio32_allocator: &mut AddressAllocator,
         mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
-        for region in self.mmio_regions.iter() {
+        for region in self.bars.iter() {
             match region.type_ {
                 PciBarRegionType::IoRegion => {
                     allocator.free_io_addresses(region.start, region.length);
@@ -1679,8 +1877,8 @@ impl VfioCommon {
         Ok(())
     }
 
-    fn find_region(&self, addr: u64) -> Option<MmioRegion> {
-        for region in self.mmio_regions.iter() {
+    fn find_region(&self, addr: u64) -> Option<VfioBar> {
+        for region in self.bars.iter() {
             if addr >= region.start.raw_value()
                 && addr < region.start.unchecked_add(region.length).raw_value()
             {
@@ -1690,6 +1888,14 @@ impl VfioCommon {
         None
     }
 
+    fn is_nvidia_bar0_config_mirror(&self, region_index: u32, offset: u64) -> bool {
+        self.vendor_id == VENDOR_NVIDIA
+            && region_index == VFIO_PCI_BAR0_REGION_INDEX
+            && (NVIDIA_BAR0_CONFIG_MIRROR_OFFSET
+                ..NVIDIA_BAR0_CONFIG_MIRROR_OFFSET + NVIDIA_BAR0_CONFIG_MIRROR_SIZE)
+                .contains(&offset)
+    }
+
     pub(crate) fn read_bar(&mut self, base: u64, offset: u64, data: &mut [u8]) {
         let addr = base + offset;
         if let Some(region) = self.find_region(addr) {
@@ -1697,6 +1903,16 @@ impl VfioCommon {
 
             if self.interrupt.msix_table_accessed(region.index, offset) {
                 self.interrupt.msix_read_table(offset, data);
+            } else if self.is_nvidia_bar0_config_mirror(region.index, offset) {
+                let config_offset = offset - NVIDIA_BAR0_CONFIG_MIRROR_OFFSET;
+                let reg_idx = (config_offset / PCI_CONFIG_REGISTER_SIZE as u64) as usize;
+                let reg_off = (config_offset % PCI_CONFIG_REGISTER_SIZE as u64) as usize;
+                if matches!(data.len(), 1 | 2 | 4)
+                    && reg_off + data.len() <= PCI_CONFIG_REGISTER_SIZE
+                {
+                    let val = self.read_config_register(reg_idx).to_le_bytes();
+                    data.copy_from_slice(&val[reg_off..reg_off + data.len()]);
+                }
             } else {
                 self.vfio_wrapper.region_read(region.index, offset, data);
             }
@@ -1725,6 +1941,22 @@ impl VfioCommon {
             // If the MSI-X table is written to, we need to update our cache.
             if self.interrupt.msix_table_accessed(region.index, offset) {
                 self.interrupt.msix_write_table(offset, data);
+            } else if self.is_nvidia_bar0_config_mirror(region.index, offset) {
+                // Route writes to the NVIDIA BAR0 config space mirror through
+                // write_config_register() so config patches, MSI/MSI-X updates,
+                // and shadow synchronization apply consistently, while ignoring
+                // writes to BAR registers to prevent guest BAR reprogramming via
+                // the mirror.
+                let config_offset = offset - NVIDIA_BAR0_CONFIG_MIRROR_OFFSET;
+                let reg_idx = (config_offset / PCI_CONFIG_REGISTER_SIZE as u64) as usize;
+                let reg_off = config_offset % PCI_CONFIG_REGISTER_SIZE as u64;
+                if matches!(data.len(), 1 | 2 | 4)
+                    && reg_off as usize + data.len() <= PCI_CONFIG_REGISTER_SIZE
+                    && !(PCI_CONFIG_BAR0_INDEX..PCI_CONFIG_BAR0_INDEX + BAR_NUMS).contains(&reg_idx)
+                    && reg_idx != PCI_ROM_EXP_BAR_INDEX
+                {
+                    let _ = self.write_config_register(reg_idx, reg_off, data);
+                }
             } else {
                 self.vfio_wrapper.region_write(region.index, offset, data);
             }
@@ -1834,23 +2066,7 @@ impl VfioCommon {
             _ => {}
         }
 
-        // Return pending BAR repgrogramming if MSE bit is set
-        let mut ret_param = self.configuration.pending_bar_reprogram();
-        if !ret_param.is_empty() {
-            if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
-                == COMMAND_REG_MEMORY_SPACE_MASK
-            {
-                info!("BAR reprogramming parameter is returned: {ret_param:x?}");
-                self.configuration.clear_pending_bar_reprogram();
-            } else {
-                info!(
-                    "MSE bit is disabled. No BAR reprogramming parameter is returned: {ret_param:x?}"
-                );
-                ret_param.clear();
-            }
-        }
-
-        (ret_param, None)
+        (self.configuration.drain_pending_bar_reprogram(), None)
     }
 
     pub(crate) fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -2190,7 +2406,6 @@ pub struct VfioPciDevice {
     // Whether to map VFIO device MMIO BARs into the host IOMMU address space.
     // Required for peer-to-peer DMA between VFIO devices.
     p2p_dma: bool,
-    p2p_dma_mapped: bool,
     memory_slot_allocator: Arc<MemorySlotAllocator>,
     // Guest memory layout, used to enumerate the IOVA ranges to track when
     // programming VFIO DMA logging.
@@ -2244,7 +2459,6 @@ impl VfioPciDevice {
             common,
             iommu_attached,
             p2p_dma,
-            p2p_dma_mapped: false,
             memory_slot_allocator,
             memory,
             bdf,
@@ -2254,8 +2468,125 @@ impl VfioPciDevice {
         Ok(vfio_pci_device)
     }
 
-    pub fn iommu_attached(&self) -> bool {
-        self.iommu_attached
+    fn carve_out_sparse_areas(
+        sparse_areas: &mut Vec<VfioRegionSparseMmapArea>,
+        region_start: u64,
+        region_size: u64,
+        inter_ranges: &BTreeMap<u64, u64>,
+    ) -> Result<(), VfioPciError> {
+        if !is_4k_aligned(region_start) {
+            error!("Region start address 0x{region_start:x} must be at least aligned on 4KiB");
+            return Err(VfioPciError::RegionAlignment);
+        }
+        if !is_4k_multiple(region_size) {
+            error!("Region size 0x{region_size:x} must be at least a multiple of 4KiB");
+            return Err(VfioPciError::RegionSize);
+        }
+
+        let mut carved_areas = Vec::new();
+        for area in sparse_areas.drain(..) {
+            let area_start = area.offset;
+            let area_end = area.offset + area.size;
+            let mut current_offset = area_start;
+
+            for (&range_offset, &range_size) in inter_ranges {
+                let hole_start = range_offset;
+                let hole_end = align_page_size_down(range_offset + range_size);
+                if hole_end <= current_offset {
+                    continue;
+                }
+                if hole_start >= area_end {
+                    break;
+                }
+                if hole_start > current_offset {
+                    carved_areas.push(VfioRegionSparseMmapArea {
+                        offset: current_offset,
+                        size: hole_start - current_offset,
+                    });
+                }
+                current_offset = cmp::min(area_end, hole_end);
+            }
+
+            if area_end > current_offset {
+                carved_areas.push(VfioRegionSparseMmapArea {
+                    offset: current_offset,
+                    size: area_end - current_offset,
+                });
+            }
+        }
+        *sparse_areas = carved_areas;
+        Ok(())
+    }
+
+    fn update_sparse_areas_msix_mappable(
+        sparse_areas: &mut Vec<VfioRegionSparseMmapArea>,
+        region_index: u32,
+        region_start: u64,
+        region_size: u64,
+        vfio_msix: Option<&VfioMsix>,
+    ) -> Result<(), VfioPciError> {
+        // In case the region contains the MSI-X vectors table or
+        // the MSI-X PBA table, we must calculate the subregions
+        // around them, leading to a list of sparse areas.
+        // We want to make sure we will still trap MMIO accesses
+        // to these MSI-X specific ranges. If these region don't align
+        // with pagesize, we can achieve it by enlarging its range.
+        //
+        // Using a BtreeMap as the list provided through the iterator is sorted
+        // by key. This ensures proper split of the whole region.
+        let mut inter_ranges = BTreeMap::new();
+        if let Some(msix) = vfio_msix {
+            if region_index == msix.cap.table_bir() {
+                let (offset, size) = msix.cap.table_range();
+                let offset = align_page_size_down(offset);
+                let size = align_page_size_up(size);
+                // MSI-X mmap region safety: when a device has a non page
+                // aligned MSI-X offset, fixup_msix_region() relocates MSI-X
+                // to the upper half of an enlarged virtual BAR, causing the
+                // offsets in msix.cap to exceed the physical BAR size. This
+                // check skips carving a hole, preventing invalid offsets from
+                // reaching the mmap path. With no holes,
+                // generate_sparse_areas() returns a single sparse region
+                // covering the entire physical BAR. The relocated MSI-X in
+                // the virtual BAR remains trapped because its upper half has
+                // no mmap backing. Exposing the physical MSI-X region through
+                // mmap is safe when the kernel advertises
+                // VFIO_REGION_INFO_CAP_MSIX_MAPPABLE. When MSI-X offsets are
+                // already page aligned, fixup_msix_region() does not relocate
+                // and this check is satisfied, so a hole is carved at the
+                // intended offset as before.
+                if offset < region_size {
+                    inter_ranges.insert(offset, size);
+                }
+            }
+            if region_index == msix.cap.pba_bir() {
+                let (offset, size) = msix.cap.pba_range();
+                let offset = align_page_size_down(offset);
+                let size = align_page_size_up(size);
+                // See MSI-X mmap safety comment above.
+                if offset < region_size {
+                    inter_ranges.insert(offset, size);
+                }
+            }
+        }
+
+        Self::carve_out_sparse_areas(sparse_areas, region_start, region_size, &inter_ranges)
+    }
+
+    fn update_sparse_areas_nvidia_mirror(
+        sparse_areas: &mut Vec<VfioRegionSparseMmapArea>,
+        region_start: u64,
+        region_size: u64,
+    ) -> Result<(), VfioPciError> {
+        let start = align_page_size_down(NVIDIA_BAR0_CONFIG_MIRROR_OFFSET);
+        let end =
+            align_page_size_up(NVIDIA_BAR0_CONFIG_MIRROR_OFFSET + NVIDIA_BAR0_CONFIG_MIRROR_SIZE);
+        let mut inter_ranges = BTreeMap::new();
+        if start < region_size {
+            inter_ranges.insert(start, end - start);
+        }
+
+        Self::carve_out_sparse_areas(sparse_areas, region_start, region_size, &inter_ranges)
     }
 
     fn generate_sparse_areas(
@@ -2264,98 +2595,41 @@ impl VfioPciDevice {
         region_start: u64,
         region_size: u64,
         vfio_msix: Option<&VfioMsix>,
+        vendor_id: u16,
     ) -> Result<Vec<VfioRegionSparseMmapArea>, VfioPciError> {
+        let mut sparse_areas = vec![VfioRegionSparseMmapArea {
+            offset: 0,
+            size: region_size,
+        }];
+        let mut msix_mappable = false;
+
         for cap in caps {
             match cap {
-                VfioRegionInfoCap::SparseMmap(sparse_mmap) => return Ok(sparse_mmap.areas.clone()),
+                VfioRegionInfoCap::SparseMmap(sparse_mmap) => {
+                    sparse_areas.clone_from(&sparse_mmap.areas);
+                }
                 VfioRegionInfoCap::MsixMappable => {
-                    if !is_4k_aligned(region_start) {
-                        error!(
-                            "Region start address 0x{region_start:x} must be at least aligned on 4KiB"
-                        );
-                        return Err(VfioPciError::RegionAlignment);
-                    }
-                    if !is_4k_multiple(region_size) {
-                        error!("Region size 0x{region_size:x} must be at least a multiple of 4KiB");
-                        return Err(VfioPciError::RegionSize);
-                    }
-
-                    // In case the region contains the MSI-X vectors table or
-                    // the MSI-X PBA table, we must calculate the subregions
-                    // around them, leading to a list of sparse areas.
-                    // We want to make sure we will still trap MMIO accesses
-                    // to these MSI-X specific ranges. If these region don't align
-                    // with pagesize, we can achieve it by enlarging its range.
-                    //
-                    // Using a BtreeMap as the list provided through the iterator is sorted
-                    // by key. This ensures proper split of the whole region.
-                    let mut inter_ranges = BTreeMap::new();
-                    if let Some(msix) = vfio_msix {
-                        if region_index == msix.cap.table_bir() {
-                            let (offset, size) = msix.cap.table_range();
-                            let offset = align_page_size_down(offset);
-                            let size = align_page_size_up(size);
-                            // MSI-X mmap region safety: when a device has a non page
-                            // aligned MSI-X offset, fixup_msix_region() relocates MSI-X
-                            // to the upper half of an enlarged virtual BAR, causing the
-                            // offsets in msix.cap to exceed the physical BAR size. This
-                            // check skips carving a hole, preventing invalid offsets from
-                            // reaching the mmap path. With no holes,
-                            // generate_sparse_areas() returns a single sparse region
-                            // covering the entire physical BAR. The relocated MSI-X in
-                            // the virtual BAR remains trapped because its upper half has
-                            // no mmap backing. Exposing the physical MSI-X region through
-                            // mmap is safe when the kernel advertises
-                            // VFIO_REGION_INFO_CAP_MSIX_MAPPABLE. When MSI-X offsets are
-                            // already page aligned, fixup_msix_region() does not relocate
-                            // and this check is satisfied, so a hole is carved at the
-                            // intended offset as before.
-                            if offset < region_size {
-                                inter_ranges.insert(offset, size);
-                            }
-                        }
-                        if region_index == msix.cap.pba_bir() {
-                            let (offset, size) = msix.cap.pba_range();
-                            let offset = align_page_size_down(offset);
-                            let size = align_page_size_up(size);
-                            // See MSI-X mmap safety comment above.
-                            if offset < region_size {
-                                inter_ranges.insert(offset, size);
-                            }
-                        }
-                    }
-
-                    let mut sparse_areas = Vec::new();
-                    let mut current_offset = 0;
-                    for (range_offset, range_size) in inter_ranges {
-                        if range_offset > current_offset {
-                            sparse_areas.push(VfioRegionSparseMmapArea {
-                                offset: current_offset,
-                                size: range_offset - current_offset,
-                            });
-                        }
-                        current_offset = align_page_size_down(range_offset + range_size);
-                    }
-
-                    if region_size > current_offset {
-                        sparse_areas.push(VfioRegionSparseMmapArea {
-                            offset: current_offset,
-                            size: region_size - current_offset,
-                        });
-                    }
-
-                    return Ok(sparse_areas);
+                    msix_mappable = true;
                 }
                 _ => {}
             }
         }
 
-        // In case no relevant capabilities have been found, create a single
-        // sparse area corresponding to the entire MMIO region.
-        Ok(vec![VfioRegionSparseMmapArea {
-            offset: 0,
-            size: region_size,
-        }])
+        if msix_mappable {
+            Self::update_sparse_areas_msix_mappable(
+                &mut sparse_areas,
+                region_index,
+                region_start,
+                region_size,
+                vfio_msix,
+            )?;
+        }
+
+        if vendor_id == VENDOR_NVIDIA && region_index == VFIO_PCI_BAR0_REGION_INDEX {
+            Self::update_sparse_areas_nvidia_mirror(&mut sparse_areas, region_start, region_size)?;
+        }
+
+        Ok(sparse_areas)
     }
 
     /// Map MMIO regions into the guest, and avoid VM exits when the guest tries
@@ -2370,7 +2644,7 @@ impl VfioPciDevice {
         let fd = self.device.as_raw_fd();
         // SAFETY: fd is guaranteed valid
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        for region in self.common.mmio_regions.iter_mut() {
+        for region in self.common.bars.iter_mut() {
             if self
                 .common
                 .x_exclude_mmap_bars
@@ -2422,6 +2696,7 @@ impl VfioPciDevice {
                     region.start.0,
                     mmap_size,
                     self.common.interrupt.msix.as_ref(),
+                    self.common.vendor_id,
                 )?;
 
                 let page_size = get_page_size();
@@ -2465,67 +2740,56 @@ impl VfioPciDevice {
                     } else {
                         area.size
                     };
-                    let mapping = match MmapRegion::mmap(
-                        mmap_len,
+                    let offset = mmap_offset
+                        .checked_add(area.offset)
+                        .ok_or(VfioPciError::MmapArea)?;
+                    let file = fd
+                        .try_clone_to_owned()
+                        .map_err(|_| VfioPciError::MmapArea)?;
+                    let size = usize::try_from(mmap_len).map_err(|_| VfioPciError::MmapArea)?;
+                    let mapping = GuestRegion::from_file(
+                        vm_memory::FileOffset::new(file.into(), offset),
+                        size,
+                        find_alignment(size),
+                        GuestAddress(region.start.0 + area.offset),
                         prot,
-                        fd,
-                        mmap_offset,
-                        area.offset,
-                    ) {
-                        Ok(mapping) => mapping,
-                        Err(_) => {
-                            error!(
-                                "Could not mmap sparse area (offset = 0x{:x}, size = 0x{:x}): {}",
-                                mmap_offset,
-                                mmap_len,
-                                io::Error::last_os_error()
-                            );
-                            return Err(VfioPciError::MmapArea);
-                        }
-                    };
+                        Arc::clone(&self.vm),
+                        Arc::clone(&self.memory_slot_allocator),
+                    )
+                    .map_err(|e| {
+                        error!("Could not mmap sparse area: {e}");
+                        VfioPciError::MmapArea
+                    })?;
 
-                    let mut user_memory_region = UserMemoryRegion {
-                        slot: self.memory_slot_allocator.next_memory_slot(),
-                        start: region.start.0 + area.offset,
-                        mapping: Arc::new(mapping),
-                        #[cfg(feature = "kvm")]
-                        dma_buf: None,
+                    mapping
+                        .register()
+                        .map_err(VfioPciError::CreateUserMemoryRegion)?;
+                    let bar_memory_region = VfioBarMemoryRegion {
+                        offset: area.offset,
+                        region: Arc::new(Mutex::new(mapping)),
+                        p2p_mapping: map_p2p.then(|| {
+                            Arc::new(Mutex::new(VfioP2pMapping {
+                                #[cfg(feature = "kvm")]
+                                device: Arc::clone(&self.device),
+                                vfio_ops: Arc::clone(&self.vfio_ops),
+                                device_path: self.device_path.clone(),
+                                bdf: self.bdf,
+                                region_index: region.index,
+                                mapped: false,
+                                #[cfg(feature = "kvm")]
+                                dma_buf: None,
+                            }))
+                        }),
                     };
-                    // SAFETY: MmapRegion invariants guarantee that
-                    // user_memory_region.mapping.addr() points to
-                    // user_memory_region.mapping.len() bytes of
-                    // valid memory that will only be unmapped with munmap().
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                            hypervisor::MemoryVisibility::Shared,
-                        )
-                    }
-                    .map_err(VfioPciError::CreateUserMemoryRegion)?;
-
                     // Map the MMIO BAR into the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
                     if map_p2p {
-                        user_memory_region.map_for_p2p(
-                            &self.device,
-                            &self.vfio_ops,
-                            &self.device_path,
-                            self.bdf,
-                            region.index,
-                            area.offset,
-                        )?;
+                        bar_memory_region.map_for_p2p()?;
                     }
-                    region.user_memory_regions.push(user_memory_region);
+                    region.bar_memory_regions.push(bar_memory_region);
                 }
             }
         }
-
-        self.p2p_dma_mapped = self.p2p_dma;
 
         Ok(())
     }
@@ -2557,13 +2821,17 @@ impl VfioPciDevice {
             ("unmap", "Unmapped")
         };
 
-        for mmio_region in self.common.mmio_regions.iter() {
-            for user_memory_region in mmio_region.user_memory_regions.iter() {
-                let Some(dma_buf) = &user_memory_region.dma_buf else {
+        for mmio_region in self.common.bars.iter_mut() {
+            for bar_memory_region in mmio_region.bar_memory_regions.iter_mut() {
+                let Some(p2p_mapping) = &bar_memory_region.p2p_mapping else {
                     continue;
                 };
-                let iova = user_memory_region.start;
-                let length = user_memory_region.mapping.len() as u64;
+                let iova = bar_memory_region.start();
+                let length = bar_memory_region.size() as u64;
+                let mut p2p_mapping = p2p_mapping.lock().unwrap();
+                let Some(dma_buf) = &p2p_mapping.dma_buf else {
+                    continue;
+                };
 
                 let res = if memory_space_enabled {
                     vfio_iommufd
@@ -2574,11 +2842,14 @@ impl VfioPciDevice {
                 };
 
                 match res {
-                    Ok(()) => debug!(
-                        "{success_action} region {} of device {} at 0x{iova:x} \
+                    Ok(()) => {
+                        p2p_mapping.mapped = memory_space_enabled;
+                        debug!(
+                            "{success_action} region {} of device {} at 0x{iova:x} \
                          through its dma-buf",
-                        mmio_region.index, self.bdf
-                    ),
+                            mmio_region.index, self.bdf
+                        );
+                    }
                     Err(e) => error!(
                         "Could not {failed_action} region {} of device {} at 0x{iova:x}: {e}",
                         mmio_region.index, self.bdf
@@ -2586,56 +2857,22 @@ impl VfioPciDevice {
                 }
             }
         }
-
-        self.p2p_dma_mapped = memory_space_enabled;
     }
 
     pub fn unmap_mmio_regions(&mut self) {
-        for region in self.common.mmio_regions.iter_mut() {
-            for user_memory_region in region.user_memory_regions.drain(..) {
-                let len = user_memory_region.mapping.len();
-                let host_addr = user_memory_region.mapping.addr();
-                // Unmap MMIO region from the host IOMMU address space via VfioOps
-                // Only needed if p2p_dma is enabled.
-                if self.p2p_dma_mapped
-                    && let Err(e) = self
-                        .vfio_ops
-                        .vfio_dma_unmap(user_memory_region.start, len)
-                        .map_err(|e| VfioPciError::DmaUnmap(e, self.device_path.clone(), self.bdf))
-                {
-                    error!(
-                        "Could not unmap MMIO region from the host IOMMU address space: \
-                            iova 0x{:x}, size 0x{:x}: {}, ",
-                        user_memory_region.start, len, e
-                    );
+        for region in &mut self.common.bars {
+            for bar_memory_region in region.bar_memory_regions.drain(..) {
+                if let Err(e) = bar_memory_region.unmap_p2p() {
+                    // The backing memory must remain alive while mapped for DMA.
+                    error!("FATAL: Failed to remove P2P mapping: {e}");
+                    process::exit(1);
                 }
-
-                // Remove region
-                // SAFETY: only valid entries are added to the user_memory_regions field
-                // of the entries of self.common.mmio_regions.
-                // Also, host_addr..host_addr + len is valid by the MmapRegion invariants.
-                if let Err(e) = unsafe {
-                    self.vm.remove_user_memory_region(
-                        user_memory_region.slot,
-                        user_memory_region.start,
-                        len,
-                        host_addr,
-                        false,
-                    )
-                } {
-                    error!("Could not remove the userspace memory region: {e}");
-                }
-
-                self.memory_slot_allocator
-                    .free_memory_slot(user_memory_region.slot);
             }
         }
-
-        self.p2p_dma_mapped = false;
     }
 
-    pub fn mmio_regions(&self) -> Vec<MmioRegion> {
-        self.common.mmio_regions.clone()
+    pub fn mmio_regions(&self) -> Vec<VfioBar> {
+        self.common.bars.clone()
     }
 
     // IOVA ranges for DMA logging. Without a virtual IOMMU the device sees an
@@ -2685,6 +2922,8 @@ impl BusDevice for VfioPciDevice {
     }
 }
 
+// Offset of the 16-bit vendor ID register in the PCI configuration space.
+const PCI_CONFIG_VENDOR_ID_OFFSET: u32 = 0x00;
 // Offset of the 16-bit status register in the PCI configuration space.
 const PCI_CONFIG_STATUS_OFFSET: u32 = 0x06;
 // Status bit indicating the presence of a capabilities list.
@@ -2713,6 +2952,14 @@ const PCI_HEADER_TYPE_REG_INDEX: usize = 3;
 const PCI_CONFIG_BAR0_INDEX: usize = 4;
 // PCI ROM expansion BAR register index
 const PCI_ROM_EXP_BAR_INDEX: usize = 12;
+// NVIDIA PCI Vendor ID.
+const VENDOR_NVIDIA: u16 = 0x10de;
+// Offset and size of the self-mirroring PCIe configuration space window
+// (NV_PCFG, 0x88000..0x89000) within NVIDIA BAR0.
+// Reference: NVIDIA open-gpu-kernel-modules (NV_PCFG in dev_nv_xve.h) and
+// QEMU's vfio_probe_nvidia_bar0_quirk() in hw/vfio/pci-quirks.c.
+const NVIDIA_BAR0_CONFIG_MIRROR_OFFSET: u64 = 0x88000;
+const NVIDIA_BAR0_CONFIG_MIRROR_SIZE: u64 = 0x1000;
 
 impl PciDevice for VfioPciDevice {
     fn allocate_bars(
@@ -2772,97 +3019,9 @@ impl PciDevice for VfioPciDevice {
     }
 
     fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
-        for region in self.common.mmio_regions.iter_mut() {
-            if region.index as usize == bar_idx {
-                let region_index = region.index;
-                let old_base = region.start.raw_value();
-                let map_p2p = self.p2p_dma_mapped && region.is_p2p_mappable();
-                region.start = GuestAddress(new_base);
-
-                for user_memory_region in region.user_memory_regions.iter_mut() {
-                    let len = user_memory_region.mapping.len();
-                    let host_addr = user_memory_region.mapping.addr();
-                    let offset = user_memory_region.start - old_base;
-                    // Unmap the old MMIO region from the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
-                    if map_p2p
-                        && let Err(e) = self
-                            .vfio_ops
-                            .vfio_dma_unmap(user_memory_region.start, len)
-                            .map_err(|e| {
-                                VfioPciError::DmaUnmap(e, self.device_path.clone(), self.bdf)
-                            })
-                    {
-                        error!(
-                            "Could not unmap MMIO region from the host IOMMU address space: \
-iova 0x{:x}, size 0x{:x}: {}, ",
-                            user_memory_region.start, len, e
-                        );
-                    }
-                    // Remove old region
-                    // SAFETY: MmapRegion invariants guarantee that
-                    // host_addr points to len bytes of
-                    // valid memory that will only be unmapped with munmap().
-                    unsafe {
-                        self.vm.remove_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            len,
-                            host_addr,
-                            false,
-                        )
-                    }
-                    .map_err(io::Error::other)?;
-
-                    // Update the user memory region with the correct start address.
-                    if new_base > old_base {
-                        user_memory_region.start += new_base - old_base;
-                    } else {
-                        user_memory_region.start -= old_base - new_base;
-                    }
-
-                    // Insert new region
-                    // SAFETY: MmapRegion invariants guarantee that
-                    // host_addr points to len bytes of
-                    // valid memory that will only be unmapped with munmap().
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            len,
-                            host_addr,
-                            false,
-                            false,
-                            hypervisor::MemoryVisibility::Shared,
-                        )
-                    }
-                    .map_err(io::Error::other)?;
-
-                    // Map the moved MMIO region into the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
-                    if map_p2p {
-                        user_memory_region
-                            .map_for_p2p(
-                                &self.device,
-                                &self.vfio_ops,
-                                &self.device_path,
-                                self.bdf,
-                                region_index,
-                                offset,
-                            )
-                            .map_err(|e| {
-                                io::Error::other(format!(
-                                    "Could not map MMIO region into the host IOMMU address space: \
-iova 0x{:x}, size 0x{:x}: {}, ",
-                                    user_memory_region.start, len, e
-                                ))
-                            })?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        self.common
+            .move_bar(bar_idx, new_base)
+            .map_err(io::Error::other)
     }
 
     fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
@@ -2960,7 +3119,7 @@ impl Migratable for VfioPciDevice {
 pub struct VfioDmaMapping<M: GuestAddressSpace> {
     vfio_ops: Arc<dyn VfioOps>,
     memory: Arc<M>,
-    mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
+    mmio_regions: Arc<Mutex<Vec<VfioBar>>>,
 }
 
 impl<M: GuestAddressSpace> VfioDmaMapping<M> {
@@ -2972,7 +3131,7 @@ impl<M: GuestAddressSpace> VfioDmaMapping<M> {
     pub fn new(
         vfio_ops: Arc<dyn VfioOps>,
         memory: Arc<M>,
-        mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
+        mmio_regions: Arc<Mutex<Vec<VfioBar>>>,
     ) -> Self {
         VfioDmaMapping {
             vfio_ops,
@@ -2986,32 +3145,33 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VfioDmaMapping<M
 where
     M::M: GuestMemoryBackend,
 {
-    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), io::Error> {
-        let Ok(usize_size): Result<usize, _> = size.try_into() else {
-            return Err(io::Error::other(format!("size {size} overflows usize")));
-        };
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
         let mem = self.memory.memory();
         let guest_addr = GuestAddress(gpa);
-        let user_addr = if mem.check_range(guest_addr, usize_size) {
-            match mem.get_slice(guest_addr, usize_size) {
-                Ok(t) => {
-                    assert!(t.len() >= usize_size);
-                    Ok(t.ptr_guard_mut())
+        let user_addr = if mem.check_range(guest_addr, size as usize) {
+            let slice = mem.get_slice(guest_addr, size as usize).map_err(|e| {
+                ExternalDmaMappingError::Map {
+                    iova,
+                    gpa,
+                    size,
+                    source: e.into(),
                 }
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "unable to retrieve user address for gpa 0x{gpa:x} from guest memory region: {e}"
-                    )));
-                }
-            }
+            })?;
+            assert!(slice.len() >= size as usize);
+            Ok(slice.ptr_guard_mut())
         } else {
             let mmio_regions = self.mmio_regions.lock().unwrap();
             if mmio_regions.check_range(gpa, size) {
-                Err(mmio_regions.find_user_address(gpa, size)?)
+                Err(mmio_regions.find_user_address(gpa, size).map_err(|e| {
+                    ExternalDmaMappingError::Map {
+                        iova,
+                        gpa,
+                        size,
+                        source: e.into(),
+                    }
+                })?)
             } else {
-                return Err(io::Error::other(format!(
-                    "failed to locate guest address 0x{gpa:x} in guest memory"
-                )));
+                return Err(ExternalDmaMappingError::InvalidGuestRange { gpa, size });
             }
         };
         let user_addr = match user_addr {
@@ -3021,24 +3181,24 @@ where
 
         // vfio_dma_map is unsound and ought to be marked as unsafe
         // SAFETY: find_user_address and GuestMemoryBackend::get_slice() guarantee that
-        // the returned pointer is valid for up to `usize_size` bytes.
-        // `usize_size` is always equal to `size` due to the above `try_into()` call.
+        // the returned pointer is valid for up to `size` bytes.
         unsafe { self.vfio_ops.vfio_dma_map(iova, size as usize, user_addr) }.map_err(|e| {
-            io::Error::other(format!(
-                "failed to map memory into the host IOMMU address space, \
-                         iova 0x{iova:x}, gpa 0x{gpa:x}, size 0x{size:x}: {e:?}"
-            ))
+            ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: e.into(),
+            }
         })
     }
 
-    fn unmap(&self, iova: u64, size: u64) -> result::Result<(), io::Error> {
+    fn unmap(&self, iova: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
         self.vfio_ops
             .vfio_dma_unmap(iova, size as usize)
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "failed to unmap memory from the host IOMMU address space, \
-                     iova 0x{iova:x}, size 0x{size:x}: {e:?}"
-                ))
+            .map_err(|e| ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: e.into(),
             })
     }
 }
@@ -3046,60 +3206,246 @@ where
 #[cfg(test)]
 mod tests {
     use std::env::temp_dir;
-    use std::os::fd::AsFd;
     use std::sync::Mutex;
+    #[cfg(feature = "kvm")]
+    use std::sync::atomic::AtomicU32;
 
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::PasidCap;
 
-    fn sparse_mmio_regions() -> Vec<MmioRegion> {
+    #[test]
+    fn find_alignment_scales_with_length() {
+        let page_size = get_page_size() as usize;
+
+        // Sub-page and page-sized mappings only need page alignment.
+        assert_eq!(find_alignment(1), page_size);
+        assert_eq!(find_alignment(page_size), page_size);
+
+        // Larger mappings round up to the next power of two.
+        assert_eq!(
+            find_alignment(page_size + 1),
+            (page_size + 1).next_power_of_two()
+        );
+        assert!(find_alignment(page_size + 1) > page_size);
+
+        // The alignment is capped at 1 GiB.
+        assert_eq!(find_alignment(ONE_GIB), ONE_GIB);
+        assert_eq!(find_alignment(ONE_GIB + 1), ONE_GIB);
+        assert_eq!(find_alignment(2 * ONE_GIB), ONE_GIB);
+    }
+
+    #[test]
+    fn move_region_preserves_backing() {
+        let mut region = sparse_mmio_regions().remove(0);
+        let entry = &mut region.bar_memory_regions[0];
+        let mapping = Arc::clone(&entry.region);
+        let host_address = entry.host_address();
+        let size = entry.size();
+        let slot = entry.region.lock().unwrap().slot();
+
+        for address in [10 * get_page_size(), get_page_size()] {
+            entry.move_region(address).unwrap();
+            assert_eq!(mapping.lock().unwrap().start_addr(), GuestAddress(address));
+            assert_eq!(entry.host_address(), host_address);
+            assert_eq!(entry.size(), size);
+            assert_eq!(entry.region.lock().unwrap().slot(), slot);
+            assert!(!entry.region.lock().unwrap().is_registered());
+        }
+    }
+
+    #[test]
+    fn move_region_rejects_overflow_without_changing_mapping() {
+        let mut region = sparse_mmio_regions().remove(0);
+        let entry = &mut region.bar_memory_regions[0];
+        let host_address = entry.host_address();
+        let old_address = entry.region.lock().unwrap().start_addr();
+
+        assert!(entry.move_region(u64::MAX).is_err());
+        assert_eq!(entry.host_address(), host_address);
+        let mapping = entry.region.try_lock().unwrap();
+        assert_eq!(mapping.start_addr(), old_address);
+        assert!(!mapping.is_registered());
+    }
+
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn move_registered_region_keeps_slot_after_failed_relocation() {
+        let page_size = get_page_size();
+        let vm = hypervisor::new()
+            .unwrap()
+            .create_vm(hypervisor::HypervisorVmConfig::default())
+            .unwrap();
+        let slot_allocator = Arc::new(MemorySlotAllocator::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let mut regions = Vec::new();
+        for address in [page_size, 2 * page_size] {
+            let mapping = GuestRegion::from_mmap(
+                vm_memory::MmapRegion::new(page_size as usize).unwrap(),
+                GuestAddress(address),
+                Arc::clone(&vm),
+                Arc::clone(&slot_allocator),
+                false,
+                false,
+                false,
+                hypervisor::MemoryVisibility::Shared,
+            )
+            .unwrap();
+            mapping.register().unwrap();
+            regions.push(VfioBarMemoryRegion {
+                offset: 0,
+                region: Arc::new(Mutex::new(mapping)),
+                p2p_mapping: None,
+            });
+        }
+        let slots = regions
+            .iter()
+            .map(|entry| entry.region.lock().unwrap().slot().unwrap())
+            .collect::<Vec<_>>();
+        let host_addresses = regions
+            .iter()
+            .map(VfioBarMemoryRegion::host_address)
+            .collect::<Vec<_>>();
+
+        regions[0].move_region(4 * page_size).unwrap();
+        assert_eq!(regions[0].start(), 4 * page_size);
+        assert!(regions[0].region.lock().unwrap().is_registered());
+
+        // KVM rejects the second mapping at the first mapping's new address.
+        regions[1].move_region(4 * page_size).unwrap_err();
+        assert_eq!(regions[1].start(), 2 * page_size);
+        assert!(!regions[1].region.lock().unwrap().is_registered());
+
+        // A failed replacement reserves the slot for explicit restoration.
+        regions[1].move_region(2 * page_size).unwrap();
+        regions[1].region.lock().unwrap().register().unwrap();
+        regions[0].move_region(page_size).unwrap();
+        for (i, entry) in regions.iter().enumerate() {
+            assert_eq!(entry.start(), (i as u64 + 1) * page_size);
+            assert_eq!(entry.host_address(), host_addresses[i]);
+            let mapping = entry.region.lock().unwrap();
+            assert_eq!(mapping.slot(), Some(slots[i]));
+            assert!(mapping.is_registered());
+        }
+    }
+
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn move_bar_restores_sparse_areas_after_failed_relocation() {
+        let page_size = get_page_size();
+        let vm = hypervisor::new()
+            .unwrap()
+            .create_vm(hypervisor::HypervisorVmConfig::default())
+            .unwrap();
+        let slot_allocator = Arc::new(MemorySlotAllocator::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let mut regions = Vec::new();
+        for address in [page_size, 3 * page_size, 6 * page_size] {
+            let mapping = GuestRegion::from_mmap(
+                vm_memory::MmapRegion::new(page_size as usize).unwrap(),
+                GuestAddress(address),
+                Arc::clone(&vm),
+                Arc::clone(&slot_allocator),
+                false,
+                false,
+                false,
+                hypervisor::MemoryVisibility::Shared,
+            )
+            .unwrap();
+            mapping.register().unwrap();
+            regions.push(VfioBarMemoryRegion {
+                offset: address - page_size,
+                region: Arc::new(Mutex::new(mapping)),
+                p2p_mapping: None,
+            });
+        }
+        // The second area will collide with this slot after the first moves.
+        let _blocker = regions.pop().unwrap();
+        let slots: Vec<_> = regions
+            .iter()
+            .map(|entry| entry.region.lock().unwrap().slot().unwrap())
+            .collect();
+        let mut common = test_vfio_common(Arc::new(DefaultVfio), None);
+        common.bars.push(VfioBar {
+            start: GuestAddress(page_size),
+            length: 3 * page_size,
+            type_: PciBarRegionType::Memory32BitRegion,
+            index: 0,
+            bar_memory_regions: regions,
+        });
+        let lookup_regions = common.bars.clone();
+
+        common.move_bar(0, 4 * page_size).unwrap_err();
+
+        assert_eq!(common.bars[0].start, GuestAddress(page_size));
+        for (i, entry) in common.bars[0].bar_memory_regions.iter().enumerate() {
+            let address = page_size + entry.offset;
+            let mapping = entry.region.lock().unwrap();
+            assert_eq!(mapping.start_addr(), GuestAddress(address));
+            assert_eq!(mapping.slot(), Some(slots[i]));
+            assert!(mapping.is_registered());
+        }
+        assert!(lookup_regions.check_range(page_size, 3 * page_size));
+        assert!(!lookup_regions.check_range(4 * page_size, page_size));
+        lookup_regions
+            .find_user_address(page_size, page_size)
+            .unwrap();
+        lookup_regions
+            .find_user_address(3 * page_size, page_size)
+            .unwrap();
+    }
+
+    fn sparse_mmio_regions() -> Vec<VfioBar> {
         let page_size = get_page_size();
         let file =
             TempFile::new_with_prefix(temp_dir().join("cloud-hypervisor-vfio-sparse-")).unwrap();
         file.as_file().set_len(2 * page_size).unwrap();
 
-        let mapping_a = Arc::new(
-            MmapRegion::mmap(
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                file.as_file().as_fd(),
-                0,
-                0,
+        let mapping_a = Arc::new(Mutex::new(
+            vm_memory::GuestRegionMmap::from_range(
+                GuestAddress(page_size),
+                page_size as usize,
+                Some(vm_memory::FileOffset::new(
+                    file.as_file().try_clone().unwrap(),
+                    0,
+                )),
             )
-            .unwrap(),
-        );
-        let mapping_b = Arc::new(
-            MmapRegion::mmap(
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                file.as_file().as_fd(),
-                page_size,
-                0,
+            .unwrap()
+            .into(),
+        ));
+        let mapping_b = Arc::new(Mutex::new(
+            vm_memory::GuestRegionMmap::from_range(
+                GuestAddress(3 * page_size),
+                page_size as usize,
+                Some(vm_memory::FileOffset::new(
+                    file.as_file().try_clone().unwrap(),
+                    page_size,
+                )),
             )
-            .unwrap(),
-        );
+            .unwrap()
+            .into(),
+        ));
 
-        vec![MmioRegion {
+        vec![VfioBar {
             start: GuestAddress(page_size),
             length: 4 * page_size,
             type_: PciBarRegionType::Memory32BitRegion,
             index: 0,
-            user_memory_regions: vec![
-                UserMemoryRegion {
-                    slot: 0,
-                    start: page_size,
-                    mapping: mapping_a,
-                    #[cfg(feature = "kvm")]
-                    dma_buf: None,
+            bar_memory_regions: vec![
+                VfioBarMemoryRegion {
+                    offset: 0,
+                    region: mapping_a,
+                    p2p_mapping: None,
                 },
-                UserMemoryRegion {
-                    slot: 1,
-                    start: 3 * page_size,
-                    mapping: mapping_b,
-                    #[cfg(feature = "kvm")]
-                    dma_buf: None,
+                VfioBarMemoryRegion {
+                    offset: 2 * page_size,
+                    region: mapping_b,
+                    p2p_mapping: None,
                 },
             ],
         }]
@@ -3122,6 +3468,50 @@ mod tests {
         regions
             .find_user_address(guest_addr, page_size)
             .unwrap_err();
+    }
+
+    #[test]
+    fn dma_lookup_through_cloned_bar_tracks_relocation() {
+        let page_size = get_page_size();
+        let mut common = test_vfio_common(Arc::new(DefaultVfio), None);
+        common.bars = sparse_mmio_regions();
+        let lookup_regions = common.bars.clone();
+        let host_addresses = [
+            lookup_regions
+                .find_user_address(page_size, page_size)
+                .unwrap(),
+            lookup_regions
+                .find_user_address(3 * page_size, page_size)
+                .unwrap(),
+        ];
+
+        for new_base in [10 * page_size, page_size] {
+            let old_base = common.bars[0].start.raw_value();
+            common.move_bar(0, new_base).unwrap();
+
+            // Only the shared mappings change in the cloned lookup records.
+            assert_eq!(lookup_regions[0].start, GuestAddress(page_size));
+            assert!(!lookup_regions.check_range(old_base, page_size));
+            assert!(lookup_regions.check_range(new_base, 4 * page_size));
+            for (i, offset) in [0, 2 * page_size].into_iter().enumerate() {
+                lookup_regions
+                    .find_user_address(old_base + offset, page_size)
+                    .unwrap_err();
+                assert_eq!(
+                    lookup_regions
+                        .find_user_address(new_base + offset, page_size)
+                        .unwrap(),
+                    host_addresses[i],
+                );
+            }
+            // Relocation must preserve the unmapped gap between sparse areas.
+            lookup_regions
+                .find_user_address(new_base + page_size, page_size)
+                .unwrap_err();
+            lookup_regions
+                .find_user_address(new_base + page_size / 2, page_size)
+                .unwrap_err();
+        }
     }
 
     // Trait default behavior and state enum round trip.
@@ -3360,7 +3750,7 @@ mod tests {
         );
         VfioCommon {
             configuration,
-            mmio_regions: Vec::new(),
+            bars: Vec::new(),
             interrupt: Interrupt {
                 intx: None,
                 msi: None,
@@ -3370,6 +3760,7 @@ mod tests {
             legacy_interrupt_group: None,
             vfio_wrapper,
             patches: HashMap::new(),
+            vendor_id: 0,
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
             migration_flags,
@@ -3846,5 +4237,208 @@ mod tests {
         restored.set_state(&state, None, None, None).unwrap();
 
         assert_eq!(restored.read_config_register(0x40 / 4), 0x0000_1234);
+    }
+
+    struct MockNvidiaDevice {
+        config_space: Mutex<Vec<u8>>,
+        bar0: Mutex<Vec<u8>>,
+    }
+
+    impl MockNvidiaDevice {
+        fn new() -> Arc<Self> {
+            let mut config_space = vec![0u8; PCIE_CONFIG_SPACE_SIZE as usize];
+            // Vendor ID = 0x10de (NVIDIA), Device ID = 0x307e
+            config_space[0..4].copy_from_slice(&0x307e_10deu32.to_le_bytes());
+            // Physical BAR0 in hardware config space (different from guest virtual BAR0)
+            config_space[0x10..0x14].copy_from_slice(&0xdead_0000u32.to_le_bytes());
+
+            let mut bar0 = vec![0u8; 0x10_0000];
+            // Put raw physical BAR0 values in the 0x88000 window and neighboring offsets
+            bar0[0x80000..0x80004].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+            bar0[0x88010..0x88014].copy_from_slice(&0xdead_0000u32.to_le_bytes());
+            bar0[0x89000..0x89004].copy_from_slice(&0x5566_7788u32.to_le_bytes());
+
+            Arc::new(Self {
+                config_space: Mutex::new(config_space),
+                bar0: Mutex::new(bar0),
+            })
+        }
+
+        fn config_dword(&self, offset: usize) -> u32 {
+            let space = self.config_space.lock().unwrap();
+            u32::from_le_bytes(space[offset..offset + 4].try_into().unwrap())
+        }
+
+        fn bar0_dword(&self, offset: usize) -> u32 {
+            let bar0 = self.bar0.lock().unwrap();
+            u32::from_le_bytes(bar0[offset..offset + 4].try_into().unwrap())
+        }
+    }
+
+    impl Vfio for MockNvidiaDevice {
+        fn region_read(&self, index: u32, offset: u64, data: &mut [u8]) {
+            let start = offset as usize;
+            if index == VFIO_PCI_CONFIG_REGION_INDEX {
+                let space = self.config_space.lock().unwrap();
+                data.copy_from_slice(&space[start..start + data.len()]);
+            } else if index == VFIO_PCI_BAR0_REGION_INDEX {
+                let bar0 = self.bar0.lock().unwrap();
+                data.copy_from_slice(&bar0[start..start + data.len()]);
+            }
+        }
+
+        fn region_write(&self, index: u32, offset: u64, data: &[u8]) {
+            let start = offset as usize;
+            if index == VFIO_PCI_CONFIG_REGION_INDEX {
+                let mut space = self.config_space.lock().unwrap();
+                space[start..start + data.len()].copy_from_slice(data);
+            } else if index == VFIO_PCI_BAR0_REGION_INDEX {
+                let mut bar0 = self.bar0.lock().unwrap();
+                bar0[start..start + data.len()].copy_from_slice(data);
+            }
+        }
+    }
+
+    #[test]
+    fn nvidia_bar0_config_mirror_mediates_reads_and_writes() {
+        let mock = MockNvidiaDevice::new();
+        let mut common = test_vfio_common(Arc::clone(&mock), None);
+        common.vendor_id = VENDOR_NVIDIA;
+
+        let bar0_gpa: u64 = 0xc000_0000;
+        let bar0_size: u64 = 0x10_0000;
+        let bar_cfg = PciBarConfiguration::default()
+            .set_index(VFIO_PCI_BAR0_REGION_INDEX as usize)
+            .set_address(bar0_gpa)
+            .set_size(bar0_size)
+            .set_region_type(PciBarRegionType::Memory32BitRegion)
+            .set_prefetchable(PciBarPrefetchable::NotPrefetchable);
+        common.configuration.add_pci_bar(&bar_cfg).unwrap();
+        common.bars.push(VfioBar {
+            start: GuestAddress(bar0_gpa),
+            length: bar0_size,
+            type_: PciBarRegionType::Memory32BitRegion,
+            index: VFIO_PCI_BAR0_REGION_INDEX,
+            bar_memory_regions: Vec::new(),
+        });
+
+        // Add a read-only config patch at offset 0x50
+        common.patch_reg(0x50 / 4, 0xffff_ffff, 0xcafe_babe, 0xffff_ffff);
+
+        // 1. Reading BAR0 + 0x88010 (BAR0 config register) returns the virtualized
+        // guest BAR0 GPA (0xc000_0000), not the physical BAR0 (0xdead_0000).
+        let mut buf = [0u8; 4];
+        common.read_bar(bar0_gpa, 0x88010, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), bar0_gpa as u32);
+
+        // 2. Reading BAR0 + 0x88050 returns the patched virtual capability value.
+        common.read_bar(bar0_gpa, 0x88050, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 0xcafe_babe);
+
+        // 3. Writing to BAR0 + 0x88010 (a BAR register) is ignored and never
+        // modifies the virtualized BAR0, physical BAR0 register, or physical BAR0 MMIO.
+        common.write_bar(bar0_gpa, 0x88010, &0xbeef_0000u32.to_le_bytes());
+        assert_eq!(mock.config_dword(0x10), 0xdead_0000);
+        assert_eq!(mock.bar0_dword(0x88010), 0xdead_0000);
+        common.read_bar(bar0_gpa, 0x88010, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), bar0_gpa as u32);
+
+        // 4. Writing to a read-only patched capability at BAR0 + 0x88050 is blocked.
+        common.write_bar(bar0_gpa, 0x88050, &0x1234_5678u32.to_le_bytes());
+        assert_eq!(mock.config_dword(0x50), 0);
+        common.read_bar(bar0_gpa, 0x88050, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 0xcafe_babe);
+
+        // 5. Writing to a writable non-BAR config register at BAR0 + 0x88040 is
+        // routed through write_config_register() to the VFIO config region.
+        common.write_bar(bar0_gpa, 0x88040, &0xabcd_ef01u32.to_le_bytes());
+        assert_eq!(mock.config_dword(0x40), 0xabcd_ef01);
+        assert_eq!(mock.bar0_dword(0x88040), 0);
+        common.read_bar(bar0_gpa, 0x88040, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 0xabcd_ef01);
+
+        // 6. Neighboring offsets on the same 64 KiB page (0x80000 and 0x89000)
+        // continue to fall through to BAR0 region_read / region_write.
+        common.read_bar(bar0_gpa, 0x80000, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 0x1122_3344);
+        common.read_bar(bar0_gpa, 0x89000, &mut buf);
+        assert_eq!(u32::from_le_bytes(buf), 0x5566_7788);
+
+        common.write_bar(bar0_gpa, 0x80000, &0x99aa_bbccu32.to_le_bytes());
+        assert_eq!(mock.bar0_dword(0x80000), 0x99aa_bbcc);
+    }
+
+    #[test]
+    fn generate_sparse_areas_carves_out_nvidia_bar0_config_mirror() {
+        let region_size: u64 = 0x400_0000; // 64 MiB BAR0
+        let hole_start = align_page_size_down(NVIDIA_BAR0_CONFIG_MIRROR_OFFSET);
+        let hole_end =
+            align_page_size_up(NVIDIA_BAR0_CONFIG_MIRROR_OFFSET + NVIDIA_BAR0_CONFIG_MIRROR_SIZE);
+
+        // 1. NVIDIA BAR0 without capabilities still carves out the mirror window.
+        let areas = VfioPciDevice::generate_sparse_areas(
+            &[],
+            VFIO_PCI_BAR0_REGION_INDEX,
+            0x1_0000_0000,
+            region_size,
+            None,
+            VENDOR_NVIDIA,
+        )
+        .unwrap();
+        assert_eq!(areas.len(), 2);
+        assert_eq!(areas[0].offset, 0);
+        assert_eq!(areas[0].size, hole_start);
+        assert_eq!(areas[1].offset, hole_end);
+        assert_eq!(areas[1].size, region_size - hole_end);
+
+        // 2. Non-NVIDIA BAR0 without capabilities maps the entire region.
+        let non_nv = VfioPciDevice::generate_sparse_areas(
+            &[],
+            VFIO_PCI_BAR0_REGION_INDEX,
+            0x1_0000_0000,
+            region_size,
+            None,
+            0x8086,
+        )
+        .unwrap();
+        assert_eq!(non_nv.len(), 1);
+        assert_eq!(non_nv[0].offset, 0);
+        assert_eq!(non_nv[0].size, region_size);
+
+        // 3. NVIDIA non-BAR0 (e.g. BAR2) without capabilities maps the entire region.
+        let nv_bar2 = VfioPciDevice::generate_sparse_areas(
+            &[],
+            VFIO_PCI_BAR2_REGION_INDEX,
+            0x1_0000_0000,
+            region_size,
+            None,
+            VENDOR_NVIDIA,
+        )
+        .unwrap();
+        assert_eq!(nv_bar2.len(), 1);
+        assert_eq!(nv_bar2[0].offset, 0);
+        assert_eq!(nv_bar2[0].size, region_size);
+
+        // 4. NVIDIA BAR0 with SparseMmap capability still carves out the mirror window.
+        let sparse_cap = VfioRegionInfoCap::SparseMmap(vfio_ioctls::VfioRegionInfoCapSparseMmap {
+            areas: vec![VfioRegionSparseMmapArea {
+                offset: 0,
+                size: region_size,
+            }],
+        });
+        let sparse_areas = VfioPciDevice::generate_sparse_areas(
+            &[sparse_cap],
+            VFIO_PCI_BAR0_REGION_INDEX,
+            0x1_0000_0000,
+            region_size,
+            None,
+            VENDOR_NVIDIA,
+        )
+        .unwrap();
+        assert_eq!(sparse_areas.len(), 2);
+        assert_eq!(sparse_areas[0].offset, 0);
+        assert_eq!(sparse_areas[0].size, hole_start);
+        assert_eq!(sparse_areas[1].offset, hole_end);
+        assert_eq!(sparse_areas[1].size, region_size - hole_end);
     }
 }
