@@ -743,7 +743,17 @@ s32 BPF_PROG(pylon_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
     }
 
     bool is_idle = false;
-    return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+
+    /*
+     * A host task that found an idle CPU runs there. On the host queue, the
+     * CPU woken for it would take the oldest task there instead, and the
+     * queue would never drain (#124).
+     */
+    if (is_idle && !vcpu_ctx(p) && !fenced(cpu, CLAIM_HOST, false)) {
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+    }
+    return cpu;
 }
 
 /*
@@ -807,11 +817,21 @@ void BPF_PROG(pylon_enqueue, struct task_struct *p, u64 enq_flags)
     } else if (p->nr_cpus_allowed == 1) {
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+    } else if ((enq_flags & SCX_ENQ_LAST) && !fenced(cpu, CLAIM_HOST, false)) {
+        /*
+         * Its slice ended with nothing else to run here, and no sibling's
+         * claim stops it: it goes on running, rather than idling this CPU
+         * until another takes it from the host queue (#124).
+         */
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+        return;
     } else {
+        /*
+         * Queued here, @p wakes no CPU: one that is idle has to be kicked,
+         * or @p waits for a busy one (#124).
+         */
         scx_bpf_dsq_insert(p, PYLON_HOST_DSQ, SCX_SLICE_DFL, enq_flags);
-        if (fenced(cpu, CLAIM_HOST, false)) {
-            kick_idle_cpu(p, CLAIM_HOST);
-        }
+        kick_idle_cpu(p, CLAIM_HOST);
     }
 
     /*
@@ -1005,6 +1025,28 @@ static void rescue_stranded_vcpus(void)
 }
 
 /*
+ * Wakes an idle CPU while host tasks wait. A task put on the host queue
+ * wakes no CPU of its own, so without this, tasks that queued at once (as
+ * when scx_pylon attaches, or at the end of slices) would wait for busy
+ * CPUs while others idle (#124). Each CPU that takes one wakes the next.
+ */
+static void kick_host_backlog(void)
+{
+    const struct cpumask *idle;
+    s32 cpu;
+
+    if (scx_bpf_dsq_nr_queued(PYLON_HOST_DSQ) <= 0) {
+        return;
+    }
+    idle = scx_bpf_get_idle_cpumask();
+    cpu = scx_bpf_pick_idle_cpu(idle, 0);
+    scx_bpf_put_idle_cpumask(idle);
+    if (cpu >= 0) {
+        scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+    }
+}
+
+/*
  * scx_ops.dispatch(cpu, prev)
  *
  * Run the pCPU's owner if it is queued. Otherwise run a vCPU thread or a
@@ -1055,6 +1097,7 @@ void BPF_PROG(pylon_dispatch, s32 cpu, struct task_struct *prev)
         return;
     }
     if (claim_cpu(cpu, CLAIM_HOST, false) && scx_bpf_dsq_move_to_local(PYLON_HOST_DSQ)) {
+        kick_host_backlog();
         return;
     }
     /* Nothing to run: the CPU goes idle. */
@@ -1160,13 +1203,23 @@ bool BPF_PROG(pylon_yield, struct task_struct *from, struct task_struct *to)
 /*
  * scx_ops.update_idle(cpu, idle)
  *
- * An idle CPU claims nothing.
+ * An idle CPU claims nothing, and one going idle with tasks left on its
+ * local queue schedules again.
  */
 SEC("struct_ops/pylon_update_idle")
 void BPF_PROG(pylon_update_idle, s32 cpu, bool idle)
 {
     if (idle) {
         set_claim(cpu, CLAIM_NONE);
+        /*
+         * A task the kernel put back on this CPU's local queue, with slice
+         * left, doesn't go through enqueue and kicks nothing. With core
+         * scheduling on, the CPU can then idle next to it for hundreds of
+         * milliseconds (#124). Have it pick again.
+         */
+        if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu) > 0) {
+            scx_bpf_kick_cpu(cpu, 0);
+        }
     }
 }
 
