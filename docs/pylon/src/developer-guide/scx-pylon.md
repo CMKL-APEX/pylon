@@ -36,7 +36,9 @@ stores: `flags`, then `target_tid` with `Release`. Bits 16–31 of
 program can find the CPUs a VM owns. The `HOST` bit (bit 2) marks an
 owner that is a host thread, not a vCPU: `pylond`'s engine owns its
 CPU, so it gets the CPU first, but `scx_pylon` doesn't tag it as a
-managed vCPU, and its SMT siblings still run host tasks. Without it, a
+managed vCPU, and its SMT siblings still run host tasks. Its slice is
+the host tasks' 3 ms, not an owner's 20 ms, so a per-CPU kworker waiting
+on its CPU runs within 3 ms (#126). Without it, a
 queued vCPU thread took the engine's CPU for a whole slice each time
 the engine's slice ended
 ([#54](https://github.com/CMKL-APEX/pylon/issues/54)). The `REVOKING`
@@ -117,6 +119,20 @@ has booted).
   on that CPU's local queue, and that CPU is kicked if it is idle.
 - Everything else goes on the host queue, and an idle CPU it may run on
   is kicked: a task on the host queue wakes no CPU by itself.
+
+Host tasks get a 3 ms slice (`PYLON_HOST_SLICE`); owners and other
+managed vCPU threads get 20 ms. A task put on a CPU's local queue waits
+for the task running there to finish its slice, and with 20 ms that was
+a per-CPU kworker's usual wait, or that of a task whose idle CPU was
+taken first (#126).
+
+An idle CPU to kick is picked on a wholly idle core first, otherwise one
+whose SMT siblings run no task with a kernel core scheduling cookie.
+With core scheduling on, a CPU next to a cookied task is forced idle
+next to whatever it takes, and that task waited there for up to seconds
+(#126). `running` records per CPU whether its task has a cookie
+(`cpu_cookied`) and `update_idle` clears it; a candidate is checked
+before it is claimed, so a CPU that is skipped stays marked idle.
 
 A task with migration disabled stays on its CPU's local queue too. The
 kernel runs a CPU's local queue before it asks `dispatch` for work, so
@@ -276,21 +292,33 @@ The flags are `SCX_OPS_ENQ_LAST`, `SCX_OPS_ENQ_EXITING`,
 - Two VMs on sibling threads (only possible without `pylond`'s
   placement, for example with VMs it doesn't manage) take turns badly:
   the lower-numbered CPU's VM wins for as long as its vCPU runs.
-- On a host with 256 CPUs and core scheduling on (Linux 6.17), a few
-  host tasks per 30 s still wait 100–700 ms to run; under the fair
-  scheduler none wait over about 2 ms (#126).
-- A per-CPU kworker on `pylond`'s engine CPU waits up to one owner
-  slice (20 ms) behind the pinned engine thread.
+- On a host with 256 CPUs and VMs with core scheduling on (Linux
+  6.17), a handful of host tasks per 30 s still wait 30–270 ms to run;
+  under the fair scheduler none wait over about 2 ms. `select_cpu`
+  still sends a task to the idle CPU that `scx_bpf_select_cpu_dfl()`
+  found, which prefers idle cores but doesn't know about cookies.
+- The 3 ms host slice lets host work on a managed CPU take its turn
+  more often: in the overcommit suite's `noisy` load, the VMs get 2.17
+  CPUs instead of 2.23 (#128).
 
 Apart from the last two, none of these has been measured yet.
 
 ## Building
 
 The verifier's limit is one million instructions per program.
-`claim_cpu()` is a global (non-inlined) function so that it is
-verified once, not at every call in `dispatch`'s queue loops; inlined,
-it took `pylon_dispatch` past the limit on Linux 6.17. Keep helpers
-called inside loops global when they grow. Loading the object without
+`claim_cpu()` and `sibling_cookied()` are global (non-inlined)
+functions so that they are verified once, not at every call in
+`enqueue`'s and `dispatch`'s loops; inlined, `claim_cpu()` took
+`pylon_dispatch` past the limit on Linux 6.17. Keep helpers called
+inside loops global when they grow.
+
+Reading another CPU's current task with `scx_bpf_cpu_curr()` or
+`scx_bpf_cpu_rq()` from `enqueue` failed to load on 6.17 and 7.0
+(`EINVAL`, empty verifier log), which is why `running` records the
+cookie per CPU instead. A CPU number from a cpumask kfunc is checked
+against `scx_bpf_nr_cpu_ids()`, not `MAX_PCPUS`: on a 32-CPU host,
+CPU 32 passed to `scx_bpf_test_and_clear_cpu_idle()` made the kernel
+disable the scheduler. Loading the object without
 attaching it (`open_embedded()`, then `load()`) runs the verifier
 without enabling `sched_ext`, and the verified instruction count is in
 `bpf_prog_info.verified_insns`.
