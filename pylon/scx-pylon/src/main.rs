@@ -41,7 +41,7 @@ struct Args {
     shm: Option<PathBuf>,
 
     /// Refuse to attach while any task has a core scheduling cookie. `auto` does this
-    /// only on kernels without the sched_ext core-scheduling fixes.
+    /// only on kernels from v6.19 without the sched_ext core-scheduling fixes.
     #[arg(long, value_enum, default_value_t)]
     core_sched_guard: GuardMode,
 

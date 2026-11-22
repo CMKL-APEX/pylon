@@ -225,7 +225,11 @@ core-scheduling pick, which ends in a NULL dereference in
   `PR_SCHED_CORE_GET` fails with `EINVAL` without `CONFIG_SCHED_CORE`
   and with `ENODEV` without SMT. Otherwise the kernel has the fix if
   its BTF has `struct scx_rq` member `lock_drop_seq`, which
-  f2da9587118d adds and d954004205c1 depends on.
+  f2da9587118d adds and d954004205c1 depends on. Failing that, it
+  predates the bug if its BTF still has the function `balance_scx`.
+  4c95380701f5 folded that into `pick_task_scx()` in v6.19, which
+  brought the bug. Kernels 6.12 to 6.18 don't need the guard, so they
+  run `scx_pylon` without BPF LSM.
 - `pylon_task_prctl` (`lsm/task_prctl`) refuses every `PR_SCHED_CORE`
   command except `GET`. It reads its answer, `EPERM` or `ENODEV`, from
   the `pylon_guard` map. `task_prctl` programs run as modify-return, so

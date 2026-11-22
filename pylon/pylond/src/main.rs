@@ -75,8 +75,8 @@ struct CliArgs {
     no_scx: bool,
 
     /// Refuse to attach scx-pylon while any task has a core scheduling cookie. `auto` does
-    /// this only on kernels without the sched_ext core-scheduling fixes; `on` also on kernels
-    /// that seem to have them.
+    /// this only on kernels from v6.19 without the sched_ext core-scheduling fixes; `on` also
+    /// on kernels that seem to have them or to predate the bug.
     #[arg(long, value_enum, default_value_t)]
     core_sched_guard: GuardMode,
 
