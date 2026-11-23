@@ -2,7 +2,7 @@
 
 ## v0.0.9 (in progress)
 
-Release candidates: `v0.0.9-rc1`, `v0.0.9-rc2`. Nothing changes in the
+Release candidates: `v0.0.9-rc1`, `v0.0.9-rc2`, `v0.0.9-rc3`. Nothing changes in the
 shared-page ABI, the host page or the `--pylon` options, so `pylond`,
 the VMM and the guest side from v0.0.8 work with these.
 
@@ -13,14 +13,18 @@ the VMM and the guest side from v0.0.8 work with these.
   changes some VMM options of its own, such as the syntax for restore
   and receive-migration and some deprecated APIs; see upstream's v55.0
   release notes.
-- **`scx_pylon` runs on more kernels.**
-  - Kernels 6.12 to 6.18 predate the `sched_ext` core-scheduling bug
-    ([#15](https://github.com/CMKL-APEX/pylon/issues/15)), so `pylond`
-    no longer guards them, and they no longer need the BPF LSM
-    ([#121](https://github.com/CMKL-APEX/pylon/pull/121)). Stock Ubuntu
-    24.04 kernels such as 6.17 ran without `scx_pylon` before.
-  - The 6.17 verifier rejected `scx_pylon` as too large
-    ([#123](https://github.com/CMKL-APEX/pylon/pull/123)).
+- **Kernels before 6.19 are guarded again** (rc3,
+  [#132](https://github.com/CMKL-APEX/pylon/issues/132)). rc1 and rc2
+  treated 6.12 to 6.18 as safe next to core scheduling
+  ([#121](https://github.com/CMKL-APEX/pylon/pull/121)), but they have a
+  related bug: a task that has exited can be scheduled again. On a 6.17
+  host with core-scheduling cookies, rc2 crashed the kernel
+  (`kernel BUG` in `do_task_dead`) and left it in soft lockups for hours.
+  As in v0.0.8, `scx_pylon` attaches on such a kernel only with the
+  guard, which needs the BPF LSM. **Don't run rc1 or rc2 with
+  `scx_pylon` on a kernel before 6.19**: use `--no-scx`, or upgrade.
+- **`scx_pylon` loads on 6.17**: its verifier rejected it as too large
+  ([#123](https://github.com/CMKL-APEX/pylon/pull/123)).
 - **Host tasks no longer wait while CPUs idle** under `scx_pylon`
   ([#125](https://github.com/CMKL-APEX/pylon/pull/125),
   [#128](https://github.com/CMKL-APEX/pylon/pull/128)). On a 256-CPU
@@ -41,13 +45,13 @@ the VMM and the guest side from v0.0.8 work with these.
 
 ### Known limits added
 
-- **Host tasks on Linux 6.17 with core scheduling on** still wait up to
-  a few hundred milliseconds a handful of times per 30 s; under the fair
-  scheduler, none wait over about 2 ms. On that kernel, `sched_ext` next
-  to core-scheduling cookies also logged one recoverable
-  `WARN_ON_ONCE` in `pick_task_scx()`, and loading `scx_pylon` one
-  verifier `REG INVARIANTS VIOLATION` warning. Both taint the kernel;
-  7.0 logs neither.
+- **Host tasks on a large host with core scheduling on** still waited
+  up to a few hundred milliseconds a handful of times per 30 s in
+  testing on 6.17, before rc3 guarded it; under the fair scheduler, none
+  wait over about 2 ms.
+- **Loading `scx_pylon` on 6.17** logs one verifier
+  `REG INVARIANTS VIOLATION` warning, which taints the kernel; 7.0 logs
+  none.
 - **The 3 ms host slice** costs a VM about 3% of its CPU time when host
   work competes for its managed CPUs (the overcommit suite's `noisy`
   load: 2.17 CPUs instead of 2.23).

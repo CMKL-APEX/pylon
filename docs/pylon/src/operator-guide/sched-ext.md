@@ -76,8 +76,10 @@ Before attaching it on a shared host:
 
 On kernels that lack upstream fixes to `sched_ext`, it can't be used
 together with kernel core scheduling (`PR_SCHED_CORE`): the host hangs
-or crashes (issue #15). The bug came with Linux 6.19, so 6.12 to 6.18
-aren't affected. Ubuntu's 7.0.0-42 is one such kernel. Core
+or crashes (issue #15). Ubuntu's 7.0.0-42 is one such kernel, and so is
+every kernel before 6.19: there, a task that has exited can be scheduled
+again, which ends in `kernel BUG at kernel/sched/core.c` in
+`do_task_dead` and soft lockups for hours (issue #132). Core
 scheduling turns on for the whole host as soon as *any* process asks
 for it, and Cloud Hypervisor does by default (`core_scheduling=vm`),
 so one VM started by anyone is enough.
@@ -104,8 +106,8 @@ guard on, deny Eperm`.
 
 | Option | Meaning |
 |---|---|
-| `--core-sched-guard auto` (default) | Guard only on kernels from 6.19 that can core-schedule and lack the fix. |
-| `--core-sched-guard on` | Also guard kernels that seem fixed or older than 6.19, for distributions that backported only part of the fix or the change that brought the bug. |
+| `--core-sched-guard auto` (default) | Guard only on kernels that can core-schedule and lack the fix. |
+| `--core-sched-guard on` | Also guard kernels that seem fixed, for distributions that backported only part of the fix. |
 | `--core-sched-guard off` | Never guard. Only for kernels you have checked yourself. |
 | `--core-sched-deny eperm` (default) | Refuse new cookies with `EPERM`: VMs asking for core scheduling don't start. |
 | `--core-sched-deny enodev` | Refuse with `ENODEV`: Cloud Hypervisor starts such VMs without core scheduling, and doesn't say so. |
