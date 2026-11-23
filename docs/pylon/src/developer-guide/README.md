@@ -71,6 +71,7 @@ The specs:
 | [06-guest-kick-path.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/06-guest-kick-path.md) | The guest kick and cooperative park design (draft). |
 | [07-aarch64-support.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/07-aarch64-support.md) | aarch64 host and guest support (draft). |
 | [08-park-in-kvm.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/08-park-in-kvm.md) | Parking vCPUs inside KVM so interrupts wake them (draft). |
+| [11-park-in-kvm-without-scx.md](https://github.com/CMKL-APEX/pylon/blob/main/spec/11-park-in-kvm-without-scx.md) | Parking inside KVM on hosts that can't run `sched_ext`, with CPU affinity and core scheduling (draft). |
 
 Specs 00–03 describe the design as first planned. Where the code
 differs, this guide describes the code and says so.
