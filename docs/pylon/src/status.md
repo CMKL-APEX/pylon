@@ -1,9 +1,9 @@
 # Status and roadmap
 
 This page says what works in Pylon today, what doesn't, and what is
-planned. It reflects the `v0.0.8` release (see the [release
+planned. It reflects the `v0.0.9` release (see the [release
 notes](release-notes.md)). Open work is tracked as GitHub issues on the
-[`v0.0.9` milestone](https://github.com/CMKL-APEX/pylon/milestone/2).
+[`v0.0.10` milestone](https://github.com/CMKL-APEX/pylon/milestone/3).
 The detailed tracker is
 [`spec/05-implementation-status.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md).
 
@@ -53,7 +53,7 @@ But:
   On the bare-metal x86_64 host, the kick takes 4–32 µs to reach the
   guest, and the guest then takes 16–64 µs to ask to park: kernel code
   runs that slowly on that host, in a guest or not ([spec 09 §9](https://github.com/CMKL-APEX/pylon/blob/main/spec/09-park-by-halt.md#9-h0-result-2026-11-14)).
-  So forced parks stay the default in v0.0.8. This was measured on
+  So forced parks stay the default, as in v0.0.8. This was measured on
   Zen 2 only, which needs some of the costliest x86 mitigations; newer
   x86 CPUs may do better and are still to be measured.
 - **Handoffs take about 100–125 µs.** On bare metal, from a revocation
@@ -107,12 +107,14 @@ But:
 
 `v0.0.8` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/1)) made parking inside KVM a `--pylon`
 option, the default on KVM hosts, with ABI version 3 ([#51](https://github.com/CMKL-APEX/pylon/issues/51)).
-The next release is `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)):
+`v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)) synced with upstream Cloud Hypervisor v55.0
+and fixed `scx_pylon` on large hosts and on 6.17 kernels.
+The next release is `v0.0.10` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/3)):
 
 | Work | Issues |
 |---|---|
 | End more parks by a wake than by the bound. | [#52](https://github.com/CMKL-APEX/pylon/issues/52) |
-| Measure and cut handoff latency; make the guest yield within the grace period. | [#53](https://github.com/CMKL-APEX/pylon/issues/53), [#54](https://github.com/CMKL-APEX/pylon/issues/54), [#74](https://github.com/CMKL-APEX/pylon/issues/74) |
+| Measure and cut scale-out latency. | [#54](https://github.com/CMKL-APEX/pylon/issues/54) |
 | Report critical sections from the guest. | [#56](https://github.com/CMKL-APEX/pylon/issues/56) |
 | Scale to zero on network traffic. | [#57](https://github.com/CMKL-APEX/pylon/issues/57) |
 | Move the shared page into a PCI BAR; get a PCI ID. | [#59](https://github.com/CMKL-APEX/pylon/issues/59), [#64](https://github.com/CMKL-APEX/pylon/issues/64) |

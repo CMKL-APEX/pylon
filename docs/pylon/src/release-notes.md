@@ -1,10 +1,11 @@
 # Release notes
 
-## v0.0.9 (in progress)
+## v0.0.9
 
-Release candidates: `v0.0.9-rc1`, `v0.0.9-rc2`, `v0.0.9-rc3`. Nothing changes in the
-shared-page ABI, the host page or the `--pylon` options, so `pylond`,
-the VMM and the guest side from v0.0.8 work with these.
+The same code as `v0.0.9-rc3`, with the Pylon components numbered
+0.0.9. Nothing changes in the shared-page ABI, the host page or the
+`--pylon` options, so `pylond`, the VMM and the guest side from v0.0.8
+work with this release.
 
 ### Changes since v0.0.8
 
@@ -55,6 +56,9 @@ the VMM and the guest side from v0.0.8 work with these.
 - **The 3 ms host slice** costs a VM about 3% of its CPU time when host
   work competes for its managed CPUs (the overcommit suite's `noisy`
   load: 2.17 CPUs instead of 2.23).
+- **The overcommit benchmark doesn't notice** when `scx_pylon` is
+  disabled partway through a run
+  ([#129](https://github.com/CMKL-APEX/pylon/issues/129)).
 
 The known limits of v0.0.8 below still apply.
 
@@ -199,5 +203,5 @@ See [Status and roadmap](status.md) for what works and what doesn't.
 - **A VM with no core isn't woken by arriving packets**
   ([#57](https://github.com/CMKL-APEX/pylon/issues/57)).
 
-The next release, `v0.0.9`, is tracked on its
-[milestone](https://github.com/CMKL-APEX/pylon/milestone/2).
+The next release, `v0.0.10`, is tracked on its
+[milestone](https://github.com/CMKL-APEX/pylon/milestone/3).
