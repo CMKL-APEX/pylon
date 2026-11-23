@@ -11,8 +11,13 @@
 //! and `rq->core_pick`, which ends in a NULL dereference or a hard hang
 //! (CMKL-APEX/pylon#15). Core scheduling turns on host-wide as soon as any task
 //! has a cookie, so on such a kernel `scx_pylon` must not run next to one.
-//! Kernels before v6.19 release the lock only in `balance_scx()`, before the
-//! pick, and aren't affected.
+//!
+//! Kernels before v6.19 have a related bug, so they count as affected too
+//! (CMKL-APEX/pylon#132): `balance_scx()` balances a core's SMT siblings and
+//! can release the rq lock while doing so, and `pick_task_scx()` then trusts
+//! a sibling's stale `SCX_RQ_BAL_KEEP` and returns its current task even
+//! after it exited. On Linux 6.17 that ended in `kernel BUG` in
+//! `do_task_dead()`, and in soft lockups for hours.
 
 use std::ffi::OsStr;
 use std::fmt::{self, Display};
@@ -20,7 +25,7 @@ use std::{fs, io};
 
 use clap::ValueEnum;
 use libbpf_rs::Btf;
-use libbpf_rs::btf::types::{Func, Struct};
+use libbpf_rs::btf::types::Struct;
 
 const PR_SCHED_CORE: libc::c_int = 62;
 const PR_SCHED_CORE_GET: libc::c_ulong = 0;
@@ -29,8 +34,7 @@ const PR_SCHED_CORE_SCOPE_THREAD: libc::c_ulong = 0;
 /// Whether to guard against core scheduling while `scx_pylon` is attached.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum GuardMode {
-    /// Guard unless the kernel has the fixes, predates the bug or can't
-    /// core-schedule.
+    /// Guard unless the kernel has the fixes or can't core-schedule.
     #[default]
     Auto,
     /// Guard whenever the kernel can core-schedule.
@@ -83,9 +87,6 @@ pub enum KernelCoreSched {
     /// Has `scx_rq.lock_drop_seq`, added by f2da9587118d, on which the fix
     /// d954004205c1 depends.
     Fixed,
-    /// Still has the function `balance_scx`, which 4c95380701f5 folded into
-    /// `pick_task_scx` in v6.19, bringing the bug.
-    Unaffected,
     /// Can core-schedule and lacks the fixes.
     Affected,
 }
@@ -96,7 +97,6 @@ impl Display for KernelCoreSched {
             Self::Unsupported => "kernel has no core scheduling",
             Self::NoSmt => "host has no SMT siblings",
             Self::Fixed => "kernel has the sched_ext core-scheduling fixes",
-            Self::Unaffected => "kernel predates the sched_ext core-scheduling bug (pylon#15)",
             Self::Affected => "kernel lacks the sched_ext core-scheduling fixes (pylon#15)",
         })
     }
@@ -124,23 +124,8 @@ impl KernelCoreSched {
             };
         }
         match Btf::from_vmlinux() {
-            Ok(btf) => Self::from_btf(
-                struct_has_member(&btf, "scx_rq", "lock_drop_seq"),
-                btf.type_by_name::<Func<'_>>("balance_scx").is_some(),
-            ),
-            Err(_) => Self::Affected,
-        }
-    }
-
-    /// Classifies a kernel that can core-schedule by what its BTF has. A
-    /// kernel that backports the fold without the fixes counts as affected.
-    fn from_btf(has_lock_drop_seq: bool, has_balance_scx: bool) -> Self {
-        if has_lock_drop_seq {
-            Self::Fixed
-        } else if has_balance_scx {
-            Self::Unaffected
-        } else {
-            Self::Affected
+            Ok(btf) if struct_has_member(&btf, "scx_rq", "lock_drop_seq") => Self::Fixed,
+            _ => Self::Affected,
         }
     }
 
@@ -227,23 +212,11 @@ mod tests {
     fn test_needs_guard() {
         use GuardMode::*;
         use KernelCoreSched::*;
-        for kernel in [Unsupported, NoSmt, Fixed, Unaffected, Affected] {
+        for kernel in [Unsupported, NoSmt, Fixed, Affected] {
             assert!(!kernel.needs_guard(Off));
             assert_eq!(kernel.needs_guard(Auto), kernel == Affected);
             assert_eq!(kernel.needs_guard(On), kernel != Unsupported);
         }
-    }
-
-    #[test]
-    fn test_from_btf() {
-        use KernelCoreSched::*;
-        // v6.19+ with the fixes, or a backport of both.
-        assert_eq!(KernelCoreSched::from_btf(true, false), Fixed);
-        assert_eq!(KernelCoreSched::from_btf(true, true), Fixed);
-        // v6.12-v6.18.
-        assert_eq!(KernelCoreSched::from_btf(false, true), Unaffected);
-        // v6.19+ without the fixes.
-        assert_eq!(KernelCoreSched::from_btf(false, false), Affected);
     }
 
     #[test]
