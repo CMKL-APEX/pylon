@@ -123,6 +123,8 @@ pub struct ControlPlane {
     socket_mode: Option<u32>,
     socket_gid: Option<u32>,
     vcpu_domains: Option<Box<dyn VcpuDomainTable>>,
+    /// Spec 11 prototype: the engine contains `park=kvm` VMs with CPU affinity.
+    affinity_containment: bool,
 }
 
 /// Where Plane 1 lists registered VMs' vCPU threads with their VMM's PID: `scx_pylon`'s
@@ -187,6 +189,7 @@ impl ControlPlane {
             socket_mode: None,
             socket_gid: None,
             vcpu_domains: None,
+            affinity_containment: false,
         }
     }
 
@@ -195,6 +198,14 @@ impl ControlPlane {
     #[must_use]
     pub fn with_vcpu_domains(mut self, table: impl VcpuDomainTable + 'static) -> Self {
         self.vcpu_domains = Some(Box::new(table));
+        self
+    }
+
+    /// Accepts `park=kvm` VMs without `scx_pylon`: the engine contains them with CPU affinity
+    /// (spec 11 prototype).
+    #[must_use]
+    pub fn with_affinity_containment(mut self) -> Self {
+        self.affinity_containment = true;
         self
     }
 
@@ -292,7 +303,7 @@ impl ControlPlane {
                     let snapshot = Arc::clone(&self.vm_snapshot);
                     // The vCPU domain table is `scx_pylon`'s, so it is set exactly when
                     // `scx_pylon` is attached.
-                    let scx_attached = self.vcpu_domains.is_some();
+                    let scx_attached = self.vcpu_domains.is_some() || self.affinity_containment;
                     limit.spawn(permit, async move {
                         if let Err(err) =
                             handle_client_connection(stream, snapshot, scx_attached).await

@@ -1,0 +1,18 @@
+// Spec 11 M4: does a tracing program see KVM wake halted vCPU threads, and how early?
+// sched_waking fires in the waker as a vCPU thread becomes runnable; kvm_vcpu_wakeup fires in
+// the vCPU thread itself once it runs after a halt. Read-only; 10 s.
+tracepoint:sched:sched_waking /strncmp(args.comm, "vcpu", 4) == 0/ {
+    @waking = count();
+    @t[args.pid] = nsecs;
+}
+tracepoint:kvm:kvm_vcpu_wakeup {
+    @kvm_wakeup = count();
+    @kvm_valid[args.valid] = count();
+    $t = @t[tid];
+    if ($t) {
+        @waking_to_running_us = hist((nsecs - $t) / 1000);
+        delete(@t[tid]);
+    }
+}
+interval:s:10 { exit(); }
+END { clear(@t); }

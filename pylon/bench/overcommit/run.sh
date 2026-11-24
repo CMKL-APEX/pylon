@@ -40,11 +40,13 @@ OUT=${OUT:-results}
 REPS=${REPS:-2}
 SYSTEMS=${SYSTEMS:-pylon,upstream,dedicated}
 : "${BENCH_HOST:?}" "${IMAGE:?}" "${FIRMWARE:?}"
-PASS=(CPUS VCPUS MEMORY PYLON1 PYLON2 PYLOND_ARGS STOP_SERVICE WARMUP SECONDS_RUN)
+PASS=(CPUS VCPUS MEMORY PYLON1 PYLON2 PYLOND_ARGS STOP_SERVICE WARMUP SECONDS_RUN
+    REQUIRE_SCX CORE_SCHED VCPU_SLICE_NS METRICS_PORT HOST_LOAD)
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 cc -O2 -static -pthread -o "$stage/pylon-overcommit-load" "$H/workload.c"
+cc -O2 -static -o "$stage/set_slice" "$H/../spec11/set_slice.c"
 
 run_one() { # scenario system rep load1 load2
     local dir="$OUT/$1/$2-$3" vmm env=() v remote
@@ -54,7 +56,7 @@ run_one() { # scenario system rep load1 load2
         vmm=${UPSTREAM_VMM:?}
     fi
     rm -rf "${stage:?}/run" && mkdir "$stage/run"
-    cp "$H/host.sh" "$H/guest.sh" "$stage/pylon-overcommit-load" "$stage/run/"
+    cp "$H/host.sh" "$H/guest.sh" "$stage/pylon-overcommit-load" "$stage/set_slice" "$stage/run/"
     cp "$vmm" "$stage/run/cloud-hypervisor"
     [ "$2" = pylon ] && cp "${PYLOND:?}" "$stage/run/pylond" && cp "${AGENT:?}" "$stage/run/pylon-guest-agent"
     env=("SYSTEM=$2" "IMAGE=$IMAGE" "FIRMWARE=$FIRMWARE" "LOAD1=$4" "LOAD2=$5")
@@ -74,6 +76,7 @@ run_one() { # scenario system rep load1 load2
     mkdir -p "$dir"
     scp -q -o BatchMode=yes "$BENCH_HOST:$remote"/{result.txt,result.log,host.out,serial1.log,serial2.log,ch1.log,ch2.log} "$dir/" || true
     scp -q -o BatchMode=yes "$BENCH_HOST:$remote/pylond.log" "$dir/" 2>/dev/null || true
+    scp -q -o BatchMode=yes "$BENCH_HOST:$remote/metrics.txt" "$dir/" 2>/dev/null || true
     ssh -o BatchMode=yes "$BENCH_HOST" "sudo rm -rf $remote"
     grep -h "restored\|ABORT" "$dir/result.log" || echo "  no log: see the test host"
 }

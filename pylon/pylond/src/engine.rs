@@ -9,11 +9,12 @@ use core::arch::asm;
 use core::arch::x86_64::{__cpuid_count, _mm_pause};
 #[cfg(not(target_arch = "x86_64"))]
 use core::hint::spin_loop;
+use core::mem::zeroed;
 use std::array::from_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{io, thread};
 
 use log::{info, warn};
 use pylon_abi::clock::{architectural_counter_khz, read_counter};
@@ -390,6 +391,11 @@ pub struct MatrixEngine {
     host_tsc_khz: u64,
     has_timed_wait: bool,
     engine_cpu: usize,
+    /// Spec 11 prototype: without `scx_pylon`, keep each `park=kvm` VM's vCPU threads on the
+    /// cores it owns (or on the shared pool when it owns none) with CPU affinity.
+    affinity_containment: bool,
+    /// The mask last applied to each vCPU thread: (VM ID, mask, vCPU index + thread ID * 256).
+    contained: Vec<(u64, [u64; MAX_PCPUS / 64], usize)>,
     /// How long a donor has to park before it is signalled (`REVOKE_GRACE_PERIOD_US` unless set).
     revoke_grace_us: u64,
     /// How long after the first signal the core is handed over anyway (`FORCE_HANDOFF_US`
@@ -455,6 +461,8 @@ impl MatrixEngine {
             host_tsc_khz: default_counter_khz(),
             has_timed_wait,
             engine_cpu: DEFAULT_ENGINE_CPU,
+            affinity_containment: false,
+            contained: Vec::with_capacity(MAX_TRACKED_VMS),
             revoke_grace_us: REVOKE_GRACE_PERIOD_US,
             force_handoff_us: FORCE_HANDOFF_US,
             smt_next: from_fn(|pcpu| pcpu as u16),
@@ -531,6 +539,124 @@ impl MatrixEngine {
     /// Sets the host CPU the polling loop pins itself to in [`Self::run`].
     pub fn set_engine_cpu(&mut self, cpu: usize) {
         self.engine_cpu = cpu;
+    }
+
+    /// Contains `park=kvm` VMs with CPU affinity instead of `scx_pylon` (spec 11 prototype).
+    pub fn set_affinity_containment(&mut self, on: bool) {
+        self.affinity_containment = on;
+    }
+
+    /// The managed cores `vm_id` owns, plus `extra` (a core being assigned to it now).
+    fn owned_mask(&self, vm_id: u64, extra: Option<usize>) -> [u64; MAX_PCPUS / 64] {
+        let mut mask = [0u64; MAX_PCPUS / 64];
+        for pcpu in 0..MAX_PCPUS {
+            let owned = matches!(self.core_states[pcpu],
+                CoreState::Assigned { vm_id: owner, .. } if owner == vm_id);
+            if self.managed_pcpus[pcpu] && (owned || extra == Some(pcpu)) {
+                mask[pcpu / 64] |= 1 << (pcpu % 64);
+            }
+        }
+        mask
+    }
+
+    /// The shared pool: managed cores no VM owns, or every managed core when all are owned.
+    fn pool_mask(&self) -> [u64; MAX_PCPUS / 64] {
+        let mut idle = [0u64; MAX_PCPUS / 64];
+        let mut all = [0u64; MAX_PCPUS / 64];
+        for pcpu in 0..MAX_PCPUS {
+            if self.managed_pcpus[pcpu] {
+                all[pcpu / 64] |= 1 << (pcpu % 64);
+                if self.core_states[pcpu] == CoreState::Idle {
+                    idle[pcpu / 64] |= 1 << (pcpu % 64);
+                }
+            }
+        }
+        if idle.iter().any(|&w| w != 0) {
+            idle
+        } else {
+            all
+        }
+    }
+
+    /// Sets the affinity of `vm`'s vCPU threads: a vCPU that owns a core runs only there; the
+    /// VM's other vCPUs run on the cores it owns, or on the shared pool when it owns none.
+    /// `extra` is a core being assigned now, to the vCPU given with it.
+    fn contain_vm(&mut self, vm: &VmHandle, extra: Option<(usize, u8)>) {
+        if !self.affinity_containment || !vm.wake_by_signal() {
+            return;
+        }
+        let owned = self.owned_mask(vm.vm_id(), extra.map(|e| e.0));
+        let shared = if owned.iter().any(|&w| w != 0) {
+            owned
+        } else {
+            self.pool_mask()
+        };
+        let num_vcpus = (vm.num_vcpus() as usize).min(MAX_VCPUS);
+        for i in 0..num_vcpus {
+            let slot = &vm.host_page().vcpus[i];
+            let tid = slot.host_tid.load(Ordering::Acquire);
+            if tid == 0 {
+                continue;
+            }
+            // The core this vCPU owns, if any.
+            let own = match extra {
+                Some((pcpu, vcpu)) if vcpu as usize == i => Some(pcpu),
+                _ => (0..MAX_PCPUS).find(|&c| {
+                    self.managed_pcpus[c]
+                        && matches!(self.core_states[c],
+                            CoreState::Assigned { vm_id, vcpu } if vm_id == vm.vm_id() && vcpu as usize == i)
+                        && extra.is_none_or(|(p, _)| p != c)
+                }),
+            };
+            let mut mask = [0u64; MAX_PCPUS / 64];
+            match own {
+                Some(c) => mask[c / 64] = 1 << (c % 64),
+                None => mask = shared,
+            }
+            let key = i + (tid as usize) * 256;
+            let cached = self
+                .contained
+                .iter()
+                .position(|c| (c.0, c.2) == (vm.vm_id(), key));
+            if cached.is_some_and(|j| self.contained[j].1 == mask) {
+                continue;
+            }
+            // SAFETY: `cpu_set_t` is plain old data.
+            let mut set: libc::cpu_set_t = unsafe { zeroed() };
+            for pcpu in 0..MAX_PCPUS {
+                if mask[pcpu / 64] & (1 << (pcpu % 64)) != 0 {
+                    // SAFETY: `pcpu` is below MAX_PCPUS, which is at most CPU_SETSIZE.
+                    unsafe { libc::CPU_SET(pcpu, &mut set) };
+                }
+            }
+            // SAFETY: a valid mask of the right size; a thread that has exited fails with ESRCH.
+            let rc = unsafe {
+                libc::sched_setaffinity(tid as libc::pid_t, size_of::<libc::cpu_set_t>(), &set)
+            };
+            if rc != 0 {
+                warn!(
+                    "VM {}: setting vCPU {i}'s affinity failed: {}",
+                    vm.vm_id(),
+                    io::Error::last_os_error()
+                );
+            }
+            match cached {
+                Some(j) => self.contained[j].1 = mask,
+                None => self.contained.push((vm.vm_id(), mask, key)),
+            }
+        }
+    }
+
+    /// Brings every contained VM's affinity in line with the cores it owns now.
+    fn reconcile_containment(&mut self, vms: &[VmHandle], vm_count: usize) {
+        if !self.affinity_containment {
+            return;
+        }
+        self.contained
+            .retain(|c| vms[..vm_count].iter().any(|vm| vm.vm_id() == c.0));
+        for vm in &vms[..vm_count] {
+            self.contain_vm(vm, None);
+        }
     }
 
     /// Sets how long a donor has to park after a revocation request before it is signalled
@@ -735,6 +861,8 @@ impl MatrixEngine {
         };
         self.pcpu_owners.write_owner(pcpu, tid, flags);
         let _ = self.pcpu_owners.kick(pcpu);
+        // Allowed on the core before it is woken (spec 11 §4.1).
+        self.contain_vm(vm, Some((pcpu, vcpu)));
         self.assigned_tsc[pcpu] = now_tsc;
         self.assigned_yield_count[pcpu] = host.yield_count.load(Ordering::Acquire);
         vm.set_assigned_pcpu(vcpu as usize, pcpu as u8);
@@ -842,6 +970,7 @@ impl MatrixEngine {
 
         // Last, so the cores assigned in this sweep are already out of the masks.
         self.publish_parked_vcpus(vms, vm_count);
+        self.reconcile_containment(vms, vm_count);
         self.last_poll_tsc = now_tsc;
     }
 

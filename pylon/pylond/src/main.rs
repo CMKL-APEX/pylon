@@ -74,6 +74,11 @@ struct CliArgs {
     #[arg(long)]
     no_scx: bool,
 
+    /// Spec 11 prototype: without scx-pylon, accept `park=kvm` VMs and keep their vCPU threads
+    /// on the cores they own with CPU affinity.
+    #[arg(long)]
+    containment_affinity: bool,
+
     /// Refuse to attach scx-pylon while any task has a core scheduling cookie. `auto` does
     /// this only on kernels without the sched_ext core-scheduling fixes; `on` also on kernels
     /// that seem to have them.
@@ -369,6 +374,11 @@ fn main() -> Result<()> {
     let engine_stop = Arc::clone(&stop_flag);
     let engine_cpu = args.engine_cpu;
     let (revoke_grace_us, force_handoff_us) = (args.revoke_grace_us, args.force_handoff_us);
+    // Only without scx_pylon: with it, scx_pylon contains woken vCPUs.
+    let containment = args.containment_affinity && vcpu_domains.is_none();
+    if args.containment_affinity && !containment {
+        warn!("--containment-affinity ignored: scx_pylon is attached");
+    }
     let engine_thread = thread::Builder::new()
         .name("pylond-engine".to_owned())
         .spawn(move || {
@@ -376,6 +386,7 @@ fn main() -> Result<()> {
                 .with_vm_vcpus(vm_vcpus)
                 .with_write_watch(write_watch);
             engine.set_engine_cpu(engine_cpu);
+            engine.set_affinity_containment(containment);
             engine.set_revocation_timing(revoke_grace_us, force_handoff_us);
             if let Some(tsc_khz) = host_tsc_khz {
                 engine.set_host_tsc_khz(tsc_khz);
@@ -397,6 +408,10 @@ fn main() -> Result<()> {
         .with_socket_permissions(args.socket_mode, args.socket_group);
     if let Some(vcpu_domains) = vcpu_domains {
         control = control.with_vcpu_domains(vcpu_domains);
+    }
+    if containment {
+        info!("Containing park=kvm VMs with CPU affinity (spec 11 prototype)");
+        control = control.with_affinity_containment();
     }
     if let Some(port) = args.metrics_port {
         let bind_addr = format!("{}:{}", args.metrics_addr, port);

@@ -27,6 +27,11 @@
 #   STOP_SERVICE    a systemd unit to stop for the run and start after it,
 #                   such as another pylond that manages the same CPUs
 #   WARMUP, SECONDS_RUN  passed to the load [40, 150]
+#   REQUIRE_SCX     0: don't abort when scx_pylon isn't attached (spec 11 prototype) [1]
+#   CORE_SCHED      the VMs' core_scheduling setting [off]
+#   VCPU_SLICE_NS   set the VMs' vCPU threads' fair-scheduler slice (Linux 6.12+)
+#   METRICS_PORT    serve pylond's metrics there, and save them to metrics.txt at the end
+#   HOST_LOAD       start this many host busy loops, allowed on every CPU, for the run
 set -u
 D=$(dirname "$(readlink -f "$0")")
 cd "$D" || exit 1
@@ -62,6 +67,7 @@ log() { echo "[$(date +%T)] $*" | tee -a result.log; }
 result() { echo "$*" >>result.txt; }
 
 cleanup() {
+    [ -n "${HOST_PIDS:-}" ] && kill $HOST_PIDS 2>/dev/null
     for p in "${VM_PIDS[@]}"; do sudo kill "$p" 2>/dev/null; done
     sleep 2
     [ -n "$PYLOND_PID" ] && sudo kill -TERM "$PYLOND_PID" 2>/dev/null && sleep 2
@@ -105,6 +111,7 @@ if [ "$SYSTEM" = pylon ]; then
     # The logs belong to the user, so the redirects are meant to run without sudo.
     # shellcheck disable=SC2086,SC2024 # PYLOND_ARGS is a list of options
     sudo env RUST_LOG=info "$D/pylond" --socket "$D/pylond.sock" --cores "$CPUS" ${PYLOND_ARGS:-} \
+        ${METRICS_PORT:+--metrics-port $METRICS_PORT} \
         >pylond.log 2>&1 &
     # Known before the check below, so that cleanup stops pylond on an abort too.
     for _ in $(seq 10); do
@@ -115,7 +122,7 @@ if [ "$SYSTEM" = pylon ]; then
         grep -qE "scx_pylon attached|not attached|Error" pylond.log && break
         sleep 1
     done
-    grep -q "scx_pylon attached successfully" pylond.log || {
+    [ "${REQUIRE_SCX:-1}" = 0 ] || grep -q "scx_pylon attached successfully" pylond.log || {
         log "ABORT: scx_pylon not attached"
         exit 1
     }
@@ -124,7 +131,7 @@ for v in 1 2; do
     # No core scheduling, as in the earlier real-guest runs: it would keep the
     # other VM off a CPU's SMT sibling, which is outside CPUS anyway.
     # shellcheck disable=SC2054 # the commas belong to the options
-    vm=(--firmware "$FIRMWARE" --memory "size=$MEMORY" --cpus "boot=$VCPUS,core_scheduling=off"
+    vm=(--firmware "$FIRMWARE" --memory "size=$MEMORY" --cpus "boot=$VCPUS,core_scheduling=${CORE_SCHED:-off}"
         --disk "path=disk$v.raw,image_type=raw" "path=seed$v.img,image_type=raw"
         --serial file="$D/serial$v.log" --console off)
     if [ "$SYSTEM" = pylon ]; then
@@ -140,6 +147,15 @@ done
 sleep 1
 for v in 1 2; do VM_PIDS+=("$(pgrep -f "^$D/cloud-hypervisor.*disk$v.raw")"); done
 log "$SYSTEM: VMs ${VM_PIDS[*]}, pylond ${PYLOND_PID:-none}"
+if [ -n "${VCPU_SLICE_NS:-}" ]; then
+    sleep 2
+    for p in "${VM_PIDS[@]}"; do
+        for t in /proc/"$p"/task/*; do
+            grep -q '^vcpu' "$t/comm" 2>/dev/null && sudo "$D/set_slice" "$VCPU_SLICE_NS" "${t##*/}"
+        done
+    done
+    log "vCPU slice set to $VCPU_SLICE_NS ns"
+fi
 
 started() { sudo grep -ac "PYLONBENCH load start" serial1.log serial2.log 2>/dev/null | grep -c ':1$'; }
 for _ in $(seq 150); do
@@ -151,6 +167,14 @@ done
     exit 1
 }
 log "both loads started"
+HOST_PIDS=
+if [ -n "${HOST_LOAD:-}" ]; then
+    for _ in $(seq "$HOST_LOAD"); do
+        sh -c 'while :; do :; done' &
+        HOST_PIDS="$HOST_PIDS $!"
+    done
+    log "host load: $HOST_LOAD busy loops"
+fi
 
 # Host CPU over the loads' window, less 10 s at the end for a late start.
 sleep "$WARMUP"
@@ -170,4 +194,5 @@ for _ in $(seq 60); do
     sleep 2
 done
 result "lockups=$(sudo cat serial1.log serial2.log | grep -a -c -i -E 'soft lockup|rcu.*stall|hung task')"
+[ -n "${METRICS_PORT:-}" ] && curl -s "http://127.0.0.1:$METRICS_PORT/metrics" >metrics.txt
 log "finished: $(tail -2 result.txt | tr '\n' ' ')"
