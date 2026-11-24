@@ -462,7 +462,36 @@ an SMT core.
 
 ### 9.7 M8: stability
 
-_Running: 8 hours on the 7.0 host, see the PR._
+8 hours on the 7.0 host, not the 6.17 one: the 6.17 host serves users,
+and M4 was the only run approved there. Without `sched_ext`, #132's bug
+can't fire on either kernel; what this run checks is the rest of M8's
+trigger, core scheduling plus churn, under the prototype.
+
+The setup:
+
+- Two contained `park=kvm` VMs ran the barrier and count loads, with
+  cookies per VM and the 100 µs slice.
+- Eight loops of short-lived processes ran beside them, plus a loop
+  starting 64 threads at a time.
+- A stock Cloud Hypervisor VM with a cookie (2 vCPUs) started every
+  3 minutes, ran for 150 s and was killed: 154 cycles.
+
+The host and both guests were checked every 5 minutes:
+
+| Check | Result |
+|---|---|
+| Kernel warning, oops, BUG, soft lockup, hung task, RCU stall | None (0 lines in 8 h) |
+| Guest soft lockup, RCU stall or hung task | None |
+| Threads holding a core-scheduling cookie | 10–15 |
+| Load average | 18.6–19.9 |
+| VM CPU on 3 managed CPUs | 1.30 + 1.37 |
+| `pylond` CPU | 1.01 (0.64–0.67 in §9.3 without the churn) |
+| Wake p50/p99, both VMs | 44/320 µs, 2.9 M handoffs |
+| Handoff p50/p99 | 144/416 µs |
+
+`pylond`'s CPU rose by half with the churn. The cause wasn't measured:
+the prototype recomputes every vCPU's mask on each poll, though it only
+calls `sched_setaffinity` when a mask changes. Profile this before §8.
 
 ### 9.8 Not measured
 
@@ -476,7 +505,7 @@ _Running: 8 hours on the 7.0 host, see the PR._
 | Gate | Result |
 |---|---|
 | No guest stalls | **Pass.** None in any run; `park=vmm` guests didn't start their load. |
-| Kernel stability | Pending (M8). |
+| Kernel stability | **Pass on 7.0** (8 h, no warning or lockup, host or guest); 6.17 untested. |
 | Handoff, median at most 2× `scx_pylon`'s | **Pass, barely.** 128–144 µs against 72–96 µs, 1.8–2.0×. |
 | Throughput: at least `park=vmm`'s, within 10% of `scx_pylon`'s | **Fail at the barrier** (0.31× `scx_pylon`); 1.2–1.3× `scx_pylon` on the other loads. At least `park=vmm`'s everywhere. |
 | Ping-pong p99 under 1 ms with the other VM busy | **Pass with the 100 µs slice** (907–995 µs); fails with the default slice (1,741 µs). |
