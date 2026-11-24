@@ -1,7 +1,9 @@
 # Specification 11: Parking Inside KVM Without `sched_ext`
 
-> **Status:** `DRAFT`. Nothing is implemented. §6 lists the measurements
-> to take before deciding whether to build it (§7).
+> **Status:** `DRAFT`, measured. §6 lists the measurements and §9 their
+> results, from a prototype (`pylon/spec-11-proto`). They changed §4.1 and
+> §4.2: an owner vCPU is pinned to its core. §7's gates pass except the
+> barrier's throughput against `scx_pylon` (§9.9).
 
 ## 1. Motivation
 
@@ -76,8 +78,9 @@ scheduler then does the scheduling, and `sched_ext` is never attached.
 
 When `pylond` gives core *c* to vCPU *v* of VM *A* (`assign_pcpu`):
 
-1. Add *c* to the affinity of every vCPU thread of *A* (§4.2). *v* must
-   be allowed on *c* before it is woken.
+1. Set *v*'s affinity to *c* alone, and add *c* to the affinity of
+   *A*'s other vCPU threads (§4.2). *v* must be pinned to *c* before it
+   is woken.
 2. Wake *v* as today: write the wake `EventFd`, and signal the thread
    when it parks inside KVM (spec 08 §3.3).
 
@@ -101,14 +104,24 @@ owned cores" on all its vCPU threads:
   into it at registration, and the write's cost grows with the number
   of threads and may take `cpuset_mutex` against other cgroup writers.
 
-§6 M1 measures both, and the choice follows from it.
+§6 M1 measures both, and the choice follows from it: per-thread
+affinity (§9.1).
+
+**Why the owner is pinned.** The first prototype gave every vCPU of *A*,
+the owner included, all of *A*'s cores. The fair scheduler then woke a
+recipient onto a busy core of its VM instead of the idle core it had
+just been given, and it ran there only when that core's slice ended:
+2–3 ms from assignment to running, against 32 µs under `scx_pylon`, with
+the given core idle 86% of the time (§9.2). Pinned to its core, it runs
+in 40 µs.
 
 ### 4.2 Containment
 
 Every vCPU thread of a registered `park=kvm` VM always has an affinity
 mask:
 
-- the cores the VM owns, if it owns any;
+- its own core, if it owns one (§4.1);
+- otherwise the cores the VM owns, if it owns any;
 - otherwise the **shared pool**: the managed cores that no VM owns
   right now, or all managed cores if every one is owned.
 
@@ -323,3 +336,157 @@ documented as slower, not made the default.
    warning when one runs with `core_scheduling=off` (§4.5).
 5. **C5:** docs: the operator guide's `sched_ext` page, the host-task
    option (§4.6), and the release notes.
+
+## 9. Results (2026-11-24)
+
+**Setup.** Unless noted: a bare-metal AMD EPYC 7282 host (Zen 2, 16 cores
+with SMT, one NUMA node), Ubuntu `7.0.0-43-generic`, `sched_ext` disabled
+outside the `scx_pylon` runs. The overcommit suite (`pylon/bench/overcommit/`):
+two 4-vCPU Ubuntu 26.04 guests on host CPUs 2–4, 150 s runs measured from
+40 s, one run per load. The prototype is branch `pylon/spec-11-proto`:
+`pylond --no-scx --containment-affinity` plus harness switches. It has no
+wake detection (§4.4), so `pylond` sees demand only from the guest agent.
+`scx_pylon` attached with the guard (this host has the BPF LSM), and the
+VMs ran without cookies unless noted.
+
+### 9.1 M1: affinity update cost
+
+`pylon/bench/spec11/m1.c` and `m1cg.c`, 2,000–5,000 changes each, µs:
+
+| Change | p50 | p99 |
+|---|---|---|
+| `sched_setaffinity`, thread blocked (as a vCPU halted in KVM) | 1.9 | 2.2 |
+| `sched_setaffinity`, thread running, its CPU stays allowed | 4–7 | 5–11 |
+| `sched_setaffinity`, thread running, its CPU removed (waits for the migration) | 21–27 | 29–37 |
+| One `cpuset.cpus` write, 4–16 sleeping threads | 80–96 | 95–118 |
+| One `cpuset.cpus` write, 4–16 spinning threads | 1,000–14,000 | 7,000–26,000 |
+
+Per-thread affinity, as §4.1 now says.
+
+### 9.2 M2: handoff latency
+
+From `pylond`'s metrics, all five loads, µs, p50 / p99:
+
+| | Wake (assigned → running) | Handoff (revocation → recipient running) |
+|---|---|---|
+| `scx_pylon` | 32–36 / 80–160 | 72–96 / 128–224 |
+| Affinity, owner on all the VM's cores (first prototype) | 80–2,048 / 1,664–3,840 | 176–2,304 / 1,792–4,096 |
+| Affinity, owner pinned to its core (§4.1) | 36–40 / 64–80 | 128–144 / 160–192 |
+
+With the owner pinned, the median handoff is 1.8–2.0× `scx_pylon`'s and
+its p99 is lower. The first prototype's recipient waited behind a busy
+core of its VM while its own core idled: a 5 s `sched_switch` trace showed
+CPU 2, the core that moved between the VMs, idle 86% of the time, and the
+VMs used 2.1 of the 3 CPUs.
+
+### 9.3 M3: turns on an owned core, and the overcommit suite (M7)
+
+Work per second for both VMs together, and the VMs' CPUs:
+
+| Load | `upstream` | `scx_pylon` | Pinned, default slice | Pinned, 100 µs slice | Pinned, 100 µs, cookies |
+|---|---|---|---|---|---|
+| `independent` | 2,370M (2.99) | 1,923M (3.00) | 2,334M (3.00) | 2,312M (2.99) | 2,304M (2.98) |
+| `barrier` | 2.5k (3.00) | 10.3k (3.00) | 3.1k (3.00) | 3.1k (3.00) | 3.2k (2.98) |
+| `spinlock` | 2.17M (3.00) | 1.68M (3.00) | 2.19M (3.00) | 2.10M (2.99) | 2.09M (2.98) |
+| `pipes` | 753k (3.00) | 570k (3.00) | 747k (3.00) | 742k (3.00) | 736k (2.97) |
+
+`noisy` (VM 1's ping-pong next to VM 2 spinning on every vCPU):
+
+| | Ping-pong p50 / p99 / p99.9, µs | VM 2 | VMs' CPUs |
+|---|---|---|---|
+| `upstream` | 62 / 4,610 / 6,713 | 2,257M | 2.99 |
+| `scx_pylon` | 189 / 374 / 467 | 1,269M | 2.21 |
+| Pinned, default slice | 316 / 1,741 / 3,087 | 1,461M | 2.22 |
+| Pinned, 100 µs slice | 308 / 907 / 1,985 | 1,489M | 2.25 |
+| Pinned, 100 µs, cookies | 307 / 995 / 2,001 | 1,483M | 2.25 |
+
+**`park=vmm`** (`pylond --no-scx`, `--pylon ...,park=vmm`): on `barrier`
+and `noisy` the guests never started their loads within 150 s, as in
+spec 08.
+
+**What it shows:**
+- No guest logged a soft lockup, RCU stall or hung task in any run of
+  the prototype, where `park=vmm` guests don't get as far as the load.
+- On loads that don't wait on each other, the prototype does what
+  upstream does (0.96–0.98×), and better than `scx_pylon` (0.76–0.81×),
+  whose 100 µs turns cost them (spec 08, the benchmarks page).
+- At the barrier it keeps a little of the gain: 1.28× upstream, against
+  4.1× for `scx_pylon`. The likely reason, not traced: the fair scheduler
+  switches a core between an owner and its VM's woken vCPUs at the tick
+  or a wakeup, not every 100 µs as `scx_pylon`'s turn timer does, and the
+  shorter slice (`sched_runtime`) doesn't add a timer of its own.
+- The 100 µs slice halves the ping-pong's p99 next to a busy VM
+  (1,741 → 907 µs) and does nothing else measurable.
+
+### 9.4 M4: wake detection
+
+`pylon/bench/spec11/m4.bt`, 10 s on each kernel, with the hosts' own
+VMs:
+
+| Kernel | BPF LSM | `kvm_vcpu_wakeup` events | `sched_waking` → vCPU running |
+|---|---|---|---|
+| Ubuntu 6.8.0-138 | no | 14,092 | 4–16 µs, a few to 1–2 ms |
+| Ubuntu 6.17.0-42 | no | 42,682 | 4–32 µs |
+| Ubuntu 7.0.0-43 | yes | 1,055 | 8–64 µs, a few to 1–2 ms |
+
+The tracepoint loads and fires on all three without `sched_ext` or the
+BPF LSM. `sched_waking` filtered on vCPU thread names sees far fewer
+wakes (3,551 of 14,092 on 6.8), most likely because halt polling catches
+the rest before the thread sleeps, so `kvm_vcpu_wakeup` is the hook to
+use. A program counting events costs about 0.8 µs per event
+(`kernel.bpf_stats_enabled`, 1,238 events on 7.0). Not measured: aarch64,
+for lack of a host.
+
+### 9.5 M5: host tasks on managed cores
+
+32 host busy loops allowed on every CPU, during the load:
+
+| | `barrier`, both VMs | `noisy` p50 / p99 | VMs' CPUs | `pylond`'s CPU |
+|---|---|---|---|---|
+| `scx_pylon` | 9.9k | 197 / 356 µs | 3.00 / 2.27 | 1.00 |
+| Affinity, owner on all the VM's cores | 0.76k | 79 / 3,819 µs | 2.00 / 1.31 | 0.71 / 0.87 |
+| Pinned, 100 µs slice | 1.07k | 73 / 3,109 µs | 2.52 / 1.75 | 0.64 / 0.67 |
+
+Under the fair scheduler, host tasks take a share of every managed core
+and of the engine's CPU: `pylond`'s engine got 0.64–0.87 of its CPU, and
+the barrier lost two thirds of its work. `scx_pylon` keeps both. So §4.6's
+operator option, keeping host tasks off managed cores and the engine CPU,
+is needed in practice, not optional. Not measured with it.
+
+### 9.6 M6: core scheduling
+
+With cookies per VM (`core_scheduling=vm`), every load is within run-to-run
+noise of the same runs without (§9.3, last two columns). Not measured: time
+spent forced idle (`core_forceidle_sum`), and a trace that no two VMs shared
+an SMT core.
+
+### 9.7 M8: stability
+
+_Running: 8 hours on the 7.0 host, see the PR._
+
+### 9.8 Not measured
+
+- aarch64 (no host), and 6.8 and 6.17 beyond M4.
+- §4.6's operator option (host tasks kept off managed cores).
+- Repeat runs: one run per configuration, so differences under about 10%
+  aren't significant.
+
+### 9.9 Against the gates (§7)
+
+| Gate | Result |
+|---|---|
+| No guest stalls | **Pass.** None in any run; `park=vmm` guests didn't start their load. |
+| Kernel stability | Pending (M8). |
+| Handoff, median at most 2× `scx_pylon`'s | **Pass, barely.** 128–144 µs against 72–96 µs, 1.8–2.0×. |
+| Throughput: at least `park=vmm`'s, within 10% of `scx_pylon`'s | **Fail at the barrier** (0.31× `scx_pylon`); 1.2–1.3× `scx_pylon` on the other loads. At least `park=vmm`'s everywhere. |
+| Ping-pong p99 under 1 ms with the other VM busy | **Pass with the 100 µs slice** (907–995 µs); fails with the default slice (1,741 µs). |
+| Wake detection without the BPF LSM | **Pass** on 6.8, 6.17 and 7.0; aarch64 untested. |
+
+**Reading.** As a replacement for `scx_pylon`, this mode loses most of its
+barrier gain: it can't time-slice an owned core at 100 µs. As the mode for
+hosts that can't run `scx_pylon` safely, which today leaves `park=vmm`, it
+keeps unmodified guests alive and runs them about as upstream does, with a
+better ping-pong tail. §7 allows that: a mode documented as slower, not
+the default where `scx_pylon` runs. Before building it, §4.6's host-task
+option needs measuring, since without it host load costs this mode far
+more than `scx_pylon`.
