@@ -421,12 +421,29 @@ spec 08.
   upstream does (0.96–0.98×), and better than `scx_pylon` (0.76–0.81×),
   whose 100 µs turns cost them (spec 08, the benchmarks page).
 - At the barrier it keeps a little of the gain: 1.28× upstream, against
-  4.1× for `scx_pylon`. The likely reason, not traced: the fair scheduler
-  switches a core between an owner and its VM's woken vCPUs at the tick
-  or a wakeup, not every 100 µs as `scx_pylon`'s turn timer does, and the
-  shorter slice (`sched_runtime`) doesn't add a timer of its own.
+  4.1× for `scx_pylon`. The barrier turns below trace why.
 - The 100 µs slice halves the ping-pong's p99 next to a busy VM
   (1,741 → 907 µs) and does nothing else measurable.
+
+**Barrier turns (2026-11-26).** The pinned prototype, 100 µs slice and
+cookies, `barrier` in both VMs, with `sched_switch` traced on the three
+managed CPUs for 30 s. The second run turned on the fair scheduler's
+`HRTICK` feature (a high-resolution timer at each slice's end; a
+host-wide debugfs switch, off by default) and nothing else. One run each.
+
+| | `barrier`, both VMs | vCPU turns ended by preemption | ... by the vCPU halting |
+|---|---|---|---|
+| Default (`NO_HRTICK`), HZ=1000 | 3.2k | 259k, mostly 128–256 µs, mean 220 µs | 25k, mean 1.3 ms |
+| `HRTICK` | 7.6k (2.4×) | 9k, mean 142 µs | 561k, mostly 64–128 µs |
+
+The tick wasn't the limit: without `HRTICK`, turns end at about twice the
+slice, at the next wakeup or scheduler event. But a vCPU waiting at the
+barrier keeps spinning through those turns and is preempted still
+runnable, so its siblings wait for it. With `HRTICK`, turns end at the
+slice and the waiting vCPUs halt instead, which hands the core to a
+sibling that has work. Handoff (144 µs median) and wake (40–44 µs)
+latency didn't change. `HRTICK` costs a timer per turn on every CPU, not
+measured here, and it affects every task on the host.
 
 ### 9.4 M4: wake detection
 
@@ -495,18 +512,19 @@ The host and both guests were checked every 5 minutes:
 | Threads holding a core-scheduling cookie | 10–15 |
 | Load average | 18.6–19.9 |
 | VM CPU on 3 managed CPUs | 1.30 + 1.37 |
-| `pylond` CPU | 1.01 (0.64–0.67 in §9.3 without the churn) |
+| `pylond` CPU | 1.01, its busy-polling engine, as in every run without host load |
 | Wake p50/p99, both VMs | 44/320 µs, 2.9 M handoffs |
 | Handoff p50/p99 | 144/416 µs |
 
-`pylond`'s CPU rose by half with the churn. The cause wasn't measured:
-the prototype recomputes every vCPU's mask on each poll, though it only
-calls `sched_setaffinity` when a mask changes. Profile this before §8.
+The churn's 8 process loops could run on every CPU, the engine's
+included, yet the engine kept a whole CPU; under §9.5's 32 busy loops it
+didn't. Why isn't measured.
 
 ### 9.8 Not measured
 
 - aarch64 (no host), and 6.8 and 6.17 beyond M4.
 - §4.6's operator option (host tasks kept off managed cores).
+- `HRTICK`'s cost on the host and on the other loads.
 - Repeat runs: one run per configuration, so differences under about 10%
   aren't significant.
 
@@ -517,17 +535,15 @@ calls `sched_setaffinity` when a mask changes. Profile this before §8.
 | No guest stalls | **Pass.** None in any run; `park=vmm` guests didn't start their load. |
 | Kernel stability | **Pass on 7.0** (8 h, no warning or lockup, host or guest); 6.17 untested. |
 | Handoff, median at most 2× `scx_pylon`'s | **Pass, barely.** 128–144 µs against 72–96 µs, 1.8–2.0×. |
-| Throughput: at least `park=vmm`'s, within 10% of `scx_pylon`'s | **Fail at the barrier** (0.31× `scx_pylon`); 1.2–1.3× `scx_pylon` on the other loads. At least `park=vmm`'s everywhere. |
+| Throughput: at least `park=vmm`'s, within 10% of `scx_pylon`'s | **Fail at the barrier** (0.31× `scx_pylon`, 0.74× with `HRTICK`); 1.2–1.3× `scx_pylon` on the other loads. At least `park=vmm`'s everywhere. |
 | Ping-pong p99 under 1 ms with the other VM busy | **Pass with the 100 µs slice** (907–995 µs); fails with the default slice (1,741 µs). |
 | Wake detection without the BPF LSM | **Pass** on 6.8, 6.17 and 7.0; aarch64 untested. |
 
 **Reading.** As a replacement for `scx_pylon`, the affinity mode loses
-most of its barrier gain: it can't time-slice an owned core at 100 µs.
-The fair scheduler checks a running task's slice mostly at the timer
-tick, so a busy vCPU likely keeps its core until the next tick, and a
-barrier round waits for every sibling's turn. That reading isn't traced
-yet: `sched_switch` turn lengths on an owned core, with and without the
-`HRTICK` scheduler feature, would confirm it. As the mode for
+most of its barrier gain by default: turns overrun the 100 µs slice, and
+vCPUs spinning at the barrier are preempted instead of halting (§9.3,
+barrier turns). The kernel's `HRTICK` feature gets back more than half
+of it (0.74× `scx_pylon`), at a host-wide cost not yet measured. As the mode for
 hosts that can't run `scx_pylon` safely, which today leaves `park=vmm`, it
 keeps unmodified guests alive and runs them about as upstream does, with a
 better ping-pong tail. §7 allows that: a mode documented as slower, not
