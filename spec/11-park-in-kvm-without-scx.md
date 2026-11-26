@@ -32,6 +32,8 @@ This spec keeps the VMM's park inside KVM and replaces what `scx_pylon`
 does with the kernel's ordinary scheduling interfaces: CPU affinity,
 `SCHED_OTHER` slices and core-scheduling cookies. The stock fair
 scheduler then does the scheduling, and `sched_ext` is never attached.
+This spec calls it the **affinity mode**, after its flag,
+`--containment affinity` (§4.7).
 
 ## 2. Goals & Non-Goals
 
@@ -203,16 +205,23 @@ competes with the owner by weight. Two levels:
 
 ### 4.7 Mode selection
 
-| `scx_pylon` attached | `park=kvm` VM registers | `--containment` |
-|---|---|---|
-| yes | as today | ignored |
-| no | refused, as today | `none` (default until §7 passes) |
-| no | accepted, contained as above | `affinity` |
+One flag, `--containment`, says what keeps `park=kvm` VMs' vCPUs on
+their VM's cores. It takes over from `--enable-scx` and `--no-scx`, which
+stay as aliases.
 
-`--containment=affinity` makes `pylond` load the tracing object (§4.4),
+| `--containment` | `scx_pylon` | `park=kvm` VMs |
+|---|---|---|
+| unset (default) | Attached when the kernel has `sched_ext`, as today | Accepted when it's attached, refused otherwise |
+| `scx` (`--enable-scx`) | Attached, or `pylond` exits | Accepted |
+| `affinity` | Never attached | Accepted, contained as above |
+| `none` (`--no-scx`) | Never attached | Refused |
+
+`--containment affinity` makes `pylond` load the tracing object (§4.4),
 set every `park=kvm` VM's vCPU affinities and slices (§4.2, §4.3), and
-expect cookies (§4.5). Once §7's gates pass, `affinity` becomes the
-default when `sched_ext` isn't attached.
+expect cookies (§4.5). Once §7's gates pass, the default falls back to
+`affinity` instead of refusing `park=kvm` VMs when `scx_pylon` isn't
+attached. Hosts that set `--no-scx` today switch to
+`--containment affinity` explicitly.
 
 ### 4.8 Changes
 
@@ -329,10 +338,10 @@ documented as slower, not made the default.
 ## 8. Implementation Outline (if §7 passes)
 
 1. **C1:** the tracing object and the `woken` mask from it (§4.4).
-2. **C2:** affinity containment in `pylond`, `--containment=affinity`
+2. **C2:** affinity containment in `pylond`, `--containment affinity`
    (§4.1, §4.2, §4.7).
 3. **C3:** vCPU slices (§4.3).
-4. **C4:** a check that `park=kvm` VMs in this mode have a cookie, and a
+4. **C4:** a check that `park=kvm` VMs in the affinity mode have a cookie, and a
    warning when one runs with `core_scheduling=off` (§4.5).
 5. **C5:** docs: the operator guide's `sched_ext` page, the host-task
    option (§4.6), and the release notes.
@@ -344,7 +353,8 @@ with SMT, one NUMA node), Ubuntu `7.0.0-43-generic`, `sched_ext` disabled
 outside the `scx_pylon` runs. The overcommit suite (`pylon/bench/overcommit/`):
 two 4-vCPU Ubuntu 26.04 guests on host CPUs 2–4, 150 s runs measured from
 40 s, one run per load. The prototype is branch `pylon/spec-11-proto`:
-`pylond --no-scx --containment-affinity` plus harness switches. It has no
+`pylond --containment affinity` plus harness switches (measured under
+its first name, `--no-scx --containment-affinity`). It has no
 wake detection (§4.4), so `pylond` sees demand only from the guest agent.
 `scx_pylon` attached with the guard (this host has the BPF LSM), and the
 VMs ran without cookies unless noted.
@@ -511,8 +521,13 @@ calls `sched_setaffinity` when a mask changes. Profile this before §8.
 | Ping-pong p99 under 1 ms with the other VM busy | **Pass with the 100 µs slice** (907–995 µs); fails with the default slice (1,741 µs). |
 | Wake detection without the BPF LSM | **Pass** on 6.8, 6.17 and 7.0; aarch64 untested. |
 
-**Reading.** As a replacement for `scx_pylon`, this mode loses most of its
-barrier gain: it can't time-slice an owned core at 100 µs. As the mode for
+**Reading.** As a replacement for `scx_pylon`, the affinity mode loses
+most of its barrier gain: it can't time-slice an owned core at 100 µs.
+The fair scheduler checks a running task's slice mostly at the timer
+tick, so a busy vCPU likely keeps its core until the next tick, and a
+barrier round waits for every sibling's turn. That reading isn't traced
+yet: `sched_switch` turn lengths on an owned core, with and without the
+`HRTICK` scheduler feature, would confirm it. As the mode for
 hosts that can't run `scx_pylon` safely, which today leaves `park=vmm`, it
 keeps unmodified guests alive and runs them about as upstream does, with a
 better ping-pong tail. §7 allows that: a mode documented as slower, not
