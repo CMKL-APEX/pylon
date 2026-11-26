@@ -13,7 +13,7 @@ use std::{io, mem, ptr, result, thread};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use log::{info, warn};
 use memmap2::MmapMut;
 use pylond::control::{ControlPlane, run_prometheus_server};
@@ -65,8 +65,9 @@ struct CliArgs {
     pcpu_map_file: Option<PathBuf>,
 
     /// Attach the live kernel sched_ext BPF dispatcher (scx-pylon), and fail if it can't be.
-    /// Without this or `--no-scx`, it is attached when the kernel has sched_ext and no
-    /// `--pcpu-map-file` is given, falling back to the in-memory table if attaching fails.
+    /// Without this, `--no-scx` or `--containment`, it is attached when the kernel has
+    /// sched_ext and no `--pcpu-map-file` is given, falling back to the in-memory table if
+    /// attaching fails.
     #[arg(long, conflicts_with = "no_scx")]
     enable_scx: bool,
 
@@ -74,10 +75,11 @@ struct CliArgs {
     #[arg(long)]
     no_scx: bool,
 
-    /// Spec 11 prototype: without scx-pylon, accept `park=kvm` VMs and keep their vCPU threads
-    /// on the cores they own with CPU affinity.
-    #[arg(long)]
-    containment_affinity: bool,
+    /// What keeps `park=kvm` VMs' vCPU threads on the cores their VM owns: `scx` is
+    /// `--enable-scx`, `none` is `--no-scx`, and `affinity` (spec 11 prototype) never attaches
+    /// scx-pylon and uses CPU affinity instead.
+    #[arg(long, value_enum, conflicts_with_all = ["enable_scx", "no_scx"])]
+    containment: Option<Containment>,
 
     /// Refuse to attach scx-pylon while any task has a core scheduling cookie. `auto` does
     /// this only on kernels without the sched_ext core-scheduling fixes; `on` also on kernels
@@ -182,6 +184,14 @@ fn parse_core_list(spec: &str) -> Result<Vec<usize>> {
 /// Present when the running kernel was built with `CONFIG_SCHED_CLASS_EXT`.
 const SCHED_EXT_SYSFS: &str = "/sys/kernel/sched_ext";
 
+/// `--containment`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Containment {
+    Scx,
+    Affinity,
+    None,
+}
+
 /// Whether to attach scx-pylon at startup.
 #[derive(Debug, PartialEq, Eq)]
 enum ScxAttach {
@@ -193,9 +203,13 @@ enum ScxAttach {
 }
 
 fn scx_attach(args: &CliArgs, kernel_has_sched_ext: bool) -> ScxAttach {
-    if args.enable_scx {
+    if args.enable_scx || args.containment == Some(Containment::Scx) {
         ScxAttach::Required
-    } else if args.no_scx || args.pcpu_map_file.is_some() || !kernel_has_sched_ext {
+    } else if args.no_scx
+        || args.containment.is_some()
+        || args.pcpu_map_file.is_some()
+        || !kernel_has_sched_ext
+    {
         ScxAttach::No
     } else {
         ScxAttach::Try
@@ -374,11 +388,8 @@ fn main() -> Result<()> {
     let engine_stop = Arc::clone(&stop_flag);
     let engine_cpu = args.engine_cpu;
     let (revoke_grace_us, force_handoff_us) = (args.revoke_grace_us, args.force_handoff_us);
-    // Only without scx_pylon: with it, scx_pylon contains woken vCPUs.
-    let containment = args.containment_affinity && vcpu_domains.is_none();
-    if args.containment_affinity && !containment {
-        warn!("--containment-affinity ignored: scx_pylon is attached");
-    }
+    // `--containment affinity` never attaches scx_pylon, which would contain woken vCPUs.
+    let containment = args.containment == Some(Containment::Affinity);
     let engine_thread = thread::Builder::new()
         .name("pylond-engine".to_owned())
         .spawn(move || {
@@ -479,6 +490,16 @@ mod tests {
         );
         assert_eq!(scx_attach(&args(&["--no-scx"]), true), ScxAttach::No);
         CliArgs::try_parse_from(["pylond", "--enable-scx", "--no-scx"]).unwrap_err();
+    }
+
+    #[test]
+    fn containment_selects_scx_attach() {
+        let attach = |mode| scx_attach(&args(&["--containment", mode]), true);
+        assert_eq!(attach("scx"), ScxAttach::Required);
+        assert_eq!(attach("affinity"), ScxAttach::No);
+        assert_eq!(attach("none"), ScxAttach::No);
+        CliArgs::try_parse_from(["pylond", "--containment", "affinity", "--no-scx"]).unwrap_err();
+        CliArgs::try_parse_from(["pylond", "--containment", "none", "--enable-scx"]).unwrap_err();
     }
 
     #[test]
