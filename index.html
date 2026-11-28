@@ -1,0 +1,114 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 CMKL-APEX -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<!-- Landing page of the Pylon docs site (gh-pages). The Pylon Docs
+     workflow puts it at the root and the book under docs/. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pylon</title>
+<meta name="description" content="Pylon: microsecond core elasticity for Cloud Hypervisor VMs, part of the Glidex cloud suite.">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5a6475; --card: #f5f7fa;
+    --border: #e1e5ec; --accent: #2b6cb0; --accent-fg: #ffffff;
+    --note-bg: #fff8e6; --note-border: #f0d999;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --fg: #e6e9ef; --muted: #a0a8b6; --card: #1b2029;
+      --border: #2a313d; --accent: #63a4e8; --accent-fg: #0d1117;
+      --note-bg: #2a2416; --note-border: #5c4a1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 4rem 1.5rem 3rem; }
+  header h1 { font-size: 2.75rem; margin: 0 0 .5rem; letter-spacing: -.02em; }
+  header p { font-size: 1.2rem; color: var(--muted); margin: 0 0 2rem; max-width: 42rem; }
+  .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 2rem; }
+  .button {
+    display: inline-block; padding: .65rem 1.2rem; border-radius: 6px;
+    border: 1px solid var(--border); color: var(--fg); text-decoration: none;
+    font-weight: 600;
+  }
+  .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  .button:hover { filter: brightness(1.08); }
+  .note {
+    background: var(--note-bg); border: 1px solid var(--note-border); border-radius: 6px;
+    padding: .8rem 1.1rem; margin: 0 0 2rem; font-size: .95rem;
+  }
+  .note a { color: var(--accent); }
+  pre {
+    background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+    padding: 1rem 1.25rem; overflow-x: auto; margin: 0 0 3rem;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  h2 { font-size: 1.3rem; margin: 0 0 1rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-bottom: 3rem; }
+  .card {
+    display: block; background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1.1rem 1.25rem; color: var(--fg); text-decoration: none;
+  }
+  a.card:hover { border-color: var(--accent); }
+  .card h3 { margin: 0 0 .35rem; font-size: 1.05rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .95rem; }
+  footer { color: var(--muted); font-size: .9rem; border-top: 1px solid var(--border); padding-top: 1.25rem; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Pylon</h1>
+    <p>Microsecond core elasticity for Cloud Hypervisor VMs. A per-host
+    arbiter moves physical CPU cores between VMs as their demand
+    changes, through shared memory and a <code>sched_ext</code>
+    scheduler. Part of the <a href="https://cmkl-apex.github.io/glidex/">Glidex</a> cloud suite.</p>
+  </header>
+
+  <div class="actions">
+    <a class="button primary" href="docs/quick-start.html">Quick start</a>
+    <a class="button" href="docs/">Documentation</a>
+    <a class="button" href="https://github.com/CMKL-APEX/pylon">GitHub</a>
+  </div>
+
+  <p class="note"><strong>Under active development.</strong> Arbitration,
+  parking and waking, metering and the <code>sched_ext</code> dispatcher work;
+  cooperative revocation doesn't yet. See <a href="docs/status.html">Status and roadmap</a>.</p>
+
+  <pre><code>git clone https://github.com/CMKL-APEX/pylon.git &amp;&amp; cd pylon
+cargo build --release -p cloud-hypervisor -p pylond</code></pre>
+
+  <h2>Features</h2>
+  <div class="grid">
+    <div class="card"><h3>Elastic vCPUs</h3><p>VMs boot with all their vCPUs; only the ones with work get a core. The rest are parked and cost nothing.</p></div>
+    <div class="card"><h3>Per-host arbiter</h3><p><code>pylond</code> polls guest demand about every microsecond on a dedicated core, with no locks or allocations in its loop.</p></div>
+    <div class="card"><h3>Per-VM policy</h3><p>Minimum and maximum cores and a priority weight per VM, changeable at runtime.</p></div>
+    <div class="card"><h3>Kernel handoff</h3><p>The <code>scx_pylon</code> BPF scheduler runs each core's owner, read from a memory-mapped map.</p></div>
+    <div class="card"><h3>Metering</h3><p>Core-microseconds, yields and preemptions per VM, over a socket and as Prometheus metrics.</p></div>
+    <div class="card"><h3>Upstream-friendly</h3><p>A surgical fork: new crates under <code>pylon/</code> and one VMM file, with one-line hooks upstream.</p></div>
+  </div>
+
+  <h2>Documentation</h2>
+  <div class="grid">
+    <a class="card" href="docs/quick-start.html"><h3>Quick start</h3><p>Build Pylon, start <code>pylond</code> and boot an elastic VM.</p></a>
+    <a class="card" href="docs/status.html"><h3>Status and roadmap</h3><p>What works today, what doesn't, and what's planned.</p></a>
+    <a class="card" href="docs/user-guide/index.html"><h3>User guide</h3><p>The <code>--pylon</code> option and what the guest sees.</p></a>
+    <a class="card" href="docs/operator-guide/index.html"><h3>Operator guide</h3><p>Installing and running <code>pylond</code>, <code>scx_pylon</code>, policy and monitoring.</p></a>
+    <a class="card" href="docs/developer-guide/index.html"><h3>Developer guide</h3><p>Architecture, ABI, the arbitration engine, design decisions, enhancements and benchmarks.</p></a>
+    <a class="card" href="docs/reference/index.html"><h3>Reference</h3><p>Options, the control socket protocol and metrics.</p></a>
+  </div>
+
+  <footer>
+    Pylon is a fork of <a href="https://www.cloudhypervisor.org/">Cloud Hypervisor</a>,
+    licensed under Apache-2.0 and BSD-3-Clause. Documentation under CC-BY-4.0.
+    <a href="https://github.com/CMKL-APEX/pylon">Source on GitHub</a>.
+  </footer>
+</main>
+</body>
+</html>
