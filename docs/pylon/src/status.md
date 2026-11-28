@@ -1,9 +1,9 @@
 # Status and roadmap
 
 This page says what works in Pylon today, what doesn't, and what is
-planned. It reflects the `v0.0.9` release (see the [release
+planned. It reflects the `v0.0.10` release (see the [release
 notes](release-notes.md)). Open work is tracked as GitHub issues on the
-[`v0.0.10` milestone](https://github.com/CMKL-APEX/pylon/milestone/3).
+[`v0.0.11` milestone](https://github.com/CMKL-APEX/pylon/milestone/4).
 The detailed tracker is
 [`spec/05-implementation-status.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md).
 
@@ -109,7 +109,8 @@ But:
 option, the default on KVM hosts, with ABI version 3 ([#51](https://github.com/CMKL-APEX/pylon/issues/51)).
 `v0.0.9` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/2)) synced with upstream Cloud Hypervisor v55.0
 and fixed `scx_pylon` on large hosts and on 6.17 kernels.
-The next release is `v0.0.10` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/3)):
+`v0.0.10` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/3)) put `pylond` in a slice of its own on 6.17 kernels.
+The next release is `v0.0.11` ([milestone](https://github.com/CMKL-APEX/pylon/milestone/4)):
 
 | Work | Issues |
 |---|---|
