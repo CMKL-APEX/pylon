@@ -4,7 +4,7 @@
 //
 
 use std::ffi::CString;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,11 +226,32 @@ fn raise_fd_limit() {
     }
 }
 
+/// Whether `pylond` runs where its engine starves the other threads on its CPU (#137): on a
+/// 6.17 kernel (`release`, as in `/proc/sys/kernel/osrelease`), in a cgroup under
+/// `system.slice` (`cgroup`, the path in `/proc/self/cgroup`). There, the slice's per-CPU
+/// weight changes with every service's load, and the kernel appears to stop charging the
+/// engine's time at the root, so nothing else on the engine CPU becomes eligible to run.
+fn engine_starves_its_cpu(release: &str, cgroup: &str) -> bool {
+    release.starts_with("6.17.") && cgroup.starts_with("/system.slice/")
+}
+
 fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = CliArgs::parse();
     raise_fd_limit();
     let tenant_pcpus = parse_core_list(&args.cores)?;
+
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let cgroup = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let cgroup = cgroup.trim().strip_prefix("0::").unwrap_or_default();
+    if engine_starves_its_cpu(release.trim(), cgroup) {
+        warn!(
+            "Kernel {} with pylond in {cgroup}: other threads on the engine CPU, kernel \
+             workers included, can get no CPU time (#137); run pylond in a slice of its own \
+             (Slice=pylon.slice in its unit)",
+            release.trim()
+        );
+    }
 
     if tenant_pcpus.contains(&args.engine_cpu) {
         warn!(
@@ -448,6 +469,19 @@ mod tests {
     fn scx_attaches_when_the_kernel_has_sched_ext() {
         assert_eq!(scx_attach(&args(&[]), true), ScxAttach::Try);
         assert_eq!(scx_attach(&args(&[]), false), ScxAttach::No);
+    }
+
+    #[test]
+    fn only_system_slice_on_6_17_starves_the_engine_cpu() {
+        let service = "/system.slice/glidex-pylond.service";
+        assert!(engine_starves_its_cpu("6.17.0-42-generic", service));
+        assert!(!engine_starves_its_cpu(
+            "6.17.0-42-generic",
+            "/pylon.slice/pylond.service"
+        ));
+        assert!(!engine_starves_its_cpu("6.17.0-42-generic", "/"));
+        assert!(!engine_starves_its_cpu("6.8.0-138-generic", service));
+        assert!(!engine_starves_its_cpu("7.0.0-43-generic", service));
     }
 
     #[test]

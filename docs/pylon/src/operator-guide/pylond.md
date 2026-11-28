@@ -37,6 +37,14 @@ option is in the [pylond reference](../reference/pylond.md).
   excludes it. Any interruption of the engine delays every handoff on
   the host. With `scx_pylon`, the engine owns its CPU, so vCPU threads
   don't run there, but kernel threads bound to that CPU still do.
+- Run `pylond` in a slice of its own, such as `Slice=pylon.slice` in its
+  unit ([the example unit](installation.md#a-systemd-unit-for-pylond)).
+  On 6.17 kernels, with `pylond` under `system.slice`, threads waiting
+  on the engine CPU, kernel workers included, get no CPU time at all
+  (#137). The engine's slice-level weight on that CPU then changes with
+  every other service's load. In a slice of its own it's steady, and
+  they get their share, as on 6.8 and 7.0. `pylond` warns at startup on
+  6.17 when it runs under `system.slice`.
 - If pinning fails, `pylond` logs a warning and keeps running unpinned.
 
 `pylond` doesn't stop other processes from running on the managed CPUs.
