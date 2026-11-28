@@ -1,5 +1,38 @@
 # Release notes
 
+## v0.0.10
+
+A small release for 6.17 hosts. Nothing changes in the shared-page ABI,
+the host page or the `--pylon` options, so `pylond`, the VMM and the
+guest side from v0.0.9 work with this release.
+
+### Changes since v0.0.9
+
+- **Run `pylond` in a slice of its own on 6.17 kernels**
+  ([#137](https://github.com/CMKL-APEX/pylon/issues/137),
+  [#138](https://github.com/CMKL-APEX/pylon/pull/138)). On a 6.17
+  kernel, with `pylond` under `system.slice`, its polling engine leaves
+  every other thread on the engine CPU with no CPU time, kernel workers
+  included. In a top-level slice of its own, such as
+  `Slice=pylon.slice` in its unit, the other threads get their share,
+  as on 6.8 and 7.0. The example unit in [Building and
+  installing](operator-guide/installation.md) now sets it, and
+  `pylond` warns at startup when it runs under `system.slice` on 6.17.
+  It changes nothing else about how `pylond` runs.
+- **CI uses Cloud Hypervisor's v7.2.8-20261125 guest kernels**
+  ([#139](https://github.com/CMKL-APEX/pylon/pull/139)). Upstream
+  replaced the files of the previous release, so their checksums no
+  longer matched.
+
+### Upgrading
+
+- **On a 6.17 host,** add `Slice=pylon.slice` to the `[Service]`
+  section of `pylond`'s unit before you upgrade, or `pylond` keeps
+  starving its engine CPU. Other kernels don't need it.
+- Otherwise, replace the binaries.
+
+The known limits of v0.0.9 and v0.0.8 below still apply.
+
 ## v0.0.9
 
 The same code as `v0.0.9-rc3`, with the Pylon components numbered
@@ -203,5 +236,5 @@ See [Status and roadmap](status.md) for what works and what doesn't.
 - **A VM with no core isn't woken by arriving packets**
   ([#57](https://github.com/CMKL-APEX/pylon/issues/57)).
 
-The next release, `v0.0.10`, is tracked on its
-[milestone](https://github.com/CMKL-APEX/pylon/milestone/3).
+The next release, `v0.0.11`, is tracked on its
+[milestone](https://github.com/CMKL-APEX/pylon/milestone/4).

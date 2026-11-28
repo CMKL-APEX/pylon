@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-abi"
-version = "0.0.10-dev"
+version = "0.0.10"
 
 [[package]]
 name = "quote"

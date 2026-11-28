@@ -9,7 +9,7 @@ and
 (both drafts). Progress is tracked in
 [`spec/05-implementation-status.md`](https://github.com/CMKL-APEX/pylon/blob/main/spec/05-implementation-status.md)
 as tracks 4, 5 and 7. Open work is tracked as GitHub issues on the
-[`v0.0.10` milestone and later ones](https://github.com/CMKL-APEX/pylon/milestones).
+[`v0.0.11` milestone and later ones](https://github.com/CMKL-APEX/pylon/milestones).
 
 ## Problems in the original revocation path
 
