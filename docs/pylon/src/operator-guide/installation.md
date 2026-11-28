@@ -122,6 +122,9 @@ Before=multi-user.target
 
 [Service]
 Type=simple
+# A slice of its own, not system.slice: on 6.17 kernels, threads on the
+# engine CPU otherwise get no CPU time (#137).
+Slice=pylon.slice
 RuntimeDirectory=pylon
 Environment=RUST_LOG=info
 # Let only the group the VMMs run as (here: pylon-vmm) use the socket.
